@@ -36,6 +36,19 @@ add_library(
   ducklake_transaction_state.cpp
   ducklake_view_entry.cpp
   ducklake_transaction_changes.cpp)
+
+if(DUCKLAKE_VANE_DISTRIBUTED)
+  add_library(ducklake_distributed_scan_objects OBJECT
+              ducklake_distributed_scan.cpp)
+  target_include_directories(
+    ducklake_distributed_scan_objects
+    PRIVATE "${DUCKDB_SOURCE_PATH}/extension/parquet/include"
+            "${DUCKDB_SOURCE_PATH}/third_party/parquet"
+            "${DUCKDB_SOURCE_PATH}/third_party/thrift")
+  list(APPEND ALL_OBJECT_FILES
+       $<TARGET_OBJECTS:ducklake_distributed_scan_objects>)
+endif()
+
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:ducklake_storage>
     PARENT_SCOPE)

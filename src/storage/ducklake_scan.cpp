@@ -5,6 +5,9 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_transaction.hpp"
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#include "storage/ducklake_distributed_scan.hpp"
+#endif
 
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_data.hpp"
@@ -242,6 +245,9 @@ TableFunction DuckLakeFunctions::GetDuckLakeScanFunction(DatabaseInstance &insta
 	function.dynamic_to_string = DuckLakeDynamicToString;
 
 	function.name = "ducklake_scan";
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	ConfigureDuckLakeDistributedScan(function);
+#endif
 	return function;
 }
 

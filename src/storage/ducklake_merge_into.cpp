@@ -121,7 +121,6 @@ SinkCombineResultType DuckLakeMergeInsert::Combine(ExecutionContext &context, Op
 	return copy.Combine(context, combine_input);
 }
 
-
 namespace {
 
 //! Extend the Event class to be able to capture a created Event
@@ -147,8 +146,9 @@ public:
 } // namespace
 
 // Scan copy operator source and sink into insert operator — shared by MergeInsert and MergeUpdate
-static SinkFinalizeType FinalizeCopyToInsert(Pipeline &pipeline, Event &event, ClientContext &context, PhysicalOperator &copy_op,
-                                 PhysicalOperator &insert_op, InterruptState &interrupt_state) {
+static SinkFinalizeType FinalizeCopyToInsert(Pipeline &pipeline, Event &event, ClientContext &context,
+                                             PhysicalOperator &copy_op, PhysicalOperator &insert_op,
+                                             InterruptState &interrupt_state) {
 	OperatorSinkFinalizeInput copy_finalize {*copy_op.sink_state, interrupt_state};
 	CaptureEvent capture_event(pipeline.executor);
 	auto finalize_result = copy_op.Finalize(pipeline, capture_event, context, copy_finalize);
@@ -446,7 +446,11 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 
 	switch (action.action_type) {
 	case MergeActionType::MERGE_UPDATE: {
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		LogicalUpdate update(context, op.table);
+#else
 		LogicalUpdate update(op.table);
+#endif
 		for (auto &def : op.bound_defaults) {
 			update.bound_defaults.push_back(def->Copy());
 		}
@@ -491,7 +495,11 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		LogicalDelete delete_op(context, op.table, 0);
+#else
 		LogicalDelete delete_op(op.table, 0);
+#endif
 		delete_op.expressions.push_back(nullptr);
 
 		vector<LogicalType> row_id_types {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::BIGINT};
@@ -504,7 +512,11 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		LogicalInsert insert_op(context, op.table, 0);
+#else
 		LogicalInsert insert_op(op.table, 0);
+#endif
 		insert_op.bound_constraints = std::move(bound_constraints);
 		for (auto &def : op.bound_defaults) {
 			insert_op.bound_defaults.push_back(def->Copy());
