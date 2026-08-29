@@ -2,6 +2,8 @@ name: Vane extension
 
 on:
   push:
+    branches:
+      - v1.5-variegata_vane
   pull_request:
   workflow_dispatch:
 
