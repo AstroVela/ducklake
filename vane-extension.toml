@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 name = "ducklake"
 extension_config = "extension_config_vane.cmake"
 build_extensions = ["httpfs", "parquet"]
@@ -7,3 +7,7 @@ native_test_selection = "test/sql/vane/native_scan.test"
 [vane]
 repository = "AstroVela/vane"
 revision = "3a85ec3c18ccc0af5d2e0f0183bc851d6443a411"
+
+[vcpkg]
+repository = "microsoft/vcpkg"
+revision = "84bab45d415d22042bd0b9081aea57f362da3f35"

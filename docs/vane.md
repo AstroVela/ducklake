@@ -3,7 +3,7 @@
 DuckLake has an explicit Vane build mode for distributed, file-backed table scans. The ordinary DuckDB extension
 build remains the default and does not compile Vane headers or distributed scan sources.
 
-Initialize the independent CI tooling and build against the exact Vane revision in `vane-extension.toml`:
+Initialize the independent CI tooling and build against the exact Vane and vcpkg revisions in `vane-extension.toml`:
 
 ```shell
 git submodule update --init --recursive
