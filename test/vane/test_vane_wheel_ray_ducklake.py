@@ -393,6 +393,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.stale_source(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.schema_source(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
         connection.execute("ALTER TABLE lake.partitioned_write_target SET PARTITIONED BY (category)")
         connection.execute("CREATE TABLE lake.concurrent_write_target(id INTEGER, payload VARCHAR)")
@@ -682,6 +683,27 @@ def exercise_distributed_writes(
         set((root / "data").rglob("*.parquet")),
         files_before_failure,
         "failed CTAS artifact cleanup",
+    )
+
+    files_before_constraint_failure = set((root / "data").rglob("*.parquet"))
+    null_source = connection.sql(
+        "SELECT CASE WHEN id = 31 THEN NULL ELSE id END::INTEGER AS id, payload FROM lake.source WHERE id < 128"
+    )
+    require_error(
+        lambda: null_source.insert_into("lake.not_null_write_target"),
+        "not null",
+        "distributed DuckLake INSERT coordinator constraint failure",
+    )
+    require_write_count(1, "constraint failure Ray dispatch count")
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.not_null_write_target").fetchone(),
+        (0,),
+        "constraint failure table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_constraint_failure,
+        "constraint failure artifact cleanup",
     )
 
     stale_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 800 AND 900")

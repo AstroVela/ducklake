@@ -189,6 +189,24 @@ static void AddDistributedDataFiles(ClientContext &context, DuckLakeInsertGlobal
 	}
 }
 
+static void CleanupValidatedDistributedDataFiles(ClientContext &context,
+                                                 const vector<distributed::DistributedCopyFileInfo> &files) {
+	auto &file_system = FileSystem::GetFileSystem(context);
+	vector<string> errors;
+	for (const auto &file : files) {
+		const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
+		try {
+			file_system.TryRemoveFile(path);
+		} catch (const std::exception &error) {
+			errors.push_back(StringUtil::Format("%s: %s", path, error.what()));
+		}
+	}
+	if (!errors.empty()) {
+		throw IOException("Failed to clean validated DuckLake distributed data files: %s",
+		                  StringUtil::Join(errors, "; "));
+	}
+}
+
 } // namespace
 
 void DuckLakeInsert::InitializeDistributedWritePlan() {
@@ -448,35 +466,54 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 	ValidateDistributedWriteShape();
 	auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
 	auto files = distributed::DecodeDistributedFileWriteResults(write_info, results);
-	auto &coordinator_catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<DuckLakeCatalog>();
-	DuckLakeTransaction::Get(context, coordinator_catalog).FailDistributedWriteOnSnapshotConflict();
-
-	optional_ptr<DuckLakeTableEntry> target_table;
-	optional_idx target_partition_id;
 	if (distributed_write_plan.operator_name == "ctas") {
 		ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, *distributed_ctas_field_data,
 		                                             distributed_partition_names, files);
-		target_table = &CreateDistributedCTASTable(context);
-		if (target_table->GetPartitionData()) {
-			target_partition_id = target_table->GetPartitionData()->partition_id;
-		}
 	} else {
-		target_table = &ResolveDistributedWriteTable(context);
-		ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, target_table->GetFieldData(),
+		ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, table->GetFieldData(),
 		                                             distributed_partition_names, files);
-		target_partition_id = partition_id;
 	}
 
-	DuckLakeInsertGlobalState global_state(*target_table);
-	AddDistributedDataFiles(context, global_state, files, target_partition_id);
-	for (const auto &data_file : global_state.written_files) {
-		global_state.total_insert_count += data_file.row_count;
+	try {
+		auto &coordinator_catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<DuckLakeCatalog>();
+		DuckLakeTransaction::Get(context, coordinator_catalog).FailDistributedWriteOnSnapshotConflict();
+
+		optional_ptr<DuckLakeTableEntry> target_table;
+		optional_idx target_partition_id;
+		if (distributed_write_plan.operator_name == "ctas") {
+			target_table = &CreateDistributedCTASTable(context);
+			if (target_table->GetPartitionData()) {
+				target_partition_id = target_table->GetPartitionData()->partition_id;
+			}
+		} else {
+			target_table = &ResolveDistributedWriteTable(context);
+			target_partition_id = partition_id;
+		}
+
+		DuckLakeInsertGlobalState global_state(*target_table);
+		AddDistributedDataFiles(context, global_state, files, target_partition_id);
+		for (const auto &data_file : global_state.written_files) {
+			global_state.total_insert_count += data_file.row_count;
+		}
+		if (!global_state.written_files.empty()) {
+			auto &transaction = DuckLakeTransaction::Get(context, target_table->catalog);
+			transaction.AppendFiles(target_table->GetTableId(), std::move(global_state.written_files));
+		}
+		return global_state.total_insert_count;
+	} catch (const std::exception &error) {
+		try {
+			CleanupValidatedDistributedDataFiles(context, files);
+		} catch (const std::exception &cleanup_error) {
+			throw IOException("%s; distributed artifact cleanup failed: %s", error.what(), cleanup_error.what());
+		}
+		throw;
+	} catch (...) {
+		try {
+			CleanupValidatedDistributedDataFiles(context, files);
+		} catch (...) {
+		}
+		throw;
 	}
-	if (!global_state.written_files.empty()) {
-		auto &transaction = DuckLakeTransaction::Get(context, target_table->catalog);
-		transaction.AppendFiles(target_table->GetTableId(), std::move(global_state.written_files));
-	}
-	return global_state.total_insert_count;
 }
 
 void DuckLakeInsert::AbortDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &) const {
