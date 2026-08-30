@@ -1,5 +1,6 @@
 #include "storage/ducklake_distributed_write.hpp"
 
+#include "common/parquet_file_scanner.hpp"
 #include "common/ducklake_util.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "storage/ducklake_insert.hpp"
@@ -209,8 +210,9 @@ static string ValidateArtifactLocation(FileSystem &file_system, const string &da
 	return std::move(location.canonical_path);
 }
 
-static void ValidateArtifactContents(FileSystem &file_system, const string &canonical_path, const string &path,
-                                     idx_t expected_size, idx_t expected_footer_size) {
+static void ValidateArtifactContents(ClientContext &context, FileSystem &file_system, const string &canonical_path,
+                                     const string &path, idx_t expected_size, idx_t expected_footer_size,
+                                     idx_t expected_row_count) {
 	try {
 		auto handle = file_system.OpenFile(canonical_path, FileFlags::FILE_FLAGS_READ);
 		auto actual_size = handle->GetFileSize();
@@ -231,6 +233,18 @@ static void ValidateArtifactContents(FileSystem &file_system, const string &cano
 		}
 		if (LoadLE<uint32_t>(trailer) != expected_footer_size) {
 			throw InvalidInputException("DuckLake distributed data-file footer mismatch for '%s'", path);
+		}
+
+		DuckLakeFileData artifact;
+		artifact.path = canonical_path;
+		artifact.file_size_bytes = actual_size;
+		artifact.footer_size = expected_footer_size;
+		ParquetFileScanner scanner(context, artifact);
+		auto actual_row_count = scanner.GetRowCount();
+		if (actual_row_count != expected_row_count) {
+			throw InvalidInputException(
+			    "DuckLake distributed data-file row-count mismatch for '%s' (worker reported %s rows, found %s)", path,
+			    to_string(expected_row_count), to_string(actual_row_count));
 		}
 	} catch (const InvalidInputException &) {
 		throw;
@@ -492,11 +506,11 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		    file.row_count > signed_max - total_rows || file.file_size_bytes > signed_max - total_bytes) {
 			throw InvalidInputException("DuckLake distributed write statistics exceed signed 64-bit limits");
 		}
+		ValidateArtifactContents(context, file_system, canonical_path, path, file.file_size_bytes,
+		                         NumericCast<idx_t>(footer_size), file.row_count);
+		ValidateColumnStatistics(file.column_statistics, field_data, not_null_fields, file.row_count);
 		total_rows += file.row_count;
 		total_bytes += file.file_size_bytes;
-		ValidateColumnStatistics(file.column_statistics, field_data, not_null_fields, file.row_count);
-		ValidateArtifactContents(file_system, canonical_path, path, file.file_size_bytes,
-		                         NumericCast<idx_t>(footer_size));
 	}
 }
 

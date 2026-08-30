@@ -28,6 +28,10 @@ public:
 	const vector<LogicalType> &GetTypes() const;
 	const vector<string> &GetNames() const;
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	idx_t GetRowCount() const;
+#endif
+
 	//! Find a column by name, returns invalid index if not found
 	optional_idx FindColumn(const string &name) const;
 

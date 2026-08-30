@@ -414,6 +414,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.schema_source(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.row_count_write_target(id INTEGER NOT NULL, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.not_null_nested_target(payload STRUCT(value INTEGER) NOT NULL)")
         connection.execute("CREATE TABLE lake.rollback_write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
@@ -586,6 +587,121 @@ def require_concurrent_write_conflict(
     )
 
 
+def require_forged_row_count_rejected(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+) -> None:
+    import pyarrow as pa
+    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
+    from vane.runners.local.runner import _InProcessFragmentExecutor
+
+    files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
+    source = connection.sql("SELECT NULL::INTEGER AS id, 'forged'::VARCHAR AS payload")
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.row_count_write_target"),
+    )
+
+    fragment_executor = _InProcessFragmentExecutor()
+    forged_file_count = 0
+
+    def execute_with_forged_statistics(request: object) -> object:
+        nonlocal forged_file_count
+        result = fragment_executor(request)
+        payloads = []
+        for payload in result.partition_payloads:
+            if payload.num_columns < 5:
+                raise AssertionError("distributed write result is missing file-statistics columns")
+            row_count_name = payload.column_names[1]
+            column_statistics_name = payload.column_names[4]
+            rows = payload.to_pylist()
+            for row in rows:
+                row[row_count_name] = 0
+                forged_statistics = []
+                forged_counts = set()
+                for column_path, statistics in row[column_statistics_name] or []:
+                    column_statistics = []
+                    for statistic_name, statistic_value in statistics or []:
+                        if statistic_name in {"null_count", "num_values"}:
+                            statistic_value = "0"
+                            forged_counts.add(statistic_name)
+                        column_statistics.append((statistic_name, statistic_value))
+                    forged_statistics.append((column_path, column_statistics))
+                require_equal(
+                    forged_counts,
+                    {"null_count", "num_values"},
+                    "forged worker row/null statistics",
+                )
+                row[column_statistics_name] = forged_statistics
+                forged_file_count += 1
+            payloads.append(pa.Table.from_pylist(rows, schema=payload.schema))
+        return vane.ray_cxx.NativeDistributedTaskResult(
+            payloads,
+            result.partition_metadatas,
+            result.result_schema,
+            result.stats,
+            result.completion_status,
+            result.flight_port,
+            result.exchange_sink_instance,
+            result.task_stats,
+        )
+
+    backend = NativeFteWorkerManagerBackend(
+        execute_fn=execute_with_forged_statistics,
+        num_workers=1,
+        max_running_tasks=1,
+    )
+    plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        outcome = plan_runner.run_copy_plan(plan, connection)
+        require_equal(
+            outcome.get("extension_catalog_committed"),
+            False,
+            "forged row-count catalog outcome",
+        )
+        require_true(
+            "row-count mismatch" in str(outcome.get("copy_output_outcome_error", "")).lower(),
+            f"unexpected forged row-count outcome: {outcome}",
+        )
+    finally:
+        cleanup_errors = []
+        for cleanup in (
+            plan_runner.shutdown,
+            backend.request_shutdown,
+            fragment_executor.request_shutdown,
+            lambda: backend.shutdown(timeout_s=30),
+            lambda: fragment_executor.close(timeout_s=30),
+        ):
+            try:
+                cleanup()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise RuntimeError(f"failed to stop forged-statistics workers: {cleanup_errors[0]}") from cleanup_errors[0]
+
+    require_true(forged_file_count > 0, "forged distributed write produced no worker files")
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.row_count_write_target").fetchone(),
+        (0,),
+        "forged row-count table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_failure,
+        "forged row-count artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_failure,
+        "forged row-count artifact-root cleanup",
+    )
+
+
 def exercise_distributed_writes(
     vane: object,
     connection: object,
@@ -754,6 +870,8 @@ def exercise_distributed_writes(
         artifact_directories_before_constraint_failure,
         "constraint failure artifact-root cleanup",
     )
+
+    require_forged_row_count_rejected(vane, connection, runner, root)
 
     files_before_missing_stats = set((root / "data").rglob("*.parquet"))
     artifact_directories_before_missing_stats = distributed_artifact_directories(root)
