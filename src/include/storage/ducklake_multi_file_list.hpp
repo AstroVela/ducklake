@@ -54,6 +54,9 @@ public:
 	optional_ptr<const FilterPushdownInfo> GetFilterInfo() const {
 		return filter_info.get();
 	}
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	const vector<DuckLakeFileListExtendedEntry> &GetDistributedFilesExtended(const DuckLakeSnapshot &snapshot) const;
+#endif
 
 	bool IsDeleteScan() const;
 	const DuckLakeDeleteScanEntry &GetDeleteScanEntry(idx_t file_idx);
@@ -87,6 +90,11 @@ private:
 	mutable vector<DuckLakeDeleteScanEntry> delete_scans;
 	//! Filter pushdown information
 	unique_ptr<FilterPushdownInfo> filter_info;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	mutable vector<DuckLakeFileListExtendedEntry> distributed_extended_files;
+	mutable DuckLakeSnapshot distributed_extended_snapshot;
+	mutable bool distributed_extended_files_loaded = false;
+#endif
 };
 
 } // namespace duckdb

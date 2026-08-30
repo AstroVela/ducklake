@@ -5,7 +5,9 @@
 #include "storage/ducklake_geo_stats.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "storage/ducklake_insert.hpp"
+#include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_partition_data.hpp"
+#include "storage/ducklake_sort_data.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_variant_stats.hpp"
 
@@ -14,9 +16,11 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/hive_partitioning.hpp"
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
@@ -36,6 +40,29 @@ namespace duckdb {
 namespace {
 
 static constexpr const char DUCKLAKE_DISTRIBUTED_ARTIFACT_PREFIX[] = ".vane-ducklake-";
+
+static void AppendDistributedIdentity(string &result, const string &value) {
+	result += to_string(value.size());
+	result += ':';
+	result += value;
+	result += ';';
+}
+
+static void AppendDistributedFieldIdentity(string &result, const DuckLakeFieldId &field) {
+	AppendDistributedIdentity(result, to_string(field.GetFieldIndex().index));
+	AppendDistributedIdentity(result, field.Name());
+	AppendDistributedIdentity(result, field.Type().ToString());
+	AppendDistributedIdentity(result, field.GetColumnData().initial_default.ToString());
+	if (field.GetColumnData().default_value) {
+		AppendDistributedIdentity(result, field.GetColumnData().default_value->ToString());
+	} else {
+		AppendDistributedIdentity(result, string());
+	}
+	for (const auto &child : field.Children()) {
+		AppendDistributedFieldIdentity(result, *child);
+	}
+	AppendDistributedIdentity(result, "end-field");
+}
 
 static string GetPartitionColumnName(const ColumnRefExpression &column_ref) {
 	if (column_ref.IsQualified()) {
@@ -798,6 +825,76 @@ static vector<string> ValidatePartitionValues(const Value &partition_keys, const
 
 } // namespace
 
+string GetDuckLakeDistributedFieldIdentity(const DuckLakeFieldData &field_data) {
+	string result;
+	for (const auto &field : field_data.GetFieldIds()) {
+		AppendDistributedFieldIdentity(result, *field);
+	}
+	return result;
+}
+
+string GetDuckLakeDistributedPartitionIdentity(const DuckLakePartition *partition_data) {
+	if (!partition_data) {
+		return string();
+	}
+	string result;
+	AppendDistributedIdentity(result, to_string(partition_data->partition_id));
+	for (const auto &field : partition_data->fields) {
+		AppendDistributedIdentity(result, to_string(field.partition_key_index));
+		AppendDistributedIdentity(result, to_string(field.field_id.index));
+		AppendDistributedIdentity(result, to_string(static_cast<uint8_t>(field.transform.type)));
+		AppendDistributedIdentity(result, to_string(field.transform.bucket_count));
+	}
+	return result;
+}
+
+string GetDuckLakeDistributedSortIdentity(const DuckLakeSort *sort_data) {
+	if (!sort_data) {
+		return string();
+	}
+	string result;
+	AppendDistributedIdentity(result, to_string(sort_data->sort_id));
+	for (const auto &field : sort_data->fields) {
+		AppendDistributedIdentity(result, to_string(field.sort_key_index));
+		AppendDistributedIdentity(result, field.expression);
+		AppendDistributedIdentity(result, field.dialect);
+		AppendDistributedIdentity(result, to_string(static_cast<uint8_t>(field.sort_direction)));
+		AppendDistributedIdentity(result, to_string(static_cast<uint8_t>(field.null_order)));
+	}
+	return result;
+}
+
+bool DuckLakeDistributedSnapshotsMatch(const DuckLakeSnapshot &left, const DuckLakeSnapshot &right) {
+	return left.snapshot_id == right.snapshot_id && left.schema_version == right.schema_version &&
+	       left.next_catalog_id == right.next_catalog_id && left.next_file_id == right.next_file_id;
+}
+
+vector<string> GetDuckLakeDistributedPartitionNames(const PhysicalCopyToFile &copy) {
+	vector<string> result;
+	for (const auto column_index : copy.partition_columns) {
+		if (column_index >= copy.names.size()) {
+			throw SerializationException("Distributed DuckLake COPY contains an invalid partition column");
+		}
+		result.push_back(copy.names[column_index]);
+	}
+	return result;
+}
+
+void ValidateDuckLakeDistributedSnapshotBaseline(ClientContext &context, const string &catalog_name,
+                                                 const DuckLakeSnapshot &expected_snapshot,
+                                                 const string &operation_name) {
+	auto &catalog = Catalog::GetCatalog(context, catalog_name).Cast<DuckLakeCatalog>();
+	auto &transaction = DuckLakeTransaction::Get(context, catalog);
+	if (!DuckLakeDistributedSnapshotsMatch(transaction.GetSnapshot(), expected_snapshot)) {
+		throw TransactionException("DuckLake %s snapshot changed after the distributed write was planned",
+		                           operation_name);
+	}
+	auto latest_snapshot = transaction.GetMetadataManager().GetSnapshot();
+	if (!latest_snapshot || !DuckLakeDistributedSnapshotsMatch(*latest_snapshot, expected_snapshot)) {
+		throw TransactionException("DuckLake %s snapshot is stale", operation_name);
+	}
+}
+
 unique_ptr<DuckLakePartition>
 PlanDuckLakeDistributedCTASPartition(const ColumnList &columns, const DuckLakeFieldData &field_data,
                                      const vector<unique_ptr<ParsedExpression>> &partition_keys) {
@@ -845,16 +942,13 @@ void CleanupDuckLakeDistributedArtifacts(ClientContext &context, const string &d
 	CleanupDuckLakeDistributedArtifacts(file_system, data_path, artifact_path);
 }
 
-void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
-                                                  const string &artifact_path, const DuckLakeFieldData &field_data,
-                                                  const case_insensitive_set_t &not_null_fields,
-                                                  const vector<string> &partition_names,
-                                                  vector<distributed::DistributedCopyFileInfo> &files) {
-	if (data_path.empty()) {
-		throw InvalidInputException("DuckLake distributed data path cannot be empty");
-	}
+static void ValidateDuckLakeDistributedDataFileArtifactsInternal(ClientContext &context,
+                                                                 const string &canonical_artifact_path,
+                                                                 const DuckLakeFieldData &field_data,
+                                                                 const case_insensitive_set_t &not_null_fields,
+                                                                 const vector<string> &partition_names,
+                                                                 vector<distributed::DistributedCopyFileInfo> &files) {
 	auto &file_system = FileSystem::GetFileSystem(context);
-	auto canonical_artifact_path = ValidateArtifactRoot(file_system, data_path, artifact_path);
 	auto expected_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
 	auto expected_fields = GetExpectedArtifactFields(field_data);
 	idx_t total_rows = 0;
@@ -903,6 +997,52 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 	}
 }
 
+static unique_ptr<DuckLakeFieldData> AddDuckLakeDistributedRowIdField(const DuckLakeFieldData &field_data) {
+	auto result = make_uniq<DuckLakeFieldData>();
+	for (const auto &field : field_data.GetFieldIds()) {
+		result->Add(field->Copy());
+	}
+	DuckLakeColumnData row_id_data;
+	row_id_data.id = FieldIndex(MultiFileReader::ROW_ID_FIELD_ID);
+	result->Add(make_uniq<DuckLakeFieldId>(std::move(row_id_data), "_ducklake_internal_row_id", LogicalType::BIGINT));
+	return result;
+}
+
+void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
+                                                  const string &artifact_path, const DuckLakeFieldData &field_data,
+                                                  const case_insensitive_set_t &not_null_fields,
+                                                  const vector<string> &partition_names,
+                                                  vector<distributed::DistributedCopyFileInfo> &files) {
+	if (data_path.empty()) {
+		throw InvalidInputException("DuckLake distributed data path cannot be empty");
+	}
+	auto &file_system = FileSystem::GetFileSystem(context);
+	auto canonical_artifact_path = ValidateArtifactRoot(file_system, data_path, artifact_path);
+	ValidateDuckLakeDistributedDataFileArtifactsInternal(context, canonical_artifact_path, field_data, not_null_fields,
+	                                                     partition_names, files);
+}
+
+void ValidateDuckLakeDistributedDataFileArtifactsInRoot(ClientContext &context, const string &artifact_root,
+                                                        const DuckLakeFieldData &field_data,
+                                                        const case_insensitive_set_t &not_null_fields,
+                                                        const vector<string> &partition_names,
+                                                        vector<distributed::DistributedCopyFileInfo> &files,
+                                                        bool expect_row_id) {
+	if (artifact_root.empty()) {
+		throw InvalidInputException("DuckLake distributed data-file artifact root cannot be empty");
+	}
+	auto &file_system = FileSystem::GetFileSystem(context);
+	auto canonical_artifact_root = CanonicalDuckLakePath(file_system, artifact_root, "data-file artifact root");
+	if (!expect_row_id) {
+		ValidateDuckLakeDistributedDataFileArtifactsInternal(context, canonical_artifact_root, field_data,
+		                                                     not_null_fields, partition_names, files);
+		return;
+	}
+	auto update_fields = AddDuckLakeDistributedRowIdField(field_data);
+	ValidateDuckLakeDistributedDataFileArtifactsInternal(context, canonical_artifact_root, *update_fields,
+	                                                     not_null_fields, partition_names, files);
+}
+
 void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader) {
 	auto register_file_write = [&](const string &name) {
 		DistributedWriteOperatorExtension extension;
@@ -915,6 +1055,18 @@ void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader) {
 	};
 	register_file_write("insert");
 	register_file_write("ctas");
+
+	auto register_row_delta = [&](const string &name) {
+		DistributedWriteOperatorExtension extension;
+		extension.name = name;
+		extension.protocol_version = 1;
+		extension.mode = DistributedWriteMode::CALLBACK;
+		extension.fragment_codec = {"ducklake.row-delta-fragment", 1};
+		extension.callbacks = DuckLakeDistributedRowDeltaCallbacks();
+		DistributedWriteOperatorExtension::Register(loader, std::move(extension));
+	};
+	register_row_delta("delete");
+	register_row_delta("update");
 }
 
 } // namespace duckdb

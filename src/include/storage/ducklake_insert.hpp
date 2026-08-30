@@ -22,6 +22,9 @@
 
 namespace duckdb {
 class DuckLakeCatalog;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+class DuckLakeDelete;
+#endif
 class DuckLakeSchemaEntry;
 class DuckLakeTableEntry;
 class DuckLakeFieldData;
@@ -91,8 +94,11 @@ public:
 	shared_ptr<DuckLakeFieldData> distributed_ctas_field_data;
 	unique_ptr<DuckLakePartition> distributed_ctas_partition;
 	optional_ptr<PhysicalOperator> distributed_worker_child;
+	optional_ptr<PhysicalCopyToFile> distributed_update_copy;
+	optional_ptr<DuckLakeDelete> distributed_update_delete;
 	mutable atomic<bool> distributed_write_claimed {false};
 	bool distributed_target_initialized = false;
+	bool distributed_update_source_is_statically_empty = false;
 	bool distributed_worker_plan_selected = false;
 #endif
 
@@ -110,6 +116,8 @@ public:
 	void ConfigureDistributedCTAS(ClientContext &context, PhysicalCopyToFile &worker_copy,
 	                              shared_ptr<DuckLakeFieldData> field_data,
 	                              unique_ptr<DuckLakePartition> partition_data);
+	void ConfigureDistributedUpdate(ClientContext &context, PhysicalCopyToFile &worker_copy,
+	                                PhysicalOperator &worker_input, DuckLakeDelete &delete_op);
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
 #endif
 

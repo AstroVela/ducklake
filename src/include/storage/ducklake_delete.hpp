@@ -131,7 +131,11 @@ private:
 	unordered_map<string, shared_ptr<DuckLakeDeleteData>> delete_data_map;
 };
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+class DuckLakeDelete : public PhysicalOperator, public distributed::ExtensionWriteTaskProvider {
+#else
 class DuckLakeDelete : public PhysicalOperator {
+#endif
 public:
 	DuckLakeDelete(PhysicalPlan &physical_plan, DuckLakeTableEntry &table, PhysicalOperator &child,
 	               shared_ptr<DuckLakeDeleteMap> delete_map, vector<idx_t> row_id_indexes, string encryption_key,
@@ -148,7 +152,43 @@ public:
 	//! Whether or not we allow duplicate deletes
 	bool allow_duplicates;
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	distributed::DistributedExtensionWritePlan distributed_write_plan;
+	string distributed_catalog_name;
+	string distributed_schema_name;
+	string distributed_table_name;
+	string distributed_schema_uuid;
+	string distributed_table_uuid;
+	string distributed_data_path;
+	string distributed_artifact_path;
+	string distributed_field_identity;
+	string distributed_partition_identity;
+	string distributed_sort_identity;
+	DuckLakeSnapshot distributed_snapshot;
+	SchemaIndex distributed_schema_id;
+	TableIndex distributed_table_id;
+	DuckLakeSnapshot distributed_source_snapshot;
+	vector<DuckLakeFileListExtendedEntry> distributed_source_files;
+	optional_ptr<PhysicalOperator> distributed_worker_child;
+	mutable atomic<bool> distributed_write_claimed {false};
+	bool distributed_has_source_scan = false;
+	bool distributed_source_prepared = false;
+	bool distributed_source_is_statically_empty = false;
+	bool distributed_worker_plan_selected = false;
+#endif
+
 public:
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
+	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
+	void ValidateDistributedWrite(ClientContext &context) const override;
+	idx_t FinalizeDistributedWrite(ClientContext &context,
+	                               const vector<DistributedWriteTaskResult> &results) const override;
+	void AbortDistributedWrite(ClientContext &context,
+	                           const vector<DistributedWriteTaskResult> &selected_results) const override;
+	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+#endif
+
 	// // Source interface
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
@@ -183,6 +223,26 @@ public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
 private:
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	void InitializeDistributedSource(const DuckLakeSnapshot &source_snapshot,
+	                                 vector<DuckLakeFileListExtendedEntry> source_files, bool source_prepared,
+	                                 bool has_source_scan, bool source_is_statically_empty);
+	void InitializeDistributedWritePlan(ClientContext &context);
+	void SelectDistributedWorkerPlan();
+	void ValidateDistributedWriteShape() const;
+	DuckLakeTableEntry &ResolveDistributedWriteTable(ClientContext &context) const;
+	void ValidateDistributedSourceBaseline(ClientContext &context, const DuckLakeTableEntry &target_table,
+	                                       const string &operation_name, const string &worker_bind_data) const;
+
+	static PhysicalOperator &PlanDeleteInternal(ClientContext &context, PhysicalPlanGenerator &planner,
+	                                            DuckLakeTableEntry &table, PhysicalOperator &child_plan,
+	                                            vector<idx_t> row_id_indexes, string encryption_key,
+	                                            bool allow_duplicates, bool initialize_distributed_write);
+
+	friend class DuckLakeInsert;
+	friend class DuckLakeUpdate;
+#endif
+
 	void FlushDelete(DuckLakeTransaction &transaction, ClientContext &context, DuckLakeDeleteGlobalState &global_state,
 	                 const string &filename, ColumnDataCollection &deleted_rows) const;
 	void FlushDeleteWithSnapshots(DuckLakeTransaction &transaction, ClientContext &context,

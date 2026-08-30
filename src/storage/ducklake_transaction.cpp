@@ -1642,6 +1642,11 @@ void DuckLakeTransaction::AppendDistributedFiles(TableIndex table_id, vector<Duc
 	state->local_changes.AppendFiles(table_id, std::move(files));
 	state->local_changes.AddDistributedArtifact(table_id, data_path, artifact_path);
 }
+
+void DuckLakeTransaction::RegisterDistributedArtifact(TableIndex table_id, const string &data_path,
+                                                      const string &artifact_path) {
+	state->local_changes.AddDistributedArtifact(table_id, data_path, artifact_path);
+}
 #endif
 
 void DuckLakeTransaction::AppendInlinedData(TableIndex table_id, unique_ptr<DuckLakeInlinedData> new_data) {

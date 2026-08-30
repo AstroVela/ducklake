@@ -197,8 +197,15 @@ public:
 	                        const std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string)> &query_executor,
 	                        const string &base_data_path, const string &separator);
 	virtual vector<DuckLakeGlobalStatsInfo> GetGlobalTableStats(DuckLakeSnapshot snapshot, TableIndex table_id);
-	virtual vector<DuckLakeFileListEntry> GetFilesForTable(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
-	                                                       const FilterPushdownInfo *filter_info = nullptr);
+	virtual vector<DuckLakeFileListEntry>
+	GetFilesForTable(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	                 const FilterPushdownInfo *filter_info = nullptr,
+	                 vector<DuckLakeFileListExtendedEntry> *distributed_extended_files = nullptr
+#else
+	                 const FilterPushdownInfo *filter_info = nullptr
+#endif
+	);
 	virtual vector<DuckLakeFileListEntry> GetTableInsertions(DuckLakeTableEntry &table, DuckLakeSnapshot start_snapshot,
 	                                                         DuckLakeSnapshot snapshot);
 	virtual vector<DuckLakeDeleteScanEntry>
