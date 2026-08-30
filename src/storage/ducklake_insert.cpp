@@ -469,7 +469,7 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 
 	DuckLakeInsertGlobalState global_state(*target_table);
 	AddDistributedDataFiles(context, global_state, files, target_partition_id);
-	for (auto &data_file : global_state.written_files) {
+	for (const auto &data_file : global_state.written_files) {
 		global_state.total_insert_count += data_file.row_count;
 	}
 	if (!global_state.written_files.empty()) {
