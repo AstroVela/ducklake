@@ -1,0 +1,25 @@
+# name: test/sql/vane/native_scan.test
+# description: verify the native DuckLake scan path used by Vane builds
+# group: [vane]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/metadata.ducklake' AS lake (DATA_PATH '__TEST_DIR__/data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id INTEGER, payload VARCHAR)
+
+statement ok
+INSERT INTO lake.items VALUES (1, 'one'), (2, 'two'), (3, 'three')
+
+statement ok
+DELETE FROM lake.items WHERE id = 2
+
+query II
+SELECT id, payload FROM lake.items ORDER BY id
+----
+1	one
+3	three

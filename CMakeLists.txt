@@ -9,6 +9,15 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
+option(DUCKLAKE_VANE_DISTRIBUTED
+       "Build the explicit Vane distributed DuckLake scan interface" OFF)
+if(DUCKLAKE_VANE_DISTRIBUTED)
+	if(NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp")
+		message(FATAL_ERROR "DUCKLAKE_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
+	endif()
+	add_definitions(-DDUCKLAKE_VANE_DISTRIBUTED)
+endif()
+
 # Roaring is installed via vcpkg and used for deletion vectors
 find_package(roaring CONFIG REQUIRED)
 if(TARGET roaring::roaring-headers)
