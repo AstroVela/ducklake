@@ -394,7 +394,7 @@ idx_t DuckLakeDelete::FinalizeDistributedWrite(ClientContext &context,
 			}
 			delete_count += file.new_delete_count;
 		}
-		if (delete_count != decoded.affected_rows || delete_files.empty()) {
+		if (delete_count == 0 || delete_count > decoded.affected_rows || delete_files.empty()) {
 			throw InvalidInputException("DuckLake distributed DELETE produced inconsistent delete artifacts");
 		}
 		auto &transaction = DuckLakeTransaction::Get(context, catalog);

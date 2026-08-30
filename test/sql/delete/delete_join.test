@@ -38,3 +38,22 @@ query I
 SELECT COUNT(*) FROM ducklake.test
 ----
 500
+
+statement ok
+DROP TABLE ducklake.test
+
+statement ok
+CREATE TABLE ducklake.test AS SELECT * FROM (VALUES (10), (20), (30)) rows(id)
+
+statement ok
+CREATE TEMPORARY TABLE duplicate_deleted_rows AS SELECT * FROM (VALUES (10), (10), (20), (20), (20)) rows(delete_id)
+
+query I
+DELETE FROM ducklake.test USING duplicate_deleted_rows WHERE id=duplicate_deleted_rows.delete_id
+----
+5
+
+query I
+SELECT id FROM ducklake.test
+----
+30

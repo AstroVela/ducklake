@@ -428,6 +428,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.mutation_unpartitioned(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.mutation_partitioned(id INTEGER, category VARCHAR, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.mutation_legacy_mapping(old_id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.mutation_duplicate_delete(id INTEGER)")
         connection.execute("ALTER TABLE lake.mutation_partitioned SET PARTITIONED BY (category)")
         for file_index in range(FILE_COUNT):
             start = file_index * ROWS_PER_FILE
@@ -461,6 +462,8 @@ def seed_tables(connection: object, root: Path) -> None:
             "WHERE table_id = (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table "
             "WHERE table_name = 'mutation_legacy_mapping')"
         )
+        connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (10)")
+        connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (20), (30)")
         connection.execute(
             "INSERT INTO lake.inlined_delete_source "
             "SELECT i::INTEGER, ('inline-' || i::VARCHAR)::VARCHAR FROM range(32) AS rows(i)"
@@ -744,6 +747,54 @@ def run_mutated_worker_write(
         if cleanup_errors:
             raise RuntimeError(f"failed to stop mutated workers: {cleanup_errors[0]}") from cleanup_errors[0]
     return outcome, mutated_file_count
+
+
+def run_repeated_mutation_input_write(
+    vane: object,
+    connection: object,
+    plan: object,
+) -> dict[str, object]:
+    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
+    from vane.runners.local.runner import _InProcessFragmentExecutor
+
+    fragment_executor = _InProcessFragmentExecutor()
+
+    class RepeatedMutationInputBackend(NativeFteWorkerManagerBackend):
+        def _request_from_task(self, task: object) -> dict[str, object]:
+            request = super()._request_from_task(task)
+            for splits in request.get("initial_splits", {}).values():
+                if not splits or any(split.get("kind") != "exchange_source_task" for split in splits):
+                    continue
+                next_sequence = max(int(split["sequence_id"]) for split in splits) + 1
+                repeated_splits = []
+                for split in list(splits):
+                    repeated_split = dict(split)
+                    repeated_split["sequence_id"] = next_sequence
+                    repeated_split["split_id"] = f"repeat-{next_sequence}"
+                    next_sequence += 1
+                    repeated_splits.append(repeated_split)
+                splits.extend(repeated_splits)
+            return request
+
+    backend = RepeatedMutationInputBackend(execute_fn=fragment_executor, num_workers=2, max_running_tasks=1)
+    plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        return plan_runner.run_copy_plan(plan, connection)
+    finally:
+        cleanup_errors = []
+        for cleanup in (
+            plan_runner.shutdown,
+            backend.request_shutdown,
+            fragment_executor.request_shutdown,
+            lambda: backend.shutdown(timeout_s=30),
+            lambda: fragment_executor.close(timeout_s=30),
+        ):
+            try:
+                cleanup()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise RuntimeError(f"failed to stop repeated-input workers: {cleanup_errors[0]}") from cleanup_errors[0]
 
 
 def require_forged_row_count_rejected(
@@ -1076,6 +1127,30 @@ def exercise_distributed_mutations(
         connection.execute("SELECT id, payload FROM lake.mutation_legacy_mapping ORDER BY id").fetchall(),
         [(42, "updated-legacy")],
         "legacy-mapping mutation readback",
+    )
+
+    duplicate_delete_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: delete_rows("lake.mutation_duplicate_delete", "id < 30"),
+    )
+    require_equal(
+        sum(len(batches) for batches in duplicate_delete_plan.scan_split_batch_map().values()),
+        2,
+        "duplicate-match DELETE source split count",
+    )
+    duplicate_delete_outcome = run_repeated_mutation_input_write(
+        vane,
+        connection,
+        duplicate_delete_plan,
+    )
+    require_equal(duplicate_delete_outcome.get("rows_copied"), 4, "duplicate-match DELETE affected rows")
+    require_equal(duplicate_delete_outcome.get("extension_artifact_count"), 2, "duplicate-match DELETE artifacts")
+    require_equal(
+        connection.execute("SELECT id FROM lake.mutation_duplicate_delete ORDER BY id").fetchall(),
+        [(30,)],
+        "duplicate-match DELETE readback",
     )
 
     unpartitioned_delete_count = connection.execute(

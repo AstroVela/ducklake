@@ -700,6 +700,7 @@ static void DuckLakeRowDeltaSink(ExecutionContext &context, const DistributedExt
 		}
 		return;
 	}
+	auto input_row_count = input.size();
 	for (auto index : global_state.bind.row_id_indexes) {
 		if (index >= input.ColumnCount()) {
 			throw InvalidInputException("DuckLake distributed row mutation row identifier index is out of bounds");
@@ -736,6 +737,10 @@ static void DuckLakeRowDeltaSink(ExecutionContext &context, const DistributedExt
 		}
 	}
 	if (selection_count == 0) {
+		if (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::DELETE) {
+			local_state.affected_rows =
+			    CheckedAdd(local_state.affected_rows, input_row_count, "worker affected row count");
+		}
 		return;
 	}
 	input.Slice(selection, selection_count);
@@ -782,7 +787,9 @@ static void DuckLakeRowDeltaSink(ExecutionContext &context, const DistributedExt
 		auto position = position_value.GetValue<int64_t>();
 		local_state.deleted_rows[std::move(file_path)].push_back(NumericCast<idx_t>(position));
 	}
-	local_state.affected_rows = CheckedAdd(local_state.affected_rows, input.size(), "worker affected row count");
+	auto affected_rows =
+	    global_state.bind.kind == DuckLakeDistributedRowDeltaKind::DELETE ? input_row_count : input.size();
+	local_state.affected_rows = CheckedAdd(local_state.affected_rows, affected_rows, "worker affected row count");
 }
 
 static void DuckLakeRowDeltaCombine(ExecutionContext &context, const DistributedExtensionWriteInfo &,
@@ -1036,8 +1043,9 @@ static vector<DistributedWriteFragment> DuckLakeRowDeltaFinalize(ClientContext &
 		delete_rows = CheckedAdd(delete_rows, file.new_delete_count, "worker delete row count");
 		byte_count = CheckedAdd(byte_count, file.file_size_bytes, "worker byte count");
 	}
-	if (delete_rows != affected_rows ||
-	    (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::UPDATE && data_rows != affected_rows)) {
+	if (delete_rows == 0 || delete_rows > affected_rows ||
+	    (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::UPDATE &&
+	     (delete_rows != affected_rows || data_rows != affected_rows))) {
 		throw InternalException("DuckLake distributed row mutation worker produced inconsistent affected-row counts");
 	}
 
@@ -1351,8 +1359,9 @@ DuckLakeDistributedRowDeltaResult DecodeDuckLakeDistributedRowDeltaResults(
 				expected_artifact_ids.push_back("delete:" + to_string(delete_artifact_index++));
 				combined.delete_files.push_back(std::move(file));
 			}
-			if (delete_row_count != fragment.row_count ||
-			    (expected_kind == DuckLakeDistributedRowDeltaKind::UPDATE && row_count != fragment.row_count) ||
+			if (delete_row_count == 0 || delete_row_count > fragment.row_count ||
+			    (expected_kind == DuckLakeDistributedRowDeltaKind::UPDATE &&
+			     (delete_row_count != fragment.row_count || row_count != fragment.row_count)) ||
 			    byte_count != fragment.byte_count || fragment.artifacts.size() != expected_artifacts.size()) {
 				throw InvalidInputException("DuckLake distributed row mutation fragment counts are inconsistent");
 			}
