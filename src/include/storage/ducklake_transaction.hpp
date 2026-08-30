@@ -47,6 +47,13 @@ struct FlushedInlinedTableInfo {
 	idx_t flush_snapshot_id;
 };
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+struct DuckLakeDistributedArtifact {
+	string data_path;
+	string artifact_path;
+};
+#endif
+
 struct LocalTableDataChanges {
 	vector<DuckLakeDataFile> new_data_files;
 	unique_ptr<DuckLakeInlinedData> new_inlined_data;
@@ -54,6 +61,9 @@ struct LocalTableDataChanges {
 	unordered_map<string, unique_ptr<DuckLakeInlinedDataDeletes>> new_inlined_data_deletes;
 	unique_ptr<DuckLakeInlinedFileDeletes> new_inlined_file_deletes;
 	vector<DuckLakeCompactionEntry> compactions;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	vector<DuckLakeDistributedArtifact> distributed_artifacts;
+#endif
 	bool IsEmpty() const;
 };
 
@@ -75,6 +85,9 @@ public:
 	shared_ptr<DuckLakeInlinedData> GetTransactionLocalInlinedData(ClientContext &context, TableIndex table_id) const;
 	void DropTransactionLocalFile(ClientContext &context, TableIndex table_id, const string &path);
 	void AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files);
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	void AddDistributedArtifact(TableIndex table_id, const string &data_path, const string &artifact_path);
+#endif
 	void AppendDeleteFiles(TableIndex table_id, const string &data_file_path, vector<DuckLakeDeleteFile> files);
 	void AppendInlinedData(ClientContext &context, TableIndex table_id, unique_ptr<DuckLakeInlinedData> new_data);
 	void AddNewInlinedDeletes(TableIndex table_id, const string &table_name, set<idx_t> new_deletes);
@@ -221,6 +234,10 @@ public:
 	bool HasTransactionLocalInserts(TableIndex table_id) const;
 	bool HasTransactionInlinedData(TableIndex table_id) const;
 	void AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files);
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	void AppendDistributedFiles(TableIndex table_id, vector<DuckLakeDataFile> files, const string &data_path,
+	                            const string &artifact_path);
+#endif
 	void AddDeletes(TableIndex table_id, vector<DuckLakeDeleteFile> files);
 	void AddCompaction(TableIndex table_id, DuckLakeCompactionEntry entry);
 

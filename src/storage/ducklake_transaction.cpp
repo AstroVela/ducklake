@@ -25,6 +25,9 @@
 #include "duckdb/logging/logger.hpp"
 #include "storage/ducklake_log_type.hpp"
 #include "duckdb/main/settings.hpp"
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#include "storage/ducklake_distributed_write.hpp"
+#endif
 #include "duckdb/main/client_config.hpp"
 
 namespace duckdb {
@@ -48,6 +51,11 @@ bool LocalTableDataChanges::IsEmpty() const {
 	if (new_inlined_file_deletes) {
 		return false;
 	}
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	if (!distributed_artifacts.empty()) {
+		return false;
+	}
+#endif
 	return true;
 }
 
@@ -79,6 +87,15 @@ void LocalTableChanges::CleanupFiles(DatabaseInstance &db) {
 				fs.TryRemoveFile(delete_files.file_name);
 			}
 		}
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		for (const auto &artifact : table_changes.distributed_artifacts) {
+			try {
+				CleanupDuckLakeDistributedArtifacts(fs, artifact.data_path, artifact.artifact_path);
+			} catch (...) {
+			}
+		}
+		table_changes.distributed_artifacts.clear();
+#endif
 		table_changes.new_data_files.clear();
 		table_changes.new_delete_files.clear();
 	}
@@ -178,6 +195,15 @@ void LocalTableChanges::AppendFiles(TableIndex table_id, vector<DuckLakeDataFile
 		                                    std::make_move_iterator(files.end()));
 	}
 }
+
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+void LocalTableChanges::AddDistributedArtifact(TableIndex table_id, const string &data_path,
+                                               const string &artifact_path) {
+	lock_guard<mutex> guard(lock);
+	auto &table_changes = changes[table_id];
+	table_changes.distributed_artifacts.push_back({data_path, artifact_path});
+}
+#endif
 
 void LocalTableChanges::AppendDeleteFiles(TableIndex table_id, const string &data_file_path,
                                           vector<DuckLakeDeleteFile> files) {
@@ -603,6 +629,11 @@ void LocalTableChanges::CleanupFiles(ClientContext &context, TableIndex table_id
 				fs.TryRemoveFile(delete_files.file_name);
 			}
 		}
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		for (const auto &artifact : table_changes.distributed_artifacts) {
+			CleanupDuckLakeDistributedArtifacts(fs, artifact.data_path, artifact.artifact_path);
+		}
+#endif
 		changes.erase(table_entry);
 	}
 }
@@ -1604,6 +1635,14 @@ void DuckLakeTransaction::AppendFiles(TableIndex table_id, vector<DuckLakeDataFi
 	}
 	state->local_changes.AppendFiles(table_id, std::move(files));
 }
+
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+void DuckLakeTransaction::AppendDistributedFiles(TableIndex table_id, vector<DuckLakeDataFile> files,
+                                                 const string &data_path, const string &artifact_path) {
+	state->local_changes.AppendFiles(table_id, std::move(files));
+	state->local_changes.AddDistributedArtifact(table_id, data_path, artifact_path);
+}
+#endif
 
 void DuckLakeTransaction::AppendInlinedData(TableIndex table_id, unique_ptr<DuckLakeInlinedData> new_data) {
 	auto context_ref = context.lock();

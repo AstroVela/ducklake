@@ -421,10 +421,15 @@ void CleanupDuckLakeDistributedArtifactData(ClientContext &context, const string
 	CleanupArtifactPaths(file_system, {canonical_artifact_path});
 }
 
-void CleanupDuckLakeDistributedArtifacts(ClientContext &context, const string &data_path, const string &artifact_path) {
-	auto &file_system = FileSystem::GetFileSystem(context);
+void CleanupDuckLakeDistributedArtifacts(FileSystem &file_system, const string &data_path,
+                                         const string &artifact_path) {
 	auto canonical_artifact_path = ValidateArtifactRoot(file_system, data_path, artifact_path);
 	CleanupArtifactPaths(file_system, {canonical_artifact_path, canonical_artifact_path + ".duckdb_commit"});
+}
+
+void CleanupDuckLakeDistributedArtifacts(ClientContext &context, const string &data_path, const string &artifact_path) {
+	auto &file_system = FileSystem::GetFileSystem(context);
+	CleanupDuckLakeDistributedArtifacts(file_system, data_path, artifact_path);
 }
 
 void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,

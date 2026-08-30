@@ -487,9 +487,10 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 		for (const auto &data_file : global_state.written_files) {
 			global_state.total_insert_count += data_file.row_count;
 		}
-		if (!global_state.written_files.empty()) {
+		if (!global_state.written_files.empty() || distributed_write_plan.operator_name == "ctas") {
 			auto &transaction = DuckLakeTransaction::Get(context, target_table->catalog);
-			transaction.AppendFiles(target_table->GetTableId(), std::move(global_state.written_files));
+			transaction.AppendDistributedFiles(target_table->GetTableId(), std::move(global_state.written_files),
+			                                   distributed_data_path, distributed_artifact_path);
 		}
 		return global_state.total_insert_count;
 	} catch (const std::exception &error) {

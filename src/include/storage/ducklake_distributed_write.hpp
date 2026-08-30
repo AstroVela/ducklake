@@ -15,6 +15,7 @@ class ClientContext;
 class ColumnList;
 class DuckLakeFieldData;
 class ExtensionLoader;
+class FileSystem;
 struct DuckLakePartition;
 class ParsedExpression;
 
@@ -29,6 +30,8 @@ void ValidateDuckLakeDistributedArtifactPath(ClientContext &context, const strin
 
 void CleanupDuckLakeDistributedArtifactData(ClientContext &context, const string &data_path,
                                             const string &artifact_path);
+
+void CleanupDuckLakeDistributedArtifacts(FileSystem &file_system, const string &data_path, const string &artifact_path);
 
 void CleanupDuckLakeDistributedArtifacts(ClientContext &context, const string &data_path, const string &artifact_path);
 

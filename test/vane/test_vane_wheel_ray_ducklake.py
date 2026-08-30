@@ -49,11 +49,7 @@ def distributed_artifact_roots(connection: object, table_name: str) -> set[str]:
 
 
 def distributed_artifact_directories(root: Path) -> set[Path]:
-    return {
-        path
-        for path in (root / "data").rglob(f"{DISTRIBUTED_ARTIFACT_PREFIX}*")
-        if path.is_dir() and not path.name.endswith(".duckdb_commit")
-    }
+    return {path for path in (root / "data").rglob(f"{DISTRIBUTED_ARTIFACT_PREFIX}*") if path.is_dir()}
 
 
 def sql_string(value: object) -> str:
@@ -418,6 +414,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.schema_source(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.rollback_write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
         connection.execute("ALTER TABLE lake.partitioned_write_target SET PARTITIONED BY (category)")
         connection.execute("CREATE TABLE lake.concurrent_write_target(id INTEGER, payload VARCHAR)")
@@ -756,6 +753,35 @@ def exercise_distributed_writes(
         artifact_directories_before_constraint_failure,
         "constraint failure artifact-root cleanup",
     )
+
+    files_before_commit_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_commit_failure = distributed_artifact_directories(root)
+    connection.execute("CALL lake.set_option('require_commit_message', true)")
+    commit_failure_source = connection.sql("SELECT id, payload FROM lake.source WHERE id < 64")
+    try:
+        require_error(
+            lambda: commit_failure_source.insert_into("lake.rollback_write_target"),
+            "commit information",
+            "distributed DuckLake transaction commit failure",
+        )
+        require_write_count(1, "transaction commit failure Ray dispatch count")
+        require_equal(
+            connection.execute("SELECT count(*) FROM lake.rollback_write_target").fetchone(),
+            (0,),
+            "transaction commit failure table visibility",
+        )
+        require_equal(
+            set((root / "data").rglob("*.parquet")),
+            files_before_commit_failure,
+            "transaction commit failure artifact cleanup",
+        )
+        require_equal(
+            distributed_artifact_directories(root),
+            artifact_directories_before_commit_failure,
+            "transaction commit failure artifact-root cleanup",
+        )
+    finally:
+        connection.execute("CALL lake.set_option('require_commit_message', false)")
 
     stale_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 800 AND 900")
     stale_plan = capture_write_plan(
