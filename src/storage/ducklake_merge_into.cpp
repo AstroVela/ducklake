@@ -121,6 +121,7 @@ SinkCombineResultType DuckLakeMergeInsert::Combine(ExecutionContext &context, Op
 	return copy.Combine(context, combine_input);
 }
 
+
 namespace {
 
 //! Extend the Event class to be able to capture a created Event
@@ -146,9 +147,8 @@ public:
 } // namespace
 
 // Scan copy operator source and sink into insert operator — shared by MergeInsert and MergeUpdate
-static SinkFinalizeType FinalizeCopyToInsert(Pipeline &pipeline, Event &event, ClientContext &context,
-                                             PhysicalOperator &copy_op, PhysicalOperator &insert_op,
-                                             InterruptState &interrupt_state) {
+static SinkFinalizeType FinalizeCopyToInsert(Pipeline &pipeline, Event &event, ClientContext &context, PhysicalOperator &copy_op,
+                                 PhysicalOperator &insert_op, InterruptState &interrupt_state) {
 	OperatorSinkFinalizeInput copy_finalize {*copy_op.sink_state, interrupt_state};
 	CaptureEvent capture_event(pipeline.executor);
 	auto finalize_result = copy_op.Finalize(pipeline, capture_event, context, copy_finalize);
