@@ -80,6 +80,7 @@ public:
 	string distributed_schema_uuid;
 	string distributed_table_uuid;
 	string distributed_data_path;
+	string distributed_artifact_path;
 	string distributed_field_identity;
 	string distributed_partition_identity;
 	string distributed_sort_identity;
@@ -90,6 +91,7 @@ public:
 	shared_ptr<DuckLakeFieldData> distributed_ctas_field_data;
 	unique_ptr<DuckLakePartition> distributed_ctas_partition;
 	optional_ptr<PhysicalOperator> distributed_worker_child;
+	mutable atomic<bool> distributed_write_claimed {false};
 	bool distributed_target_initialized = false;
 	bool distributed_worker_plan_selected = false;
 #endif

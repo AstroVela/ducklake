@@ -20,6 +20,7 @@ ROW_COUNT = FILE_COUNT * ROWS_PER_FILE
 CONFLICT_ID = f"{os.getpid()}-{uuid.uuid4().hex}"
 CONFLICT_STARTED_PATH = Path("/tmp") / f"vane-ray-ducklake-conflict-{CONFLICT_ID}.started"
 CONFLICT_RELEASE_PATH = Path("/tmp") / f"vane-ray-ducklake-conflict-{CONFLICT_ID}.release"
+DISTRIBUTED_ARTIFACT_PREFIX = ".vane-ducklake-"
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -30,6 +31,29 @@ def require_equal(actual: object, expected: object, description: str) -> None:
 def require_true(value: bool, description: str) -> None:
     if not value:
         raise AssertionError(description)
+
+
+def distributed_artifact_roots(connection: object, table_name: str) -> set[str]:
+    rows = connection.execute(f"SELECT data_file FROM ducklake_list_files('lake', '{table_name}')").fetchall()
+    roots = set()
+    for (data_file,) in rows:
+        candidates = [part for part in Path(data_file).parts if part.startswith(DISTRIBUTED_ARTIFACT_PREFIX)]
+        require_equal(len(candidates), 1, f"{table_name} distributed artifact root count")
+        write_id = candidates[0][len(DISTRIBUTED_ARTIFACT_PREFIX) :]
+        try:
+            uuid.UUID(write_id)
+        except ValueError as error:
+            raise AssertionError(f"{table_name} has an invalid distributed write identity: {write_id}") from error
+        roots.add(candidates[0])
+    return roots
+
+
+def distributed_artifact_directories(root: Path) -> set[Path]:
+    return {
+        path
+        for path in (root / "data").rglob(f"{DISTRIBUTED_ARTIFACT_PREFIX}*")
+        if path.is_dir() and not path.name.endswith(".duckdb_commit")
+    }
 
 
 def sql_string(value: object) -> str:
@@ -598,6 +622,11 @@ def exercise_distributed_writes(
         file_count >= WORKER_COUNT,
         "distributed INSERT did not publish multiple worker artifacts",
     )
+    require_equal(
+        len(distributed_artifact_roots(connection, "write_target")),
+        2,
+        "distributed INSERT write roots",
+    )
 
     partitioned_source = connection.sql(
         "SELECT id, ('category-' || (id % 4)::VARCHAR)::VARCHAR AS category, payload " "FROM lake.source WHERE id < 512"
@@ -615,6 +644,11 @@ def exercise_distributed_writes(
         [(f"category-{index}",) for index in range(4)],
         "distributed INSERT partition paths",
     )
+    require_equal(
+        len(distributed_artifact_roots(connection, "partitioned_write_target")),
+        1,
+        "partitioned distributed INSERT write roots",
+    )
 
     ctas_source = connection.sql("SELECT id, payload FROM lake.source WHERE id < 768")
     require_write("distributed DuckLake CTAS", lambda: ctas_source.create("lake.ctas_target"))
@@ -622,6 +656,11 @@ def exercise_distributed_writes(
         connection.execute("SELECT count(*)::BIGINT, sum(id)::BIGINT FROM lake.ctas_target").fetchone(),
         (767, 768 * 767 // 2 - 17),
         "native readback after distributed CTAS",
+    )
+    require_equal(
+        len(distributed_artifact_roots(connection, "ctas_target")),
+        1,
+        "distributed CTAS write roots",
     )
 
     empty_ctas_source = connection.sql("SELECT id, payload FROM lake.empty_source")
@@ -662,6 +701,7 @@ def exercise_distributed_writes(
     )
 
     files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
     failing_source = connection.sql(
         "SELECT CASE WHEN id < 512 THEN id ELSE payload::INTEGER END AS id " "FROM lake.source"
     )
@@ -684,8 +724,14 @@ def exercise_distributed_writes(
         files_before_failure,
         "failed CTAS artifact cleanup",
     )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_failure,
+        "failed CTAS artifact-root cleanup",
+    )
 
     files_before_constraint_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_constraint_failure = distributed_artifact_directories(root)
     null_source = connection.sql(
         "SELECT CASE WHEN id = 31 THEN NULL ELSE id END::INTEGER AS id, payload FROM lake.source WHERE id < 128"
     )
@@ -704,6 +750,11 @@ def exercise_distributed_writes(
         set((root / "data").rglob("*.parquet")),
         files_before_constraint_failure,
         "constraint failure artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_constraint_failure,
+        "constraint failure artifact-root cleanup",
     )
 
     stale_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 800 AND 900")

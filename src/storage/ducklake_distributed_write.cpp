@@ -14,6 +14,7 @@
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/distributed_write.hpp"
@@ -26,6 +27,8 @@
 namespace duckdb {
 
 namespace {
+
+static constexpr const char DUCKLAKE_DISTRIBUTED_ARTIFACT_PREFIX[] = ".vane-ducklake-";
 
 static string GetPartitionColumnName(const ColumnRefExpression &column_ref) {
 	if (column_ref.IsQualified()) {
@@ -103,6 +106,44 @@ static string CanonicalDuckLakePath(FileSystem &file_system, const string &path,
 		throw InvalidInputException("Invalid DuckLake distributed %s path: %s", description, canonical.error().what());
 	}
 	return std::move(canonical).value();
+}
+
+static string ValidateArtifactRoot(FileSystem &file_system, const string &data_path, const string &artifact_path) {
+	auto canonical_data_path = CanonicalDuckLakePath(file_system, data_path, "data root");
+	auto canonical_artifact_path = CanonicalDuckLakePath(file_system, artifact_path, "artifact root");
+	auto separator = file_system.PathSeparator(canonical_data_path);
+	if (separator.empty() || canonical_artifact_path == canonical_data_path ||
+	    !distributed::DistributedCopyPathIsInDirectory(canonical_artifact_path, canonical_data_path, separator)) {
+		throw InvalidInputException("DuckLake distributed artifact root is outside its table data root");
+	}
+
+	auto relative_path = canonical_artifact_path.substr(canonical_data_path.size());
+	while (StringUtil::StartsWith(relative_path, separator)) {
+		relative_path.erase(0, separator.size());
+	}
+	if (!StringUtil::StartsWith(relative_path, DUCKLAKE_DISTRIBUTED_ARTIFACT_PREFIX) ||
+	    relative_path.find(separator) != string::npos) {
+		throw InvalidInputException("DuckLake distributed artifact root has an invalid write identity");
+	}
+	auto write_id = relative_path.substr(sizeof(DUCKLAKE_DISTRIBUTED_ARTIFACT_PREFIX) - 1);
+	hugeint_t parsed_write_id;
+	if (!BaseUUID::FromString(write_id, parsed_write_id, true)) {
+		throw InvalidInputException("DuckLake distributed artifact root has an invalid write identity");
+	}
+	return canonical_artifact_path;
+}
+
+static void CleanupArtifactPaths(FileSystem &file_system, const vector<string> &paths) {
+	vector<string> errors;
+	for (const auto &path : paths) {
+		auto cleanup_result = distributed::CleanupDistributedCopyPrefix(file_system, path);
+		if (cleanup_result.is_err()) {
+			errors.push_back(cleanup_result.error().what());
+		}
+	}
+	if (!errors.empty()) {
+		throw IOException("Failed to clean DuckLake distributed artifacts: %s", StringUtil::Join(errors, "; "));
+	}
 }
 
 struct ValidatedArtifactLocation {
@@ -359,16 +400,42 @@ PlanDuckLakeDistributedCTASPartition(const ColumnList &columns, const DuckLakeFi
 	return result;
 }
 
+string CreateDuckLakeDistributedArtifactPath(ClientContext &context, const string &data_path) {
+	auto &file_system = FileSystem::GetFileSystem(context);
+	auto canonical_data_path = CanonicalDuckLakePath(file_system, data_path, "data root");
+	auto write_id = UUID::ToString(UUID::GenerateRandomUUID());
+	return distributed::DistributedCopyPathInDirectory(file_system, canonical_data_path,
+	                                                   string(DUCKLAKE_DISTRIBUTED_ARTIFACT_PREFIX) + write_id);
+}
+
+void ValidateDuckLakeDistributedArtifactPath(ClientContext &context, const string &data_path,
+                                             const string &artifact_path) {
+	auto &file_system = FileSystem::GetFileSystem(context);
+	ValidateArtifactRoot(file_system, data_path, artifact_path);
+}
+
+void CleanupDuckLakeDistributedArtifactData(ClientContext &context, const string &data_path,
+                                            const string &artifact_path) {
+	auto &file_system = FileSystem::GetFileSystem(context);
+	auto canonical_artifact_path = ValidateArtifactRoot(file_system, data_path, artifact_path);
+	CleanupArtifactPaths(file_system, {canonical_artifact_path});
+}
+
+void CleanupDuckLakeDistributedArtifacts(ClientContext &context, const string &data_path, const string &artifact_path) {
+	auto &file_system = FileSystem::GetFileSystem(context);
+	auto canonical_artifact_path = ValidateArtifactRoot(file_system, data_path, artifact_path);
+	CleanupArtifactPaths(file_system, {canonical_artifact_path, canonical_artifact_path + ".duckdb_commit"});
+}
+
 void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
-                                                  const DuckLakeFieldData &field_data,
+                                                  const string &artifact_path, const DuckLakeFieldData &field_data,
                                                   const vector<string> &partition_names,
-                                                  const vector<distributed::DistributedCopyFileInfo> &files,
-                                                  vector<string> &cleanup_paths) {
-	cleanup_paths.clear();
+                                                  const vector<distributed::DistributedCopyFileInfo> &files) {
 	if (data_path.empty()) {
 		throw InvalidInputException("DuckLake distributed data path cannot be empty");
 	}
 	auto &file_system = FileSystem::GetFileSystem(context);
+	auto canonical_artifact_path = ValidateArtifactRoot(file_system, data_path, artifact_path);
 	auto expected_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
 	idx_t total_rows = 0;
 	idx_t total_bytes = 0;
@@ -382,8 +449,7 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		}
 		auto partition_components = ValidatePartitionValues(file.partition_keys, partition_names);
 		auto canonical_path =
-		    ValidateArtifactLocation(file_system, data_path, path, partition_names, partition_components);
-		cleanup_paths.push_back(canonical_path);
+		    ValidateArtifactLocation(file_system, canonical_artifact_path, path, partition_names, partition_components);
 
 		if (file.footer_size_bytes.IsNull() || file.footer_size_bytes.type() != expected_types[3]) {
 			throw InvalidInputException("DuckLake distributed write returned invalid data-file footer statistics");
@@ -409,38 +475,6 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		ValidateColumnStatistics(file.column_statistics, field_data);
 		ValidateArtifactContents(file_system, canonical_path, path, file.file_size_bytes,
 		                         NumericCast<idx_t>(footer_size));
-	}
-}
-
-void CollectDuckLakeDistributedArtifactCleanupPaths(ClientContext &context, const string &data_path,
-                                                    const vector<string> &partition_names,
-                                                    const DistributedExtensionWriteInfo &write_info,
-                                                    const vector<DistributedWriteTaskResult> &results,
-                                                    vector<string> &cleanup_paths) {
-	auto &file_system = FileSystem::GetFileSystem(context);
-	set<string> unique_paths(cleanup_paths.begin(), cleanup_paths.end());
-	for (const auto &result : results) {
-		if (result.capability != write_info.capability || result.fragment_codec != write_info.fragment_codec ||
-		    result.query_id.empty() || result.fragments.size() != 1) {
-			continue;
-		}
-		const auto &fragment = result.fragments[0];
-		if (fragment.artifacts.size() != 1) {
-			continue;
-		}
-		const auto &artifact = fragment.artifacts[0];
-		if (artifact.artifact_id != "data_file" || artifact.codec != DistributedPayloadCodec {"duckdb.file", 1} ||
-		    !artifact.payload.empty() || artifact.uri.empty() || fragment.fragment_id != artifact.uri ||
-		    result.task_attempt_id != "file:" + artifact.uri) {
-			continue;
-		}
-		try {
-			auto location = ValidateArtifactCleanupLocation(file_system, data_path, artifact.uri, partition_names);
-			if (unique_paths.insert(location.canonical_path).second) {
-				cleanup_paths.push_back(std::move(location.canonical_path));
-			}
-		} catch (...) {
-		}
 	}
 }
 

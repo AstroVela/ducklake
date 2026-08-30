@@ -189,22 +189,6 @@ static void AddDistributedDataFiles(ClientContext &context, DuckLakeInsertGlobal
 	}
 }
 
-static void CleanupValidatedDistributedDataFiles(ClientContext &context, const vector<string> &cleanup_paths) {
-	auto &file_system = FileSystem::GetFileSystem(context);
-	vector<string> errors;
-	for (const auto &path : cleanup_paths) {
-		try {
-			file_system.TryRemoveFile(path);
-		} catch (const std::exception &error) {
-			errors.push_back(StringUtil::Format("%s: %s", path, error.what()));
-		}
-	}
-	if (!errors.empty()) {
-		throw IOException("Failed to clean validated DuckLake distributed data files: %s",
-		                  StringUtil::Join(errors, "; "));
-	}
-}
-
 } // namespace
 
 void DuckLakeInsert::InitializeDistributedWritePlan() {
@@ -237,6 +221,8 @@ void DuckLakeInsert::ConfigureDistributedInsert(ClientContext &context, Physical
 	}
 	InitializeDistributedWriteTarget(context, *table);
 	distributed_data_path = worker_copy.file_path;
+	distributed_artifact_path = CreateDuckLakeDistributedArtifactPath(context, distributed_data_path);
+	worker_copy.file_path = distributed_artifact_path;
 	distributed_worker_child = &worker_copy;
 	distributed_partition_names = GetDistributedPartitionNames(worker_copy);
 }
@@ -257,6 +243,8 @@ void DuckLakeInsert::ConfigureDistributedCTAS(ClientContext &context, PhysicalCo
 	distributed_schema_uuid = ducklake_schema.GetSchemaUUID();
 	distributed_table_uuid = table_uuid;
 	distributed_data_path = worker_copy.file_path;
+	distributed_artifact_path = CreateDuckLakeDistributedArtifactPath(context, distributed_data_path);
+	worker_copy.file_path = distributed_artifact_path;
 	distributed_field_identity = GetDistributedFieldIdentity(*field_data);
 	distributed_partition_identity = GetDistributedPartitionIdentity(partition_data.get());
 	distributed_snapshot = transaction.GetSnapshot();
@@ -276,7 +264,7 @@ void DuckLakeInsert::ValidateDistributedWriteShape() const {
 		throw InvalidInputException(
 		    "DuckLake distributed write requires exactly one COPY child returning written-file statistics");
 	}
-	ValidateDistributedCopyShape(distributed_worker_child->Cast<PhysicalCopyToFile>(), distributed_data_path);
+	ValidateDistributedCopyShape(distributed_worker_child->Cast<PhysicalCopyToFile>(), distributed_artifact_path);
 
 	if (distributed_write_plan.operator_name == "insert") {
 		if (!distributed_target_initialized || !table || schema || info || !distributed_schema_id.IsValid() ||
@@ -379,6 +367,10 @@ const distributed::DistributedExtensionWritePlan &DuckLakeInsert::WritePlan() co
 
 void DuckLakeInsert::ValidateDistributedWrite(ClientContext &context) const {
 	ValidateDistributedWriteShape();
+	bool expected = false;
+	if (!distributed_write_claimed.compare_exchange_strong(expected, true)) {
+		throw InvalidInputException("A distributed DuckLake write plan can only be executed once");
+	}
 	auto &catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<DuckLakeCatalog>();
 	if (catalog.GetAttached().IsReadOnly()) {
 		throw PermissionException("Distributed DuckLake writes require a writable catalog");
@@ -392,9 +384,10 @@ void DuckLakeInsert::ValidateDistributedWrite(ClientContext &context) const {
 	if (!encryption_key.empty()) {
 		throw NotImplementedException("Distributed DuckLake writes do not support encrypted tables");
 	}
-	if (distributed_data_path.empty()) {
+	if (distributed_data_path.empty() || distributed_artifact_path.empty()) {
 		throw InvalidInputException("Distributed DuckLake writes require a non-empty table data path");
 	}
+	ValidateDuckLakeDistributedArtifactPath(context, distributed_data_path, distributed_artifact_path);
 	auto &transaction = DuckLakeTransaction::Get(context, catalog);
 	if (transaction.ChangesMade()) {
 		throw NotImplementedException("Distributed DuckLake writes require an otherwise empty catalog transaction");
@@ -463,15 +456,15 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
                                                const vector<DistributedWriteTaskResult> &results) const {
 	ValidateDistributedWriteShape();
 	auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
-	vector<string> cleanup_paths;
 	try {
 		auto files = distributed::DecodeDistributedFileWriteResults(write_info, results);
 		if (distributed_write_plan.operator_name == "ctas") {
-			ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, *distributed_ctas_field_data,
-			                                             distributed_partition_names, files, cleanup_paths);
+			ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, distributed_artifact_path,
+			                                             *distributed_ctas_field_data, distributed_partition_names,
+			                                             files);
 		} else {
-			ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, table->GetFieldData(),
-			                                             distributed_partition_names, files, cleanup_paths);
+			ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, distributed_artifact_path,
+			                                             table->GetFieldData(), distributed_partition_names, files);
 		}
 
 		auto &coordinator_catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<DuckLakeCatalog>();
@@ -501,31 +494,22 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 		return global_state.total_insert_count;
 	} catch (const std::exception &error) {
 		try {
-			CollectDuckLakeDistributedArtifactCleanupPaths(context, distributed_data_path, distributed_partition_names,
-			                                               write_info, results, cleanup_paths);
-		} catch (...) {
-		}
-		try {
-			CleanupValidatedDistributedDataFiles(context, cleanup_paths);
+			CleanupDuckLakeDistributedArtifacts(context, distributed_data_path, distributed_artifact_path);
 		} catch (const std::exception &cleanup_error) {
 			throw IOException("%s; distributed artifact cleanup failed: %s", error.what(), cleanup_error.what());
 		}
 		throw;
 	} catch (...) {
 		try {
-			CollectDuckLakeDistributedArtifactCleanupPaths(context, distributed_data_path, distributed_partition_names,
-			                                               write_info, results, cleanup_paths);
-		} catch (...) {
-		}
-		try {
-			CleanupValidatedDistributedDataFiles(context, cleanup_paths);
+			CleanupDuckLakeDistributedArtifacts(context, distributed_data_path, distributed_artifact_path);
 		} catch (...) {
 		}
 		throw;
 	}
 }
 
-void DuckLakeInsert::AbortDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &) const {
+void DuckLakeInsert::AbortDistributedWrite(ClientContext &context, const vector<DistributedWriteTaskResult> &) const {
+	CleanupDuckLakeDistributedArtifactData(context, distributed_data_path, distributed_artifact_path);
 }
 
 void DuckLakeInsert::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
@@ -1316,14 +1300,11 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
 	auto &insert = DuckLakeInsert::PlanInsert(context, planner, ducklake_table, std::move(copy_input.encryption_key));
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
-	optional_ptr<PhysicalCopyToFile> distributed_copy = &physical_copy.Cast<PhysicalCopyToFile>();
-	if (inline_data) {
-		DuckLakeCopyInput distributed_copy_input(context, ducklake_table);
-		distributed_copy =
-		    &DuckLakeInsert::PlanCopyForInsert(context, planner, distributed_copy_input, distributed_plan)
-		         .Cast<PhysicalCopyToFile>();
-	}
-	insert.Cast<DuckLakeInsert>().ConfigureDistributedInsert(context, *distributed_copy);
+	DuckLakeCopyInput distributed_copy_input(context, ducklake_table);
+	auto &distributed_copy =
+	    DuckLakeInsert::PlanCopyForInsert(context, planner, distributed_copy_input, distributed_plan)
+	        .Cast<PhysicalCopyToFile>();
+	insert.Cast<DuckLakeInsert>().ConfigureDistributedInsert(context, distributed_copy);
 #endif
 	if (inline_data) {
 		inline_data->insert = insert.Cast<DuckLakeInsert>();
