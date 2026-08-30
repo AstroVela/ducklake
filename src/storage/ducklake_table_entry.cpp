@@ -95,6 +95,12 @@ void DuckLakeTableEntry::CheckSupportedTypes() {
 	}
 }
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+string DuckLakeTableEntry::GetLogicalWriteTargetIdentity() const {
+	return "ducklake-table:v1:" + table_uuid;
+}
+#endif
+
 DuckLakeTableEntry::DuckLakeTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                        TableIndex table_id, string table_uuid_p, string data_path_p,
                                        shared_ptr<DuckLakeFieldData> field_data_p, optional_idx next_column_id_p,

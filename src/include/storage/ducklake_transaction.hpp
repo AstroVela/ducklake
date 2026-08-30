@@ -159,6 +159,9 @@ struct DuckLakeRetryConfig {
 	idx_t max_retry_count = 10;
 	idx_t retry_wait_ms = 100;
 	double retry_backoff = 1.5;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	bool fail_on_snapshot_conflict = false;
+#endif
 
 	static DuckLakeRetryConfig FromContext(ClientContext &context);
 };
@@ -297,6 +300,11 @@ public:
 	//! If there are no uncommitted changes, this is the schema version of the snapshot.
 	//! Otherwise, it is an id that is incremented whenever the schema changes (not stored between restarts)
 	idx_t GetCatalogVersion();
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	void FailDistributedWriteOnSnapshotConflict() {
+		fail_distributed_write_on_snapshot_conflict = true;
+	}
+#endif
 
 protected:
 	void SetMetadataManager(unique_ptr<DuckLakeMetadataManager> metadata_manager) {
@@ -353,6 +361,9 @@ private:
 	value_map_t<DuckLakeSnapshot> snapshot_cache;
 	//! New set of transaction-local name maps
 	DuckLakeNameMapSet new_name_maps;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	bool fail_distributed_write_on_snapshot_conflict = false;
+#endif
 
 	atomic<idx_t> catalog_version;
 };

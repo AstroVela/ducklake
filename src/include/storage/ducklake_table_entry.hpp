@@ -113,6 +113,10 @@ public:
 
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	string GetLogicalWriteTargetIdentity() const override;
+#endif
+
 	unique_ptr<CatalogEntry> Alter(ClientContext &context, DuckLakeTransaction &transaction, AlterTableInfo &info);
 	unique_ptr<CatalogEntry> Alter(DuckLakeTransaction &transaction, SetCommentInfo &info);
 	unique_ptr<CatalogEntry> Alter(DuckLakeTransaction &transaction, SetColumnCommentInfo &info);

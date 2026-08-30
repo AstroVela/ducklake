@@ -1,8 +1,8 @@
 schema_version = 2
 name = "ducklake"
 extension_config = "extension_config_vane.cmake"
-build_extensions = ["httpfs", "parquet"]
-native_test_selection = "test/sql/vane/native_scan.test"
+build_extensions = ["httpfs", "parquet", "sqlite_scanner"]
+native_test_selection = "test/sql/vane/*"
 
 [vane]
 repository = "AstroVela/vane"

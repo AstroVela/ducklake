@@ -15,6 +15,10 @@
 #include "storage/ducklake_stats.hpp"
 #include "common/ducklake_data_file.hpp"
 #include "storage/ducklake_field_data.hpp"
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#include "common/ducklake_snapshot.hpp"
+#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#endif
 
 namespace duckdb {
 class DuckLakeCatalog;
@@ -39,7 +43,11 @@ public:
 	idx_t rows_flushed = 0;
 };
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+class DuckLakeInsert : public PhysicalOperator, public distributed::ExtensionWriteTaskProvider {
+#else
 class DuckLakeInsert : public PhysicalOperator {
+#endif
 public:
 	//! INSERT INTO
 	DuckLakeInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types, DuckLakeTableEntry &table,
@@ -64,7 +72,45 @@ public:
 	//! The encryption key used for writing the Parquet files
 	string encryption_key;
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	distributed::DistributedExtensionWritePlan distributed_write_plan;
+	string distributed_catalog_name;
+	string distributed_schema_name;
+	string distributed_table_name;
+	string distributed_schema_uuid;
+	string distributed_table_uuid;
+	string distributed_data_path;
+	string distributed_field_identity;
+	string distributed_partition_identity;
+	string distributed_sort_identity;
+	DuckLakeSnapshot distributed_snapshot;
+	SchemaIndex distributed_schema_id;
+	TableIndex distributed_table_id;
+	vector<string> distributed_partition_names;
+	shared_ptr<DuckLakeFieldData> distributed_ctas_field_data;
+	unique_ptr<DuckLakePartition> distributed_ctas_partition;
+	optional_ptr<PhysicalOperator> distributed_worker_child;
+	bool distributed_target_initialized = false;
+	bool distributed_worker_plan_selected = false;
+#endif
+
 public:
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
+	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
+	void ValidateDistributedWrite(ClientContext &context) const override;
+	idx_t FinalizeDistributedWrite(ClientContext &context,
+	                               const vector<DistributedWriteTaskResult> &results) const override;
+	void AbortDistributedWrite(ClientContext &context,
+	                           const vector<DistributedWriteTaskResult> &selected_results) const override;
+
+	void ConfigureDistributedInsert(ClientContext &context, PhysicalCopyToFile &worker_copy);
+	void ConfigureDistributedCTAS(ClientContext &context, PhysicalCopyToFile &worker_copy,
+	                              shared_ptr<DuckLakeFieldData> field_data,
+	                              unique_ptr<DuckLakePartition> partition_data);
+	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+#endif
+
 	// // Source interface
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
@@ -107,6 +153,17 @@ public:
 
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
+
+private:
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	void InitializeDistributedWritePlan();
+	void InitializeDistributedWriteTarget(ClientContext &context, DuckLakeTableEntry &table_entry);
+	void SelectDistributedWorkerPlan();
+	void ValidateDistributedWriteShape() const;
+	DuckLakeSchemaEntry &ResolveDistributedWriteSchema(ClientContext &context) const;
+	DuckLakeTableEntry &ResolveDistributedWriteTable(ClientContext &context) const;
+	DuckLakeTableEntry &CreateDistributedCTASTable(ClientContext &context) const;
+#endif
 };
 
 struct DuckLakeCopyOptions {

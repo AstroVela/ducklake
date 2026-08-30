@@ -1342,6 +1342,10 @@ void DuckLakeTransaction::DropEmptySupersededInlinedTablesClientSide() {
 void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
                                         const TransactionChangeInformation &transaction_changes,
                                         const DuckLakeRetryConfig &retry_config) {
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	auto effective_retry_config = retry_config;
+	effective_retry_config.fail_on_snapshot_conflict = fail_distributed_write_on_snapshot_conflict;
+#endif
 	DuckLakeCommitContext context;
 	context.conflict_query_executor = [&](string q) -> unique_ptr<QueryResult> {
 		auto result = metadata_manager->Query(transaction_snapshot, q);
@@ -1458,7 +1462,11 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		ducklake_catalog.SetCommittedSnapshotId(snapshot_id);
 	};
 	context.commit_info = state->commit_info;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	state->Commit(transaction_snapshot, transaction_changes, effective_retry_config, context);
+#else
 	state->Commit(transaction_snapshot, transaction_changes, retry_config, context);
+#endif
 }
 
 void DuckLakeTransaction::SetConfigOption(const DuckLakeConfigOption &option) {
