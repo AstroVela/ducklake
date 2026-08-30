@@ -1,0 +1,47 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// storage/ducklake_distributed_write.hpp
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/execution/distributed/copy_to_file.hpp"
+
+namespace duckdb {
+
+class ClientContext;
+class ColumnList;
+class DuckLakeFieldData;
+class ExtensionLoader;
+class FileSystem;
+struct DuckLakePartition;
+class ParsedExpression;
+
+unique_ptr<DuckLakePartition>
+PlanDuckLakeDistributedCTASPartition(const ColumnList &columns, const DuckLakeFieldData &field_data,
+                                     const vector<unique_ptr<ParsedExpression>> &partition_keys);
+
+string CreateDuckLakeDistributedArtifactPath(ClientContext &context, const string &data_path);
+
+void ValidateDuckLakeDistributedArtifactPath(ClientContext &context, const string &data_path,
+                                             const string &artifact_path);
+
+void CleanupDuckLakeDistributedArtifactData(ClientContext &context, const string &data_path,
+                                            const string &artifact_path);
+
+void CleanupDuckLakeDistributedArtifacts(FileSystem &file_system, const string &data_path, const string &artifact_path);
+
+void CleanupDuckLakeDistributedArtifacts(ClientContext &context, const string &data_path, const string &artifact_path);
+
+void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
+                                                  const string &artifact_path, const DuckLakeFieldData &field_data,
+                                                  const case_insensitive_set_t &not_null_fields,
+                                                  const vector<string> &partition_names,
+                                                  vector<distributed::DistributedCopyFileInfo> &files);
+
+void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader);
+
+} // namespace duckdb

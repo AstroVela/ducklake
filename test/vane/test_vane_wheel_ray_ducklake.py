@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Exercise DuckLake scans through a packaged two-worker Vane Ray runtime."""
+"""Exercise DuckLake scans and writes through a packaged two-worker Vane Ray runtime."""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import tempfile
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 WORKER_COUNT = 2
 FILE_COUNT = 8
 ROWS_PER_FILE = 256
 ROW_COUNT = FILE_COUNT * ROWS_PER_FILE
+CONFLICT_ID = f"{os.getpid()}-{uuid.uuid4().hex}"
+CONFLICT_STARTED_PATH = Path("/tmp") / f"vane-ray-ducklake-conflict-{CONFLICT_ID}.started"
+CONFLICT_RELEASE_PATH = Path("/tmp") / f"vane-ray-ducklake-conflict-{CONFLICT_ID}.release"
+DISTRIBUTED_ARTIFACT_PREFIX = ".vane-ducklake-"
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -24,6 +31,25 @@ def require_equal(actual: object, expected: object, description: str) -> None:
 def require_true(value: bool, description: str) -> None:
     if not value:
         raise AssertionError(description)
+
+
+def distributed_artifact_roots(connection: object, table_name: str) -> set[str]:
+    rows = connection.execute(f"SELECT data_file FROM ducklake_list_files('lake', '{table_name}')").fetchall()
+    roots = set()
+    for (data_file,) in rows:
+        candidates = [part for part in Path(data_file).parts if part.startswith(DISTRIBUTED_ARTIFACT_PREFIX)]
+        require_equal(len(candidates), 1, f"{table_name} distributed artifact root count")
+        write_id = candidates[0][len(DISTRIBUTED_ARTIFACT_PREFIX) :]
+        try:
+            uuid.UUID(write_id)
+        except ValueError as error:
+            raise AssertionError(f"{table_name} has an invalid distributed write identity: {write_id}") from error
+        roots.add(candidates[0])
+    return roots
+
+
+def distributed_artifact_directories(root: Path) -> set[Path]:
+    return {path for path in (root / "data").rglob(f"{DISTRIBUTED_ARTIFACT_PREFIX}*") if path.is_dir()}
 
 
 def sql_string(value: object) -> str:
@@ -38,6 +64,7 @@ def verify_extension_is_wheel_linked(connection: object) -> None:
         raise AssertionError("the packaged Vane wheel does not contain ducklake")
     require_equal(extension[1], "STATICALLY_LINKED", "ducklake install mode before LOAD")
     connection.execute("LOAD parquet")
+    connection.execute("LOAD sqlite_scanner")
     connection.execute("LOAD ducklake")
     loaded = connection.execute(
         "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = 'ducklake'"
@@ -99,6 +126,19 @@ class AnnotateWorkerNode:
                 "worker_node_id": [node_id] * table.num_rows,
             }
         )
+
+
+class WaitForCoordinatorConflict:
+    """Hold worker output until another connection changes the target."""
+
+    def __call__(self, table: object) -> object:
+        CONFLICT_STARTED_PATH.touch()
+        deadline = time.monotonic() + 90
+        while not CONFLICT_RELEASE_PATH.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("timed out waiting for the DuckLake conflict mutation")
+            time.sleep(0.05)
+        return table
 
 
 class NoOutputHandle:
@@ -355,12 +395,16 @@ def verify_stale_split_rejected(
 
 
 def seed_tables(connection: object, root: Path) -> None:
+    with sqlite3.connect(root / "metadata.sqlite") as metadata_connection:
+        journal_mode = metadata_connection.execute("PRAGMA journal_mode=WAL").fetchone()
+    require_equal(journal_mode, ("wal",), "SQLite metadata journal mode")
+
     configured_runner = os.environ.get("VANE_RUNNER")
     os.environ["VANE_RUNNER"] = "local-fast"
     try:
         connection.execute(
-            f"ATTACH {sql_string('ducklake:' + str(root / 'metadata.ducklake'))} AS lake "
-            f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0)"
+            f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
+            f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0, BUSY_TIMEOUT 30000)"
         )
         connection.execute("CREATE TABLE lake.source(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.empty_source(id INTEGER, payload VARCHAR)")
@@ -368,6 +412,19 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.mapped_source(old_id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.stale_source(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.schema_source(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.row_count_write_target(id INTEGER NOT NULL, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.schema_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.duplicate_path_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.footer_stats_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.inexact_stats_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.nested_write_target(payload STRUCT(value INTEGER), items INTEGER[])")
+        connection.execute("CREATE TABLE lake.not_null_nested_target(payload STRUCT(value INTEGER) NOT NULL)")
+        connection.execute("CREATE TABLE lake.rollback_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
+        connection.execute("ALTER TABLE lake.partitioned_write_target SET PARTITIONED BY (category)")
+        connection.execute("CREATE TABLE lake.concurrent_write_target(id INTEGER, payload VARCHAR)")
         for file_index in range(FILE_COUNT):
             start = file_index * ROWS_PER_FILE
             stop = start + ROWS_PER_FILE
@@ -395,6 +452,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("INSERT INTO lake.mapped_source VALUES (43, 'new', 9)")
         connection.execute("INSERT INTO lake.stale_source VALUES (1, 'old')")
         connection.execute("INSERT INTO lake.schema_source VALUES (1, 'old')")
+        connection.execute("INSERT INTO lake.concurrent_write_target VALUES (-1, 'seed')")
     finally:
         if configured_runner is None:
             os.environ.pop("VANE_RUNNER", None)
@@ -408,14 +466,745 @@ def reopen_lake_read_only(connection: object, root: Path) -> None:
     try:
         connection.execute("DETACH lake")
         connection.execute(
-            f"ATTACH {sql_string('ducklake:' + str(root / 'metadata.ducklake'))} AS lake "
-            f"(DATA_PATH {sql_string(root / 'data')}, READ_ONLY)"
+            f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
+            f"(DATA_PATH {sql_string(root / 'data')}, READ_ONLY, BUSY_TIMEOUT 30000)"
         )
     finally:
         if configured_runner is None:
             os.environ.pop("VANE_RUNNER", None)
         else:
             os.environ["VANE_RUNNER"] = configured_runner
+
+
+def capture_write_plan(vane: object, runner: object, operation: Callable[[], object]) -> object:
+    captured = []
+    original_run_write = runner.run_write
+
+    def capture(relation: object) -> dict[str, object]:
+        captured.append(
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+                relation,
+                f"vane-ducklake-stale-{uuid.uuid4().hex}",
+            )
+        )
+        return {}
+
+    runner.run_write = capture
+    try:
+        operation()
+    finally:
+        runner.run_write = original_run_write
+    require_equal(len(captured), 1, "captured DuckLake write plan count")
+    return captured[0]
+
+
+def capture_physical_write_plan(
+    vane: object,
+    connection: object,
+    runner: object,
+    operation: Callable[[], object],
+) -> object:
+    return capture_write_plan(vane, runner, operation).to_physical_plan(connection)
+
+
+def require_concurrent_write_conflict(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+    require_write_count: Callable[[int, str], None],
+) -> None:
+    CONFLICT_STARTED_PATH.unlink(missing_ok=True)
+    CONFLICT_RELEASE_PATH.unlink(missing_ok=True)
+    errors = []
+    source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 100 AND 700").map_batches(
+        WaitForCoordinatorConflict,
+        schema={
+            "id": vane.sqltype("INTEGER"),
+            "payload": vane.sqltype("VARCHAR"),
+        },
+        batch_size=64,
+        cpus=1.0,
+        execution_backend="ray_actor",
+        actor_number=WORKER_COUNT,
+        target_max_batch_bytes=4096,
+    )
+
+    def execute_write() -> None:
+        try:
+            source.insert_into("lake.concurrent_write_target")
+        except BaseException as error:
+            errors.append(error)
+
+    write_thread = threading.Thread(target=execute_write, name="vane-ducklake-conflict", daemon=True)
+    write_thread.start()
+    coordination_error = None
+    conflict_connection = None
+    files_after_conflict_commit = None
+    try:
+        deadline = time.monotonic() + 90
+        while not CONFLICT_STARTED_PATH.exists():
+            if not write_thread.is_alive():
+                if errors:
+                    raise AssertionError(f"write failed before conflict injection: {errors[0]!r}") from errors[0]
+                raise AssertionError("write stopped before conflict injection")
+            if time.monotonic() >= deadline:
+                raise AssertionError("timed out waiting for distributed DuckLake worker output")
+            time.sleep(0.05)
+        conflict_connection = vane.connect(
+            ":memory:",
+            config={
+                "autoinstall_known_extensions": "false",
+                "autoload_known_extensions": "false",
+            },
+        )
+        verify_extension_is_wheel_linked(conflict_connection)
+        conflict_connection.execute(
+            f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
+            f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0, BUSY_TIMEOUT 30000)"
+        )
+        conflict_connection.execute("INSERT INTO lake.concurrent_write_target VALUES (-2, 'concurrent')")
+        files_after_conflict_commit = set((root / "data").rglob("*.parquet"))
+    except BaseException as error:
+        coordination_error = error
+    finally:
+        CONFLICT_RELEASE_PATH.touch()
+        if conflict_connection is not None:
+            conflict_connection.close()
+
+    write_thread.join(timeout=120)
+    CONFLICT_STARTED_PATH.unlink(missing_ok=True)
+    CONFLICT_RELEASE_PATH.unlink(missing_ok=True)
+    if write_thread.is_alive():
+        raise AssertionError("distributed DuckLake conflict write did not stop")
+    if coordination_error is not None:
+        raise coordination_error
+    require_write_count(1, "concurrent conflict Ray dispatch count")
+    require_equal(len(errors), 1, "concurrent conflict failure count")
+    require_true(
+        "snapshot" in str(errors[0]).lower(),
+        f"unexpected concurrent conflict error: {errors[0]}",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_after_conflict_commit,
+        "concurrent conflict artifact cleanup",
+    )
+
+
+def run_mutated_worker_write(
+    vane: object,
+    connection: object,
+    plan: object,
+    mutate: Callable[[dict[str, object], object], list[dict[str, object]] | None],
+) -> tuple[dict[str, object], int]:
+    import pyarrow as pa
+    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
+    from vane.runners.local.runner import _InProcessFragmentExecutor
+
+    fragment_executor = _InProcessFragmentExecutor()
+    mutated_file_count = 0
+
+    def execute_with_mutated_result(request: object) -> object:
+        nonlocal mutated_file_count
+        result = fragment_executor(request)
+        payloads = []
+        for payload in result.partition_payloads:
+            if payload.num_columns < 5:
+                raise AssertionError("distributed write result is missing file-statistics columns")
+            mutated_rows = []
+            for row in payload.to_pylist():
+                additional_rows = mutate(row, payload)
+                mutated_rows.append(row)
+                if additional_rows:
+                    mutated_rows.extend(additional_rows)
+                mutated_file_count += 1
+            payloads.append(pa.Table.from_pylist(mutated_rows, schema=payload.schema))
+        return vane.ray_cxx.NativeDistributedTaskResult(
+            payloads,
+            result.partition_metadatas,
+            result.result_schema,
+            result.stats,
+            result.completion_status,
+            result.flight_port,
+            result.exchange_sink_instance,
+            result.task_stats,
+        )
+
+    backend = NativeFteWorkerManagerBackend(
+        execute_fn=execute_with_mutated_result,
+        num_workers=1,
+        max_running_tasks=1,
+    )
+    plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        outcome = plan_runner.run_copy_plan(plan, connection)
+    finally:
+        cleanup_errors = []
+        for cleanup in (
+            plan_runner.shutdown,
+            backend.request_shutdown,
+            fragment_executor.request_shutdown,
+            lambda: backend.shutdown(timeout_s=30),
+            lambda: fragment_executor.close(timeout_s=30),
+        ):
+            try:
+                cleanup()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise RuntimeError(f"failed to stop mutated workers: {cleanup_errors[0]}") from cleanup_errors[0]
+    return outcome, mutated_file_count
+
+
+def require_forged_row_count_rejected(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+) -> None:
+    files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
+    source = connection.sql("SELECT NULL::INTEGER AS id, 'forged'::VARCHAR AS payload")
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.row_count_write_target"),
+    )
+
+    def forge_row_count(row: dict[str, object], payload: object) -> None:
+        row_count_name = payload.column_names[1]
+        column_statistics_name = payload.column_names[4]
+        row[row_count_name] = 0
+        forged_statistics = []
+        forged_counts = set()
+        for column_path, statistics in row[column_statistics_name] or []:
+            column_statistics = []
+            for statistic_name, statistic_value in statistics or []:
+                if statistic_name in {"null_count", "num_values"}:
+                    statistic_value = "0"
+                    forged_counts.add(statistic_name)
+                column_statistics.append((statistic_name, statistic_value))
+            forged_statistics.append((column_path, column_statistics))
+        require_equal(
+            forged_counts,
+            {"null_count", "num_values"},
+            "forged worker row/null statistics",
+        )
+        row[column_statistics_name] = forged_statistics
+
+    outcome, forged_file_count = run_mutated_worker_write(vane, connection, plan, forge_row_count)
+    require_equal(
+        outcome.get("extension_catalog_committed"),
+        False,
+        "forged row-count catalog outcome",
+    )
+    require_true(
+        "row-count mismatch" in str(outcome.get("copy_output_outcome_error", "")).lower(),
+        f"unexpected forged row-count outcome: {outcome}",
+    )
+
+    require_true(forged_file_count > 0, "forged distributed write produced no worker files")
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.row_count_write_target").fetchone(),
+        (0,),
+        "forged row-count table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_failure,
+        "forged row-count artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_failure,
+        "forged row-count artifact-root cleanup",
+    )
+
+
+def require_forged_parquet_schema_rejected(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
+    source = connection.sql("SELECT 42::INTEGER AS id, 'schema'::VARCHAR AS payload")
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.schema_write_target"),
+    )
+
+    def remove_field_ids(row: dict[str, object], payload: object) -> None:
+        path = Path(row[payload.column_names[0]])
+        table = pq.read_table(path)
+        schema = pa.schema([pa.field(field.name, field.type, field.nullable) for field in table.schema])
+        pq.write_table(pa.Table.from_arrays(table.columns, schema=schema), path)
+        row[payload.column_names[2]] = path.stat().st_size
+        with path.open("rb") as parquet_file:
+            parquet_file.seek(-8, os.SEEK_END)
+            row[payload.column_names[3]] = int.from_bytes(parquet_file.read(4), "little")
+
+    outcome, forged_file_count = run_mutated_worker_write(vane, connection, plan, remove_field_ids)
+    require_equal(
+        outcome.get("extension_catalog_committed"),
+        False,
+        "forged schema catalog outcome",
+    )
+    require_true(
+        "field id" in str(outcome.get("copy_output_outcome_error", "")).lower(),
+        f"unexpected forged schema outcome: {outcome}",
+    )
+    require_true(forged_file_count > 0, "forged schema write produced no worker files")
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.schema_write_target").fetchone(),
+        (0,),
+        "forged schema table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_failure,
+        "forged schema artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_failure,
+        "forged schema artifact-root cleanup",
+    )
+
+
+def require_duplicate_artifact_rejected(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+) -> None:
+    files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
+    source = connection.sql("SELECT 43::INTEGER AS id, 'duplicate'::VARCHAR AS payload")
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.duplicate_path_write_target"),
+    )
+
+    def duplicate_artifact(row: dict[str, object], _payload: object) -> list[dict[str, object]]:
+        return [dict(row)]
+
+    try:
+        outcome, _ = run_mutated_worker_write(vane, connection, plan, duplicate_artifact)
+    except BaseException as error:
+        require_true(
+            "duplicate final path" in str(error).lower(),
+            f"unexpected duplicate artifact error: {error}",
+        )
+    else:
+        require_equal(
+            outcome.get("extension_catalog_committed"),
+            False,
+            "duplicate artifact catalog outcome",
+        )
+        require_true(
+            "duplicate data-file artifact" in str(outcome.get("copy_output_outcome_error", "")).lower(),
+            f"unexpected duplicate artifact outcome: {outcome}",
+        )
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.duplicate_path_write_target").fetchone(),
+        (0,),
+        "duplicate artifact table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_failure,
+        "duplicate artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_failure,
+        "duplicate artifact-root cleanup",
+    )
+
+
+def require_forged_min_max_replaced(
+    vane: object,
+    connection: object,
+    runner: object,
+    require_write: Callable[[str, Callable[[], object]], None],
+) -> None:
+    source = connection.sql(
+        "SELECT id::INTEGER AS id, ('footer-' || id::VARCHAR)::VARCHAR AS payload FROM range(100, 128) rows(id)"
+    )
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.footer_stats_write_target"),
+    )
+
+    def forge_min_max(row: dict[str, object], payload: object) -> None:
+        column_statistics_name = payload.column_names[4]
+        forged_statistics = []
+        forged_names = set()
+        for column_path, statistics in row[column_statistics_name] or []:
+            column_statistics = []
+            for statistic_name, statistic_value in statistics or []:
+                if statistic_name in {"min", "max"}:
+                    statistic_value = "0"
+                    forged_names.add(statistic_name)
+                column_statistics.append((statistic_name, statistic_value))
+            forged_statistics.append((column_path, column_statistics))
+        require_equal(forged_names, {"min", "max"}, "forged worker min/max statistics")
+        row[column_statistics_name] = forged_statistics
+
+    outcome, forged_file_count = run_mutated_worker_write(vane, connection, plan, forge_min_max)
+    require_equal(
+        outcome.get("extension_catalog_committed"),
+        True,
+        "forged min/max catalog outcome",
+    )
+    require_true(
+        not outcome.get("copy_output_outcome_error"),
+        f"unexpected forged min/max outcome: {outcome}",
+    )
+    require_true(forged_file_count > 0, "forged min/max write produced no worker files")
+    require_equal(
+        connection.execute(
+            "SELECT stats.min_value, stats.max_value "
+            "FROM __ducklake_metadata_lake.ducklake_table_column_stats stats "
+            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
+            "JOIN __ducklake_metadata_lake.ducklake_column columns USING (table_id, column_id) "
+            "WHERE tables.table_name = 'footer_stats_write_target' AND tables.end_snapshot IS NULL "
+            "AND columns.column_name = 'id' AND columns.end_snapshot IS NULL"
+        ).fetchone(),
+        ("100", "127"),
+        "footer-derived min/max metadata",
+    )
+    require_equal(
+        connection.execute("SELECT id FROM lake.footer_stats_write_target ORDER BY id DESC LIMIT 1").fetchone(),
+        (127,),
+        "footer-derived min/max Top-N readback",
+    )
+
+    inexact_source = connection.sql(
+        "SELECT id::INTEGER AS id, (repeat('x', 300) || id::VARCHAR)::VARCHAR AS payload " "FROM range(4) rows(id)"
+    )
+    require_write(
+        "distributed DuckLake inexact footer statistics",
+        lambda: inexact_source.insert_into("lake.inexact_stats_write_target"),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT stats.min_value, stats.max_value "
+            "FROM __ducklake_metadata_lake.ducklake_table_column_stats stats "
+            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
+            "JOIN __ducklake_metadata_lake.ducklake_column columns USING (table_id, column_id) "
+            "WHERE tables.table_name = 'inexact_stats_write_target' AND tables.end_snapshot IS NULL "
+            "AND columns.column_name = 'payload' AND columns.end_snapshot IS NULL"
+        ).fetchone(),
+        (None, None),
+        "inexact footer min/max omission",
+    )
+
+
+def exercise_distributed_writes(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+    require_write: Callable[[str, Callable[[], object]], None],
+    require_write_count: Callable[[int, str], None],
+) -> None:
+    expected_rows = ROW_COUNT - 1
+    first_half = connection.sql("SELECT id, payload FROM lake.source WHERE id < 1024")
+    require_write(
+        "distributed DuckLake INSERT",
+        lambda: first_half.insert_into("lake.write_target"),
+    )
+    second_half = connection.sql("SELECT id, payload FROM lake.source WHERE id >= 1024")
+    require_write(
+        "distributed DuckLake append",
+        lambda: second_half.insert_into("lake.write_target"),
+    )
+    empty_source = connection.sql("SELECT id, payload FROM lake.source WHERE false")
+    require_write(
+        "empty distributed DuckLake INSERT",
+        lambda: empty_source.insert_into("lake.write_target"),
+    )
+    require_equal(
+        connection.execute("SELECT count(*)::BIGINT, sum(id)::BIGINT FROM lake.write_target").fetchone(),
+        (expected_rows, ROW_COUNT * (ROW_COUNT - 1) // 2 - 17),
+        "native readback after distributed INSERT",
+    )
+    file_count = connection.execute("SELECT count(*) FROM ducklake_list_files('lake', 'write_target')").fetchone()[0]
+    require_true(
+        file_count >= WORKER_COUNT,
+        "distributed INSERT did not publish multiple worker artifacts",
+    )
+    require_equal(
+        len(distributed_artifact_roots(connection, "write_target")),
+        2,
+        "distributed INSERT write roots",
+    )
+
+    nested_source = connection.sql(
+        "SELECT {'value': id}::STRUCT(value INTEGER) AS payload, [id, id + 1]::INTEGER[] AS items "
+        "FROM lake.source WHERE id BETWEEN 40 AND 42"
+    )
+    require_write(
+        "nested distributed DuckLake INSERT",
+        lambda: nested_source.insert_into("lake.nested_write_target"),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT payload.value, items[1], items[2] FROM lake.nested_write_target ORDER BY payload.value"
+        ).fetchall(),
+        [(value, value, value + 1) for value in range(40, 43)],
+        "nested distributed INSERT readback",
+    )
+
+    partitioned_source = connection.sql(
+        "SELECT id, ('category-' || (id % 4)::VARCHAR)::VARCHAR AS category, payload " "FROM lake.source WHERE id < 512"
+    )
+    require_write(
+        "partitioned distributed DuckLake INSERT",
+        lambda: partitioned_source.insert_into("lake.partitioned_write_target"),
+    )
+    partitions = connection.execute(
+        "SELECT DISTINCT regexp_extract(data_file, 'category=([^/]+)', 1) "
+        "FROM ducklake_list_files('lake', 'partitioned_write_target') ORDER BY 1"
+    ).fetchall()
+    require_equal(
+        partitions,
+        [(f"category-{index}",) for index in range(4)],
+        "distributed INSERT partition paths",
+    )
+    require_equal(
+        len(distributed_artifact_roots(connection, "partitioned_write_target")),
+        1,
+        "partitioned distributed INSERT write roots",
+    )
+
+    ctas_source = connection.sql("SELECT id, payload FROM lake.source WHERE id < 768")
+    require_write("distributed DuckLake CTAS", lambda: ctas_source.create("lake.ctas_target"))
+    require_equal(
+        connection.execute("SELECT count(*)::BIGINT, sum(id)::BIGINT FROM lake.ctas_target").fetchone(),
+        (767, 768 * 767 // 2 - 17),
+        "native readback after distributed CTAS",
+    )
+    require_equal(
+        len(distributed_artifact_roots(connection, "ctas_target")),
+        1,
+        "distributed CTAS write roots",
+    )
+
+    empty_ctas_source = connection.sql("SELECT id, payload FROM lake.empty_source")
+    require_write(
+        "empty distributed DuckLake CTAS",
+        lambda: empty_ctas_source.create("lake.empty_ctas_target"),
+    )
+    require_equal(
+        connection.execute("SELECT count(*)::BIGINT FROM lake.empty_ctas_target").fetchone(),
+        (0,),
+        "empty distributed CTAS table visibility",
+    )
+    require_equal(
+        connection.execute("SELECT count(*) FROM ducklake_list_files('lake', 'empty_ctas_target')").fetchone(),
+        (0,),
+        "empty distributed CTAS artifacts",
+    )
+
+    partitioned_ctas_source = connection.sql(
+        "SELECT id, ('group-' || (id % 3)::VARCHAR)::VARCHAR AS category, payload " "FROM lake.source WHERE id < 384"
+    )
+    require_write(
+        "partitioned distributed DuckLake CTAS",
+        lambda: partitioned_ctas_source.create("lake.partitioned_ctas_target", partition_by=["category"]),
+    )
+    require_equal(
+        connection.execute("SELECT count(*)::BIGINT FROM lake.partitioned_ctas_target").fetchone(),
+        (383,),
+        "native readback after partitioned distributed CTAS",
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(DISTINCT regexp_extract(data_file, 'category=([^/]+)', 1)) "
+            "FROM ducklake_list_files('lake', 'partitioned_ctas_target')"
+        ).fetchone(),
+        (3,),
+        "distributed CTAS partition paths",
+    )
+
+    files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
+    failing_source = connection.sql(
+        "SELECT CASE WHEN id < 512 THEN id ELSE payload::INTEGER END AS id " "FROM lake.source"
+    )
+    require_error(
+        lambda: failing_source.create("lake.failed_ctas_target"),
+        "Could not convert string",
+        "distributed DuckLake CTAS worker failure",
+    )
+    require_write_count(1, "failed CTAS Ray dispatch count")
+    require_equal(
+        connection.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_catalog = 'lake' AND table_name = 'failed_ctas_target'"
+        ).fetchone(),
+        (0,),
+        "failed distributed CTAS catalog visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_failure,
+        "failed CTAS artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_failure,
+        "failed CTAS artifact-root cleanup",
+    )
+
+    files_before_constraint_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_constraint_failure = distributed_artifact_directories(root)
+    null_source = connection.sql(
+        "SELECT CASE WHEN id = 31 THEN NULL ELSE id END::INTEGER AS id, payload FROM lake.source WHERE id < 128"
+    )
+    require_error(
+        lambda: null_source.insert_into("lake.not_null_write_target"),
+        "not null",
+        "distributed DuckLake INSERT coordinator constraint failure",
+    )
+    require_write_count(1, "constraint failure Ray dispatch count")
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.not_null_write_target").fetchone(),
+        (0,),
+        "constraint failure table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_constraint_failure,
+        "constraint failure artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_constraint_failure,
+        "constraint failure artifact-root cleanup",
+    )
+
+    require_forged_row_count_rejected(vane, connection, runner, root)
+    require_forged_parquet_schema_rejected(vane, connection, runner, root)
+    require_duplicate_artifact_rejected(vane, connection, runner, root)
+    require_forged_min_max_replaced(vane, connection, runner, require_write)
+
+    files_before_missing_stats = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_missing_stats = distributed_artifact_directories(root)
+    nested_source = connection.sql(
+        "SELECT {'value': id}::STRUCT(value INTEGER) AS payload FROM lake.source WHERE id < 64"
+    )
+    require_error(
+        lambda: nested_source.insert_into("lake.not_null_nested_target"),
+        "missing column statistics for not null column",
+        "distributed DuckLake missing NOT NULL statistics",
+    )
+    require_write_count(1, "missing NOT NULL statistics Ray dispatch count")
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.not_null_nested_target").fetchone(),
+        (0,),
+        "missing NOT NULL statistics table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_missing_stats,
+        "missing NOT NULL statistics artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_missing_stats,
+        "missing NOT NULL statistics artifact-root cleanup",
+    )
+
+    files_before_commit_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_commit_failure = distributed_artifact_directories(root)
+    connection.execute("CALL lake.set_option('require_commit_message', true)")
+    commit_failure_source = connection.sql("SELECT id, payload FROM lake.source WHERE id < 64")
+    try:
+        require_error(
+            lambda: commit_failure_source.insert_into("lake.rollback_write_target"),
+            "commit information",
+            "distributed DuckLake transaction commit failure",
+        )
+        require_write_count(1, "transaction commit failure Ray dispatch count")
+        require_equal(
+            connection.execute("SELECT count(*) FROM lake.rollback_write_target").fetchone(),
+            (0,),
+            "transaction commit failure table visibility",
+        )
+        require_equal(
+            set((root / "data").rglob("*.parquet")),
+            files_before_commit_failure,
+            "transaction commit failure artifact cleanup",
+        )
+        require_equal(
+            distributed_artifact_directories(root),
+            artifact_directories_before_commit_failure,
+            "transaction commit failure artifact-root cleanup",
+        )
+    finally:
+        connection.execute("CALL lake.set_option('require_commit_message', false)")
+
+    stale_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 800 AND 900")
+    stale_plan = capture_write_plan(
+        vane,
+        runner,
+        lambda: stale_source.insert_into("lake.write_target"),
+    )
+    connection.execute("ALTER TABLE lake.write_target ADD COLUMN added INTEGER DEFAULT 7")
+    query_driver = runner.query_driver_client
+    if query_driver is None:
+        raise AssertionError("the Ray runner did not create a query driver client")
+    require_error(
+        lambda: query_driver.run_copy_plan(stale_plan),
+        "definition",
+        "stale schema distributed INSERT",
+    )
+    require_equal(
+        connection.execute("SELECT count(*)::BIGINT FROM lake.write_target").fetchone(),
+        (expected_rows,),
+        "stale distributed INSERT did not commit",
+    )
+
+    stale_snapshot_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 901 AND 950")
+    stale_snapshot_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: stale_snapshot_source.insert_into("lake.concurrent_write_target"),
+    )
+    connection.execute("INSERT INTO lake.stale_source VALUES (3, 'snapshot')")
+    physical_plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    try:
+        require_error(
+            lambda: physical_plan_runner.run_copy_plan(stale_snapshot_plan, connection),
+            "snapshot",
+            "stale snapshot distributed INSERT",
+        )
+    finally:
+        physical_plan_runner.shutdown()
+    require_equal(
+        connection.execute("SELECT count(*)::BIGINT FROM lake.concurrent_write_target").fetchone(),
+        (1,),
+        "stale snapshot distributed INSERT did not commit",
+    )
+
+    require_concurrent_write_conflict(vane, connection, runner, root, require_write_count)
 
 
 def main() -> None:
@@ -434,6 +1223,7 @@ def main() -> None:
     connection = None
     runner = None
     original_run_iter_tables = None
+    original_run_write = None
     try:
         expected_nodes = execution_node_ids(ray)
         vane.set_runner_ray(noop_if_initialized=True)
@@ -452,6 +1242,38 @@ def main() -> None:
         with tempfile.TemporaryDirectory(prefix="vane-ducklake-ray-") as temporary_directory:
             root = Path(temporary_directory)
             seed_tables(connection, root)
+
+            write_dispatch_count = 0
+            write_dispatch_checkpoint = 0
+            original_run_write = runner.run_write
+
+            def record_distributed_write(*args: object, **kwargs: object) -> object:
+                nonlocal write_dispatch_count
+                write_dispatch_count += 1
+                return original_run_write(*args, **kwargs)
+
+            def require_write_count(expected: int, description: str) -> None:
+                nonlocal write_dispatch_checkpoint
+                require_equal(
+                    write_dispatch_count - write_dispatch_checkpoint,
+                    expected,
+                    description,
+                )
+                write_dispatch_checkpoint = write_dispatch_count
+
+            def require_distributed_write(description: str, operation: Callable[[], object]) -> None:
+                operation()
+                require_write_count(1, f"{description} Ray dispatch count")
+
+            runner.run_write = record_distributed_write
+            exercise_distributed_writes(
+                vane,
+                connection,
+                runner,
+                root,
+                require_distributed_write,
+                require_write_count,
+            )
 
             verify_worker_transport(vane, connection)
             verify_stale_split_rejected(
@@ -491,6 +1313,11 @@ def main() -> None:
                 connection.sql("SELECT count(*)::BIGINT FROM lake.source").fetchall(),
                 [(ROW_COUNT - 1,)],
                 "distributed delete-aware row count",
+            )
+            require_equal(
+                connection.sql("SELECT count(*)::BIGINT FROM lake.write_target").fetchall(),
+                [(ROW_COUNT - 1,)],
+                "Vane readback after distributed write",
             )
             require_equal(
                 connection.sql("SELECT payload FROM lake.source WHERE id BETWEEN 510 AND 514 ORDER BY id").fetchall(),
@@ -556,9 +1383,12 @@ def main() -> None:
             observed_nodes = {str(row[1]) for row in annotated_rows}
             require_equal(observed_nodes, expected_nodes, "two-worker DuckLake scan topology")
             require_true(dispatch_count >= 4, "DuckLake queries did not use the Ray runner")
+            require_true(write_dispatch_count >= 9, "DuckLake writes did not use the Ray runner")
     finally:
         if runner is not None and original_run_iter_tables is not None:
             runner.run_iter_tables = original_run_iter_tables
+        if runner is not None and original_run_write is not None:
+            runner.run_write = original_run_write
         try:
             if connection is not None:
                 connection.close()

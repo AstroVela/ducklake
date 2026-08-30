@@ -1741,6 +1741,13 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 			// rollback if there is an active transaction
 			context.try_rollback();
 			bool retry_on_error = DuckLakeTransaction::RetryOnError(error.Message());
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+			auto database_locked = StringUtil::Contains(StringUtil::Lower(error.Message()), "database is locked");
+			if (can_retry && (retry_on_error || database_locked) && retry_config.fail_on_snapshot_conflict) {
+				CleanupFiles();
+				throw TransactionException("DuckLake distributed write snapshot changed before commit");
+			}
+#endif
 			bool finished_retrying = i + 1 >= retry_config.max_retry_count;
 			if (!can_retry || !retry_on_error || finished_retrying) {
 				// we abort after the max retry count

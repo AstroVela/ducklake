@@ -47,6 +47,13 @@ struct FlushedInlinedTableInfo {
 	idx_t flush_snapshot_id;
 };
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+struct DuckLakeDistributedArtifact {
+	string data_path;
+	string artifact_path;
+};
+#endif
+
 struct LocalTableDataChanges {
 	vector<DuckLakeDataFile> new_data_files;
 	unique_ptr<DuckLakeInlinedData> new_inlined_data;
@@ -54,6 +61,9 @@ struct LocalTableDataChanges {
 	unordered_map<string, unique_ptr<DuckLakeInlinedDataDeletes>> new_inlined_data_deletes;
 	unique_ptr<DuckLakeInlinedFileDeletes> new_inlined_file_deletes;
 	vector<DuckLakeCompactionEntry> compactions;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	vector<DuckLakeDistributedArtifact> distributed_artifacts;
+#endif
 	bool IsEmpty() const;
 };
 
@@ -75,6 +85,9 @@ public:
 	shared_ptr<DuckLakeInlinedData> GetTransactionLocalInlinedData(ClientContext &context, TableIndex table_id) const;
 	void DropTransactionLocalFile(ClientContext &context, TableIndex table_id, const string &path);
 	void AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files);
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	void AddDistributedArtifact(TableIndex table_id, const string &data_path, const string &artifact_path);
+#endif
 	void AppendDeleteFiles(TableIndex table_id, const string &data_file_path, vector<DuckLakeDeleteFile> files);
 	void AppendInlinedData(ClientContext &context, TableIndex table_id, unique_ptr<DuckLakeInlinedData> new_data);
 	void AddNewInlinedDeletes(TableIndex table_id, const string &table_name, set<idx_t> new_deletes);
@@ -159,6 +172,9 @@ struct DuckLakeRetryConfig {
 	idx_t max_retry_count = 10;
 	idx_t retry_wait_ms = 100;
 	double retry_backoff = 1.5;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	bool fail_on_snapshot_conflict = false;
+#endif
 
 	static DuckLakeRetryConfig FromContext(ClientContext &context);
 };
@@ -218,6 +234,10 @@ public:
 	bool HasTransactionLocalInserts(TableIndex table_id) const;
 	bool HasTransactionInlinedData(TableIndex table_id) const;
 	void AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files);
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	void AppendDistributedFiles(TableIndex table_id, vector<DuckLakeDataFile> files, const string &data_path,
+	                            const string &artifact_path);
+#endif
 	void AddDeletes(TableIndex table_id, vector<DuckLakeDeleteFile> files);
 	void AddCompaction(TableIndex table_id, DuckLakeCompactionEntry entry);
 
@@ -297,6 +317,11 @@ public:
 	//! If there are no uncommitted changes, this is the schema version of the snapshot.
 	//! Otherwise, it is an id that is incremented whenever the schema changes (not stored between restarts)
 	idx_t GetCatalogVersion();
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	void FailDistributedWriteOnSnapshotConflict() {
+		fail_distributed_write_on_snapshot_conflict = true;
+	}
+#endif
 
 protected:
 	void SetMetadataManager(unique_ptr<DuckLakeMetadataManager> metadata_manager) {
@@ -353,6 +378,9 @@ private:
 	value_map_t<DuckLakeSnapshot> snapshot_cache;
 	//! New set of transaction-local name maps
 	DuckLakeNameMapSet new_name_maps;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	bool fail_distributed_write_on_snapshot_conflict = false;
+#endif
 
 	atomic<idx_t> catalog_version;
 };

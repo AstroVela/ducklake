@@ -1,0 +1,44 @@
+# name: test/sql/vane/native_write.test
+# description: verify native DuckLake INSERT and CTAS in Vane builds
+# group: [vane]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/metadata.ducklake' AS lake (DATA_PATH '__TEST_DIR__/data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.source(id INTEGER, category VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO lake.source VALUES (1, 'A', 'one'), (2, 'B', 'two')
+
+statement ok
+CREATE TABLE lake.created AS SELECT id, payload FROM lake.source
+
+statement ok
+INSERT INTO lake.created VALUES (3, 'three')
+
+query II
+SELECT id, payload FROM lake.created ORDER BY id
+----
+1	one
+2	two
+3	three
+
+statement ok
+CREATE TABLE lake.partitioned(id INTEGER, category VARCHAR)
+
+statement ok
+ALTER TABLE lake.partitioned SET PARTITIONED BY (category)
+
+statement ok
+INSERT INTO lake.partitioned SELECT id, category FROM lake.source
+
+query II
+SELECT id, category FROM lake.partitioned ORDER BY id
+----
+1	A
+2	B

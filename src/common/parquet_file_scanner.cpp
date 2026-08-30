@@ -59,6 +59,19 @@ const vector<string> &ParquetFileScanner::GetNames() const {
 	return return_names;
 }
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+idx_t ParquetFileScanner::GetRowCount() const {
+	if (!parquet_scan.cardinality) {
+		throw InternalException("Parquet scan does not expose file cardinality");
+	}
+	auto cardinality = parquet_scan.cardinality(context, bind_data.get());
+	if (!cardinality || !cardinality->has_estimated_cardinality) {
+		throw InvalidInputException("Parquet file does not expose its row count");
+	}
+	return cardinality->estimated_cardinality;
+}
+#endif
+
 optional_idx ParquetFileScanner::FindColumn(const string &name) const {
 	for (idx_t i = 0; i < return_names.size(); i++) {
 		if (return_names[i] == name) {

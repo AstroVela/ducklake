@@ -10,6 +10,9 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "storage/ducklake_log_type.hpp"
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#include "storage/ducklake_distributed_write.hpp"
+#endif
 
 namespace duckdb {
 
@@ -109,6 +112,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register ducklake_scan so it can be found during deserialization
 	auto ducklake_scan = DuckLakeFunctions::GetDuckLakeScanFunction(loader.GetDatabaseInstance());
 	loader.RegisterFunction(ducklake_scan);
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	RegisterDuckLakeDistributedWrites(loader);
+#endif
 
 	// secrets
 	auto secret_type = DuckLakeSecret::GetSecretType();

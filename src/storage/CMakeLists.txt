@@ -39,7 +39,7 @@ add_library(
 
 if(DUCKLAKE_VANE_DISTRIBUTED)
   add_library(ducklake_distributed_scan_objects OBJECT
-              ducklake_distributed_scan.cpp)
+              ducklake_distributed_scan.cpp ducklake_distributed_write.cpp)
   target_include_directories(
     ducklake_distributed_scan_objects
     PRIVATE "${DUCKDB_SOURCE_PATH}/extension/parquet/include"
