@@ -2,6 +2,7 @@
 
 #include "common/parquet_file_scanner.hpp"
 #include "common/ducklake_util.hpp"
+#include "storage/ducklake_geo_stats.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "storage/ducklake_insert.hpp"
 #include "storage/ducklake_partition_data.hpp"
@@ -16,14 +17,19 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/distributed_write.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 namespace duckdb {
 
@@ -152,6 +158,373 @@ struct ValidatedArtifactLocation {
 	vector<string> components;
 };
 
+struct ParquetArtifactMetadata {
+	Value row_groups;
+	Value schema;
+};
+
+struct ExpectedArtifactField {
+	const DuckLakeFieldId *field;
+	vector<string> path;
+	optional_idx parent_field_id;
+};
+
+struct ParquetSchemaFrame {
+	idx_t remaining_children;
+	optional_idx field_id;
+};
+
+static constexpr idx_t PARQUET_FULL_METADATA_ROW_GROUPS = 1;
+static constexpr idx_t PARQUET_FULL_METADATA_SCHEMA = 2;
+
+static constexpr idx_t PARQUET_METADATA_COLUMN_ID = 5;
+static constexpr idx_t PARQUET_METADATA_NUM_VALUES = 7;
+static constexpr idx_t PARQUET_METADATA_STATS_MIN = 10;
+static constexpr idx_t PARQUET_METADATA_STATS_MAX = 11;
+static constexpr idx_t PARQUET_METADATA_STATS_NULL_COUNT = 12;
+static constexpr idx_t PARQUET_METADATA_STATS_MIN_VALUE = 14;
+static constexpr idx_t PARQUET_METADATA_STATS_MAX_VALUE = 15;
+static constexpr idx_t PARQUET_METADATA_TOTAL_COMPRESSED_SIZE = 21;
+static constexpr idx_t PARQUET_METADATA_GEO_BBOX = 29;
+static constexpr idx_t PARQUET_METADATA_GEO_TYPES = 30;
+
+static constexpr idx_t PARQUET_SCHEMA_NAME = 1;
+static constexpr idx_t PARQUET_SCHEMA_NUM_CHILDREN = 5;
+static constexpr idx_t PARQUET_SCHEMA_FIELD_ID = 9;
+
+static ParquetArtifactMetadata ReadParquetArtifactMetadata(ClientContext &context, const string &path) {
+	auto &instance = DatabaseInstance::GetDatabase(context);
+	ExtensionLoader loader(instance, "ducklake");
+	auto &function_entry = loader.GetTableFunction("parquet_full_metadata");
+	auto function = function_entry.functions.functions[0];
+
+	vector<Value> children {Value(path)};
+	named_parameter_map_t named_parameters;
+	vector<LogicalType> input_types;
+	vector<string> input_names;
+	TableFunctionRef empty;
+	TableFunction dummy_function;
+	dummy_function.name = "DuckLakeDistributedParquetMetadata";
+	TableFunctionBindInput bind_input(children, named_parameters, input_types, input_names, nullptr, nullptr,
+	                                  dummy_function, empty);
+	vector<LogicalType> return_types;
+	vector<string> return_names;
+	auto bind_data = function.bind(context, bind_input, return_types, return_names);
+	if (return_types.size() <= PARQUET_FULL_METADATA_SCHEMA) {
+		throw InternalException("Parquet full metadata returned an invalid schema");
+	}
+
+	vector<column_t> column_ids;
+	for (idx_t index = 0; index < return_types.size(); index++) {
+		column_ids.push_back(index);
+	}
+	ThreadContext thread_context(context);
+	ExecutionContext execution_context(context, thread_context, nullptr);
+	TableFunctionInitInput init_input(bind_data.get(), column_ids, vector<idx_t>(), nullptr);
+	auto global_state = function.init_global(context, init_input);
+	auto local_state = function.init_local(execution_context, init_input, global_state.get());
+	TableFunctionInput function_input(bind_data.get(), local_state.get(), global_state.get());
+	DataChunk chunk;
+	chunk.Initialize(context, return_types);
+	function.function(context, function_input, chunk);
+	if (chunk.size() != 1) {
+		throw InvalidInputException("Parquet full metadata returned %s files for '%s'", to_string(chunk.size()), path);
+	}
+
+	ParquetArtifactMetadata result;
+	result.row_groups = chunk.GetValue(PARQUET_FULL_METADATA_ROW_GROUPS, 0);
+	result.schema = chunk.GetValue(PARQUET_FULL_METADATA_SCHEMA, 0);
+	return result;
+}
+
+static void CollectExpectedArtifactFields(const DuckLakeFieldId &field, const vector<string> &parent_path,
+                                          const optional_idx &parent_field_id,
+                                          unordered_map<idx_t, ExpectedArtifactField> &result) {
+	auto field_index = field.GetFieldIndex().index;
+	if (field_index > NumericLimits<int32_t>::Maximum()) {
+		throw InvalidInputException("DuckLake distributed target contains an invalid Parquet field id");
+	}
+	auto path = parent_path;
+	path.push_back(field.Name());
+	if (!result.emplace(field_index, ExpectedArtifactField {&field, path, parent_field_id}).second) {
+		throw InternalException("DuckLake distributed target contains duplicate field id %s", to_string(field_index));
+	}
+	for (const auto &child : field.Children()) {
+		CollectExpectedArtifactFields(*child, path, optional_idx(field_index), result);
+	}
+}
+
+static unordered_map<idx_t, ExpectedArtifactField> GetExpectedArtifactFields(const DuckLakeFieldData &field_data) {
+	unordered_map<idx_t, ExpectedArtifactField> result;
+	for (const auto &field : field_data.GetFieldIds()) {
+		CollectExpectedArtifactFields(*field, {}, optional_idx(), result);
+	}
+	return result;
+}
+
+static idx_t GetOptionalNonNegativeIndex(const Value &value, const string &description) {
+	if (value.IsNull()) {
+		throw InvalidInputException("DuckLake distributed Parquet metadata is missing %s", description);
+	}
+	auto index = BigIntValue::Get(value);
+	if (index < 0) {
+		throw InvalidInputException("DuckLake distributed Parquet metadata contains an invalid %s", description);
+	}
+	return NumericCast<idx_t>(index);
+}
+
+static vector<const ExpectedArtifactField *>
+ValidateArtifactSchema(const ParquetFileScanner &scanner, const Value &schema, const DuckLakeFieldData &field_data,
+                       const unordered_map<idx_t, ExpectedArtifactField> &expected_fields, const string &path) {
+	auto &expected_roots = field_data.GetFieldIds();
+	auto &actual_names = scanner.GetNames();
+	auto &actual_types = scanner.GetTypes();
+	if (actual_names.size() != expected_roots.size() || actual_types.size() != expected_roots.size()) {
+		throw InvalidInputException("DuckLake distributed data-file schema mismatch for '%s'", path);
+	}
+	for (idx_t index = 0; index < expected_roots.size(); index++) {
+		if (actual_names[index] != expected_roots[index]->Name() ||
+		    actual_types[index] != expected_roots[index]->Type()) {
+			throw InvalidInputException(
+			    "DuckLake distributed data-file schema mismatch for '%s' at column '%s' (found '%s' %s)", path,
+			    expected_roots[index]->Name(), actual_names[index], actual_types[index].ToString());
+		}
+	}
+
+	auto &schema_entries = ListValue::GetChildren(schema);
+	if (schema_entries.empty()) {
+		throw InvalidInputException("DuckLake distributed data-file schema is empty for '%s'", path);
+	}
+	auto &root = StructValue::GetChildren(schema_entries[0]);
+	if (root.size() <= PARQUET_SCHEMA_FIELD_ID || !root[PARQUET_SCHEMA_FIELD_ID].IsNull()) {
+		throw InvalidInputException("DuckLake distributed data-file root has an invalid field id for '%s'", path);
+	}
+	auto root_children = GetOptionalNonNegativeIndex(root[PARQUET_SCHEMA_NUM_CHILDREN], "schema root child count");
+	if (root_children != expected_roots.size()) {
+		throw InvalidInputException("DuckLake distributed data-file schema mismatch for '%s'", path);
+	}
+
+	vector<ParquetSchemaFrame> stack;
+	stack.push_back(ParquetSchemaFrame {root_children, optional_idx()});
+	unordered_set<idx_t> seen_field_ids;
+	vector<const ExpectedArtifactField *> leaf_fields;
+	for (idx_t schema_index = 1; schema_index < schema_entries.size(); schema_index++) {
+		while (!stack.empty() && stack.back().remaining_children == 0) {
+			stack.pop_back();
+		}
+		if (stack.empty()) {
+			throw InvalidInputException("DuckLake distributed data-file schema is unaligned for '%s'", path);
+		}
+		auto parent_field_id = stack.back().field_id;
+		stack.back().remaining_children--;
+
+		auto &children = StructValue::GetChildren(schema_entries[schema_index]);
+		if (children.size() <= PARQUET_SCHEMA_FIELD_ID || children[PARQUET_SCHEMA_NAME].IsNull()) {
+			throw InvalidInputException("DuckLake distributed data-file schema is invalid for '%s'", path);
+		}
+		auto &name = StringValue::Get(children[PARQUET_SCHEMA_NAME]);
+		idx_t child_count = 0;
+		if (!children[PARQUET_SCHEMA_NUM_CHILDREN].IsNull()) {
+			child_count = GetOptionalNonNegativeIndex(children[PARQUET_SCHEMA_NUM_CHILDREN], "schema child count");
+		}
+
+		optional_idx current_field_id = parent_field_id;
+		const ExpectedArtifactField *expected_field = nullptr;
+		if (!children[PARQUET_SCHEMA_FIELD_ID].IsNull()) {
+			auto field_id = GetOptionalNonNegativeIndex(children[PARQUET_SCHEMA_FIELD_ID], "field id");
+			auto expected_entry = expected_fields.find(field_id);
+			if (expected_entry == expected_fields.end() || !seen_field_ids.insert(field_id).second) {
+				throw InvalidInputException("DuckLake distributed data-file schema has an invalid field id for '%s'",
+				                            path);
+			}
+			expected_field = &expected_entry->second;
+			if (name != expected_field->field->Name() || parent_field_id != expected_field->parent_field_id) {
+				throw InvalidInputException(
+				    "DuckLake distributed data-file schema has an invalid field-id mapping for '%s'", path);
+			}
+			current_field_id = field_id;
+		}
+		if (child_count == 0) {
+			leaf_fields.push_back(expected_field);
+		} else {
+			stack.push_back(ParquetSchemaFrame {child_count, current_field_id});
+		}
+	}
+	while (!stack.empty() && stack.back().remaining_children == 0) {
+		stack.pop_back();
+	}
+	if (!stack.empty() || seen_field_ids.size() != expected_fields.size()) {
+		throw InvalidInputException("DuckLake distributed data-file schema is missing field ids for '%s'", path);
+	}
+	return leaf_fields;
+}
+
+static void ReadGeoStatistics(const vector<Value> &metadata, DuckLakeColumnStats &statistics) {
+	if (!statistics.extra_stats || statistics.extra_stats->GetStatsType() != DuckLakeExtraStatsType::GEOMETRY) {
+		return;
+	}
+	auto &geo_statistics = statistics.extra_stats->Cast<DuckLakeColumnGeoStats>();
+	if (!metadata[PARQUET_METADATA_GEO_BBOX].IsNull()) {
+		auto &bbox = StructValue::GetChildren(metadata[PARQUET_METADATA_GEO_BBOX]);
+		if (!bbox[0].IsNull()) {
+			geo_statistics.xmin = DoubleValue::Get(bbox[0]);
+		}
+		if (!bbox[1].IsNull()) {
+			geo_statistics.xmax = DoubleValue::Get(bbox[1]);
+		}
+		if (!bbox[2].IsNull()) {
+			geo_statistics.ymin = DoubleValue::Get(bbox[2]);
+		}
+		if (!bbox[3].IsNull()) {
+			geo_statistics.ymax = DoubleValue::Get(bbox[3]);
+		}
+		if (!bbox[4].IsNull()) {
+			geo_statistics.zmin = DoubleValue::Get(bbox[4]);
+		}
+		if (!bbox[5].IsNull()) {
+			geo_statistics.zmax = DoubleValue::Get(bbox[5]);
+		}
+		if (!bbox[6].IsNull()) {
+			geo_statistics.mmin = DoubleValue::Get(bbox[6]);
+		}
+		if (!bbox[7].IsNull()) {
+			geo_statistics.mmax = DoubleValue::Get(bbox[7]);
+		}
+	}
+	if (!metadata[PARQUET_METADATA_GEO_TYPES].IsNull()) {
+		for (const auto &type : ListValue::GetChildren(metadata[PARQUET_METADATA_GEO_TYPES])) {
+			geo_statistics.geo_types.insert(StringValue::Get(type));
+		}
+	}
+}
+
+static Value SerializeArtifactStatistics(const map<string, DuckLakeColumnStats> &statistics) {
+	vector<Value> column_names;
+	vector<Value> column_values;
+	for (const auto &column : statistics) {
+		map<string, Value> values;
+		auto &stats = column.second;
+		values.emplace("column_size_bytes", Value::UBIGINT(stats.column_size_bytes));
+		if (stats.has_num_values) {
+			values.emplace("num_values", Value::UBIGINT(stats.num_values));
+		}
+		if (stats.has_min) {
+			values.emplace("min", Value(stats.min));
+		}
+		if (stats.has_max) {
+			values.emplace("max", Value(stats.max));
+		}
+		if (stats.has_null_count) {
+			values.emplace("null_count", Value::UBIGINT(stats.null_count));
+		}
+		if (stats.extra_stats && stats.extra_stats->GetStatsType() == DuckLakeExtraStatsType::GEOMETRY) {
+			auto &geo_stats = stats.extra_stats->Cast<DuckLakeColumnGeoStats>();
+			if (geo_stats.xmin != NumericLimits<double>::Maximum()) {
+				values.emplace("bbox_xmin", Value::DOUBLE(geo_stats.xmin));
+				values.emplace("bbox_xmax", Value::DOUBLE(geo_stats.xmax));
+				values.emplace("bbox_ymin", Value::DOUBLE(geo_stats.ymin));
+				values.emplace("bbox_ymax", Value::DOUBLE(geo_stats.ymax));
+			}
+			if (geo_stats.zmin != NumericLimits<double>::Maximum()) {
+				values.emplace("bbox_zmin", Value::DOUBLE(geo_stats.zmin));
+				values.emplace("bbox_zmax", Value::DOUBLE(geo_stats.zmax));
+			}
+			if (geo_stats.mmin != NumericLimits<double>::Maximum()) {
+				values.emplace("bbox_mmin", Value::DOUBLE(geo_stats.mmin));
+				values.emplace("bbox_mmax", Value::DOUBLE(geo_stats.mmax));
+			}
+			if (!geo_stats.geo_types.empty()) {
+				vector<Value> types;
+				for (const auto &type : geo_stats.geo_types) {
+					types.emplace_back(type);
+				}
+				values.emplace("geo_types", Value::LIST(LogicalType::VARCHAR, std::move(types)));
+			}
+		}
+
+		vector<Value> names;
+		vector<Value> stats_values;
+		for (auto &entry : values) {
+			names.emplace_back(entry.first);
+			stats_values.push_back(std::move(entry.second));
+		}
+		column_names.emplace_back(column.first);
+		column_values.push_back(
+		    Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(names), std::move(stats_values)));
+	}
+	auto stats_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	return Value::MAP(LogicalType::VARCHAR, stats_type, std::move(column_names), std::move(column_values));
+}
+
+static void MergeArtifactStatistics(DuckLakeColumnStats &target, const DuckLakeColumnStats &source) {
+	const auto signed_max = NumericCast<idx_t>(NumericLimits<int64_t>::Maximum());
+	if (target.column_size_bytes > signed_max - source.column_size_bytes ||
+	    (target.has_num_values && source.has_num_values && target.num_values > signed_max - source.num_values) ||
+	    (target.has_null_count && source.has_null_count && target.null_count > signed_max - source.null_count)) {
+		throw InvalidInputException("DuckLake distributed Parquet metadata contains overflowing column statistics");
+	}
+	target.MergeStats(source);
+}
+
+static Value GetArtifactStatistics(const Value &row_groups, const vector<const ExpectedArtifactField *> &leaf_fields,
+                                   const string &path) {
+	map<string, DuckLakeColumnStats> result;
+	for (const auto &row_group : ListValue::GetChildren(row_groups)) {
+		auto &metadata = StructValue::GetChildren(row_group);
+		if (metadata.size() <= PARQUET_METADATA_GEO_TYPES) {
+			throw InvalidInputException("DuckLake distributed Parquet metadata is invalid for '%s'", path);
+		}
+		auto column_id = GetOptionalNonNegativeIndex(metadata[PARQUET_METADATA_COLUMN_ID], "column id");
+		if (column_id >= leaf_fields.size()) {
+			throw InvalidInputException("DuckLake distributed Parquet metadata has an invalid column id for '%s'",
+			                            path);
+		}
+		auto expected_field = leaf_fields[column_id];
+		if (!expected_field) {
+			continue;
+		}
+
+		DuckLakeColumnStats statistics(expected_field->field->Type());
+		statistics.has_num_values = true;
+		statistics.num_values = GetOptionalNonNegativeIndex(metadata[PARQUET_METADATA_NUM_VALUES], "value count");
+		if (!metadata[PARQUET_METADATA_STATS_NULL_COUNT].IsNull()) {
+			statistics.has_null_count = true;
+			statistics.null_count =
+			    GetOptionalNonNegativeIndex(metadata[PARQUET_METADATA_STATS_NULL_COUNT], "null count");
+			if (statistics.null_count > statistics.num_values) {
+				throw InvalidInputException(
+				    "DuckLake distributed Parquet metadata has invalid value/null counts for '%s'", path);
+			}
+		}
+		if (!metadata[PARQUET_METADATA_STATS_MIN].IsNull()) {
+			statistics.has_min = true;
+			statistics.min = StringValue::Get(metadata[PARQUET_METADATA_STATS_MIN]);
+		} else if (!metadata[PARQUET_METADATA_STATS_MIN_VALUE].IsNull()) {
+			statistics.has_min = true;
+			statistics.min = StringValue::Get(metadata[PARQUET_METADATA_STATS_MIN_VALUE]);
+		}
+		if (!metadata[PARQUET_METADATA_STATS_MAX].IsNull()) {
+			statistics.has_max = true;
+			statistics.max = StringValue::Get(metadata[PARQUET_METADATA_STATS_MAX]);
+		} else if (!metadata[PARQUET_METADATA_STATS_MAX_VALUE].IsNull()) {
+			statistics.has_max = true;
+			statistics.max = StringValue::Get(metadata[PARQUET_METADATA_STATS_MAX_VALUE]);
+		}
+		statistics.column_size_bytes =
+		    GetOptionalNonNegativeIndex(metadata[PARQUET_METADATA_TOTAL_COMPRESSED_SIZE], "compressed size");
+		ReadGeoStatistics(metadata, statistics);
+
+		auto column_path = DuckLakeUtil::ToQuotedList(expected_field->path, '.');
+		auto entry = result.find(column_path);
+		if (entry == result.end()) {
+			result.emplace(std::move(column_path), std::move(statistics));
+		} else {
+			MergeArtifactStatistics(entry->second, statistics);
+		}
+	}
+	return SerializeArtifactStatistics(result);
+}
+
 static ValidatedArtifactLocation ValidateArtifactCleanupLocation(FileSystem &file_system, const string &data_path,
                                                                  const string &path,
                                                                  const vector<string> &partition_names) {
@@ -210,9 +583,10 @@ static string ValidateArtifactLocation(FileSystem &file_system, const string &da
 	return std::move(location.canonical_path);
 }
 
-static void ValidateArtifactContents(ClientContext &context, FileSystem &file_system, const string &canonical_path,
-                                     const string &path, idx_t expected_size, idx_t expected_footer_size,
-                                     idx_t expected_row_count) {
+static Value ValidateArtifactContents(ClientContext &context, FileSystem &file_system, const string &canonical_path,
+                                      const string &path, idx_t expected_size, idx_t expected_footer_size,
+                                      idx_t expected_row_count, const DuckLakeFieldData &field_data,
+                                      const unordered_map<idx_t, ExpectedArtifactField> &expected_fields) {
 	try {
 		auto handle = file_system.OpenFile(canonical_path, FileFlags::FILE_FLAGS_READ);
 		auto actual_size = handle->GetFileSize();
@@ -246,6 +620,9 @@ static void ValidateArtifactContents(ClientContext &context, FileSystem &file_sy
 			    "DuckLake distributed data-file row-count mismatch for '%s' (worker reported %s rows, found %s)", path,
 			    to_string(expected_row_count), to_string(actual_row_count));
 		}
+		auto metadata = ReadParquetArtifactMetadata(context, canonical_path);
+		auto leaf_fields = ValidateArtifactSchema(scanner, metadata.schema, field_data, expected_fields, path);
+		return GetArtifactStatistics(metadata.row_groups, leaf_fields, path);
 	} catch (const InvalidInputException &) {
 		throw;
 	} catch (const std::exception &error) {
@@ -466,16 +843,17 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
                                                   const string &artifact_path, const DuckLakeFieldData &field_data,
                                                   const case_insensitive_set_t &not_null_fields,
                                                   const vector<string> &partition_names,
-                                                  const vector<distributed::DistributedCopyFileInfo> &files) {
+                                                  vector<distributed::DistributedCopyFileInfo> &files) {
 	if (data_path.empty()) {
 		throw InvalidInputException("DuckLake distributed data path cannot be empty");
 	}
 	auto &file_system = FileSystem::GetFileSystem(context);
 	auto canonical_artifact_path = ValidateArtifactRoot(file_system, data_path, artifact_path);
 	auto expected_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+	auto expected_fields = GetExpectedArtifactFields(field_data);
 	idx_t total_rows = 0;
 	idx_t total_bytes = 0;
-	for (const auto &file : files) {
+	for (auto &file : files) {
 		const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
 		if (path.empty()) {
 			throw InvalidInputException("DuckLake distributed write returned an empty data-file artifact");
@@ -506,8 +884,9 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		    file.row_count > signed_max - total_rows || file.file_size_bytes > signed_max - total_bytes) {
 			throw InvalidInputException("DuckLake distributed write statistics exceed signed 64-bit limits");
 		}
-		ValidateArtifactContents(context, file_system, canonical_path, path, file.file_size_bytes,
-		                         NumericCast<idx_t>(footer_size), file.row_count);
+		file.column_statistics =
+		    ValidateArtifactContents(context, file_system, canonical_path, path, file.file_size_bytes,
+		                             NumericCast<idx_t>(footer_size), file.row_count, field_data, expected_fields);
 		ValidateColumnStatistics(file.column_statistics, field_data, not_null_fields, file.row_count);
 		total_rows += file.row_count;
 		total_bytes += file.file_size_bytes;

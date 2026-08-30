@@ -415,6 +415,9 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.row_count_write_target(id INTEGER NOT NULL, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.schema_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.footer_stats_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.nested_write_target(payload STRUCT(value INTEGER), items INTEGER[])")
         connection.execute("CREATE TABLE lake.not_null_nested_target(payload STRUCT(value INTEGER) NOT NULL)")
         connection.execute("CREATE TABLE lake.rollback_write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
@@ -587,58 +590,30 @@ def require_concurrent_write_conflict(
     )
 
 
-def require_forged_row_count_rejected(
+def run_mutated_worker_write(
     vane: object,
     connection: object,
-    runner: object,
-    root: Path,
-) -> None:
+    plan: object,
+    mutate: Callable[[dict[str, object], object], None],
+) -> tuple[dict[str, object], int]:
     import pyarrow as pa
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
     from vane.runners.local.runner import _InProcessFragmentExecutor
 
-    files_before_failure = set((root / "data").rglob("*.parquet"))
-    artifact_directories_before_failure = distributed_artifact_directories(root)
-    source = connection.sql("SELECT NULL::INTEGER AS id, 'forged'::VARCHAR AS payload")
-    plan = capture_physical_write_plan(
-        vane,
-        connection,
-        runner,
-        lambda: source.insert_into("lake.row_count_write_target"),
-    )
-
     fragment_executor = _InProcessFragmentExecutor()
-    forged_file_count = 0
+    mutated_file_count = 0
 
-    def execute_with_forged_statistics(request: object) -> object:
-        nonlocal forged_file_count
+    def execute_with_mutated_result(request: object) -> object:
+        nonlocal mutated_file_count
         result = fragment_executor(request)
         payloads = []
         for payload in result.partition_payloads:
             if payload.num_columns < 5:
                 raise AssertionError("distributed write result is missing file-statistics columns")
-            row_count_name = payload.column_names[1]
-            column_statistics_name = payload.column_names[4]
             rows = payload.to_pylist()
             for row in rows:
-                row[row_count_name] = 0
-                forged_statistics = []
-                forged_counts = set()
-                for column_path, statistics in row[column_statistics_name] or []:
-                    column_statistics = []
-                    for statistic_name, statistic_value in statistics or []:
-                        if statistic_name in {"null_count", "num_values"}:
-                            statistic_value = "0"
-                            forged_counts.add(statistic_name)
-                        column_statistics.append((statistic_name, statistic_value))
-                    forged_statistics.append((column_path, column_statistics))
-                require_equal(
-                    forged_counts,
-                    {"null_count", "num_values"},
-                    "forged worker row/null statistics",
-                )
-                row[column_statistics_name] = forged_statistics
-                forged_file_count += 1
+                mutate(row, payload)
+                mutated_file_count += 1
             payloads.append(pa.Table.from_pylist(rows, schema=payload.schema))
         return vane.ray_cxx.NativeDistributedTaskResult(
             payloads,
@@ -652,22 +627,13 @@ def require_forged_row_count_rejected(
         )
 
     backend = NativeFteWorkerManagerBackend(
-        execute_fn=execute_with_forged_statistics,
+        execute_fn=execute_with_mutated_result,
         num_workers=1,
         max_running_tasks=1,
     )
     plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
     try:
         outcome = plan_runner.run_copy_plan(plan, connection)
-        require_equal(
-            outcome.get("extension_catalog_committed"),
-            False,
-            "forged row-count catalog outcome",
-        )
-        require_true(
-            "row-count mismatch" in str(outcome.get("copy_output_outcome_error", "")).lower(),
-            f"unexpected forged row-count outcome: {outcome}",
-        )
     finally:
         cleanup_errors = []
         for cleanup in (
@@ -682,7 +648,57 @@ def require_forged_row_count_rejected(
             except BaseException as error:
                 cleanup_errors.append(error)
         if cleanup_errors:
-            raise RuntimeError(f"failed to stop forged-statistics workers: {cleanup_errors[0]}") from cleanup_errors[0]
+            raise RuntimeError(f"failed to stop mutated workers: {cleanup_errors[0]}") from cleanup_errors[0]
+    return outcome, mutated_file_count
+
+
+def require_forged_row_count_rejected(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+) -> None:
+    files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
+    source = connection.sql("SELECT NULL::INTEGER AS id, 'forged'::VARCHAR AS payload")
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.row_count_write_target"),
+    )
+
+    def forge_row_count(row: dict[str, object], payload: object) -> None:
+        row_count_name = payload.column_names[1]
+        column_statistics_name = payload.column_names[4]
+        row[row_count_name] = 0
+        forged_statistics = []
+        forged_counts = set()
+        for column_path, statistics in row[column_statistics_name] or []:
+            column_statistics = []
+            for statistic_name, statistic_value in statistics or []:
+                if statistic_name in {"null_count", "num_values"}:
+                    statistic_value = "0"
+                    forged_counts.add(statistic_name)
+                column_statistics.append((statistic_name, statistic_value))
+            forged_statistics.append((column_path, column_statistics))
+        require_equal(
+            forged_counts,
+            {"null_count", "num_values"},
+            "forged worker row/null statistics",
+        )
+        row[column_statistics_name] = forged_statistics
+
+    outcome, forged_file_count = run_mutated_worker_write(vane, connection, plan, forge_row_count)
+    require_equal(
+        outcome.get("extension_catalog_committed"),
+        False,
+        "forged row-count catalog outcome",
+    )
+    require_true(
+        "row-count mismatch" in str(outcome.get("copy_output_outcome_error", "")).lower(),
+        f"unexpected forged row-count outcome: {outcome}",
+    )
 
     require_true(forged_file_count > 0, "forged distributed write produced no worker files")
     require_equal(
@@ -699,6 +715,123 @@ def require_forged_row_count_rejected(
         distributed_artifact_directories(root),
         artifact_directories_before_failure,
         "forged row-count artifact-root cleanup",
+    )
+
+
+def require_forged_parquet_schema_rejected(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
+    source = connection.sql("SELECT 42::INTEGER AS id, 'schema'::VARCHAR AS payload")
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.schema_write_target"),
+    )
+
+    def remove_field_ids(row: dict[str, object], payload: object) -> None:
+        path = Path(row[payload.column_names[0]])
+        table = pq.read_table(path)
+        schema = pa.schema([pa.field(field.name, field.type, field.nullable) for field in table.schema])
+        pq.write_table(pa.Table.from_arrays(table.columns, schema=schema), path)
+        row[payload.column_names[2]] = path.stat().st_size
+        with path.open("rb") as parquet_file:
+            parquet_file.seek(-8, os.SEEK_END)
+            row[payload.column_names[3]] = int.from_bytes(parquet_file.read(4), "little")
+
+    outcome, forged_file_count = run_mutated_worker_write(vane, connection, plan, remove_field_ids)
+    require_equal(
+        outcome.get("extension_catalog_committed"),
+        False,
+        "forged schema catalog outcome",
+    )
+    require_true(
+        "field id" in str(outcome.get("copy_output_outcome_error", "")).lower(),
+        f"unexpected forged schema outcome: {outcome}",
+    )
+    require_true(forged_file_count > 0, "forged schema write produced no worker files")
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.schema_write_target").fetchone(),
+        (0,),
+        "forged schema table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_failure,
+        "forged schema artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_failure,
+        "forged schema artifact-root cleanup",
+    )
+
+
+def require_forged_min_max_replaced(
+    vane: object,
+    connection: object,
+    runner: object,
+) -> None:
+    source = connection.sql(
+        "SELECT id::INTEGER AS id, ('footer-' || id::VARCHAR)::VARCHAR AS payload FROM range(100, 128) rows(id)"
+    )
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.footer_stats_write_target"),
+    )
+
+    def forge_min_max(row: dict[str, object], payload: object) -> None:
+        column_statistics_name = payload.column_names[4]
+        forged_statistics = []
+        forged_names = set()
+        for column_path, statistics in row[column_statistics_name] or []:
+            column_statistics = []
+            for statistic_name, statistic_value in statistics or []:
+                if statistic_name in {"min", "max"}:
+                    statistic_value = "0"
+                    forged_names.add(statistic_name)
+                column_statistics.append((statistic_name, statistic_value))
+            forged_statistics.append((column_path, column_statistics))
+        require_equal(forged_names, {"min", "max"}, "forged worker min/max statistics")
+        row[column_statistics_name] = forged_statistics
+
+    outcome, forged_file_count = run_mutated_worker_write(vane, connection, plan, forge_min_max)
+    require_equal(
+        outcome.get("extension_catalog_committed"),
+        True,
+        "forged min/max catalog outcome",
+    )
+    require_true(
+        not outcome.get("copy_output_outcome_error"),
+        f"unexpected forged min/max outcome: {outcome}",
+    )
+    require_true(forged_file_count > 0, "forged min/max write produced no worker files")
+    require_equal(
+        connection.execute(
+            "SELECT stats.min_value, stats.max_value "
+            "FROM __ducklake_metadata_lake.ducklake_table_column_stats stats "
+            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
+            "JOIN __ducklake_metadata_lake.ducklake_column columns USING (table_id, column_id) "
+            "WHERE tables.table_name = 'footer_stats_write_target' AND tables.end_snapshot IS NULL "
+            "AND columns.column_name = 'id' AND columns.end_snapshot IS NULL"
+        ).fetchone(),
+        ("100", "127"),
+        "footer-derived min/max metadata",
+    )
+    require_equal(
+        connection.execute("SELECT id FROM lake.footer_stats_write_target ORDER BY id DESC LIMIT 1").fetchone(),
+        (127,),
+        "footer-derived min/max Top-N readback",
     )
 
 
@@ -740,6 +873,22 @@ def exercise_distributed_writes(
         len(distributed_artifact_roots(connection, "write_target")),
         2,
         "distributed INSERT write roots",
+    )
+
+    nested_source = connection.sql(
+        "SELECT {'value': id}::STRUCT(value INTEGER) AS payload, [id, id + 1]::INTEGER[] AS items "
+        "FROM lake.source WHERE id BETWEEN 40 AND 42"
+    )
+    require_write(
+        "nested distributed DuckLake INSERT",
+        lambda: nested_source.insert_into("lake.nested_write_target"),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT payload.value, items[1], items[2] FROM lake.nested_write_target ORDER BY payload.value"
+        ).fetchall(),
+        [(value, value, value + 1) for value in range(40, 43)],
+        "nested distributed INSERT readback",
     )
 
     partitioned_source = connection.sql(
@@ -872,6 +1021,8 @@ def exercise_distributed_writes(
     )
 
     require_forged_row_count_rejected(vane, connection, runner, root)
+    require_forged_parquet_schema_rejected(vane, connection, runner, root)
+    require_forged_min_max_replaced(vane, connection, runner)
 
     files_before_missing_stats = set((root / "data").rglob("*.parquet"))
     artifact_directories_before_missing_stats = distributed_artifact_directories(root)

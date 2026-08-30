@@ -40,7 +40,7 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
                                                   const string &artifact_path, const DuckLakeFieldData &field_data,
                                                   const case_insensitive_set_t &not_null_fields,
                                                   const vector<string> &partition_names,
-                                                  const vector<distributed::DistributedCopyFileInfo> &files);
+                                                  vector<distributed::DistributedCopyFileInfo> &files);
 
 void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader);
 
