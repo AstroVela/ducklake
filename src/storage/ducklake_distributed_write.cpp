@@ -185,6 +185,8 @@ static constexpr idx_t PARQUET_METADATA_STATS_NULL_COUNT = 12;
 static constexpr idx_t PARQUET_METADATA_STATS_MIN_VALUE = 14;
 static constexpr idx_t PARQUET_METADATA_STATS_MAX_VALUE = 15;
 static constexpr idx_t PARQUET_METADATA_TOTAL_COMPRESSED_SIZE = 21;
+static constexpr idx_t PARQUET_METADATA_MIN_IS_EXACT = 26;
+static constexpr idx_t PARQUET_METADATA_MAX_IS_EXACT = 27;
 static constexpr idx_t PARQUET_METADATA_GEO_BBOX = 29;
 static constexpr idx_t PARQUET_METADATA_GEO_TYPES = 30;
 
@@ -496,17 +498,21 @@ static Value GetArtifactStatistics(const Value &row_groups, const vector<const E
 				    "DuckLake distributed Parquet metadata has invalid value/null counts for '%s'", path);
 			}
 		}
-		if (!metadata[PARQUET_METADATA_STATS_MIN].IsNull()) {
+		const auto min_is_exact = !metadata[PARQUET_METADATA_MIN_IS_EXACT].IsNull() &&
+		                          BooleanValue::Get(metadata[PARQUET_METADATA_MIN_IS_EXACT]);
+		const auto max_is_exact = !metadata[PARQUET_METADATA_MAX_IS_EXACT].IsNull() &&
+		                          BooleanValue::Get(metadata[PARQUET_METADATA_MAX_IS_EXACT]);
+		if (min_is_exact && !metadata[PARQUET_METADATA_STATS_MIN].IsNull()) {
 			statistics.has_min = true;
 			statistics.min = StringValue::Get(metadata[PARQUET_METADATA_STATS_MIN]);
-		} else if (!metadata[PARQUET_METADATA_STATS_MIN_VALUE].IsNull()) {
+		} else if (min_is_exact && !metadata[PARQUET_METADATA_STATS_MIN_VALUE].IsNull()) {
 			statistics.has_min = true;
 			statistics.min = StringValue::Get(metadata[PARQUET_METADATA_STATS_MIN_VALUE]);
 		}
-		if (!metadata[PARQUET_METADATA_STATS_MAX].IsNull()) {
+		if (max_is_exact && !metadata[PARQUET_METADATA_STATS_MAX].IsNull()) {
 			statistics.has_max = true;
 			statistics.max = StringValue::Get(metadata[PARQUET_METADATA_STATS_MAX]);
-		} else if (!metadata[PARQUET_METADATA_STATS_MAX_VALUE].IsNull()) {
+		} else if (max_is_exact && !metadata[PARQUET_METADATA_STATS_MAX_VALUE].IsNull()) {
 			statistics.has_max = true;
 			statistics.max = StringValue::Get(metadata[PARQUET_METADATA_STATS_MAX_VALUE]);
 		}
@@ -853,6 +859,7 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 	auto expected_fields = GetExpectedArtifactFields(field_data);
 	idx_t total_rows = 0;
 	idx_t total_bytes = 0;
+	unordered_set<string> artifact_paths;
 	for (auto &file : files) {
 		const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
 		if (path.empty()) {
@@ -864,6 +871,9 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		auto partition_components = ValidatePartitionValues(file.partition_keys, partition_names);
 		auto canonical_path =
 		    ValidateArtifactLocation(file_system, canonical_artifact_path, path, partition_names, partition_components);
+		if (!artifact_paths.insert(canonical_path).second) {
+			throw InvalidInputException("DuckLake distributed write returned a duplicate data-file artifact");
+		}
 
 		if (file.footer_size_bytes.IsNull() || file.footer_size_bytes.type() != expected_types[3]) {
 			throw InvalidInputException("DuckLake distributed write returned invalid data-file footer statistics");

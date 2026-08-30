@@ -416,7 +416,9 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.row_count_write_target(id INTEGER NOT NULL, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.schema_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.duplicate_path_write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.footer_stats_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.inexact_stats_write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.nested_write_target(payload STRUCT(value INTEGER), items INTEGER[])")
         connection.execute("CREATE TABLE lake.not_null_nested_target(payload STRUCT(value INTEGER) NOT NULL)")
         connection.execute("CREATE TABLE lake.rollback_write_target(id INTEGER, payload VARCHAR)")
@@ -594,7 +596,7 @@ def run_mutated_worker_write(
     vane: object,
     connection: object,
     plan: object,
-    mutate: Callable[[dict[str, object], object], None],
+    mutate: Callable[[dict[str, object], object], list[dict[str, object]] | None],
 ) -> tuple[dict[str, object], int]:
     import pyarrow as pa
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
@@ -610,11 +612,14 @@ def run_mutated_worker_write(
         for payload in result.partition_payloads:
             if payload.num_columns < 5:
                 raise AssertionError("distributed write result is missing file-statistics columns")
-            rows = payload.to_pylist()
-            for row in rows:
-                mutate(row, payload)
+            mutated_rows = []
+            for row in payload.to_pylist():
+                additional_rows = mutate(row, payload)
+                mutated_rows.append(row)
+                if additional_rows:
+                    mutated_rows.extend(additional_rows)
                 mutated_file_count += 1
-            payloads.append(pa.Table.from_pylist(rows, schema=payload.schema))
+            payloads.append(pa.Table.from_pylist(mutated_rows, schema=payload.schema))
         return vane.ray_cxx.NativeDistributedTaskResult(
             payloads,
             result.partition_metadatas,
@@ -775,10 +780,64 @@ def require_forged_parquet_schema_rejected(
     )
 
 
+def require_duplicate_artifact_rejected(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+) -> None:
+    files_before_failure = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_failure = distributed_artifact_directories(root)
+    source = connection.sql("SELECT 43::INTEGER AS id, 'duplicate'::VARCHAR AS payload")
+    plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: source.insert_into("lake.duplicate_path_write_target"),
+    )
+
+    def duplicate_artifact(row: dict[str, object], _payload: object) -> list[dict[str, object]]:
+        return [dict(row)]
+
+    try:
+        outcome, _ = run_mutated_worker_write(vane, connection, plan, duplicate_artifact)
+    except BaseException as error:
+        require_true(
+            "duplicate final path" in str(error).lower(),
+            f"unexpected duplicate artifact error: {error}",
+        )
+    else:
+        require_equal(
+            outcome.get("extension_catalog_committed"),
+            False,
+            "duplicate artifact catalog outcome",
+        )
+        require_true(
+            "duplicate data-file artifact" in str(outcome.get("copy_output_outcome_error", "")).lower(),
+            f"unexpected duplicate artifact outcome: {outcome}",
+        )
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.duplicate_path_write_target").fetchone(),
+        (0,),
+        "duplicate artifact table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_failure,
+        "duplicate artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_failure,
+        "duplicate artifact-root cleanup",
+    )
+
+
 def require_forged_min_max_replaced(
     vane: object,
     connection: object,
     runner: object,
+    require_write: Callable[[str, Callable[[], object]], None],
 ) -> None:
     source = connection.sql(
         "SELECT id::INTEGER AS id, ('footer-' || id::VARCHAR)::VARCHAR AS payload FROM range(100, 128) rows(id)"
@@ -832,6 +891,26 @@ def require_forged_min_max_replaced(
         connection.execute("SELECT id FROM lake.footer_stats_write_target ORDER BY id DESC LIMIT 1").fetchone(),
         (127,),
         "footer-derived min/max Top-N readback",
+    )
+
+    inexact_source = connection.sql(
+        "SELECT id::INTEGER AS id, (repeat('x', 300) || id::VARCHAR)::VARCHAR AS payload " "FROM range(4) rows(id)"
+    )
+    require_write(
+        "distributed DuckLake inexact footer statistics",
+        lambda: inexact_source.insert_into("lake.inexact_stats_write_target"),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT stats.min_value, stats.max_value "
+            "FROM __ducklake_metadata_lake.ducklake_table_column_stats stats "
+            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
+            "JOIN __ducklake_metadata_lake.ducklake_column columns USING (table_id, column_id) "
+            "WHERE tables.table_name = 'inexact_stats_write_target' AND tables.end_snapshot IS NULL "
+            "AND columns.column_name = 'payload' AND columns.end_snapshot IS NULL"
+        ).fetchone(),
+        (None, None),
+        "inexact footer min/max omission",
     )
 
 
@@ -1022,7 +1101,8 @@ def exercise_distributed_writes(
 
     require_forged_row_count_rejected(vane, connection, runner, root)
     require_forged_parquet_schema_rejected(vane, connection, runner, root)
-    require_forged_min_max_replaced(vane, connection, runner)
+    require_duplicate_artifact_rejected(vane, connection, runner, root)
+    require_forged_min_max_replaced(vane, connection, runner, require_write)
 
     files_before_missing_stats = set((root / "data").rglob("*.parquet"))
     artifact_directories_before_missing_stats = distributed_artifact_directories(root)
