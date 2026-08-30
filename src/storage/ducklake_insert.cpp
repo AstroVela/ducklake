@@ -458,13 +458,16 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 	auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
 	try {
 		auto files = distributed::DecodeDistributedFileWriteResults(write_info, results);
+		case_insensitive_set_t not_null_fields;
 		if (distributed_write_plan.operator_name == "ctas") {
 			ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, distributed_artifact_path,
-			                                             *distributed_ctas_field_data, distributed_partition_names,
-			                                             files);
+			                                             *distributed_ctas_field_data, not_null_fields,
+			                                             distributed_partition_names, files);
 		} else {
+			not_null_fields = table->GetNotNullFields();
 			ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, distributed_artifact_path,
-			                                             table->GetFieldData(), distributed_partition_names, files);
+			                                             table->GetFieldData(), not_null_fields,
+			                                             distributed_partition_names, files);
 		}
 
 		auto &coordinator_catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<DuckLakeCatalog>();

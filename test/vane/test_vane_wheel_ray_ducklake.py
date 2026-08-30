@@ -414,6 +414,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.schema_source(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.not_null_nested_target(payload STRUCT(value INTEGER) NOT NULL)")
         connection.execute("CREATE TABLE lake.rollback_write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
         connection.execute("ALTER TABLE lake.partitioned_write_target SET PARTITIONED BY (category)")
@@ -752,6 +753,33 @@ def exercise_distributed_writes(
         distributed_artifact_directories(root),
         artifact_directories_before_constraint_failure,
         "constraint failure artifact-root cleanup",
+    )
+
+    files_before_missing_stats = set((root / "data").rglob("*.parquet"))
+    artifact_directories_before_missing_stats = distributed_artifact_directories(root)
+    nested_source = connection.sql(
+        "SELECT {'value': id}::STRUCT(value INTEGER) AS payload FROM lake.source WHERE id < 64"
+    )
+    require_error(
+        lambda: nested_source.insert_into("lake.not_null_nested_target"),
+        "missing column statistics for not null column",
+        "distributed DuckLake missing NOT NULL statistics",
+    )
+    require_write_count(1, "missing NOT NULL statistics Ray dispatch count")
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.not_null_nested_target").fetchone(),
+        (0,),
+        "missing NOT NULL statistics table visibility",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_before_missing_stats,
+        "missing NOT NULL statistics artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        artifact_directories_before_missing_stats,
+        "missing NOT NULL statistics artifact-root cleanup",
     )
 
     files_before_commit_failure = set((root / "data").rglob("*.parquet"))

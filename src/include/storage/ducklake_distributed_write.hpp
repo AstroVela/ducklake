@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/execution/distributed/copy_to_file.hpp"
 
 namespace duckdb {
@@ -37,6 +38,7 @@ void CleanupDuckLakeDistributedArtifacts(ClientContext &context, const string &d
 
 void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
                                                   const string &artifact_path, const DuckLakeFieldData &field_data,
+                                                  const case_insensitive_set_t &not_null_fields,
                                                   const vector<string> &partition_names,
                                                   const vector<distributed::DistributedCopyFileInfo> &files);
 

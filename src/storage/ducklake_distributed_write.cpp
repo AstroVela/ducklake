@@ -288,8 +288,10 @@ static void ValidateParsedColumnStatistics(const DuckLakeColumnStats &statistics
 	}
 }
 
-static void ValidateColumnStatistics(const Value &column_statistics, const DuckLakeFieldData &field_data) {
+static void ValidateColumnStatistics(const Value &column_statistics, const DuckLakeFieldData &field_data,
+                                     const case_insensitive_set_t &not_null_fields, idx_t row_count) {
 	case_insensitive_set_t column_paths;
+	auto missing_not_null_fields = not_null_fields;
 	map<FieldIndex, PartialVariantStats> variant_stats;
 	for (const auto &column_entry : MapValue::GetChildren(column_statistics)) {
 		if (column_entry.IsNull()) {
@@ -344,6 +346,20 @@ static void ValidateColumnStatistics(const Value &column_statistics, const DuckL
 		}
 		auto parsed_statistics = DuckLakeInsert::ParseColumnStats(field.Type(), statistics);
 		ValidateParsedColumnStatistics(parsed_statistics);
+		if (column_names.size() == 1 && not_null_fields.count(field.Name())) {
+			if (!parsed_statistics.has_null_count || !parsed_statistics.has_num_values ||
+			    parsed_statistics.num_values != row_count) {
+				throw InvalidInputException(
+				    "DuckLake distributed data file has incomplete row/null statistics for NOT NULL column '%s'",
+				    field.Name());
+			}
+			missing_not_null_fields.erase(field.Name());
+		}
+	}
+	if (!missing_not_null_fields.empty()) {
+		throw InvalidInputException(
+		    "DuckLake distributed data file is missing column statistics for NOT NULL column '%s'",
+		    *missing_not_null_fields.begin());
 	}
 	for (auto &entry : variant_stats) {
 		auto parsed_statistics = entry.second.Finalize();
@@ -434,6 +450,7 @@ void CleanupDuckLakeDistributedArtifacts(ClientContext &context, const string &d
 
 void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
                                                   const string &artifact_path, const DuckLakeFieldData &field_data,
+                                                  const case_insensitive_set_t &not_null_fields,
                                                   const vector<string> &partition_names,
                                                   const vector<distributed::DistributedCopyFileInfo> &files) {
 	if (data_path.empty()) {
@@ -477,7 +494,7 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		}
 		total_rows += file.row_count;
 		total_bytes += file.file_size_bytes;
-		ValidateColumnStatistics(file.column_statistics, field_data);
+		ValidateColumnStatistics(file.column_statistics, field_data, not_null_fields, file.row_count);
 		ValidateArtifactContents(file_system, canonical_path, path, file.file_size_bytes,
 		                         NumericCast<idx_t>(footer_size));
 	}
