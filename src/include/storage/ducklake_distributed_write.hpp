@@ -25,7 +25,8 @@ PlanDuckLakeDistributedCTASPartition(const ColumnList &columns, const DuckLakeFi
 void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
                                                   const DuckLakeFieldData &field_data,
                                                   const vector<string> &partition_names,
-                                                  const vector<distributed::DistributedCopyFileInfo> &files);
+                                                  const vector<distributed::DistributedCopyFileInfo> &files,
+                                                  vector<string> &cleanup_paths);
 
 void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader);
 

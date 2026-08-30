@@ -105,10 +105,8 @@ static string CanonicalDuckLakePath(FileSystem &file_system, const string &path,
 	return std::move(canonical).value();
 }
 
-static void ValidateArtifactPath(ClientContext &context, const string &data_path, const string &path,
-                                 idx_t expected_size, idx_t expected_footer_size,
-                                 const vector<string> &expected_partition_components) {
-	auto &file_system = FileSystem::GetFileSystem(context);
+static string ValidateArtifactLocation(FileSystem &file_system, const string &data_path, const string &path,
+                                       const vector<string> &expected_partition_components) {
 	auto canonical_root = CanonicalDuckLakePath(file_system, data_path, "data root");
 	auto canonical_path = CanonicalDuckLakePath(file_system, path, "data file");
 	auto separator = file_system.PathSeparator(canonical_root);
@@ -147,7 +145,11 @@ static void ValidateArtifactPath(ClientContext &context, const string &data_path
 			throw InvalidInputException("DuckLake distributed data-file path does not match its partition values");
 		}
 	}
+	return canonical_path;
+}
 
+static void ValidateArtifactContents(FileSystem &file_system, const string &canonical_path, const string &path,
+                                     idx_t expected_size, idx_t expected_footer_size) {
 	try {
 		auto handle = file_system.OpenFile(canonical_path, FileFlags::FILE_FLAGS_READ);
 		auto actual_size = handle->GetFileSize();
@@ -340,14 +342,28 @@ PlanDuckLakeDistributedCTASPartition(const ColumnList &columns, const DuckLakeFi
 void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
                                                   const DuckLakeFieldData &field_data,
                                                   const vector<string> &partition_names,
-                                                  const vector<distributed::DistributedCopyFileInfo> &files) {
+                                                  const vector<distributed::DistributedCopyFileInfo> &files,
+                                                  vector<string> &cleanup_paths) {
+	cleanup_paths.clear();
 	if (data_path.empty()) {
 		throw InvalidInputException("DuckLake distributed data path cannot be empty");
 	}
+	auto &file_system = FileSystem::GetFileSystem(context);
 	auto expected_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
 	idx_t total_rows = 0;
 	idx_t total_bytes = 0;
 	for (const auto &file : files) {
+		const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
+		if (path.empty()) {
+			throw InvalidInputException("DuckLake distributed write returned an empty data-file artifact");
+		}
+		if (file.partition_keys.type() != expected_types[5]) {
+			throw InvalidInputException("DuckLake distributed write returned invalid data-file partition values");
+		}
+		auto partition_components = ValidatePartitionValues(file.partition_keys, partition_names);
+		auto canonical_path = ValidateArtifactLocation(file_system, data_path, path, partition_components);
+		cleanup_paths.push_back(canonical_path);
+
 		if (file.footer_size_bytes.IsNull() || file.footer_size_bytes.type() != expected_types[3]) {
 			throw InvalidInputException("DuckLake distributed write returned invalid data-file footer statistics");
 		}
@@ -359,11 +375,7 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		if (file.column_statistics.IsNull() || file.column_statistics.type() != expected_types[4]) {
 			throw InvalidInputException("DuckLake distributed write returned invalid data-file column statistics");
 		}
-		if (file.partition_keys.type() != expected_types[5]) {
-			throw InvalidInputException("DuckLake distributed write returned invalid data-file partition values");
-		}
-		const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
-		if (path.empty() || file.file_size_bytes == 0) {
+		if (file.file_size_bytes == 0) {
 			throw InvalidInputException("DuckLake distributed write returned an empty data-file artifact");
 		}
 		const auto signed_max = NumericCast<idx_t>(NumericLimits<int64_t>::Maximum());
@@ -374,9 +386,8 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		total_rows += file.row_count;
 		total_bytes += file.file_size_bytes;
 		ValidateColumnStatistics(file.column_statistics, field_data);
-		auto partition_components = ValidatePartitionValues(file.partition_keys, partition_names);
-		ValidateArtifactPath(context, data_path, path, file.file_size_bytes, NumericCast<idx_t>(footer_size),
-		                     partition_components);
+		ValidateArtifactContents(file_system, canonical_path, path, file.file_size_bytes,
+		                         NumericCast<idx_t>(footer_size));
 	}
 }
 
