@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/execution/distributed/copy_to_file.hpp"
+#include "duckdb/function/distributed_write.hpp"
 
 namespace duckdb {
 
@@ -27,6 +28,12 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
                                                   const vector<string> &partition_names,
                                                   const vector<distributed::DistributedCopyFileInfo> &files,
                                                   vector<string> &cleanup_paths);
+
+void CollectDuckLakeDistributedArtifactCleanupPaths(ClientContext &context, const string &data_path,
+                                                    const vector<string> &partition_names,
+                                                    const DistributedExtensionWriteInfo &write_info,
+                                                    const vector<DistributedWriteTaskResult> &results,
+                                                    vector<string> &cleanup_paths);
 
 void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader);
 

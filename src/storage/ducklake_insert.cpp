@@ -463,9 +463,9 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
                                                const vector<DistributedWriteTaskResult> &results) const {
 	ValidateDistributedWriteShape();
 	auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
-	auto files = distributed::DecodeDistributedFileWriteResults(write_info, results);
 	vector<string> cleanup_paths;
 	try {
+		auto files = distributed::DecodeDistributedFileWriteResults(write_info, results);
 		if (distributed_write_plan.operator_name == "ctas") {
 			ValidateDuckLakeDistributedDataFileArtifacts(context, distributed_data_path, *distributed_ctas_field_data,
 			                                             distributed_partition_names, files, cleanup_paths);
@@ -501,12 +501,22 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 		return global_state.total_insert_count;
 	} catch (const std::exception &error) {
 		try {
+			CollectDuckLakeDistributedArtifactCleanupPaths(context, distributed_data_path, distributed_partition_names,
+			                                               write_info, results, cleanup_paths);
+		} catch (...) {
+		}
+		try {
 			CleanupValidatedDistributedDataFiles(context, cleanup_paths);
 		} catch (const std::exception &cleanup_error) {
 			throw IOException("%s; distributed artifact cleanup failed: %s", error.what(), cleanup_error.what());
 		}
 		throw;
 	} catch (...) {
+		try {
+			CollectDuckLakeDistributedArtifactCleanupPaths(context, distributed_data_path, distributed_partition_names,
+			                                               write_info, results, cleanup_paths);
+		} catch (...) {
+		}
 		try {
 			CleanupValidatedDistributedDataFiles(context, cleanup_paths);
 		} catch (...) {

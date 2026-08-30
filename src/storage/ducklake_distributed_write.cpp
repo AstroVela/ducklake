@@ -105,8 +105,14 @@ static string CanonicalDuckLakePath(FileSystem &file_system, const string &path,
 	return std::move(canonical).value();
 }
 
-static string ValidateArtifactLocation(FileSystem &file_system, const string &data_path, const string &path,
-                                       const vector<string> &expected_partition_components) {
+struct ValidatedArtifactLocation {
+	string canonical_path;
+	vector<string> components;
+};
+
+static ValidatedArtifactLocation ValidateArtifactCleanupLocation(FileSystem &file_system, const string &data_path,
+                                                                 const string &path,
+                                                                 const vector<string> &partition_names) {
 	auto canonical_root = CanonicalDuckLakePath(file_system, data_path, "data root");
 	auto canonical_path = CanonicalDuckLakePath(file_system, path, "data file");
 	auto separator = file_system.PathSeparator(canonical_root);
@@ -122,7 +128,8 @@ static string ValidateArtifactLocation(FileSystem &file_system, const string &da
 	while (StringUtil::StartsWith(relative_path, separator)) {
 		relative_path.erase(0, separator.size());
 	}
-	vector<string> components;
+	ValidatedArtifactLocation result;
+	result.canonical_path = std::move(canonical_path);
 	idx_t component_start = 0;
 	while (component_start <= relative_path.size()) {
 		auto component_end = relative_path.find(separator, component_start);
@@ -131,21 +138,34 @@ static string ValidateArtifactLocation(FileSystem &file_system, const string &da
 		if (component.empty() || component == "." || component == "..") {
 			throw InvalidInputException("DuckLake distributed data-file path contains an invalid component");
 		}
-		components.push_back(std::move(component));
+		result.components.push_back(std::move(component));
 		if (component_end == string::npos) {
 			break;
 		}
 		component_start = component_end + separator.size();
 	}
-	if (components.size() != expected_partition_components.size() + 1) {
+	if (result.components.size() != partition_names.size() + 1) {
 		throw InvalidInputException("DuckLake distributed data-file path has an invalid partition layout");
 	}
-	for (idx_t index = 0; index < expected_partition_components.size(); index++) {
-		if (components[index] != expected_partition_components[index]) {
+	for (idx_t index = 0; index < partition_names.size(); index++) {
+		auto partition_prefix = HivePartitioning::Escape(partition_names[index]) + "=";
+		if (!StringUtil::StartsWith(result.components[index], partition_prefix)) {
 			throw InvalidInputException("DuckLake distributed data-file path does not match its partition values");
 		}
 	}
-	return canonical_path;
+	return result;
+}
+
+static string ValidateArtifactLocation(FileSystem &file_system, const string &data_path, const string &path,
+                                       const vector<string> &partition_names,
+                                       const vector<string> &expected_partition_components) {
+	auto location = ValidateArtifactCleanupLocation(file_system, data_path, path, partition_names);
+	for (idx_t index = 0; index < expected_partition_components.size(); index++) {
+		if (location.components[index] != expected_partition_components[index]) {
+			throw InvalidInputException("DuckLake distributed data-file path does not match its partition values");
+		}
+	}
+	return std::move(location.canonical_path);
 }
 
 static void ValidateArtifactContents(FileSystem &file_system, const string &canonical_path, const string &path,
@@ -361,7 +381,8 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 			throw InvalidInputException("DuckLake distributed write returned invalid data-file partition values");
 		}
 		auto partition_components = ValidatePartitionValues(file.partition_keys, partition_names);
-		auto canonical_path = ValidateArtifactLocation(file_system, data_path, path, partition_components);
+		auto canonical_path =
+		    ValidateArtifactLocation(file_system, data_path, path, partition_names, partition_components);
 		cleanup_paths.push_back(canonical_path);
 
 		if (file.footer_size_bytes.IsNull() || file.footer_size_bytes.type() != expected_types[3]) {
@@ -388,6 +409,38 @@ void ValidateDuckLakeDistributedDataFileArtifacts(ClientContext &context, const 
 		ValidateColumnStatistics(file.column_statistics, field_data);
 		ValidateArtifactContents(file_system, canonical_path, path, file.file_size_bytes,
 		                         NumericCast<idx_t>(footer_size));
+	}
+}
+
+void CollectDuckLakeDistributedArtifactCleanupPaths(ClientContext &context, const string &data_path,
+                                                    const vector<string> &partition_names,
+                                                    const DistributedExtensionWriteInfo &write_info,
+                                                    const vector<DistributedWriteTaskResult> &results,
+                                                    vector<string> &cleanup_paths) {
+	auto &file_system = FileSystem::GetFileSystem(context);
+	set<string> unique_paths(cleanup_paths.begin(), cleanup_paths.end());
+	for (const auto &result : results) {
+		if (result.capability != write_info.capability || result.fragment_codec != write_info.fragment_codec ||
+		    result.query_id.empty() || result.fragments.size() != 1) {
+			continue;
+		}
+		const auto &fragment = result.fragments[0];
+		if (fragment.artifacts.size() != 1) {
+			continue;
+		}
+		const auto &artifact = fragment.artifacts[0];
+		if (artifact.artifact_id != "data_file" || artifact.codec != DistributedPayloadCodec {"duckdb.file", 1} ||
+		    !artifact.payload.empty() || artifact.uri.empty() || fragment.fragment_id != artifact.uri ||
+		    result.task_attempt_id != "file:" + artifact.uri) {
+			continue;
+		}
+		try {
+			auto location = ValidateArtifactCleanupLocation(file_system, data_path, artifact.uri, partition_names);
+			if (unique_paths.insert(location.canonical_path).second) {
+				cleanup_paths.push_back(std::move(location.canonical_path));
+			}
+		} catch (...) {
+		}
 	}
 }
 
