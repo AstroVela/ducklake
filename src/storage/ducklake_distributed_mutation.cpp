@@ -51,7 +51,7 @@ struct DuckLakeDistributedRowDeltaSourceState {
 	optional_idx data_file_footer_size;
 	idx_t record_count = 0;
 	optional_idx row_id_start;
-	idx_t mapping_id = 0;
+	optional_idx mapping_id;
 	bool has_delete_file = false;
 	idx_t delete_file_id = 0;
 	string delete_file_path;
@@ -230,7 +230,9 @@ BuildSourceState(ClientContext &context, const DuckLakeFileListExtendedEntry &fi
 	result.data_file_footer_size = file.file.footer_size;
 	result.record_count = file.row_count;
 	result.row_id_start = file.row_id_start;
-	result.mapping_id = file.mapping_id.index;
+	if (file.mapping_id.IsValid()) {
+		result.mapping_id = file.mapping_id.index;
+	}
 	ValidateFileSize(context, file.file.path, file.file.file_size_bytes, "source data file");
 
 	if (file.delete_file.path.empty()) {
@@ -335,16 +337,16 @@ static void SerializeSource(Serializer &serializer, const DuckLakeDistributedRow
 	WriteOptionalIndex(serializer, 4, 5, "data_file_footer_size", source.data_file_footer_size);
 	serializer.WriteProperty(6, "record_count", source.record_count);
 	WriteOptionalIndex(serializer, 7, 8, "row_id_start", source.row_id_start);
-	serializer.WriteProperty(9, "mapping_id", source.mapping_id);
-	serializer.WriteProperty(10, "has_delete_file", source.has_delete_file);
-	serializer.WriteProperty(11, "delete_file_id", source.delete_file_id);
-	serializer.WriteProperty(12, "delete_file_path", source.delete_file_path);
-	serializer.WriteProperty(13, "delete_file_size_bytes", source.delete_file_size_bytes);
-	WriteOptionalIndex(serializer, 14, 15, "delete_file_footer_size", source.delete_file_footer_size);
-	serializer.WriteProperty(16, "delete_file_format", static_cast<uint8_t>(source.delete_file_format));
-	WriteOptionalIndex(serializer, 17, 18, "delete_file_begin_snapshot", source.delete_file_begin_snapshot);
-	serializer.WriteProperty(19, "existing_delete_rows", source.existing_delete_rows);
-	serializer.WriteProperty(20, "existing_delete_snapshots", source.existing_delete_snapshots);
+	WriteOptionalIndex(serializer, 9, 10, "mapping_id", source.mapping_id);
+	serializer.WriteProperty(11, "has_delete_file", source.has_delete_file);
+	serializer.WriteProperty(12, "delete_file_id", source.delete_file_id);
+	serializer.WriteProperty(13, "delete_file_path", source.delete_file_path);
+	serializer.WriteProperty(14, "delete_file_size_bytes", source.delete_file_size_bytes);
+	WriteOptionalIndex(serializer, 15, 16, "delete_file_footer_size", source.delete_file_footer_size);
+	serializer.WriteProperty(17, "delete_file_format", static_cast<uint8_t>(source.delete_file_format));
+	WriteOptionalIndex(serializer, 18, 19, "delete_file_begin_snapshot", source.delete_file_begin_snapshot);
+	serializer.WriteProperty(20, "existing_delete_rows", source.existing_delete_rows);
+	serializer.WriteProperty(21, "existing_delete_snapshots", source.existing_delete_snapshots);
 }
 
 static DuckLakeDistributedRowDeltaSourceState DeserializeSource(Deserializer &deserializer) {
@@ -355,20 +357,20 @@ static DuckLakeDistributedRowDeltaSourceState DeserializeSource(Deserializer &de
 	result.data_file_footer_size = ReadOptionalIndex(deserializer, 4, 5, "data_file_footer_size");
 	result.record_count = deserializer.ReadProperty<idx_t>(6, "record_count");
 	result.row_id_start = ReadOptionalIndex(deserializer, 7, 8, "row_id_start");
-	result.mapping_id = deserializer.ReadProperty<idx_t>(9, "mapping_id");
-	result.has_delete_file = deserializer.ReadProperty<bool>(10, "has_delete_file");
-	result.delete_file_id = deserializer.ReadProperty<idx_t>(11, "delete_file_id");
-	result.delete_file_path = deserializer.ReadProperty<string>(12, "delete_file_path");
-	result.delete_file_size_bytes = deserializer.ReadProperty<idx_t>(13, "delete_file_size_bytes");
-	result.delete_file_footer_size = ReadOptionalIndex(deserializer, 14, 15, "delete_file_footer_size");
-	auto format = deserializer.ReadProperty<uint8_t>(16, "delete_file_format");
+	result.mapping_id = ReadOptionalIndex(deserializer, 9, 10, "mapping_id");
+	result.has_delete_file = deserializer.ReadProperty<bool>(11, "has_delete_file");
+	result.delete_file_id = deserializer.ReadProperty<idx_t>(12, "delete_file_id");
+	result.delete_file_path = deserializer.ReadProperty<string>(13, "delete_file_path");
+	result.delete_file_size_bytes = deserializer.ReadProperty<idx_t>(14, "delete_file_size_bytes");
+	result.delete_file_footer_size = ReadOptionalIndex(deserializer, 15, 16, "delete_file_footer_size");
+	auto format = deserializer.ReadProperty<uint8_t>(17, "delete_file_format");
 	if (format > static_cast<uint8_t>(DeleteFileFormat::PUFFIN)) {
 		throw SerializationException("DuckLake distributed row mutation source has an invalid delete format");
 	}
 	result.delete_file_format = static_cast<DeleteFileFormat>(format);
-	result.delete_file_begin_snapshot = ReadOptionalIndex(deserializer, 17, 18, "delete_file_begin_snapshot");
-	result.existing_delete_rows = deserializer.ReadProperty<vector<idx_t>>(19, "existing_delete_rows");
-	result.existing_delete_snapshots = deserializer.ReadProperty<vector<idx_t>>(20, "existing_delete_snapshots");
+	result.delete_file_begin_snapshot = ReadOptionalIndex(deserializer, 18, 19, "delete_file_begin_snapshot");
+	result.existing_delete_rows = deserializer.ReadProperty<vector<idx_t>>(20, "existing_delete_rows");
+	result.existing_delete_snapshots = deserializer.ReadProperty<vector<idx_t>>(21, "existing_delete_snapshots");
 	return result;
 }
 
@@ -413,6 +415,9 @@ static void ValidateSourceState(const DuckLakeDistributedRowDeltaSourceState &so
 	if (source.data_file_footer_size.IsValid() &&
 	    source.data_file_footer_size.GetIndex() > source.data_file_size_bytes) {
 		throw SerializationException("DuckLake distributed row mutation contains invalid source-file footer state");
+	}
+	if (source.mapping_id.IsValid() && source.mapping_id.GetIndex() >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START) {
+		throw SerializationException("DuckLake distributed row mutation contains invalid source-file mapping state");
 	}
 	if (source.has_delete_file) {
 		if (source.delete_file_id >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START || source.delete_file_path.empty() ||
@@ -1382,7 +1387,7 @@ static bool SourceStatesEqual(const DuckLakeDistributedRowDeltaSourceState &left
 	       left.data_file_size_bytes == right.data_file_size_bytes &&
 	       OptionalIndexesEqual(left.data_file_footer_size, right.data_file_footer_size) &&
 	       left.record_count == right.record_count && OptionalIndexesEqual(left.row_id_start, right.row_id_start) &&
-	       left.mapping_id == right.mapping_id && left.has_delete_file == right.has_delete_file &&
+	       OptionalIndexesEqual(left.mapping_id, right.mapping_id) && left.has_delete_file == right.has_delete_file &&
 	       left.delete_file_id == right.delete_file_id && left.delete_file_path == right.delete_file_path &&
 	       left.delete_file_size_bytes == right.delete_file_size_bytes &&
 	       OptionalIndexesEqual(left.delete_file_footer_size, right.delete_file_footer_size) &&

@@ -427,6 +427,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.concurrent_write_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.mutation_unpartitioned(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.mutation_partitioned(id INTEGER, category VARCHAR, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.mutation_legacy_mapping(old_id INTEGER, payload VARCHAR)")
         connection.execute("ALTER TABLE lake.mutation_partitioned SET PARTITIONED BY (category)")
         for file_index in range(FILE_COUNT):
             start = file_index * ROWS_PER_FILE
@@ -453,6 +454,13 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("DELETE FROM lake.source WHERE id = 17")
         connection.execute("DELETE FROM lake.mutation_unpartitioned WHERE id = 17")
         connection.execute("DELETE FROM lake.mutation_partitioned WHERE id = 18")
+        connection.execute("INSERT INTO lake.mutation_legacy_mapping VALUES (42, 'legacy'), (43, 'delete-me')")
+        connection.execute("ALTER TABLE lake.mutation_legacy_mapping RENAME COLUMN old_id TO id")
+        connection.execute(
+            "UPDATE __ducklake_metadata_lake.ducklake_data_file SET mapping_id = NULL "
+            "WHERE table_id = (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table "
+            "WHERE table_name = 'mutation_legacy_mapping')"
+        )
         connection.execute(
             "INSERT INTO lake.inlined_delete_source "
             "SELECT i::INTEGER, ('inline-' || i::VARCHAR)::VARCHAR FROM range(32) AS rows(i)"
@@ -1041,6 +1049,33 @@ def exercise_distributed_mutations(
         distributed_artifact_directories(root),
         directories_before_noop,
         "zero-match mutation artifact roots",
+    )
+
+    require_equal(
+        connection.execute(
+            "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file files "
+            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
+            "WHERE tables.table_name = 'mutation_legacy_mapping' AND files.mapping_id IS NULL"
+        ).fetchone(),
+        (1,),
+        "legacy mutation source mapping state",
+    )
+    require_write(
+        "legacy-mapping distributed DuckLake UPDATE",
+        lambda: update_rows(
+            "lake.mutation_legacy_mapping",
+            {"payload": "'updated-legacy'"},
+            "id = 42",
+        ),
+    )
+    require_write(
+        "legacy-mapping distributed DuckLake DELETE",
+        lambda: delete_rows("lake.mutation_legacy_mapping", "id = 43"),
+    )
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.mutation_legacy_mapping ORDER BY id").fetchall(),
+        [(42, "updated-legacy")],
+        "legacy-mapping mutation readback",
     )
 
     unpartitioned_delete_count = connection.execute(
@@ -1742,7 +1777,7 @@ def main() -> None:
             observed_nodes = {str(row[1]) for row in annotated_rows}
             require_equal(observed_nodes, expected_nodes, "two-worker DuckLake scan topology")
             require_true(dispatch_count >= 4, "DuckLake queries did not use the Ray runner")
-            require_true(write_dispatch_count >= 16, "DuckLake writes did not use the Ray runner")
+            require_true(write_dispatch_count >= 18, "DuckLake writes did not use the Ray runner")
     finally:
         if runner is not None and original_run_iter_tables is not None:
             runner.run_iter_tables = original_run_iter_tables
