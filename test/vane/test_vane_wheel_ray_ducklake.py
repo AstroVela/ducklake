@@ -511,6 +511,7 @@ def require_concurrent_write_conflict(
     write_thread.start()
     coordination_error = None
     conflict_connection = None
+    files_after_conflict_commit = None
     try:
         deadline = time.monotonic() + 90
         while not CONFLICT_STARTED_PATH.exists():
@@ -534,6 +535,7 @@ def require_concurrent_write_conflict(
             f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0, BUSY_TIMEOUT 30000)"
         )
         conflict_connection.execute("INSERT INTO lake.concurrent_write_target VALUES (-2, 'concurrent')")
+        files_after_conflict_commit = set((root / "data").rglob("*.parquet"))
     except BaseException as error:
         coordination_error = error
     finally:
@@ -553,6 +555,11 @@ def require_concurrent_write_conflict(
     require_true(
         "snapshot" in str(errors[0]).lower(),
         f"unexpected concurrent conflict error: {errors[0]}",
+    )
+    require_equal(
+        set((root / "data").rglob("*.parquet")),
+        files_after_conflict_commit,
+        "concurrent conflict artifact cleanup",
     )
 
 

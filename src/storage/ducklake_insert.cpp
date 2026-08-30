@@ -471,7 +471,6 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 	AddDistributedDataFiles(context, global_state, files, target_partition_id);
 	for (auto &data_file : global_state.written_files) {
 		global_state.total_insert_count += data_file.row_count;
-		data_file.created_by_ducklake = false;
 	}
 	if (!global_state.written_files.empty()) {
 		auto &transaction = DuckLakeTransaction::Get(context, target_table->catalog);
