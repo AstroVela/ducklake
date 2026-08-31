@@ -1584,9 +1584,15 @@ string DuckLakeMetadataManager::BuildBucketPartitionPruningClause(DuckLakeTableE
 	return result;
 }
 
-vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLakeTableEntry &table,
-                                                                        DuckLakeSnapshot snapshot,
-                                                                        const FilterPushdownInfo *filter_info) {
+vector<DuckLakeFileListEntry>
+DuckLakeMetadataManager::GetFilesForTable(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+                                          const FilterPushdownInfo *filter_info,
+                                          vector<DuckLakeFileListExtendedEntry> *distributed_extended_files
+#else
+                                          const FilterPushdownInfo *filter_info
+#endif
+) {
 	auto table_id = table.GetTableId();
 
 	// If we have Top-N dynamic filter pushdown, include file-level min/max stats for pruning and ordering
@@ -1642,7 +1648,11 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
 
 	string select_list = "data.data_file_id, " + GetFileSelectList("data") +
 	                     ", data.row_id_start, data.begin_snapshot, data.partial_max, data.mapping_id, " +
-	                     GetDeleteFileSelectList("del") + stats_select_list;
+	                     GetDeleteFileSelectList("del");
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	select_list += ", data.record_count, del.delete_file_id, del.begin_snapshot";
+#endif
+	select_list += stats_select_list;
 
 	string query;
 	string where_clause;
@@ -1716,6 +1726,23 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 		}
 		col_idx++;
 		file_entry.delete_file = ReadDeleteFile(table, row, col_idx, IsEncrypted());
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		DuckLakeFileListExtendedEntry extended_entry;
+		extended_entry.file_id = file_entry.file_id;
+		extended_entry.file = file_entry.file;
+		extended_entry.delete_file = file_entry.delete_file;
+		extended_entry.row_id_start = file_entry.row_id_start;
+		extended_entry.mapping_id = file_entry.mapping_id;
+		extended_entry.row_count = row.GetValue<idx_t>(col_idx++);
+		if (!row.IsNull(col_idx)) {
+			extended_entry.delete_file_id = DataFileIndex(row.GetValue<idx_t>(col_idx));
+		}
+		col_idx++;
+		if (!row.IsNull(col_idx)) {
+			extended_entry.delete_file_begin_snapshot = row.GetValue<idx_t>(col_idx);
+		}
+		col_idx++;
+#endif
 		for (auto &dfc : dynamic_filter_columns) {
 			string min_val;
 			string max_val;
@@ -1737,6 +1764,11 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 			file_entry.inlined_file_deletions = std::move(del_entry->second);
 		}
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		if (distributed_extended_files) {
+			distributed_extended_files->push_back(std::move(extended_entry));
+		}
+#endif
 		files.push_back(std::move(file_entry));
 	}
 	return files;

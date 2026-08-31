@@ -218,8 +218,26 @@ unique_ptr<MultiFileList> DuckLakeMultiFileList::Copy() const {
 	result->read_file_list = read_file_list;
 	result->delete_scans = delete_scans;
 	result->inlined_data_tables = inlined_data_tables;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	result->distributed_extended_files = distributed_extended_files;
+	result->distributed_extended_snapshot = distributed_extended_snapshot;
+	result->distributed_extended_files_loaded = distributed_extended_files_loaded;
+#endif
 	return std::move(result);
 }
+
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+const vector<DuckLakeFileListExtendedEntry> &
+DuckLakeMultiFileList::GetDistributedFilesExtended(const DuckLakeSnapshot &snapshot) const {
+	if (!distributed_extended_files_loaded || distributed_extended_snapshot.snapshot_id != snapshot.snapshot_id ||
+	    distributed_extended_snapshot.schema_version != snapshot.schema_version ||
+	    distributed_extended_snapshot.next_catalog_id != snapshot.next_catalog_id ||
+	    distributed_extended_snapshot.next_file_id != snapshot.next_file_id) {
+		throw TransactionException("DuckLake distributed source metadata was not frozen with its scan snapshot");
+	}
+	return distributed_extended_files;
+}
+#endif
 
 const DuckLakeFileListEntry &DuckLakeMultiFileList::GetFileEntry(idx_t file_idx) const {
 	auto &files = GetFiles();
@@ -316,7 +334,15 @@ void DuckLakeMultiFileList::GetFilesForTable() const {
 	if (!read_info.table_id.IsTransactionLocal()) {
 		// not a transaction local table - read the file list from the metadata store
 		auto &metadata_manager = transaction.GetMetadataManager();
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		distributed_extended_files.clear();
+		files = metadata_manager.GetFilesForTable(read_info.table, read_info.snapshot, filter_info.get(),
+		                                          &distributed_extended_files);
+		distributed_extended_snapshot = read_info.snapshot;
+		distributed_extended_files_loaded = true;
+#else
 		files = metadata_manager.GetFilesForTable(read_info.table, read_info.snapshot, filter_info.get());
+#endif
 	}
 	if (transaction.HasDroppedFiles()) {
 		for (idx_t file_idx = 0; file_idx < files.size(); file_idx++) {

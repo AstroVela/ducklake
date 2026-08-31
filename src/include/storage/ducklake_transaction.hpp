@@ -237,6 +237,7 @@ public:
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 	void AppendDistributedFiles(TableIndex table_id, vector<DuckLakeDataFile> files, const string &data_path,
 	                            const string &artifact_path);
+	void RegisterDistributedArtifact(TableIndex table_id, const string &data_path, const string &artifact_path);
 #endif
 	void AddDeletes(TableIndex table_id, vector<DuckLakeDeleteFile> files);
 	void AddCompaction(TableIndex table_id, DuckLakeCompactionEntry entry);

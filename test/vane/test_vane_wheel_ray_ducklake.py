@@ -425,6 +425,11 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
         connection.execute("ALTER TABLE lake.partitioned_write_target SET PARTITIONED BY (category)")
         connection.execute("CREATE TABLE lake.concurrent_write_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.mutation_unpartitioned(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.mutation_partitioned(id INTEGER, category VARCHAR, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.mutation_legacy_mapping(old_id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.mutation_duplicate_delete(id INTEGER)")
+        connection.execute("ALTER TABLE lake.mutation_partitioned SET PARTITIONED BY (category)")
         for file_index in range(FILE_COUNT):
             start = file_index * ROWS_PER_FILE
             stop = start + ROWS_PER_FILE
@@ -433,7 +438,32 @@ def seed_tables(connection: object, root: Path) -> None:
                 "SELECT i::INTEGER, ('value-' || i::VARCHAR)::VARCHAR "
                 f"FROM range({start}, {stop}) AS rows(i)"
             )
+        for file_index in range(4):
+            start = file_index * 128
+            stop = start + 128
+            connection.execute(
+                "INSERT INTO lake.mutation_unpartitioned "
+                "SELECT i::INTEGER, ('mutation-' || i::VARCHAR)::VARCHAR "
+                f"FROM range({start}, {stop}) AS rows(i)"
+            )
+            connection.execute(
+                "INSERT INTO lake.mutation_partitioned "
+                "SELECT i::INTEGER, ('category-' || (i % 4)::VARCHAR)::VARCHAR, "
+                "('partitioned-' || i::VARCHAR)::VARCHAR "
+                f"FROM range({start}, {stop}) AS rows(i)"
+            )
         connection.execute("DELETE FROM lake.source WHERE id = 17")
+        connection.execute("DELETE FROM lake.mutation_unpartitioned WHERE id = 17")
+        connection.execute("DELETE FROM lake.mutation_partitioned WHERE id = 18")
+        connection.execute("INSERT INTO lake.mutation_legacy_mapping VALUES (42, 'legacy'), (43, 'delete-me')")
+        connection.execute("ALTER TABLE lake.mutation_legacy_mapping RENAME COLUMN old_id TO id")
+        connection.execute(
+            "UPDATE __ducklake_metadata_lake.ducklake_data_file SET mapping_id = NULL "
+            "WHERE table_id = (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table "
+            "WHERE table_name = 'mutation_legacy_mapping')"
+        )
+        connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (10)")
+        connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (20), (30)")
         connection.execute(
             "INSERT INTO lake.inlined_delete_source "
             "SELECT i::INTEGER, ('inline-' || i::VARCHAR)::VARCHAR FROM range(32) AS rows(i)"
@@ -597,6 +627,8 @@ def run_mutated_worker_write(
     connection: object,
     plan: object,
     mutate: Callable[[dict[str, object], object], list[dict[str, object]] | None],
+    selected_attempt_id: int = 0,
+    artifact_data_root: Path | None = None,
 ) -> tuple[dict[str, object], int]:
     import pyarrow as pa
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
@@ -604,6 +636,8 @@ def run_mutated_worker_write(
 
     fragment_executor = _InProcessFragmentExecutor()
     mutated_file_count = 0
+    loser_artifacts: set[Path] = set()
+    existing_artifact_roots = distributed_artifact_directories(artifact_data_root) if artifact_data_root else set()
 
     def execute_with_mutated_result(request: object) -> object:
         nonlocal mutated_file_count
@@ -631,14 +665,72 @@ def run_mutated_worker_write(
             result.task_stats,
         )
 
-    backend = NativeFteWorkerManagerBackend(
-        execute_fn=execute_with_mutated_result,
-        num_workers=1,
+    class SelectedAttemptTask:
+        def __init__(self, task: object) -> None:
+            self.task = task
+
+        def context(self) -> dict[str, object]:
+            result = dict(self.task.context())
+            result["attempt_id"] = selected_attempt_id
+            return result
+
+        def task_context(self) -> object:
+            return self.task.task_context()
+
+        def Inputs(self) -> object:
+            return self.task.Inputs()
+
+        def plan(self) -> object:
+            return self.task.plan()
+
+        def exchange_sink_config(self) -> object:
+            return self.task.exchange_sink_config()
+
+        def name(self) -> str:
+            return str(self.task.name())
+
+    class SelectedAttemptBackend(NativeFteWorkerManagerBackend):
+        def submit_tasks(self, tasks: object) -> object:
+            return super().submit_tasks([SelectedAttemptTask(task) for task in tasks])
+
+    def execute_selected_attempt(request: object) -> object:
+        result = fragment_executor(request)
+        if artifact_data_root is None:
+            return result
+        for artifact_root in distributed_artifact_directories(artifact_data_root) - existing_artifact_roots:
+            for attempt_root in artifact_root.iterdir():
+                if not attempt_root.is_dir():
+                    continue
+                try:
+                    attempt_id = bytes.fromhex(attempt_root.name).decode()
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                if not attempt_id.endswith(f".{selected_attempt_id}"):
+                    continue
+                loser_attempt_id = attempt_id.rsplit(".", 1)[0] + ".0"
+                loser_root = artifact_root / loser_attempt_id.encode().hex()
+                loser_root.mkdir(parents=True, exist_ok=True)
+                loser_artifact = loser_root / "unselected-attempt.artifact"
+                loser_artifact.write_bytes(b"unselected")
+                loser_artifacts.add(loser_artifact)
+        return result
+
+    backend_type = SelectedAttemptBackend if selected_attempt_id != 0 else NativeFteWorkerManagerBackend
+    backend = backend_type(
+        execute_fn=execute_selected_attempt if selected_attempt_id != 0 else execute_with_mutated_result,
+        num_workers=2 if selected_attempt_id != 0 else 1,
         max_running_tasks=1,
     )
     plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
     try:
         outcome = plan_runner.run_copy_plan(plan, connection)
+        if selected_attempt_id != 0:
+            mutated_file_count = int(outcome.get("extension_artifact_count") or 0)
+            require_true(bool(loser_artifacts), "selected retry did not create an unselected attempt artifact")
+            require_true(
+                all(not artifact.exists() for artifact in loser_artifacts),
+                "selected retry retained an unselected attempt artifact",
+            )
     finally:
         cleanup_errors = []
         for cleanup in (
@@ -655,6 +747,54 @@ def run_mutated_worker_write(
         if cleanup_errors:
             raise RuntimeError(f"failed to stop mutated workers: {cleanup_errors[0]}") from cleanup_errors[0]
     return outcome, mutated_file_count
+
+
+def run_repeated_mutation_input_write(
+    vane: object,
+    connection: object,
+    plan: object,
+) -> dict[str, object]:
+    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
+    from vane.runners.local.runner import _InProcessFragmentExecutor
+
+    fragment_executor = _InProcessFragmentExecutor()
+
+    class RepeatedMutationInputBackend(NativeFteWorkerManagerBackend):
+        def _request_from_task(self, task: object) -> dict[str, object]:
+            request = super()._request_from_task(task)
+            for splits in request.get("initial_splits", {}).values():
+                if not splits or any(split.get("kind") != "exchange_source_task" for split in splits):
+                    continue
+                next_sequence = max(int(split["sequence_id"]) for split in splits) + 1
+                repeated_splits = []
+                for split in list(splits):
+                    repeated_split = dict(split)
+                    repeated_split["sequence_id"] = next_sequence
+                    repeated_split["split_id"] = f"repeat-{next_sequence}"
+                    next_sequence += 1
+                    repeated_splits.append(repeated_split)
+                splits.extend(repeated_splits)
+            return request
+
+    backend = RepeatedMutationInputBackend(execute_fn=fragment_executor, num_workers=2, max_running_tasks=1)
+    plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        return plan_runner.run_copy_plan(plan, connection)
+    finally:
+        cleanup_errors = []
+        for cleanup in (
+            plan_runner.shutdown,
+            backend.request_shutdown,
+            fragment_executor.request_shutdown,
+            lambda: backend.shutdown(timeout_s=30),
+            lambda: fragment_executor.close(timeout_s=30),
+        ):
+            try:
+                cleanup()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise RuntimeError(f"failed to stop repeated-input workers: {cleanup_errors[0]}") from cleanup_errors[0]
 
 
 def require_forged_row_count_rejected(
@@ -911,6 +1051,327 @@ def require_forged_min_max_replaced(
         ).fetchone(),
         (None, None),
         "inexact footer min/max omission",
+    )
+
+
+def exercise_distributed_mutations(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+    require_write: Callable[[str, Callable[[], object]], None],
+    require_write_count: Callable[[int, str], None],
+) -> None:
+    def delete_rows(table_name: str, condition: str) -> None:
+        connection.table(table_name).delete(condition=vane.SQLExpression(condition))
+
+    def update_rows(table_name: str, assignments: dict[str, str], condition: str) -> None:
+        connection.table(table_name).update(
+            {name: vane.SQLExpression(expression) for name, expression in assignments.items()},
+            condition=vane.SQLExpression(condition),
+        )
+
+    initial_unpartitioned_count = connection.execute("SELECT count(*) FROM lake.mutation_unpartitioned").fetchone()[0]
+    files_before_noop = {path for path in (root / "data").rglob("*") if path.is_file()}
+    directories_before_noop = distributed_artifact_directories(root)
+    require_write(
+        "zero-match distributed DuckLake DELETE",
+        lambda: delete_rows("lake.mutation_unpartitioned", "regexp_matches(payload, '^never-match$')"),
+    )
+    require_write(
+        "zero-match distributed DuckLake UPDATE",
+        lambda: update_rows(
+            "lake.mutation_unpartitioned",
+            {"payload": "'never'"},
+            "regexp_matches(payload, '^never-match$')",
+        ),
+    )
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.mutation_unpartitioned").fetchone(),
+        (initial_unpartitioned_count,),
+        "zero-match mutation visibility",
+    )
+    require_equal(
+        {path for path in (root / "data").rglob("*") if path.is_file()},
+        files_before_noop,
+        "zero-match mutation artifacts",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_noop,
+        "zero-match mutation artifact roots",
+    )
+
+    require_equal(
+        connection.execute(
+            "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file files "
+            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
+            "WHERE tables.table_name = 'mutation_legacy_mapping' AND files.mapping_id IS NULL"
+        ).fetchone(),
+        (1,),
+        "legacy mutation source mapping state",
+    )
+    require_write(
+        "legacy-mapping distributed DuckLake UPDATE",
+        lambda: update_rows(
+            "lake.mutation_legacy_mapping",
+            {"payload": "'updated-legacy'"},
+            "id = 42",
+        ),
+    )
+    require_write(
+        "legacy-mapping distributed DuckLake DELETE",
+        lambda: delete_rows("lake.mutation_legacy_mapping", "id = 43"),
+    )
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.mutation_legacy_mapping ORDER BY id").fetchall(),
+        [(42, "updated-legacy")],
+        "legacy-mapping mutation readback",
+    )
+
+    duplicate_delete_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: delete_rows("lake.mutation_duplicate_delete", "id < 30"),
+    )
+    require_equal(
+        sum(len(batches) for batches in duplicate_delete_plan.scan_split_batch_map().values()),
+        2,
+        "duplicate-match DELETE source split count",
+    )
+    duplicate_delete_outcome = run_repeated_mutation_input_write(
+        vane,
+        connection,
+        duplicate_delete_plan,
+    )
+    require_equal(duplicate_delete_outcome.get("rows_copied"), 4, "duplicate-match DELETE affected rows")
+    require_equal(duplicate_delete_outcome.get("extension_artifact_count"), 2, "duplicate-match DELETE artifacts")
+    require_equal(
+        connection.execute("SELECT id FROM lake.mutation_duplicate_delete ORDER BY id").fetchall(),
+        [(30,)],
+        "duplicate-match DELETE readback",
+    )
+
+    unpartitioned_delete_count = connection.execute(
+        "SELECT count(*) FROM lake.mutation_unpartitioned WHERE id % 11 = 0"
+    ).fetchone()[0]
+    require_true(unpartitioned_delete_count > 0, "unpartitioned DELETE selected no rows")
+    require_write(
+        "unpartitioned distributed DuckLake DELETE",
+        lambda: delete_rows("lake.mutation_unpartitioned", "id % 11 = 0"),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*), count(*) FILTER (WHERE id % 11 = 0) FROM lake.mutation_unpartitioned"
+        ).fetchone(),
+        (initial_unpartitioned_count - unpartitioned_delete_count, 0),
+        "unpartitioned distributed DELETE readback",
+    )
+
+    unpartitioned_update_count = connection.execute(
+        "SELECT count(*) FROM lake.mutation_unpartitioned WHERE id BETWEEN 100 AND 299"
+    ).fetchone()[0]
+    require_true(unpartitioned_update_count > 0, "unpartitioned UPDATE selected no rows")
+    require_write(
+        "unpartitioned distributed DuckLake UPDATE",
+        lambda: update_rows(
+            "lake.mutation_unpartitioned",
+            {"payload": "'updated-' || id::VARCHAR"},
+            "id BETWEEN 100 AND 299",
+        ),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*) FROM lake.mutation_unpartitioned "
+            "WHERE id BETWEEN 100 AND 299 AND payload = 'updated-' || id::VARCHAR"
+        ).fetchone(),
+        (unpartitioned_update_count,),
+        "unpartitioned distributed UPDATE readback",
+    )
+
+    initial_partitioned_count = connection.execute("SELECT count(*) FROM lake.mutation_partitioned").fetchone()[0]
+    partitioned_update_count = connection.execute(
+        "SELECT count(*) FROM lake.mutation_partitioned " "WHERE id BETWEEN 64 AND 319 AND id % 13 <> 0"
+    ).fetchone()[0]
+    require_true(partitioned_update_count > 0, "partitioned UPDATE selected no rows")
+    require_write(
+        "partitioned distributed DuckLake UPDATE",
+        lambda: update_rows(
+            "lake.mutation_partitioned",
+            {"payload": "'partition-updated-' || id::VARCHAR"},
+            "id BETWEEN 64 AND 319 AND id % 13 <> 0",
+        ),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*) FROM lake.mutation_partitioned "
+            "WHERE id BETWEEN 64 AND 319 AND id % 13 <> 0 "
+            "AND payload = 'partition-updated-' || id::VARCHAR"
+        ).fetchone(),
+        (partitioned_update_count,),
+        "partitioned distributed UPDATE readback",
+    )
+
+    partitioned_delete_count = connection.execute(
+        "SELECT count(*) FROM lake.mutation_partitioned " "WHERE id BETWEEN 128 AND 447 AND id % 17 = 0"
+    ).fetchone()[0]
+    require_true(partitioned_delete_count > 0, "partitioned DELETE selected no rows")
+    require_write(
+        "partitioned distributed DuckLake DELETE",
+        lambda: delete_rows(
+            "lake.mutation_partitioned",
+            "id BETWEEN 128 AND 447 AND id % 17 = 0",
+        ),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*), count(*) FILTER (WHERE id BETWEEN 128 AND 447 AND id % 17 = 0) "
+            "FROM lake.mutation_partitioned"
+        ).fetchone(),
+        (initial_partitioned_count - partitioned_delete_count, 0),
+        "partitioned distributed DELETE readback",
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(DISTINCT regexp_extract(data_file, 'category=([^/]+)', 1)) "
+            "FROM ducklake_list_files('lake', 'mutation_partitioned')"
+        ).fetchone(),
+        (4,),
+        "partitioned mutation data paths",
+    )
+
+    state_before_failure = connection.execute(
+        "SELECT count(*), sum(id), sum(length(payload)) FROM lake.mutation_unpartitioned"
+    ).fetchone()
+    files_before_failure = {path for path in (root / "data").rglob("*") if path.is_file()}
+    directories_before_failure = distributed_artifact_directories(root)
+    require_error(
+        lambda: update_rows(
+            "lake.mutation_unpartitioned",
+            {"id": "CASE WHEN id < 256 THEN id ELSE payload::INTEGER END"},
+            "id BETWEEN 200 AND 400",
+        ),
+        "no selected task results",
+        "distributed DuckLake UPDATE partial worker failure",
+    )
+    require_write_count(1, "failed UPDATE Ray dispatch count")
+    require_equal(
+        connection.execute(
+            "SELECT count(*), sum(id), sum(length(payload)) FROM lake.mutation_unpartitioned"
+        ).fetchone(),
+        state_before_failure,
+        "failed UPDATE table visibility",
+    )
+    require_equal(
+        {path for path in (root / "data").rglob("*") if path.is_file()},
+        files_before_failure,
+        "failed UPDATE artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_failure,
+        "failed UPDATE artifact-root cleanup",
+    )
+
+    files_before_retry = set(
+        row[0]
+        for row in connection.execute(
+            "SELECT data_file FROM ducklake_list_files('lake', 'mutation_unpartitioned')"
+        ).fetchall()
+    )
+    retry_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: update_rows(
+            "lake.mutation_unpartitioned",
+            {"payload": "'retry-selected'"},
+            "id = 499",
+        ),
+    )
+    retry_outcome, retry_file_count = run_mutated_worker_write(
+        vane,
+        connection,
+        retry_plan,
+        lambda _row, _payload: None,
+        selected_attempt_id=1,
+        artifact_data_root=root,
+    )
+    require_equal(retry_outcome.get("extension_catalog_committed"), True, "selected retry UPDATE commit")
+    require_equal(retry_outcome.get("rows_copied"), 1, "selected retry UPDATE affected rows")
+    require_true(retry_file_count > 0, "selected retry UPDATE produced no worker artifacts")
+    require_equal(
+        connection.execute("SELECT payload FROM lake.mutation_unpartitioned WHERE id = 499").fetchone(),
+        ("retry-selected",),
+        "selected retry UPDATE readback",
+    )
+    files_after_retry = set(
+        row[0]
+        for row in connection.execute(
+            "SELECT data_file FROM ducklake_list_files('lake', 'mutation_unpartitioned')"
+        ).fetchall()
+    )
+    retry_files = files_after_retry - files_before_retry
+    require_equal(len(retry_files), 1, "selected retry UPDATE data-file count")
+    retry_file_parts = Path(next(iter(retry_files))).parts
+    artifact_root_index = next(
+        index for index, part in enumerate(retry_file_parts) if part.startswith(DISTRIBUTED_ARTIFACT_PREFIX)
+    )
+    selected_attempt = bytes.fromhex(retry_file_parts[artifact_root_index + 1]).decode()
+    require_true(selected_attempt.endswith(".1"), "selected retry UPDATE task-attempt identity")
+
+    stale_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: delete_rows("lake.mutation_partitioned", "id = 333"),
+    )
+    configured_runner = os.environ.get("VANE_RUNNER")
+    os.environ["VANE_RUNNER"] = "local-fast"
+    try:
+        connection.execute("INSERT INTO lake.stale_source VALUES (4, 'mutation-snapshot')")
+    finally:
+        if configured_runner is None:
+            os.environ.pop("VANE_RUNNER", None)
+        else:
+            os.environ["VANE_RUNNER"] = configured_runner
+    stale_directories = distributed_artifact_directories(root)
+    physical_plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    try:
+        require_error(
+            lambda: physical_plan_runner.run_copy_plan(stale_plan, connection),
+            "snapshot",
+            "stale snapshot distributed DELETE",
+        )
+    finally:
+        physical_plan_runner.shutdown()
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.mutation_partitioned WHERE id = 333").fetchone(),
+        (1,),
+        "stale distributed DELETE did not commit",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        stale_directories,
+        "stale distributed DELETE artifact cleanup",
+    )
+
+    native_unpartitioned = connection.execute(
+        "SELECT id, payload FROM lake.mutation_unpartitioned ORDER BY id"
+    ).fetchall()
+    require_equal(
+        connection.sql("SELECT id, payload FROM lake.mutation_unpartitioned ORDER BY id").fetchall(),
+        native_unpartitioned,
+        "Vane and native unpartitioned mutation readback",
+    )
+    native_partitioned = connection.execute(
+        "SELECT id, category, payload FROM lake.mutation_partitioned ORDER BY id"
+    ).fetchall()
+    require_equal(
+        connection.sql("SELECT id, category, payload FROM lake.mutation_partitioned ORDER BY id").fetchall(),
+        native_partitioned,
+        "Vane and native partitioned mutation readback",
     )
 
 
@@ -1274,6 +1735,14 @@ def main() -> None:
                 require_distributed_write,
                 require_write_count,
             )
+            exercise_distributed_mutations(
+                vane,
+                connection,
+                runner,
+                root,
+                require_distributed_write,
+                require_write_count,
+            )
 
             verify_worker_transport(vane, connection)
             verify_stale_split_rejected(
@@ -1383,7 +1852,7 @@ def main() -> None:
             observed_nodes = {str(row[1]) for row in annotated_rows}
             require_equal(observed_nodes, expected_nodes, "two-worker DuckLake scan topology")
             require_true(dispatch_count >= 4, "DuckLake queries did not use the Ray runner")
-            require_true(write_dispatch_count >= 9, "DuckLake writes did not use the Ray runner")
+            require_true(write_dispatch_count >= 18, "DuckLake writes did not use the Ray runner")
     finally:
         if runner is not None and original_run_iter_tables is not None:
             runner.run_iter_tables = original_run_iter_tables

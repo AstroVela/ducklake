@@ -25,6 +25,14 @@
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "common/ducklake_util.hpp"
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#include "storage/ducklake_distributed_scan.hpp"
+#include "storage/ducklake_distributed_write.hpp"
+
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/execution/distributed/copy_finalize.hpp"
+#include "duckdb/main/attached_database.hpp"
+#endif
 
 namespace duckdb {
 
@@ -195,6 +203,230 @@ DuckLakeDelete::DuckLakeDelete(PhysicalPlan &physical_plan, DuckLakeTableEntry &
       encryption_key(std::move(encryption_key_p)), allow_duplicates(allow_duplicates) {
 	children.push_back(child);
 }
+
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+void DuckLakeDelete::InitializeDistributedSource(const DuckLakeSnapshot &source_snapshot,
+                                                 vector<DuckLakeFileListExtendedEntry> source_files,
+                                                 bool source_prepared, bool has_source_scan,
+                                                 bool source_is_statically_empty) {
+	distributed_source_snapshot = source_snapshot;
+	distributed_source_files = std::move(source_files);
+	distributed_source_prepared = source_prepared;
+	distributed_has_source_scan = has_source_scan;
+	distributed_source_is_statically_empty = source_is_statically_empty;
+}
+
+void DuckLakeDelete::InitializeDistributedWritePlan(ClientContext &context) {
+	distributed_write_plan.extension_name = "ducklake";
+	distributed_write_plan.operator_name = "delete";
+	auto &schema = table.ParentSchema().Cast<DuckLakeSchemaEntry>();
+	auto &catalog = table.catalog.Cast<DuckLakeCatalog>();
+	auto &transaction = DuckLakeTransaction::Get(context, catalog);
+	distributed_catalog_name = catalog.GetName();
+	distributed_schema_name = schema.name;
+	distributed_table_name = table.name;
+	distributed_schema_uuid = schema.GetSchemaUUID();
+	distributed_table_uuid = table.GetTableUUID();
+	distributed_data_path = table.DataPath();
+	distributed_artifact_path = CreateDuckLakeDistributedArtifactPath(context, distributed_data_path);
+	distributed_field_identity = GetDuckLakeDistributedFieldIdentity(table.GetFieldData());
+	distributed_partition_identity = GetDuckLakeDistributedPartitionIdentity(table.GetPartitionData().get());
+	distributed_sort_identity = GetDuckLakeDistributedSortIdentity(table.GetSortData().get());
+	distributed_snapshot = transaction.GetSnapshot();
+	distributed_schema_id = schema.GetSchemaId();
+	distributed_table_id = table.GetTableId();
+	if (distributed_has_source_scan &&
+	    !DuckLakeDistributedSnapshotsMatch(distributed_source_snapshot, distributed_snapshot)) {
+		throw TransactionException("DuckLake DELETE source snapshot does not match its target snapshot");
+	}
+}
+
+void DuckLakeDelete::ValidateDistributedWriteShape() const {
+	if (distributed_write_plan.extension_name != "ducklake" || distributed_write_plan.operator_name != "delete" ||
+	    distributed_write_plan.worker_bind_data.empty() || distributed_artifact_path.empty() ||
+	    !distributed_worker_child || !distributed_worker_plan_selected || children.size() != 1 ||
+	    !distributed_schema_id.IsValid() || !distributed_table_id.IsValid() || !distributed_source_prepared) {
+		throw InvalidInputException("DuckLake distributed DELETE worker plan was not initialized");
+	}
+	if (distributed_source_is_statically_empty) {
+		if (distributed_has_source_scan || !distributed_source_files.empty()) {
+			throw InvalidInputException("DuckLake distributed DELETE has invalid statically-empty source state");
+		}
+	} else if (!distributed_has_source_scan || distributed_source_files.empty()) {
+		throw InvalidInputException("DuckLake distributed DELETE is missing its planned source scan");
+	}
+}
+
+DuckLakeTableEntry &DuckLakeDelete::ResolveDistributedWriteTable(ClientContext &context) const {
+	ValidateDistributedWriteShape();
+	auto &catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<DuckLakeCatalog>();
+	auto &resolved_schema = catalog.GetSchema(context, distributed_schema_name).Cast<DuckLakeSchemaEntry>();
+	if (resolved_schema.GetSchemaId() != distributed_schema_id ||
+	    resolved_schema.GetSchemaUUID() != distributed_schema_uuid) {
+		throw TransactionException("DuckLake schema %s.%s changed after the distributed DELETE was planned",
+		                           distributed_catalog_name, distributed_schema_name);
+	}
+	auto &resolved_table = Catalog::GetEntry<TableCatalogEntry>(context, distributed_catalog_name,
+	                                                            distributed_schema_name, distributed_table_name)
+	                           .Cast<DuckLakeTableEntry>();
+	auto &transaction = DuckLakeTransaction::Get(context, catalog);
+	if (resolved_table.GetTableId() != distributed_table_id ||
+	    resolved_table.GetTableUUID() != distributed_table_uuid) {
+		throw TransactionException("DuckLake table %s.%s.%s was replaced after the distributed DELETE was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	if (resolved_table.IsTransactionLocal() || transaction.HasAnyLocalChanges(resolved_table.GetTableId())) {
+		throw NotImplementedException("Distributed DuckLake DELETE does not support transaction-local table state");
+	}
+	auto &file_system = FileSystem::GetFileSystem(context);
+	auto current_data_path = distributed::CanonicalDistributedCopyBasePath(file_system, resolved_table.DataPath());
+	auto planned_data_path = distributed::CanonicalDistributedCopyBasePath(file_system, distributed_data_path);
+	if (current_data_path.is_err() || planned_data_path.is_err() ||
+	    current_data_path.value() != planned_data_path.value()) {
+		throw TransactionException("DuckLake table %s.%s.%s data path changed after the distributed DELETE was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	if (GetDuckLakeDistributedFieldIdentity(resolved_table.GetFieldData()) != distributed_field_identity ||
+	    GetDuckLakeDistributedPartitionIdentity(resolved_table.GetPartitionData().get()) !=
+	        distributed_partition_identity ||
+	    GetDuckLakeDistributedSortIdentity(resolved_table.GetSortData().get()) != distributed_sort_identity) {
+		throw TransactionException("DuckLake table %s.%s.%s layout changed after the distributed DELETE was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	ValidateDuckLakeDistributedSnapshotBaseline(context, distributed_catalog_name, distributed_snapshot, "DELETE");
+	return resolved_table;
+}
+
+void DuckLakeDelete::ValidateDistributedSourceBaseline(ClientContext &context, const DuckLakeTableEntry &target_table,
+                                                       const string &operation_name,
+                                                       const string &worker_bind_data) const {
+	ValidateDuckLakeDistributedRowDeltaSourceBaseline(context, target_table, distributed_source_files, worker_bind_data,
+	                                                  operation_name, distributed_source_is_statically_empty);
+}
+
+optional_ptr<distributed::ExtensionWriteTaskProvider> DuckLakeDelete::GetExtensionWriteTaskProvider() {
+	if (!distributed_source_prepared) {
+		throw NotImplementedException("Distributed DuckLake DELETE supports committed file-backed source data only");
+	}
+	if (!encryption_key.empty()) {
+		throw NotImplementedException("Distributed DuckLake DELETE does not support encrypted tables");
+	}
+	if (distributed_write_plan.worker_bind_data.empty()) {
+		throw InvalidInputException("DuckLake distributed DELETE is missing its frozen worker bind");
+	}
+	SelectDistributedWorkerPlan();
+	return this;
+}
+
+void DuckLakeDelete::SelectDistributedWorkerPlan() {
+	if (distributed_worker_plan_selected) {
+		return;
+	}
+	if (children.size() != 1 || !distributed_worker_child) {
+		throw InvalidInputException("DuckLake distributed DELETE requires exactly one worker child");
+	}
+	children[0] = *distributed_worker_child;
+	distributed_worker_plan_selected = true;
+}
+
+const distributed::DistributedExtensionWritePlan &DuckLakeDelete::WritePlan() const {
+	ValidateDistributedWriteShape();
+	return distributed_write_plan;
+}
+
+void DuckLakeDelete::ValidateDistributedWrite(ClientContext &context) const {
+	ValidateDistributedWriteShape();
+	bool expected = false;
+	if (!distributed_write_claimed.compare_exchange_strong(expected, true)) {
+		throw InvalidInputException("A distributed DuckLake DELETE plan can only be executed once");
+	}
+	auto &catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<DuckLakeCatalog>();
+	if (catalog.GetAttached().IsReadOnly()) {
+		throw PermissionException("Distributed DuckLake DELETE requires a writable catalog");
+	}
+	if (catalog.CatalogSnapshot()) {
+		throw NotImplementedException("Distributed DuckLake DELETE does not support snapshot-attached catalogs");
+	}
+	if (catalog.RetrialsServerSide()) {
+		throw NotImplementedException("Distributed DuckLake DELETE does not support server-side commit retries");
+	}
+	if (!encryption_key.empty()) {
+		throw NotImplementedException("Distributed DuckLake DELETE does not support encrypted tables");
+	}
+	ValidateDuckLakeDistributedArtifactPath(context, distributed_data_path, distributed_artifact_path);
+	auto &transaction = DuckLakeTransaction::Get(context, catalog);
+	if (transaction.ChangesMade()) {
+		throw NotImplementedException("Distributed DuckLake DELETE requires an otherwise empty catalog transaction");
+	}
+	auto &target_table = ResolveDistributedWriteTable(context);
+	ValidateDistributedSourceBaseline(context, target_table, "DELETE", distributed_write_plan.worker_bind_data);
+}
+
+idx_t DuckLakeDelete::FinalizeDistributedWrite(ClientContext &context,
+                                               const vector<DistributedWriteTaskResult> &results) const {
+	ValidateDistributedWriteShape();
+	bool ownership_transferred = false;
+	try {
+		auto &target_table = ResolveDistributedWriteTable(context);
+		ValidateDistributedSourceBaseline(context, target_table, "DELETE", distributed_write_plan.worker_bind_data);
+		auto &catalog = target_table.catalog.Cast<DuckLakeCatalog>();
+		auto &schema = target_table.ParentSchema().Cast<DuckLakeSchemaEntry>();
+		auto use_deletion_vectors = catalog.WriteDeletionVectors(schema.GetSchemaId(), target_table.GetTableId());
+		auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
+		auto decoded = DecodeDuckLakeDistributedRowDeltaResults(
+		    context, distributed_data_path, distributed_artifact_path, write_info, results,
+		    DuckLakeDistributedRowDeltaKind::DELETE, use_deletion_vectors);
+		CleanupDuckLakeDistributedRowDelta(context, distributed_data_path, distributed_artifact_path,
+		                                   &decoded.selected_artifact_paths);
+		if (decoded.affected_rows == 0) {
+			if (!decoded.delete_files.empty()) {
+				throw InvalidInputException("DuckLake distributed DELETE returned artifacts for zero affected rows");
+			}
+			CleanupDuckLakeDistributedRowDelta(context, distributed_data_path, distributed_artifact_path);
+			return 0;
+		}
+		auto delete_files = BuildDuckLakeDistributedDeleteFiles(
+		    context, distributed_source_files, distributed_write_plan.worker_bind_data, decoded.delete_files, "DELETE");
+		idx_t delete_count = 0;
+		for (const auto &file : decoded.delete_files) {
+			if (file.new_delete_count > NumericLimits<idx_t>::Maximum() - delete_count) {
+				throw InvalidInputException("DuckLake distributed DELETE row count overflow");
+			}
+			delete_count += file.new_delete_count;
+		}
+		if (delete_count == 0 || delete_count > decoded.affected_rows || delete_files.empty()) {
+			throw InvalidInputException("DuckLake distributed DELETE produced inconsistent delete artifacts");
+		}
+		auto &transaction = DuckLakeTransaction::Get(context, catalog);
+		transaction.FailDistributedWriteOnSnapshotConflict();
+		transaction.RegisterDistributedArtifact(target_table.GetTableId(), distributed_data_path,
+		                                        distributed_artifact_path);
+		ownership_transferred = true;
+		transaction.AddDeletes(target_table.GetTableId(), std::move(delete_files));
+		return decoded.affected_rows;
+	} catch (...) {
+		if (!ownership_transferred) {
+			try {
+				CleanupDuckLakeDistributedRowDelta(context, distributed_data_path, distributed_artifact_path);
+			} catch (...) {
+			}
+		}
+		throw;
+	}
+}
+
+void DuckLakeDelete::AbortDistributedWrite(ClientContext &context, const vector<DistributedWriteTaskResult> &) const {
+	CleanupDuckLakeDistributedRowDelta(context, distributed_data_path, distributed_artifact_path);
+}
+
+void DuckLakeDelete::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+	if (distributed_worker_plan_selected) {
+		throw InvalidInputException(
+		    "A distributed DuckLake DELETE worker plan cannot execute as a native coordinator operator");
+	}
+	PhysicalOperator::BuildPipelines(current, meta_pipeline);
+}
+#endif
 
 //===--------------------------------------------------------------------===//
 // States
@@ -652,10 +884,101 @@ optional_ptr<PhysicalTableScan> FindDeleteSource(PhysicalOperator &plan) {
 	return nullptr;
 }
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+PhysicalOperator &DuckLakeDelete::PlanDeleteInternal(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                     DuckLakeTableEntry &table, PhysicalOperator &child_plan,
+                                                     vector<idx_t> row_id_indexes, string encryption_key,
+                                                     bool allow_duplicates, bool initialize_distributed_write) {
+	auto delete_source = FindDeleteSource(child_plan);
+	auto delete_map = make_shared_ptr<DuckLakeDeleteMap>();
+	DuckLakeSnapshot source_snapshot;
+	vector<DuckLakeFileListExtendedEntry> files;
+	bool has_source_scan = delete_source != nullptr;
+	bool source_prepared = false;
+	if (delete_source) {
+		auto &bind_data = delete_source->bind_data->Cast<MultiFileBindData>();
+		if (!TryGetDuckLakeDistributedMutationSource(bind_data, table, source_snapshot, files)) {
+			auto reader = dynamic_cast<DuckLakeMultiFileReader *>(bind_data.multi_file_reader.get());
+			auto file_list = dynamic_cast<DuckLakeMultiFileList *>(bind_data.file_list.get());
+			if (!reader || !file_list) {
+				throw InternalException("DuckLake DELETE source scan has an unexpected physical implementation");
+			}
+			source_snapshot = reader->read_info.snapshot;
+			auto native_files = file_list->GetFilesExtended();
+			for (const auto &file_entry : native_files) {
+				delete_map->AddExtendedFileInfo(file_entry);
+			}
+			reader->delete_map = delete_map;
+
+			auto &catalog = table.catalog.Cast<DuckLakeCatalog>();
+			auto &transaction = DuckLakeTransaction::Get(context, catalog);
+			auto &scan_files = file_list->GetFiles();
+			source_prepared = !table.IsTransactionLocal() && !transaction.HasAnyLocalChanges(table.GetTableId()) &&
+			                  table.GetInlinedDataTables().empty() && !file_list->HasTransactionLocalData() &&
+			                  scan_files.size() == native_files.size();
+			unordered_set<string> scan_paths;
+			for (const auto &scan_file : scan_files) {
+				if (scan_file.data_type != DuckLakeDataType::DATA_FILE || !scan_file.file_id.IsValid() ||
+				    !scan_file.inlined_file_deletions.empty() || scan_file.max_row_count.IsValid() ||
+				    scan_file.snapshot_filter_min.IsValid() || scan_file.snapshot_filter_max.IsValid() ||
+				    !scan_paths.insert(scan_file.file.path).second) {
+					source_prepared = false;
+				}
+			}
+			for (const auto &file : native_files) {
+				if (file.data_type != DuckLakeDataType::DATA_FILE || !file.file_id.IsValid() ||
+				    file.file.path.empty() || file.file.file_size_bytes == 0 || file.row_count == 0 ||
+				    !file.file.encryption_key.empty() || !file.delete_file.encryption_key.empty() ||
+				    file.delete_file.path.empty() != !file.delete_file_id.IsValid() ||
+				    scan_paths.find(file.file.path) == scan_paths.end()) {
+					source_prepared = false;
+				}
+			}
+			if (source_prepared) {
+				files = std::move(native_files);
+			}
+		} else {
+			source_prepared = true;
+		}
+	}
+	auto source_is_statically_empty = (!delete_source && child_plan.type == PhysicalOperatorType::EMPTY_RESULT) ||
+	                                  (delete_source && source_prepared && files.empty());
+	if (source_is_statically_empty) {
+		has_source_scan = false;
+		source_prepared = true;
+	}
+	auto &result = planner
+	                   .Make<DuckLakeDelete>(table, child_plan, std::move(delete_map), std::move(row_id_indexes),
+	                                         std::move(encryption_key), allow_duplicates)
+	                   .Cast<DuckLakeDelete>();
+	result.InitializeDistributedSource(source_snapshot, std::move(files), source_prepared, has_source_scan,
+	                                   source_is_statically_empty);
+	if (initialize_distributed_write) {
+		result.InitializeDistributedWritePlan(context);
+		if (source_prepared && result.encryption_key.empty()) {
+			result.distributed_write_plan.worker_bind_data = BuildDuckLakeDistributedDeleteBind(
+			    context, table, result.distributed_source_files, result.row_id_indexes,
+			    result.distributed_artifact_path, source_is_statically_empty);
+		}
+		if (source_is_statically_empty) {
+			result.distributed_worker_child = &child_plan;
+		} else if (has_source_scan) {
+			result.distributed_worker_child =
+			    &PlanDuckLakeDistributedRowDeltaRepartition(planner, child_plan, result.row_id_indexes[0]);
+		}
+	}
+	return result;
+}
+#endif
+
 PhysicalOperator &DuckLakeDelete::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                              DuckLakeTableEntry &table, PhysicalOperator &child_plan,
                                              vector<idx_t> row_id_indexes, string encryption_key,
                                              bool allow_duplicates) {
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	return PlanDeleteInternal(context, planner, table, child_plan, std::move(row_id_indexes), std::move(encryption_key),
+	                          allow_duplicates, true);
+#else
 	auto delete_source = FindDeleteSource(child_plan);
 	auto delete_map = make_shared_ptr<DuckLakeDeleteMap>();
 	if (delete_source) {
@@ -670,6 +993,7 @@ PhysicalOperator &DuckLakeDelete::PlanDelete(ClientContext &context, PhysicalPla
 	}
 	return planner.Make<DuckLakeDelete>(table, child_plan, std::move(delete_map), std::move(row_id_indexes),
 	                                    std::move(encryption_key), allow_duplicates);
+#endif
 }
 
 PhysicalOperator &DuckLakeCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,

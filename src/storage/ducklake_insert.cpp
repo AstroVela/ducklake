@@ -33,6 +33,7 @@
 #include "storage/ducklake_variant_stats.hpp"
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 #include "storage/ducklake_distributed_write.hpp"
+#include "storage/ducklake_delete.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -65,73 +66,6 @@ DuckLakeInsert::DuckLakeInsert(PhysicalPlan &physical_plan, const vector<Logical
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 namespace {
 
-static void AppendDistributedIdentity(string &result, const string &value) {
-	result += to_string(value.size());
-	result += ':';
-	result += value;
-	result += ';';
-}
-
-static void AppendDistributedFieldIdentity(string &result, const DuckLakeFieldId &field) {
-	AppendDistributedIdentity(result, to_string(field.GetFieldIndex().index));
-	AppendDistributedIdentity(result, field.Name());
-	AppendDistributedIdentity(result, field.Type().ToString());
-	AppendDistributedIdentity(result, field.GetColumnData().initial_default.ToString());
-	if (field.GetColumnData().default_value) {
-		AppendDistributedIdentity(result, field.GetColumnData().default_value->ToString());
-	} else {
-		AppendDistributedIdentity(result, string());
-	}
-	for (const auto &child : field.Children()) {
-		AppendDistributedFieldIdentity(result, *child);
-	}
-	AppendDistributedIdentity(result, "end-field");
-}
-
-static string GetDistributedFieldIdentity(const DuckLakeFieldData &field_data) {
-	string result;
-	for (const auto &field : field_data.GetFieldIds()) {
-		AppendDistributedFieldIdentity(result, *field);
-	}
-	return result;
-}
-
-static string GetDistributedPartitionIdentity(const DuckLakePartition *partition_data) {
-	if (!partition_data) {
-		return string();
-	}
-	string result;
-	AppendDistributedIdentity(result, to_string(partition_data->partition_id));
-	for (const auto &field : partition_data->fields) {
-		AppendDistributedIdentity(result, to_string(field.partition_key_index));
-		AppendDistributedIdentity(result, to_string(field.field_id.index));
-		AppendDistributedIdentity(result, to_string(static_cast<uint8_t>(field.transform.type)));
-		AppendDistributedIdentity(result, to_string(field.transform.bucket_count));
-	}
-	return result;
-}
-
-static string GetDistributedSortIdentity(const DuckLakeSort *sort_data) {
-	if (!sort_data) {
-		return string();
-	}
-	string result;
-	AppendDistributedIdentity(result, to_string(sort_data->sort_id));
-	for (const auto &field : sort_data->fields) {
-		AppendDistributedIdentity(result, to_string(field.sort_key_index));
-		AppendDistributedIdentity(result, field.expression);
-		AppendDistributedIdentity(result, field.dialect);
-		AppendDistributedIdentity(result, to_string(static_cast<uint8_t>(field.sort_direction)));
-		AppendDistributedIdentity(result, to_string(static_cast<uint8_t>(field.null_order)));
-	}
-	return result;
-}
-
-static bool DistributedSnapshotsMatch(const DuckLakeSnapshot &left, const DuckLakeSnapshot &right) {
-	return left.snapshot_id == right.snapshot_id && left.schema_version == right.schema_version &&
-	       left.next_catalog_id == right.next_catalog_id && left.next_file_id == right.next_file_id;
-}
-
 static void ValidateDistributedCopyShape(const PhysicalCopyToFile &copy, const string &data_path) {
 	auto partitioned = copy.partition_output && copy.write_empty_file && !copy.rotate && !copy.per_thread_output;
 	auto rotating = !copy.partition_output && !copy.write_empty_file && copy.rotate && !copy.per_thread_output &&
@@ -158,17 +92,6 @@ static void ValidateDistributedCopyShape(const PhysicalCopyToFile &copy, const s
 			throw SerializationException("Distributed DuckLake COPY contains an invalid partition column");
 		}
 	}
-}
-
-static vector<string> GetDistributedPartitionNames(const PhysicalCopyToFile &copy) {
-	vector<string> result;
-	for (const auto column_index : copy.partition_columns) {
-		if (column_index >= copy.names.size()) {
-			throw SerializationException("Distributed DuckLake COPY contains an invalid partition column");
-		}
-		result.push_back(copy.names[column_index]);
-	}
-	return result;
 }
 
 static void AddDistributedDataFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state,
@@ -206,9 +129,9 @@ void DuckLakeInsert::InitializeDistributedWriteTarget(ClientContext &context, Du
 	distributed_schema_uuid = ducklake_schema.GetSchemaUUID();
 	distributed_table_uuid = table_entry.GetTableUUID();
 	distributed_data_path = table_entry.DataPath();
-	distributed_field_identity = GetDistributedFieldIdentity(table_entry.GetFieldData());
-	distributed_partition_identity = GetDistributedPartitionIdentity(table_entry.GetPartitionData().get());
-	distributed_sort_identity = GetDistributedSortIdentity(table_entry.GetSortData().get());
+	distributed_field_identity = GetDuckLakeDistributedFieldIdentity(table_entry.GetFieldData());
+	distributed_partition_identity = GetDuckLakeDistributedPartitionIdentity(table_entry.GetPartitionData().get());
+	distributed_sort_identity = GetDuckLakeDistributedSortIdentity(table_entry.GetSortData().get());
 	distributed_snapshot = transaction.GetSnapshot();
 	distributed_schema_id = ducklake_schema.GetSchemaId();
 	distributed_table_id = table_entry.GetTableId();
@@ -224,7 +147,7 @@ void DuckLakeInsert::ConfigureDistributedInsert(ClientContext &context, Physical
 	distributed_artifact_path = CreateDuckLakeDistributedArtifactPath(context, distributed_data_path);
 	worker_copy.file_path = distributed_artifact_path;
 	distributed_worker_child = &worker_copy;
-	distributed_partition_names = GetDistributedPartitionNames(worker_copy);
+	distributed_partition_names = GetDuckLakeDistributedPartitionNames(worker_copy);
 }
 
 void DuckLakeInsert::ConfigureDistributedCTAS(ClientContext &context, PhysicalCopyToFile &worker_copy,
@@ -245,20 +168,77 @@ void DuckLakeInsert::ConfigureDistributedCTAS(ClientContext &context, PhysicalCo
 	distributed_data_path = worker_copy.file_path;
 	distributed_artifact_path = CreateDuckLakeDistributedArtifactPath(context, distributed_data_path);
 	worker_copy.file_path = distributed_artifact_path;
-	distributed_field_identity = GetDistributedFieldIdentity(*field_data);
-	distributed_partition_identity = GetDistributedPartitionIdentity(partition_data.get());
+	distributed_field_identity = GetDuckLakeDistributedFieldIdentity(*field_data);
+	distributed_partition_identity = GetDuckLakeDistributedPartitionIdentity(partition_data.get());
 	distributed_snapshot = transaction.GetSnapshot();
 	distributed_schema_id = ducklake_schema.GetSchemaId();
 	distributed_ctas_field_data = std::move(field_data);
 	distributed_ctas_partition = std::move(partition_data);
 	distributed_worker_child = &worker_copy;
-	distributed_partition_names = GetDistributedPartitionNames(worker_copy);
+	distributed_partition_names = GetDuckLakeDistributedPartitionNames(worker_copy);
+}
+
+void DuckLakeInsert::ConfigureDistributedUpdate(ClientContext &context, PhysicalCopyToFile &worker_copy,
+                                                PhysicalOperator &worker_input, DuckLakeDelete &delete_op) {
+	if (!table) {
+		throw InternalException("DuckLake distributed UPDATE is missing its target table");
+	}
+	distributed_write_plan.operator_name = "update";
+	InitializeDistributedWriteTarget(context, *table);
+	distributed_artifact_path = CreateDuckLakeDistributedArtifactPath(context, distributed_data_path);
+	distributed_worker_child = &worker_input;
+	distributed_update_copy = &worker_copy;
+	distributed_update_delete = &delete_op;
+	distributed_partition_names = GetDuckLakeDistributedPartitionNames(worker_copy);
+	distributed_update_source_is_statically_empty = delete_op.distributed_source_is_statically_empty;
+	if (delete_op.distributed_has_source_scan &&
+	    !DuckLakeDistributedSnapshotsMatch(delete_op.distributed_source_snapshot, distributed_snapshot)) {
+		throw TransactionException("DuckLake UPDATE source snapshot does not match its target snapshot");
+	}
+	auto copy_column_count = worker_copy.expected_types.size();
+	if (worker_input.types.size() != copy_column_count + 2 ||
+	    worker_input.types[copy_column_count] != LogicalType::VARCHAR ||
+	    worker_input.types[copy_column_count + 1] != LogicalType::BIGINT) {
+		throw InternalException("DuckLake distributed UPDATE worker projection has an invalid output shape");
+	}
+	for (idx_t index = 0; index < copy_column_count; index++) {
+		if (worker_input.types[index] != worker_copy.expected_types[index]) {
+			throw InternalException(
+			    "DuckLake distributed UPDATE worker projection does not match its COPY input types");
+		}
+	}
+	if (delete_op.distributed_source_prepared && encryption_key.empty()) {
+		distributed_write_plan.worker_bind_data = BuildDuckLakeDistributedUpdateBind(
+		    context, *table, delete_op.distributed_source_files, worker_copy, copy_column_count, copy_column_count,
+		    copy_column_count + 1, distributed_artifact_path, distributed_update_source_is_statically_empty);
+	}
 }
 
 void DuckLakeInsert::ValidateDistributedWriteShape() const {
-	if (distributed_write_plan.extension_name != "ducklake" || distributed_write_plan.worker_bind_data.size() != 0 ||
-	    !distributed_worker_child || !distributed_worker_plan_selected || children.size() != 1) {
+	if (distributed_write_plan.extension_name != "ducklake" || !distributed_worker_child ||
+	    !distributed_worker_plan_selected || children.size() != 1) {
 		throw InvalidInputException("DuckLake distributed write worker plan was not initialized");
+	}
+	if (distributed_write_plan.operator_name == "update") {
+		if (!distributed_target_initialized || !table || schema || info || !distributed_schema_id.IsValid() ||
+		    !distributed_table_id.IsValid() || distributed_write_plan.worker_bind_data.empty() ||
+		    !distributed_update_copy || !distributed_update_delete || distributed_artifact_path.empty()) {
+			throw InvalidInputException("DuckLake distributed UPDATE worker plan was not initialized");
+		}
+		ValidateDuckLakeDistributedUpdateCopyShape(*distributed_update_copy);
+		if (distributed_update_source_is_statically_empty) {
+			if (distributed_update_delete->distributed_has_source_scan ||
+			    !distributed_update_delete->distributed_source_files.empty()) {
+				throw InvalidInputException("DuckLake distributed UPDATE has invalid statically-empty source state");
+			}
+		} else if (!distributed_update_delete->distributed_has_source_scan ||
+		           distributed_update_delete->distributed_source_files.empty()) {
+			throw InvalidInputException("DuckLake distributed UPDATE is missing its planned source scan");
+		}
+		return;
+	}
+	if (!distributed_write_plan.worker_bind_data.empty()) {
+		throw InvalidInputException("DuckLake distributed file write unexpectedly contains worker bind data");
 	}
 	if (distributed_worker_child->type != PhysicalOperatorType::COPY_TO_FILE) {
 		throw InvalidInputException(
@@ -283,18 +263,6 @@ void DuckLakeInsert::ValidateDistributedWriteShape() const {
 	throw InvalidInputException("DuckLake distributed write has an invalid operation name");
 }
 
-static void ValidateDistributedSnapshotBaseline(DuckLakeTransaction &transaction,
-                                                const DuckLakeSnapshot &expected_snapshot, const string &operation) {
-	auto transaction_snapshot = transaction.GetSnapshot();
-	if (!DistributedSnapshotsMatch(transaction_snapshot, expected_snapshot)) {
-		throw TransactionException("DuckLake %s snapshot changed after the distributed write was planned", operation);
-	}
-	auto latest_snapshot = transaction.GetMetadataManager().GetSnapshot();
-	if (!latest_snapshot || !DistributedSnapshotsMatch(*latest_snapshot, expected_snapshot)) {
-		throw TransactionException("DuckLake %s snapshot is stale", operation);
-	}
-}
-
 DuckLakeSchemaEntry &DuckLakeInsert::ResolveDistributedWriteSchema(ClientContext &context) const {
 	auto &catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<DuckLakeCatalog>();
 	auto &resolved_schema = catalog.GetSchema(context, distributed_schema_name).Cast<DuckLakeSchemaEntry>();
@@ -308,7 +276,7 @@ DuckLakeSchemaEntry &DuckLakeInsert::ResolveDistributedWriteSchema(ClientContext
 
 DuckLakeTableEntry &DuckLakeInsert::ResolveDistributedWriteTable(ClientContext &context) const {
 	ValidateDistributedWriteShape();
-	if (distributed_write_plan.operator_name != "insert") {
+	if (distributed_write_plan.operator_name != "insert" && distributed_write_plan.operator_name != "update") {
 		throw InternalException("DuckLake distributed CTAS target is created during coordinator finalization");
 	}
 	auto &resolved_schema = ResolveDistributedWriteSchema(context);
@@ -324,7 +292,8 @@ DuckLakeTableEntry &DuckLakeInsert::ResolveDistributedWriteTable(ClientContext &
 		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
 	}
 	if (resolved_table.IsTransactionLocal() || transaction.HasAnyLocalChanges(resolved_table.GetTableId())) {
-		throw NotImplementedException("Distributed DuckLake INSERT does not support transaction-local table state");
+		throw NotImplementedException("Distributed DuckLake %s does not support transaction-local table state",
+		                              distributed_write_plan.operator_name == "update" ? "UPDATE" : "INSERT");
 	}
 	auto &file_system = FileSystem::GetFileSystem(context);
 	auto current_data_path = distributed::CanonicalDistributedCopyBasePath(file_system, resolved_table.DataPath());
@@ -334,17 +303,35 @@ DuckLakeTableEntry &DuckLakeInsert::ResolveDistributedWriteTable(ClientContext &
 		throw TransactionException("DuckLake table %s.%s.%s data path changed after the distributed write was planned",
 		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
 	}
-	if (GetDistributedFieldIdentity(resolved_table.GetFieldData()) != distributed_field_identity ||
-	    GetDistributedPartitionIdentity(resolved_table.GetPartitionData().get()) != distributed_partition_identity ||
-	    GetDistributedSortIdentity(resolved_table.GetSortData().get()) != distributed_sort_identity) {
+	if (GetDuckLakeDistributedFieldIdentity(resolved_table.GetFieldData()) != distributed_field_identity ||
+	    GetDuckLakeDistributedPartitionIdentity(resolved_table.GetPartitionData().get()) !=
+	        distributed_partition_identity ||
+	    GetDuckLakeDistributedSortIdentity(resolved_table.GetSortData().get()) != distributed_sort_identity) {
 		throw TransactionException("DuckLake table %s.%s.%s layout changed after the distributed write was planned",
 		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
 	}
-	ValidateDistributedSnapshotBaseline(transaction, distributed_snapshot, "INSERT");
+	ValidateDuckLakeDistributedSnapshotBaseline(context, distributed_catalog_name, distributed_snapshot,
+	                                            distributed_write_plan.operator_name == "update" ? "UPDATE" : "INSERT");
 	return resolved_table;
 }
 
 optional_ptr<distributed::ExtensionWriteTaskProvider> DuckLakeInsert::GetExtensionWriteTaskProvider() {
+	if (distributed_write_plan.operator_name == "update") {
+		if (!distributed_update_copy || !distributed_update_delete || !table) {
+			throw InvalidInputException("DuckLake distributed UPDATE is missing its planning state");
+		}
+		if (!distributed_update_delete->distributed_source_prepared) {
+			throw NotImplementedException(
+			    "Distributed DuckLake UPDATE supports committed file-backed source data only");
+		}
+		if (!encryption_key.empty()) {
+			throw NotImplementedException("Distributed DuckLake UPDATE does not support encrypted tables");
+		}
+		if (distributed_write_plan.worker_bind_data.empty()) {
+			throw InvalidInputException("DuckLake distributed UPDATE is missing its frozen worker bind");
+		}
+		ValidateDuckLakeDistributedUpdateCopyShape(*distributed_update_copy);
+	}
 	SelectDistributedWorkerPlan();
 	return this;
 }
@@ -397,6 +384,12 @@ void DuckLakeInsert::ValidateDistributedWrite(ClientContext &context) const {
 		ResolveDistributedWriteTable(context);
 		return;
 	}
+	if (distributed_write_plan.operator_name == "update") {
+		auto &target_table = ResolveDistributedWriteTable(context);
+		distributed_update_delete->ValidateDistributedSourceBaseline(context, target_table, "UPDATE",
+		                                                             distributed_write_plan.worker_bind_data);
+		return;
+	}
 	auto &file_system = FileSystem::GetFileSystem(context);
 	auto target_data_path = distributed::CanonicalDistributedCopyBasePath(file_system, table_data_path);
 	auto planned_data_path = distributed::CanonicalDistributedCopyBasePath(file_system, distributed_data_path);
@@ -404,7 +397,7 @@ void DuckLakeInsert::ValidateDistributedWrite(ClientContext &context) const {
 	    target_data_path.value() != planned_data_path.value()) {
 		throw TransactionException("DuckLake CTAS data path changed after the distributed write was planned");
 	}
-	ValidateDistributedSnapshotBaseline(transaction, distributed_snapshot, "CTAS");
+	ValidateDuckLakeDistributedSnapshotBaseline(context, distributed_catalog_name, distributed_snapshot, "CTAS");
 	ResolveDistributedWriteSchema(context);
 	if (info->Base().on_conflict != OnCreateConflict::ERROR_ON_CONFLICT) {
 		throw NotImplementedException("Distributed DuckLake CTAS does not support IF NOT EXISTS or OR REPLACE");
@@ -417,8 +410,8 @@ void DuckLakeInsert::ValidateDistributedWrite(ClientContext &context) const {
 		throw CatalogException("Table with name \"%s\" already exists", distributed_table_name);
 	}
 	auto current_field_data = DuckLakeFieldData::FromColumns(info->Base().columns);
-	if (GetDistributedFieldIdentity(*current_field_data) != distributed_field_identity ||
-	    GetDistributedPartitionIdentity(distributed_ctas_partition.get()) != distributed_partition_identity) {
+	if (GetDuckLakeDistributedFieldIdentity(*current_field_data) != distributed_field_identity ||
+	    GetDuckLakeDistributedPartitionIdentity(distributed_ctas_partition.get()) != distributed_partition_identity) {
 		throw InvalidInputException("DuckLake distributed CTAS definition changed after planning");
 	}
 }
@@ -427,7 +420,7 @@ DuckLakeTableEntry &DuckLakeInsert::CreateDistributedCTASTable(ClientContext &co
 	auto &resolved_schema = ResolveDistributedWriteSchema(context);
 	auto &catalog = resolved_schema.ParentCatalog().Cast<DuckLakeCatalog>();
 	auto &transaction = DuckLakeTransaction::Get(context, catalog);
-	ValidateDistributedSnapshotBaseline(transaction, distributed_snapshot, "CTAS");
+	ValidateDuckLakeDistributedSnapshotBaseline(context, distributed_catalog_name, distributed_snapshot, "CTAS");
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto created_entry =
 	    resolved_schema.CreateTableExtended(catalog_transaction, *info, distributed_table_uuid, table_data_path);
@@ -436,7 +429,7 @@ DuckLakeTableEntry &DuckLakeInsert::CreateDistributedCTASTable(ClientContext &co
 	}
 	auto table_entry = &created_entry->Cast<DuckLakeTableEntry>();
 	if (table_entry->GetTableUUID() != distributed_table_uuid || table_entry->DataPath() != table_data_path ||
-	    GetDistributedFieldIdentity(table_entry->GetFieldData()) != distributed_field_identity) {
+	    GetDuckLakeDistributedFieldIdentity(table_entry->GetFieldData()) != distributed_field_identity) {
 		throw TransactionException("DuckLake distributed CTAS target does not match its planned table identity");
 	}
 	if (distributed_ctas_partition) {
@@ -455,6 +448,81 @@ DuckLakeTableEntry &DuckLakeInsert::CreateDistributedCTASTable(ClientContext &co
 idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
                                                const vector<DistributedWriteTaskResult> &results) const {
 	ValidateDistributedWriteShape();
+	if (distributed_write_plan.operator_name == "update") {
+		bool ownership_transferred = false;
+		try {
+			auto &target_table = ResolveDistributedWriteTable(context);
+			distributed_update_delete->ValidateDistributedSourceBaseline(context, target_table, "UPDATE",
+			                                                             distributed_write_plan.worker_bind_data);
+			auto &catalog = target_table.catalog.Cast<DuckLakeCatalog>();
+			auto &schema = target_table.ParentSchema().Cast<DuckLakeSchemaEntry>();
+			auto use_deletion_vectors = catalog.WriteDeletionVectors(schema.GetSchemaId(), target_table.GetTableId());
+			auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
+			auto decoded = DecodeDuckLakeDistributedRowDeltaResults(
+			    context, distributed_data_path, distributed_artifact_path, write_info, results,
+			    DuckLakeDistributedRowDeltaKind::UPDATE, use_deletion_vectors);
+			CleanupDuckLakeDistributedRowDelta(context, distributed_data_path, distributed_artifact_path,
+			                                   &decoded.selected_artifact_paths);
+			if (decoded.affected_rows == 0) {
+				if (!decoded.data_files.empty() || !decoded.delete_files.empty()) {
+					throw InvalidInputException(
+					    "DuckLake distributed UPDATE returned artifacts for zero affected rows");
+				}
+				CleanupDuckLakeDistributedRowDelta(context, distributed_data_path, distributed_artifact_path);
+				return 0;
+			}
+			if (decoded.data_files.size() != decoded.data_file_artifact_roots.size()) {
+				throw InvalidInputException("DuckLake distributed UPDATE returned incomplete data-file ownership");
+			}
+			for (idx_t index = 0; index < decoded.data_files.size(); index++) {
+				vector<distributed::DistributedCopyFileInfo> one_file;
+				one_file.push_back(std::move(decoded.data_files[index]));
+				ValidateDuckLakeDistributedDataFileArtifactsInRoot(
+				    context, decoded.data_file_artifact_roots[index], target_table.GetFieldData(),
+				    target_table.GetNotNullFields(), distributed_partition_names, one_file, true);
+				decoded.data_files[index] = std::move(one_file[0]);
+			}
+			auto delete_files = BuildDuckLakeDistributedDeleteFiles(
+			    context, distributed_update_delete->distributed_source_files, distributed_write_plan.worker_bind_data,
+			    decoded.delete_files, "UPDATE");
+			DuckLakeInsertGlobalState insert_state(target_table);
+			AddDistributedDataFiles(context, insert_state, decoded.data_files, partition_id);
+			idx_t data_row_count = 0;
+			for (const auto &file : insert_state.written_files) {
+				if (file.row_count > NumericLimits<idx_t>::Maximum() - data_row_count) {
+					throw InvalidInputException("DuckLake distributed UPDATE data row count overflow");
+				}
+				data_row_count += file.row_count;
+			}
+			idx_t delete_row_count = 0;
+			for (const auto &file : decoded.delete_files) {
+				if (file.new_delete_count > NumericLimits<idx_t>::Maximum() - delete_row_count) {
+					throw InvalidInputException("DuckLake distributed UPDATE delete row count overflow");
+				}
+				delete_row_count += file.new_delete_count;
+			}
+			if (data_row_count != decoded.affected_rows || delete_row_count != decoded.affected_rows ||
+			    insert_state.written_files.empty() || delete_files.empty()) {
+				throw InvalidInputException("DuckLake distributed UPDATE produced inconsistent mutation artifacts");
+			}
+			auto &transaction = DuckLakeTransaction::Get(context, catalog);
+			transaction.FailDistributedWriteOnSnapshotConflict();
+			transaction.RegisterDistributedArtifact(target_table.GetTableId(), distributed_data_path,
+			                                        distributed_artifact_path);
+			ownership_transferred = true;
+			transaction.AppendFiles(target_table.GetTableId(), std::move(insert_state.written_files));
+			transaction.AddDeletes(target_table.GetTableId(), std::move(delete_files));
+			return decoded.affected_rows;
+		} catch (...) {
+			if (!ownership_transferred) {
+				try {
+					CleanupDuckLakeDistributedRowDelta(context, distributed_data_path, distributed_artifact_path);
+				} catch (...) {
+				}
+			}
+			throw;
+		}
+	}
 	auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
 	try {
 		auto files = distributed::DecodeDistributedFileWriteResults(write_info, results);

@@ -23,6 +23,9 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#include "storage/ducklake_distributed_write.hpp"
+#endif
 
 namespace duckdb {
 
@@ -231,8 +234,13 @@ DuckLakeUpdate &DuckLakeUpdate::PlanUpdateOperator(ClientContext &context, Physi
 	for (idx_t i = 0; i < DuckLakeUpdate::DELETION_INFO_SIZE; i++) {
 		row_id_indexes.push_back(i);
 	}
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	auto &delete_op = DuckLakeDelete::PlanDeleteInternal(context, planner, table, child_plan, std::move(row_id_indexes),
+	                                                     copy_input.encryption_key, false, false);
+#else
 	auto &delete_op = DuckLakeDelete::PlanDelete(context, planner, table, child_plan, std::move(row_id_indexes),
 	                                             copy_input.encryption_key, false);
+#endif
 
 	// build update expressions (physical columns only, no partition cols, no casts)
 	vector<unique_ptr<Expression>> expressions;
@@ -257,6 +265,38 @@ DuckLakeUpdate &DuckLakeUpdate::PlanUpdateOperator(ClientContext &context, Physi
 	return update_op;
 }
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+static PhysicalOperator &PreserveDistributedUpdateRowIdentifiers(PhysicalPlanGenerator &planner,
+                                                                 PhysicalOperator &original, PhysicalOperator &source) {
+	if (&original == &source) {
+		return source;
+	}
+	if (original.type != PhysicalOperatorType::PROJECTION || original.children.size() != 1) {
+		throw NotImplementedException(
+		    "DuckLake distributed UPDATE only supports projection transforms before its COPY writer");
+	}
+	auto &projection = original.Cast<PhysicalProjection>();
+	auto &child = PreserveDistributedUpdateRowIdentifiers(planner, original.children[0], source);
+	if (child.types.size() < 2 || child.types[child.types.size() - 2] != LogicalType::VARCHAR ||
+	    child.types.back() != LogicalType::BIGINT) {
+		throw InternalException("DuckLake distributed UPDATE lost its row identifiers during planning");
+	}
+	vector<unique_ptr<Expression>> expressions;
+	for (const auto &expression : projection.select_list) {
+		expressions.push_back(expression->Copy());
+	}
+	auto types = projection.types;
+	types.push_back(LogicalType::VARCHAR);
+	expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, child.types.size() - 2));
+	types.push_back(LogicalType::BIGINT);
+	expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, child.types.size() - 1));
+	auto &result =
+	    planner.Make<PhysicalProjection>(std::move(types), std::move(expressions), projection.estimated_cardinality);
+	result.children.push_back(child);
+	return result;
+}
+#endif
+
 PhysicalOperator &DuckLakeCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                               PhysicalOperator &child_plan) {
 	if (op.return_chunk) {
@@ -267,6 +307,29 @@ PhysicalOperator &DuckLakeCatalog::PlanUpdate(ClientContext &context, PhysicalPl
 	DuckLakeCopyInput copy_input(context, table);
 	copy_input.virtual_columns = InsertVirtualColumns::WRITE_ROW_ID;
 	auto &update_op = DuckLakeUpdate::PlanUpdateOperator(context, planner, op, child_plan, copy_input);
+
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	vector<unique_ptr<Expression>> distributed_expressions;
+	vector<LogicalType> distributed_types;
+	for (const auto &expression : update_op.expressions) {
+		distributed_types.push_back(expression->return_type);
+		distributed_expressions.push_back(expression->Copy());
+	}
+	distributed_types.push_back(LogicalType::BIGINT);
+	distributed_expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, update_op.row_id_index));
+	auto deletion_info_start = child_plan.types.size() - DuckLakeUpdate::DELETION_INFO_SIZE;
+	distributed_types.push_back(LogicalType::VARCHAR);
+	distributed_expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, deletion_info_start));
+	distributed_types.push_back(LogicalType::BIGINT);
+	distributed_expressions.push_back(
+	    make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, deletion_info_start + 2));
+	auto &distributed_update =
+	    planner
+	        .Make<PhysicalProjection>(std::move(distributed_types), std::move(distributed_expressions),
+	                                  child_plan.estimated_cardinality)
+	        .Cast<PhysicalProjection>();
+	distributed_update.children.push_back(child_plan);
+#endif
 
 	// follow the insert path for inlining
 	optional_ptr<PhysicalOperator> plan = &update_op;
@@ -279,7 +342,27 @@ PhysicalOperator &DuckLakeCatalog::PlanUpdate(ClientContext &context, PhysicalPl
 	}
 
 	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
+
 	auto &insert_op = DuckLakeInsert::PlanInsert(context, planner, table, std::move(copy_input.encryption_key));
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	DuckLakeCopyInput distributed_copy_input(context, table);
+	distributed_copy_input.virtual_columns = InsertVirtualColumns::WRITE_ROW_ID;
+	auto &distributed_copy =
+	    DuckLakeInsert::PlanCopyForInsert(context, planner, distributed_copy_input, &distributed_update)
+	        .Cast<PhysicalCopyToFile>();
+	if (distributed_copy.children.size() != 1) {
+		throw InternalException("DuckLake distributed UPDATE COPY is missing its planned input");
+	}
+	auto &worker_input =
+	    PreserveDistributedUpdateRowIdentifiers(planner, distributed_copy.children[0], distributed_update);
+	if (worker_input.types.size() < 2) {
+		throw InternalException("DuckLake distributed UPDATE worker input is missing row identifiers");
+	}
+	auto &distributed_repartition =
+	    PlanDuckLakeDistributedRowDeltaRepartition(planner, worker_input, worker_input.types.size() - 2);
+	insert_op.Cast<DuckLakeInsert>().ConfigureDistributedUpdate(context, distributed_copy, distributed_repartition,
+	                                                            update_op.delete_op.Cast<DuckLakeDelete>());
+#endif
 	if (inline_data) {
 		inline_data->insert = insert_op.Cast<DuckLakeInsert>();
 	}
