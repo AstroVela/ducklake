@@ -54,3 +54,34 @@ SELECT id, category FROM lake.partitioned ORDER BY id
 ----
 1	A
 2	B
+
+statement ok
+CREATE TABLE lake.merge_target(id INTEGER, payload VARCHAR)
+
+statement ok
+INSERT INTO lake.merge_target VALUES (1, 'old'), (2, 'delete')
+
+query I
+MERGE INTO lake.merge_target AS target
+USING (VALUES (1, 'updated'), (3, 'inserted')) AS source(id, payload)
+ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET payload = source.payload
+WHEN NOT MATCHED THEN INSERT VALUES (source.id, source.payload)
+----
+2
+
+query I
+MERGE INTO lake.merge_target AS target
+USING (VALUES (2, 'unused'), (4, 'four')) AS source(id, payload)
+ON target.id = source.id
+WHEN MATCHED THEN DELETE
+WHEN NOT MATCHED THEN INSERT VALUES (source.id, source.payload)
+----
+2
+
+query II
+SELECT id, payload FROM lake.merge_target ORDER BY id
+----
+1	updated
+3	inserted
+4	four

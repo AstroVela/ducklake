@@ -19,6 +19,7 @@ namespace duckdb {
 class ClientContext;
 class ColumnList;
 class DuckLakeFieldData;
+class DuckLakeInsertGlobalState;
 class DuckLakeTableEntry;
 class ExtensionLoader;
 class FileSystem;
@@ -31,7 +32,7 @@ struct DuckLakeSnapshot;
 struct DuckLakeSort;
 class ParsedExpression;
 
-enum class DuckLakeDistributedRowDeltaKind : uint8_t { DELETE = 0, UPDATE = 1 };
+enum class DuckLakeDistributedRowDeltaKind : uint8_t { DELETE = 0, UPDATE = 1, MERGE_INSERT = 2 };
 
 struct DuckLakeDistributedDeleteFileResult {
 	string data_file_path;
@@ -66,7 +67,7 @@ string GetDuckLakeDistributedPartitionIdentity(const DuckLakePartition *partitio
 string GetDuckLakeDistributedSortIdentity(const DuckLakeSort *sort_data);
 bool DuckLakeDistributedSnapshotsMatch(const DuckLakeSnapshot &left, const DuckLakeSnapshot &right);
 vector<string> GetDuckLakeDistributedPartitionNames(const PhysicalCopyToFile &copy);
-void ValidateDuckLakeDistributedUpdateCopyShape(const PhysicalCopyToFile &copy);
+void ValidateDuckLakeDistributedRowDeltaCopyShape(const PhysicalCopyToFile &copy);
 void ValidateDuckLakeDistributedSnapshotBaseline(ClientContext &context, const string &catalog_name,
                                                  const DuckLakeSnapshot &expected_snapshot,
                                                  const string &operation_name);
@@ -107,6 +108,14 @@ string BuildDuckLakeDistributedUpdateBind(ClientContext &context, const DuckLake
                                           const PhysicalCopyToFile &copy, idx_t copy_column_count,
                                           idx_t file_path_index, idx_t row_position_index, const string &artifact_path,
                                           bool source_is_statically_empty);
+
+string BuildDuckLakeDistributedMergeInsertBind(ClientContext &context, const DuckLakeTableEntry &table,
+                                               const PhysicalCopyToFile &copy, idx_t copy_column_count,
+                                               const string &artifact_path);
+
+void AddDuckLakeDistributedDataFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state,
+                                     const vector<distributed::DistributedCopyFileInfo> &files,
+                                     optional_idx partition_id);
 
 DistributedExtensionWriteCallbacks DuckLakeDistributedRowDeltaCallbacks();
 

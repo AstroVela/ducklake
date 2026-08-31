@@ -291,11 +291,12 @@ def worker_connection(vane: object) -> object:
     return connection
 
 
-def require_error(call: object, message: str, description: str) -> None:
+def require_error(call: object, message: str | tuple[str, ...], description: str) -> None:
     try:
         call()
     except Exception as error:
-        if message.lower() not in str(error).lower():
+        messages = (message,) if isinstance(message, str) else message
+        if not any(expected.lower() in str(error).lower() for expected in messages):
             raise AssertionError(f"{description}: unexpected error: {error}") from error
         return
     raise AssertionError(f"{description}: expected an error")
@@ -430,6 +431,15 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.mutation_legacy_mapping(old_id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.mutation_duplicate_delete(id INTEGER)")
         connection.execute("ALTER TABLE lake.mutation_partitioned SET PARTITIONED BY (category)")
+        connection.execute("CREATE TABLE lake.merge_update_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.merge_delete_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.merge_partitioned_target(id INTEGER, category VARCHAR, payload VARCHAR)")
+        connection.execute("ALTER TABLE lake.merge_partitioned_target SET PARTITIONED BY (category)")
+        connection.execute("CREATE TABLE lake.merge_noop_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.merge_by_source_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.merge_retry_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.merge_failure_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.merge_conflict_target(id INTEGER, payload VARCHAR)")
         for file_index in range(FILE_COUNT):
             start = file_index * ROWS_PER_FILE
             stop = start + ROWS_PER_FILE
@@ -452,9 +462,38 @@ def seed_tables(connection: object, root: Path) -> None:
                 "('partitioned-' || i::VARCHAR)::VARCHAR "
                 f"FROM range({start}, {stop}) AS rows(i)"
             )
+            connection.execute(
+                "INSERT INTO lake.merge_update_target "
+                "SELECT i::INTEGER, ('merge-old-' || i::VARCHAR)::VARCHAR "
+                f"FROM range({start}, {stop}) AS rows(i)"
+            )
+            connection.execute(
+                "INSERT INTO lake.merge_failure_target "
+                "SELECT i::INTEGER, ('failure-old-' || i::VARCHAR)::VARCHAR "
+                f"FROM range({start + 512}, {stop + 512}) AS rows(i)"
+            )
+            connection.execute(
+                "INSERT INTO lake.merge_conflict_target "
+                "SELECT i::INTEGER, ('conflict-old-' || i::VARCHAR)::VARCHAR "
+                f"FROM range({start + 100}, {stop + 100}) AS rows(i)"
+            )
+        for file_index in range(4):
+            start = 768 + file_index * 96
+            stop = start + 96
+            connection.execute(
+                "INSERT INTO lake.merge_delete_target "
+                "SELECT i::INTEGER, ('delete-old-' || i::VARCHAR)::VARCHAR "
+                f"FROM range({start}, {stop}) AS rows(i)"
+            )
+        connection.execute(
+            "INSERT INTO lake.merge_partitioned_target "
+            "SELECT i::INTEGER, ('category-' || (i % 4)::VARCHAR)::VARCHAR, "
+            "('partition-old-' || i::VARCHAR)::VARCHAR FROM range(1280, 1664) AS rows(i)"
+        )
         connection.execute("DELETE FROM lake.source WHERE id = 17")
         connection.execute("DELETE FROM lake.mutation_unpartitioned WHERE id = 17")
         connection.execute("DELETE FROM lake.mutation_partitioned WHERE id = 18")
+        connection.execute("DELETE FROM lake.merge_update_target WHERE id = 18")
         connection.execute("INSERT INTO lake.mutation_legacy_mapping VALUES (42, 'legacy'), (43, 'delete-me')")
         connection.execute("ALTER TABLE lake.mutation_legacy_mapping RENAME COLUMN old_id TO id")
         connection.execute(
@@ -483,6 +522,8 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("INSERT INTO lake.stale_source VALUES (1, 'old')")
         connection.execute("INSERT INTO lake.schema_source VALUES (1, 'old')")
         connection.execute("INSERT INTO lake.concurrent_write_target VALUES (-1, 'seed')")
+        connection.execute("INSERT INTO lake.merge_noop_target VALUES (1, 'noop-old'), (2, 'noop-keep')")
+        connection.execute("INSERT INTO lake.merge_by_source_target VALUES (10, 'remove'), (11, 'keep')")
     finally:
         if configured_runner is None:
             os.environ.pop("VANE_RUNNER", None)
@@ -543,9 +584,13 @@ def require_concurrent_write_conflict(
     runner: object,
     root: Path,
     require_write_count: Callable[[int, str], None],
+    operation: Callable[[object], None],
+    conflict_sql: str,
+    description: str,
 ) -> None:
     CONFLICT_STARTED_PATH.unlink(missing_ok=True)
     CONFLICT_RELEASE_PATH.unlink(missing_ok=True)
+    directories_before_write = distributed_artifact_directories(root)
     errors = []
     source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 100 AND 700").map_batches(
         WaitForCoordinatorConflict,
@@ -562,7 +607,7 @@ def require_concurrent_write_conflict(
 
     def execute_write() -> None:
         try:
-            source.insert_into("lake.concurrent_write_target")
+            operation(source)
         except BaseException as error:
             errors.append(error)
 
@@ -593,7 +638,7 @@ def require_concurrent_write_conflict(
             f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
             f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0, BUSY_TIMEOUT 30000)"
         )
-        conflict_connection.execute("INSERT INTO lake.concurrent_write_target VALUES (-2, 'concurrent')")
+        conflict_connection.execute(conflict_sql)
         files_after_conflict_commit = set((root / "data").rglob("*.parquet"))
     except BaseException as error:
         coordination_error = error
@@ -609,16 +654,21 @@ def require_concurrent_write_conflict(
         raise AssertionError("distributed DuckLake conflict write did not stop")
     if coordination_error is not None:
         raise coordination_error
-    require_write_count(1, "concurrent conflict Ray dispatch count")
-    require_equal(len(errors), 1, "concurrent conflict failure count")
+    require_write_count(1, f"{description} Ray dispatch count")
+    require_equal(len(errors), 1, f"{description} failure count")
     require_true(
         "snapshot" in str(errors[0]).lower(),
-        f"unexpected concurrent conflict error: {errors[0]}",
+        f"unexpected {description} error: {errors[0]}",
     )
     require_equal(
         set((root / "data").rglob("*.parquet")),
         files_after_conflict_commit,
-        "concurrent conflict artifact cleanup",
+        f"{description} artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_write,
+        f"{description} artifact-root cleanup",
     )
 
 
@@ -637,7 +687,6 @@ def run_mutated_worker_write(
     fragment_executor = _InProcessFragmentExecutor()
     mutated_file_count = 0
     loser_artifacts: set[Path] = set()
-    existing_artifact_roots = distributed_artifact_directories(artifact_data_root) if artifact_data_root else set()
 
     def execute_with_mutated_result(request: object) -> object:
         nonlocal mutated_file_count
@@ -665,45 +714,42 @@ def run_mutated_worker_write(
             result.task_stats,
         )
 
-    class SelectedAttemptTask:
-        def __init__(self, task: object) -> None:
-            self.task = task
-
-        def context(self) -> dict[str, object]:
-            result = dict(self.task.context())
-            result["attempt_id"] = selected_attempt_id
-            return result
-
-        def task_context(self) -> object:
-            return self.task.task_context()
-
-        def Inputs(self) -> object:
-            return self.task.Inputs()
-
-        def plan(self) -> object:
-            return self.task.plan()
-
-        def exchange_sink_config(self) -> object:
-            return self.task.exchange_sink_config()
-
-        def name(self) -> str:
-            return str(self.task.name())
-
     class SelectedAttemptBackend(NativeFteWorkerManagerBackend):
-        def submit_tasks(self, tasks: object) -> object:
-            return super().submit_tasks([SelectedAttemptTask(task) for task in tasks])
+        @staticmethod
+        def _request_from_task(task: object) -> dict[str, object]:
+            request = NativeFteWorkerManagerBackend._request_from_task(task)
+            if request.get("exchange_sink_instance") is not None:
+                return request
+            task_id = dict(request.get("task_id") or {})
+            if not task_id:
+                raise AssertionError("selected retry task is missing its identity")
+            task_id["attempt_id"] = selected_attempt_id
+            request["task_id"] = task_id
+            for key in ("context", "task_context", "task_context_info"):
+                value = request.get(key)
+                if not isinstance(value, dict):
+                    continue
+                updated = dict(value)
+                if "attempt_id" in updated or key == "context":
+                    updated["attempt_id"] = selected_attempt_id
+                request[key] = updated
+            return request
 
     def execute_selected_attempt(request: object) -> object:
         result = fragment_executor(request)
         if artifact_data_root is None:
             return result
-        for artifact_root in distributed_artifact_directories(artifact_data_root) - existing_artifact_roots:
+        task_id = dict(request).get("task_id")
+        query_id = str(dict(task_id or {}).get("query_id") or "")
+        for artifact_root in distributed_artifact_directories(artifact_data_root):
             for attempt_root in artifact_root.iterdir():
                 if not attempt_root.is_dir():
                     continue
                 try:
                     attempt_id = bytes.fromhex(attempt_root.name).decode()
                 except (UnicodeDecodeError, ValueError):
+                    continue
+                if not query_id or not attempt_id.startswith(f"{query_id}."):
                     continue
                 if not attempt_id.endswith(f".{selected_attempt_id}"):
                     continue
@@ -726,11 +772,12 @@ def run_mutated_worker_write(
         outcome = plan_runner.run_copy_plan(plan, connection)
         if selected_attempt_id != 0:
             mutated_file_count = int(outcome.get("extension_artifact_count") or 0)
-            require_true(bool(loser_artifacts), "selected retry did not create an unselected attempt artifact")
-            require_true(
-                all(not artifact.exists() for artifact in loser_artifacts),
-                "selected retry retained an unselected attempt artifact",
-            )
+            if artifact_data_root is not None:
+                require_true(bool(loser_artifacts), "selected retry did not create an unselected attempt artifact")
+                require_true(
+                    all(not artifact.exists() for artifact in loser_artifacts),
+                    "selected retry retained an unselected attempt artifact",
+                )
     finally:
         cleanup_errors = []
         for cleanup in (
@@ -1252,7 +1299,7 @@ def exercise_distributed_mutations(
             {"id": "CASE WHEN id < 256 THEN id ELSE payload::INTEGER END"},
             "id BETWEEN 200 AND 400",
         ),
-        "no selected task results",
+        ("could not convert string", "no selected task results"),
         "distributed DuckLake UPDATE partial worker failure",
     )
     require_write_count(1, "failed UPDATE Ray dispatch count")
@@ -1373,6 +1420,329 @@ def exercise_distributed_mutations(
         native_partitioned,
         "Vane and native partitioned mutation readback",
     )
+
+
+def exercise_distributed_merges(
+    vane: object,
+    connection: object,
+    runner: object,
+    root: Path,
+    expected_worker_nodes: set[str],
+    require_write: Callable[[str, Callable[[], object]], None],
+    require_write_count: Callable[[int, str], None],
+) -> None:
+    require_equal(len(expected_worker_nodes), WORKER_COUNT, "MERGE Ray cluster topology")
+    update_clauses = [
+        "WHEN MATCHED THEN UPDATE SET payload = source.payload",
+        "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+    ]
+
+    require_equal(
+        connection.execute(
+            "SELECT count(*) FROM ducklake_list_files('lake', 'merge_update_target') " "WHERE delete_file IS NOT NULL"
+        ).fetchone(),
+        (1,),
+        "MERGE target existing delete state",
+    )
+
+    def update_source() -> object:
+        return connection.sql("SELECT id, payload FROM lake.source WHERE id < 640")
+
+    update_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: update_source().merge_into(
+            "lake.merge_update_target",
+            "target.id = source.id",
+            update_clauses,
+        ),
+    )
+    require_true(
+        sum(len(batches) for batches in update_plan.scan_split_batch_map().values()) > 1,
+        "distributed MERGE did not preserve multiple source-file splits",
+    )
+    require_write(
+        "unpartitioned distributed DuckLake MERGE UPDATE and INSERT",
+        lambda: update_source().merge_into(
+            "lake.merge_update_target",
+            "target.id = source.id",
+            update_clauses,
+        ),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*), "
+            "count(*) FILTER (WHERE id = 17 AND payload = 'merge-old-17'), "
+            "count(*) FILTER (WHERE id <> 17 AND payload = 'value-' || id::VARCHAR) "
+            "FROM lake.merge_update_target"
+        ).fetchone(),
+        (640, 1, 639),
+        "distributed MERGE UPDATE and INSERT readback",
+    )
+    merge_attempt_ids = set()
+    for (data_file,) in connection.execute(
+        "SELECT data_file FROM ducklake_list_files('lake', 'merge_update_target')"
+    ).fetchall():
+        parts = Path(data_file).parts
+        for index, part in enumerate(parts):
+            if part.startswith(DISTRIBUTED_ARTIFACT_PREFIX):
+                merge_attempt_ids.add(bytes.fromhex(parts[index + 1]).decode())
+                break
+    require_true(len(merge_attempt_ids) > 1, "distributed MERGE did not publish multiple task attempts")
+
+    retry_source = connection.sql("SELECT 9001::INTEGER AS id, 'retry-selected'::VARCHAR AS payload")
+    retry_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: retry_source.merge_into(
+            "lake.merge_retry_target",
+            "target.id = source.id",
+            ["WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)"],
+        ),
+    )
+    retry_outcome, retry_file_count = run_mutated_worker_write(
+        vane,
+        connection,
+        retry_plan,
+        lambda _row, _payload: None,
+        selected_attempt_id=1,
+        artifact_data_root=root,
+    )
+    require_equal(retry_outcome.get("extension_catalog_committed"), True, "selected retry MERGE commit")
+    require_equal(retry_outcome.get("rows_copied"), 1, "selected retry MERGE affected rows")
+    require_true(retry_file_count > 0, "selected retry MERGE produced no worker artifacts")
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.merge_retry_target").fetchone(),
+        (9001, "retry-selected"),
+        "selected retry MERGE readback",
+    )
+    retry_files = {
+        row[0]
+        for row in connection.execute(
+            "SELECT data_file FROM ducklake_list_files('lake', 'merge_retry_target')"
+        ).fetchall()
+    }
+    require_equal(len(retry_files), 1, "selected retry MERGE data-file count")
+    retry_file_parts = Path(next(iter(retry_files))).parts
+    artifact_root_index = next(
+        index for index, part in enumerate(retry_file_parts) if part.startswith(DISTRIBUTED_ARTIFACT_PREFIX)
+    )
+    selected_attempt = bytes.fromhex(retry_file_parts[artifact_root_index + 1]).decode()
+    require_true(selected_attempt.endswith(".1"), "selected retry MERGE task-attempt identity")
+
+    delete_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 896 AND 1279")
+    require_write(
+        "unpartitioned distributed DuckLake MERGE DELETE and INSERT",
+        lambda: delete_source.merge_into(
+            "lake.merge_delete_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN DELETE",
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+            ],
+        ),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*), min(id), max(id), "
+            "count(*) FILTER (WHERE id BETWEEN 896 AND 1151), "
+            "count(*) FILTER (WHERE id >= 1152 AND payload = 'value-' || id::VARCHAR) "
+            "FROM lake.merge_delete_target"
+        ).fetchone(),
+        (256, 768, 1279, 0, 128),
+        "distributed MERGE DELETE and INSERT readback",
+    )
+
+    by_source = connection.sql("SELECT id, payload FROM lake.source WHERE id IN (11, 12)")
+    require_write(
+        "not-matched-by-source distributed DuckLake MERGE",
+        lambda: by_source.merge_into(
+            "lake.merge_by_source_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN DO NOTHING",
+                "WHEN NOT MATCHED BY SOURCE THEN DELETE",
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+            ],
+        ),
+    )
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.merge_by_source_target ORDER BY id").fetchall(),
+        [(11, "keep"), (12, "value-12")],
+        "not-matched-by-source distributed MERGE readback",
+    )
+
+    def partitioned_source() -> object:
+        return connection.sql(
+            "SELECT id, ('category-' || (id % 4)::VARCHAR)::VARCHAR AS category, payload "
+            "FROM lake.source WHERE id BETWEEN 1408 AND 1791"
+        )
+
+    require_write(
+        "partitioned distributed DuckLake MERGE",
+        lambda: partitioned_source().merge_into(
+            "lake.merge_partitioned_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN UPDATE SET category = source.category, payload = source.payload",
+                "WHEN NOT MATCHED THEN INSERT (id, category, payload) "
+                "VALUES (source.id, source.category, source.payload)",
+            ],
+        ),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*), "
+            "count(*) FILTER (WHERE id >= 1408 AND payload = 'value-' || id::VARCHAR), "
+            "count(DISTINCT category) FROM lake.merge_partitioned_target"
+        ).fetchone(),
+        (512, 384, 4),
+        "partitioned distributed MERGE readback",
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(DISTINCT regexp_extract(data_file, 'category=([^/]+)', 1)) "
+            "FROM ducklake_list_files('lake', 'merge_partitioned_target')"
+        ).fetchone(),
+        (4,),
+        "partitioned distributed MERGE data paths",
+    )
+
+    files_before_noop = {path for path in (root / "data").rglob("*") if path.is_file()}
+    directories_before_noop = distributed_artifact_directories(root)
+    noop_source = connection.sql("SELECT id, payload FROM lake.source WHERE id IN (1, 900)")
+    require_write(
+        "zero-action distributed DuckLake MERGE",
+        lambda: noop_source.merge_into(
+            "lake.merge_noop_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN DO NOTHING",
+                "WHEN NOT MATCHED AND source.id < 0 THEN " "INSERT (id, payload) VALUES (source.id, source.payload)",
+            ],
+        ),
+    )
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.merge_noop_target ORDER BY id").fetchall(),
+        [(1, "noop-old"), (2, "noop-keep")],
+        "zero-action distributed MERGE visibility",
+    )
+    require_equal(
+        {path for path in (root / "data").rglob("*") if path.is_file()},
+        files_before_noop,
+        "zero-action distributed MERGE artifacts",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_noop,
+        "zero-action distributed MERGE artifact roots",
+    )
+
+    files_before_error = {path for path in (root / "data").rglob("*") if path.is_file()}
+    directories_before_error = distributed_artifact_directories(root)
+    error_source = connection.sql("SELECT id, payload FROM lake.source WHERE id = 1")
+    require_error(
+        lambda: error_source.merge_into(
+            "lake.merge_noop_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN ERROR 'distributed merge error'",
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+            ],
+        ),
+        "merge error",
+        "distributed DuckLake MERGE ERROR action",
+    )
+    require_write_count(1, "MERGE ERROR Ray dispatch count")
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.merge_noop_target ORDER BY id").fetchall(),
+        [(1, "noop-old"), (2, "noop-keep")],
+        "MERGE ERROR action visibility",
+    )
+    require_equal(
+        {path for path in (root / "data").rglob("*") if path.is_file()},
+        files_before_error,
+        "MERGE ERROR artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_error,
+        "MERGE ERROR artifact-root cleanup",
+    )
+
+    state_before_failure = connection.execute(
+        "SELECT count(*), sum(id), sum(length(payload)) FROM lake.merge_failure_target"
+    ).fetchone()
+    files_before_failure = {path for path in (root / "data").rglob("*") if path.is_file()}
+    directories_before_failure = distributed_artifact_directories(root)
+    failing_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 256 AND 1279")
+    require_error(
+        lambda: failing_source.merge_into(
+            "lake.merge_failure_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN UPDATE SET payload = CASE WHEN source.id < 768 "
+                "THEN source.payload ELSE source.payload::INTEGER::VARCHAR END",
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+            ],
+        ),
+        ("could not convert string", "no selected task results"),
+        "distributed DuckLake MERGE partial worker failure",
+    )
+    require_write_count(1, "failed MERGE Ray dispatch count")
+    require_equal(
+        connection.execute("SELECT count(*), sum(id), sum(length(payload)) FROM lake.merge_failure_target").fetchone(),
+        state_before_failure,
+        "failed MERGE atomic visibility",
+    )
+    require_equal(
+        {path for path in (root / "data").rglob("*") if path.is_file()},
+        files_before_failure,
+        "failed MERGE artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_failure,
+        "failed MERGE artifact-root cleanup",
+    )
+
+    require_concurrent_write_conflict(
+        vane,
+        connection,
+        runner,
+        root,
+        require_write_count,
+        lambda source: source.merge_into(
+            "lake.merge_conflict_target",
+            "target.id = source.id",
+            update_clauses,
+        ),
+        "INSERT INTO lake.merge_conflict_target VALUES (-2, 'concurrent')",
+        "concurrent MERGE conflict",
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*), count(*) FILTER (WHERE id = -2 AND payload = 'concurrent'), "
+            "count(*) FILTER (WHERE payload LIKE 'value-%') FROM lake.merge_conflict_target"
+        ).fetchone(),
+        (513, 1, 0),
+        "concurrent MERGE conflict visibility",
+    )
+
+    for table_name, columns in (
+        ("merge_update_target", "id, payload"),
+        ("merge_delete_target", "id, payload"),
+        ("merge_by_source_target", "id, payload"),
+        ("merge_partitioned_target", "id, category, payload"),
+    ):
+        native_rows = connection.execute(f"SELECT {columns} FROM lake.{table_name} ORDER BY id").fetchall()
+        require_equal(
+            connection.sql(f"SELECT {columns} FROM lake.{table_name} ORDER BY id").fetchall(),
+            native_rows,
+            f"Vane and native {table_name} MERGE readback",
+        )
 
 
 def exercise_distributed_writes(
@@ -1665,7 +2035,16 @@ def exercise_distributed_writes(
         "stale snapshot distributed INSERT did not commit",
     )
 
-    require_concurrent_write_conflict(vane, connection, runner, root, require_write_count)
+    require_concurrent_write_conflict(
+        vane,
+        connection,
+        runner,
+        root,
+        require_write_count,
+        lambda source: source.insert_into("lake.concurrent_write_target"),
+        "INSERT INTO lake.concurrent_write_target VALUES (-2, 'concurrent')",
+        "concurrent INSERT conflict",
+    )
 
 
 def main() -> None:
@@ -1740,6 +2119,15 @@ def main() -> None:
                 connection,
                 runner,
                 root,
+                require_distributed_write,
+                require_write_count,
+            )
+            exercise_distributed_merges(
+                vane,
+                connection,
+                runner,
+                root,
+                expected_nodes,
                 require_distributed_write,
                 require_write_count,
             )
@@ -1852,7 +2240,7 @@ def main() -> None:
             observed_nodes = {str(row[1]) for row in annotated_rows}
             require_equal(observed_nodes, expected_nodes, "two-worker DuckLake scan topology")
             require_true(dispatch_count >= 4, "DuckLake queries did not use the Ray runner")
-            require_true(write_dispatch_count >= 18, "DuckLake writes did not use the Ray runner")
+            require_true(write_dispatch_count >= 25, "DuckLake writes did not use the Ray runner")
     finally:
         if runner is not None and original_run_iter_tables is not None:
             runner.run_iter_tables = original_run_iter_tables

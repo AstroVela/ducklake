@@ -15,8 +15,23 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/parallel/event.hpp"
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#include "storage/ducklake_distributed_merge.hpp"
+#include "storage/ducklake_distributed_write.hpp"
+#endif
 
 namespace duckdb {
+
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+static vector<unique_ptr<Expression>> CopyMergeExpressions(const vector<unique_ptr<Expression>> &expressions) {
+	vector<unique_ptr<Expression>> result;
+	result.reserve(expressions.size());
+	for (const auto &expression : expressions) {
+		result.push_back(expression->Copy());
+	}
+	return result;
+}
+#endif
 
 //===--------------------------------------------------------------------===//
 // Merge Insert
@@ -433,7 +448,12 @@ SinkFinalizeType DuckLakeMergeUpdate::Finalize(Pipeline &pipeline, Event &event,
 static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog &catalog, ClientContext &context,
                                                                  LogicalMergeInto &op, PhysicalPlanGenerator &planner,
                                                                  BoundMergeIntoAction &action,
-                                                                 PhysicalOperator &child_plan) {
+                                                                 PhysicalOperator &child_plan
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+                                                                 ,
+                                                                 DuckLakeDistributedMergePlanAction &distributed_action
+#endif
+) {
 	auto result = make_uniq<MergeIntoOperator>();
 
 	result->action_type = action.action_type;
@@ -492,6 +512,16 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 		                         .Cast<DuckLakeMergeUpdate>();
 		merge_update.extra_projections = std::move(copy_options.projection_list);
 		result->op = merge_update;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		distributed_action.expressions = CopyMergeExpressions(update_op.expressions);
+		distributed_action.projections = CopyMergeExpressions(merge_update.extra_projections);
+		distributed_action.copy = &copy_op.Cast<PhysicalCopyToFile>();
+		distributed_action.delete_op = &update_op.delete_op.Cast<DuckLakeDelete>();
+		distributed_action.encryption_key = insert_op.Cast<DuckLakeInsert>().encryption_key;
+		distributed_action.update_row_id_index = update_op.row_id_index;
+		distributed_action.update_file_path_index = child_plan.types.size() - DuckLakeUpdate::DELETION_INFO_SIZE;
+		distributed_action.update_row_position_index = child_plan.types.size() - 1;
+#endif
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
@@ -509,6 +539,10 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 		}
 		delete_op.bound_constraints = std::move(bound_constraints);
 		result->op = catalog.PlanDelete(context, planner, delete_op, child_plan);
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		distributed_action.delete_op = &result->op->Cast<DuckLakeDelete>();
+		distributed_action.encryption_key = distributed_action.delete_op->encryption_key;
+#endif
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
@@ -552,16 +586,28 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 		    planner.Make<DuckLakeMergeInsert>(insert.types, insert, physical_copy).Cast<DuckLakeMergeInsert>();
 		merge_insert.extra_projections = std::move(copy_options.projection_list);
 		result->op = merge_insert;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		distributed_action.expressions = CopyMergeExpressions(result->expressions);
+		distributed_action.projections = CopyMergeExpressions(merge_insert.extra_projections);
+		distributed_action.copy = &physical_copy.Cast<PhysicalCopyToFile>();
+		distributed_action.encryption_key = insert.Cast<DuckLakeInsert>().encryption_key;
+#endif
 		break;
 	}
 	case MergeActionType::MERGE_ERROR:
 		result->expressions = std::move(action.expressions);
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+		distributed_action.expressions = CopyMergeExpressions(result->expressions);
+#endif
 		break;
 	case MergeActionType::MERGE_DO_NOTHING:
 		break;
 	default:
 		throw InternalException("Unsupported merge action");
 	}
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	distributed_action.condition = result->condition ? result->condition->Copy() : nullptr;
+#endif
 	return result;
 }
 
@@ -571,6 +617,9 @@ PhysicalOperator &DuckLakeCatalog::PlanMergeInto(ClientContext &context, Physica
 		throw NotImplementedException("RETURNING is not implemented for DuckLake yet");
 	}
 	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	vector<DuckLakeDistributedMergePlanAction> distributed_actions;
+#endif
 
 	// plan the merge into clauses
 	idx_t update_delete_count = 0;
@@ -585,14 +634,36 @@ PhysicalOperator &DuckLakeCatalog::PlanMergeInto(ClientContext &context, Physica
 					    "MERGE INTO with DuckLake only supports a single UPDATE/DELETE action currently");
 				}
 			}
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+			DuckLakeDistributedMergePlanAction distributed_action;
+			distributed_action.match_condition = entry.first;
+			distributed_action.action_type = action->action_type;
+			planned_actions.push_back(
+			    DuckLakePlanMergeIntoAction(*this, context, op, planner, *action, plan, distributed_action));
+			distributed_actions.push_back(std::move(distributed_action));
+#else
 			planned_actions.push_back(DuckLakePlanMergeIntoAction(*this, context, op, planner, *action, plan));
+#endif
 		}
 		actions.emplace(entry.first, std::move(planned_actions));
 	}
 
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	optional_ptr<PhysicalOperator> worker_child = &plan;
+	if (update_delete_count != 0) {
+		worker_child = &PlanDuckLakeDistributedRowDeltaRepartition(planner, plan, op.row_id_start + 1);
+	}
+	auto &result = static_cast<DuckLakeDistributedMergeInto &>(planner.Make<DuckLakeDistributedMergeInto>(
+	    op.types, std::move(actions), op.row_id_start, op.source_marker, true, op.return_chunk));
+#else
 	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
 	                                               true, op.return_chunk);
+#endif
 	result.children.push_back(plan);
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	result.ConfigureDistributedMerge(context, op.table.Cast<DuckLakeTableEntry>(), std::move(distributed_actions),
+	                                 *worker_child, plan.types, op.row_id_start, op.source_marker);
+#endif
 	return result;
 }
 
