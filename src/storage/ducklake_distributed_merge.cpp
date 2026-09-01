@@ -305,6 +305,8 @@ public:
 	DuckLakeDistributedMergeBind bind;
 	vector<DistributedExtensionWriteInfo> sub_infos;
 	vector<unique_ptr<DistributedWriteGlobalState>> sub_states;
+	mutex seen_update_rows_lock;
+	unordered_map<string, unordered_set<idx_t>> seen_update_rows;
 };
 
 struct DuckLakeDistributedMergeActionLocalState {
@@ -475,6 +477,30 @@ static void SinkMergeUpdate(ExecutionContext &context, const DistributedWriteTas
 	    !action.update_file_path_index.IsValid() || !action.update_row_position_index.IsValid()) {
 		throw InternalException("DuckLake distributed MERGE UPDATE state is incomplete");
 	}
+	SelectionVector selection(input.size());
+	idx_t selection_count = 0;
+	{
+		lock_guard<mutex> guard(global_state.seen_update_rows_lock);
+		for (idx_t row = 0; row < input.size(); row++) {
+			auto file_value = input.GetValue(action.update_file_path_index.GetIndex(), row);
+			auto position_value = input.GetValue(action.update_row_position_index.GetIndex(), row);
+			if (file_value.IsNull() || position_value.IsNull()) {
+				throw InvalidInputException("DuckLake distributed MERGE UPDATE received a NULL row identifier");
+			}
+			auto position = position_value.GetValue<int64_t>();
+			if (position < 0) {
+				throw InvalidInputException("DuckLake distributed MERGE UPDATE received a negative row position");
+			}
+			auto file_path = file_value.GetValue<string>();
+			if (global_state.seen_update_rows[file_path].insert(NumericCast<idx_t>(position)).second) {
+				selection.set_index(selection_count++, row);
+			}
+		}
+	}
+	if (selection_count == 0) {
+		return;
+	}
+	input.Slice(selection, selection_count);
 	action_state.expression_chunk.Reset();
 	action_state.expression_executor->Execute(input, action_state.expression_chunk);
 	action_state.value_chunk.Reset();

@@ -20,6 +20,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
@@ -32,6 +33,7 @@
 #include "duckdb/parallel/interrupt.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace duckdb {
@@ -43,6 +45,57 @@ static const string DUCKLAKE_ROW_DELTA_FRAGMENT_CODEC = "ducklake.row-delta-frag
 static const DistributedPayloadCodec DUCKLAKE_DATA_FILE_CODEC {"ducklake.data-file", 1};
 static const DistributedPayloadCodec DUCKLAKE_POSITION_DELETE_FILE_CODEC {"ducklake.position-delete-file", 1};
 static const DistributedPayloadCodec DUCKLAKE_DELETION_VECTOR_FILE_CODEC {"ducklake.deletion-vector", 1};
+static const string DUCKLAKE_MERGE_PARTITION_FUNCTION = "__ducklake_vane_merge_partition_hash";
+
+struct DuckLakeMergePartitionLocalState : FunctionLocalState {
+	idx_t row_offset = 0;
+};
+
+static unique_ptr<FunctionLocalState> DuckLakeMergePartitionInit(ExpressionState &, const BoundFunctionExpression &,
+                                                                 FunctionData *) {
+	return make_uniq<DuckLakeMergePartitionLocalState>();
+}
+
+static void DuckLakeMergePartitionHash(DataChunk &args, ExpressionState &state, Vector &result) {
+	if (args.ColumnCount() == 0) {
+		throw InternalException("DuckLake distributed MERGE partition hash requires a file-path column");
+	}
+	const auto count = args.size();
+	const auto has_fallback = args.ColumnCount() > 1;
+	Vector file_is_null(LogicalType::BOOLEAN, count);
+	Vector file_hash(LogicalType::HASH, count);
+	Vector fallback_hash(LogicalType::HASH, count);
+	Vector partition_hash(LogicalType::HASH, count);
+	VectorOperations::IsNull(args.data[0], file_is_null, count);
+	VectorOperations::Hash(args.data[0], file_hash, count);
+	if (has_fallback) {
+		VectorOperations::Hash(args.data[1], fallback_hash, count);
+		for (idx_t index = 2; index < args.ColumnCount(); index++) {
+			VectorOperations::CombineHash(fallback_hash, args.data[index], count);
+		}
+	}
+
+	file_is_null.Flatten(count);
+	file_hash.Flatten(count);
+	if (has_fallback) {
+		fallback_hash.Flatten(count);
+	}
+	const auto file_is_null_values = FlatVector::GetData<bool>(file_is_null);
+	const auto file_hash_values = FlatVector::GetData<hash_t>(file_hash);
+	const auto fallback_hash_values = has_fallback ? FlatVector::GetData<hash_t>(fallback_hash) : nullptr;
+	auto result_values = FlatVector::GetData<hash_t>(partition_hash);
+	auto &local_state = ExecuteFunctionState::GetFunctionState(state)->Cast<DuckLakeMergePartitionLocalState>();
+	for (idx_t row = 0; row < count; row++) {
+		if (!file_is_null_values[row]) {
+			result_values[row] = file_hash_values[row];
+			continue;
+		}
+		auto row_hash = Hash<idx_t>(local_state.row_offset + row);
+		result_values[row] = has_fallback ? CombineHash(fallback_hash_values[row], row_hash) : row_hash;
+	}
+	local_state.row_offset += count;
+	result.Reference(partition_hash);
+}
 
 struct DuckLakeDistributedRowDeltaSourceState {
 	string scan_file_path;
@@ -1161,6 +1214,43 @@ static void ValidateCopyFileValues(const distributed::DistributedCopyFileInfo &f
 
 void ValidateDuckLakeDistributedRowDeltaCopyShape(const PhysicalCopyToFile &copy) {
 	ValidateDistributedRowDeltaCopyShape(copy);
+}
+
+ScalarFunction DuckLakeDistributedMergePartitionFunction() {
+	auto result = ScalarFunction(DUCKLAKE_MERGE_PARTITION_FUNCTION, {LogicalType::VARCHAR}, LogicalType::HASH,
+	                             DuckLakeMergePartitionHash);
+	result.varargs = LogicalType::ANY;
+	result.SetInitStateCallback(DuckLakeMergePartitionInit);
+	result.SetStability(FunctionStability::VOLATILE);
+	result.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	return result;
+}
+
+PhysicalOperator &PlanDuckLakeDistributedRowDeltaRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
+                                                             idx_t file_path_index,
+                                                             const vector<idx_t> &null_file_path_partition_indexes) {
+	if (file_path_index >= input.types.size() || input.types[file_path_index] != LogicalType::VARCHAR) {
+		throw InternalException("DuckLake distributed row mutation file-path column is invalid");
+	}
+	vector<unique_ptr<Expression>> arguments;
+	arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, file_path_index));
+	for (auto partition_index : null_file_path_partition_indexes) {
+		if (partition_index >= input.types.size() || partition_index == file_path_index) {
+			throw InternalException("DuckLake distributed row mutation fallback partition column is invalid");
+		}
+		if (input.types[partition_index].id() == LogicalTypeId::SQLNULL) {
+			continue;
+		}
+		arguments.push_back(make_uniq<BoundReferenceExpression>(input.types[partition_index], partition_index));
+	}
+	vector<ExprRef> partition_by;
+	partition_by.emplace_back(make_uniq<BoundFunctionExpression>(
+	    LogicalType::HASH, DuckLakeDistributedMergePartitionFunction(), std::move(arguments), nullptr));
+	auto repartition_spec = RepartitionSpec::create_hash(0, std::move(partition_by));
+	auto &result =
+	    planner.Make<PhysicalRepartition>(input.types, std::move(repartition_spec), input.estimated_cardinality);
+	result.children.push_back(input);
+	return result;
 }
 
 PhysicalOperator &PlanDuckLakeDistributedRowDeltaRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,

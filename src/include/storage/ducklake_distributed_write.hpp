@@ -26,6 +26,7 @@ class FileSystem;
 class PhysicalCopyToFile;
 class PhysicalOperator;
 class PhysicalPlanGenerator;
+class ScalarFunction;
 struct DuckLakePartition;
 struct DuckLakeFileListExtendedEntry;
 struct DuckLakeSnapshot;
@@ -97,6 +98,9 @@ void ValidateDuckLakeDistributedDataFileArtifactsInRoot(ClientContext &context, 
 
 PhysicalOperator &PlanDuckLakeDistributedRowDeltaRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
                                                              idx_t file_path_index);
+PhysicalOperator &PlanDuckLakeDistributedRowDeltaRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
+                                                             idx_t file_path_index,
+                                                             const vector<idx_t> &null_file_path_partition_indexes);
 
 string BuildDuckLakeDistributedDeleteBind(ClientContext &context, const DuckLakeTableEntry &table,
                                           const vector<DuckLakeFileListExtendedEntry> &source_files,
@@ -118,6 +122,7 @@ void AddDuckLakeDistributedDataFiles(ClientContext &context, DuckLakeInsertGloba
                                      optional_idx partition_id);
 
 DistributedExtensionWriteCallbacks DuckLakeDistributedRowDeltaCallbacks();
+ScalarFunction DuckLakeDistributedMergePartitionFunction();
 
 DuckLakeDistributedRowDeltaResult
 DecodeDuckLakeDistributedRowDeltaResults(ClientContext &context, const string &data_path, const string &artifact_path,

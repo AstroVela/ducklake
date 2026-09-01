@@ -438,6 +438,8 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.merge_noop_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.merge_by_source_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.merge_retry_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.merge_duplicate_update_target(id INTEGER, payload INTEGER)")
+        connection.execute("CREATE TABLE lake.merge_constant_insert_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.merge_failure_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.merge_conflict_target(id INTEGER, payload VARCHAR)")
         for file_index in range(FILE_COUNT):
@@ -476,6 +478,12 @@ def seed_tables(connection: object, root: Path) -> None:
                 "INSERT INTO lake.merge_conflict_target "
                 "SELECT i::INTEGER, ('conflict-old-' || i::VARCHAR)::VARCHAR "
                 f"FROM range({start + 100}, {stop + 100}) AS rows(i)"
+            )
+            constant_start = 10000 + file_index * 128
+            connection.execute(
+                "INSERT INTO lake.merge_constant_insert_target "
+                "SELECT i::INTEGER, 'seed'::VARCHAR "
+                f"FROM range({constant_start}, {constant_start + 128}) AS rows(i)"
             )
         for file_index in range(4):
             start = 768 + file_index * 96
@@ -524,6 +532,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("INSERT INTO lake.concurrent_write_target VALUES (-1, 'seed')")
         connection.execute("INSERT INTO lake.merge_noop_target VALUES (1, 'noop-old'), (2, 'noop-keep')")
         connection.execute("INSERT INTO lake.merge_by_source_target VALUES (10, 'remove'), (11, 'keep')")
+        connection.execute("INSERT INTO lake.merge_duplicate_update_target VALUES (7000, 0)")
     finally:
         if configured_runner is None:
             os.environ.pop("VANE_RUNNER", None)
@@ -1436,6 +1445,61 @@ def exercise_distributed_merges(
     require_write_count: Callable[[int, str], None],
 ) -> None:
     require_equal(len(expected_worker_nodes), WORKER_COUNT, "MERGE Ray cluster topology")
+    duplicate_update_source = connection.sql(
+        "SELECT * FROM (VALUES (7000::INTEGER, 'winner'::VARCHAR, 0::INTEGER), "
+        "(7000::INTEGER, 'discarded'::VARCHAR, 1::INTEGER)) AS rows(id, payload, source_order) "
+        "ORDER BY source_order"
+    )
+    require_write(
+        "duplicate-match distributed DuckLake MERGE UPDATE",
+        lambda: duplicate_update_source.merge_into(
+            "lake.merge_duplicate_update_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN UPDATE SET payload = CASE WHEN source.source_order = 0 "
+                "THEN 7 ELSE source.payload::INTEGER END"
+            ],
+        ),
+    )
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.merge_duplicate_update_target").fetchone(),
+        (7000, 7),
+        "duplicate-match distributed MERGE UPDATE readback",
+    )
+
+    constant_insert_source = connection.sql("SELECT id FROM lake.source WHERE id < 640")
+    require_write(
+        "constant-value distributed DuckLake MERGE INSERT",
+        lambda: constant_insert_source.merge_into(
+            "lake.merge_constant_insert_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN UPDATE SET payload = 'updated'",
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (1, 'constant')",
+            ],
+        ),
+    )
+    require_equal(
+        connection.execute(
+            "SELECT count(*) FROM lake.merge_constant_insert_target WHERE payload = 'constant'"
+        ).fetchone(),
+        (639,),
+        "constant-value distributed MERGE INSERT readback",
+    )
+    constant_insert_attempt_ids = set()
+    for (data_file,) in connection.execute(
+        "SELECT data_file FROM ducklake_list_files('lake', 'merge_constant_insert_target')"
+    ).fetchall():
+        parts = Path(data_file).parts
+        for index, part in enumerate(parts):
+            if part.startswith(DISTRIBUTED_ARTIFACT_PREFIX):
+                constant_insert_attempt_ids.add(bytes.fromhex(parts[index + 1]).decode())
+                break
+    require_true(
+        len(constant_insert_attempt_ids) > 1,
+        "constant-value distributed MERGE INSERT rows were not spread across task attempts",
+    )
+
     update_clauses = [
         "WHEN MATCHED THEN UPDATE SET payload = source.payload",
         "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
@@ -1485,15 +1549,26 @@ def exercise_distributed_merges(
         "distributed MERGE UPDATE and INSERT readback",
     )
     merge_attempt_ids = set()
+    merge_insert_attempt_ids = set()
     for (data_file,) in connection.execute(
         "SELECT data_file FROM ducklake_list_files('lake', 'merge_update_target')"
     ).fetchall():
+        contains_insert = connection.execute(
+            f"SELECT count(*) > 0 FROM read_parquet({sql_string(data_file)}) WHERE id = 18 OR id >= 512"
+        ).fetchone()[0]
         parts = Path(data_file).parts
         for index, part in enumerate(parts):
             if part.startswith(DISTRIBUTED_ARTIFACT_PREFIX):
-                merge_attempt_ids.add(bytes.fromhex(parts[index + 1]).decode())
+                attempt_id = bytes.fromhex(parts[index + 1]).decode()
+                merge_attempt_ids.add(attempt_id)
+                if contains_insert:
+                    merge_insert_attempt_ids.add(attempt_id)
                 break
     require_true(len(merge_attempt_ids) > 1, "distributed MERGE did not publish multiple task attempts")
+    require_true(
+        len(merge_insert_attempt_ids) > 1,
+        "distributed MERGE INSERT rows were not spread across task attempts",
+    )
 
     missing_result_source = connection.sql("SELECT 9000::INTEGER AS id, 'missing-result'::VARCHAR AS payload")
     missing_result_plan = capture_physical_write_plan(

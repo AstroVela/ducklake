@@ -1045,6 +1045,8 @@ void ValidateDuckLakeDistributedDataFileArtifactsInRoot(ClientContext &context, 
 }
 
 void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader) {
+	loader.RegisterFunction(DuckLakeDistributedMergePartitionFunction());
+
 	auto register_file_write = [&](const string &name) {
 		DistributedWriteOperatorExtension extension;
 		extension.name = name;
