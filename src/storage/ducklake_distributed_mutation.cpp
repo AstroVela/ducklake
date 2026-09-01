@@ -20,6 +20,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
@@ -32,6 +33,7 @@
 #include "duckdb/parallel/interrupt.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace duckdb {
@@ -43,6 +45,57 @@ static const string DUCKLAKE_ROW_DELTA_FRAGMENT_CODEC = "ducklake.row-delta-frag
 static const DistributedPayloadCodec DUCKLAKE_DATA_FILE_CODEC {"ducklake.data-file", 1};
 static const DistributedPayloadCodec DUCKLAKE_POSITION_DELETE_FILE_CODEC {"ducklake.position-delete-file", 1};
 static const DistributedPayloadCodec DUCKLAKE_DELETION_VECTOR_FILE_CODEC {"ducklake.deletion-vector", 1};
+static const string DUCKLAKE_MERGE_PARTITION_FUNCTION = "__ducklake_vane_merge_partition_hash";
+
+struct DuckLakeMergePartitionLocalState : FunctionLocalState {
+	idx_t row_offset = 0;
+};
+
+static unique_ptr<FunctionLocalState> DuckLakeMergePartitionInit(ExpressionState &, const BoundFunctionExpression &,
+                                                                 FunctionData *) {
+	return make_uniq<DuckLakeMergePartitionLocalState>();
+}
+
+static void DuckLakeMergePartitionHash(DataChunk &args, ExpressionState &state, Vector &result) {
+	if (args.ColumnCount() == 0) {
+		throw InternalException("DuckLake distributed MERGE partition hash requires a file-path column");
+	}
+	const auto count = args.size();
+	const auto has_fallback = args.ColumnCount() > 1;
+	Vector file_is_null(LogicalType::BOOLEAN, count);
+	Vector file_hash(LogicalType::HASH, count);
+	Vector fallback_hash(LogicalType::HASH, count);
+	Vector partition_hash(LogicalType::HASH, count);
+	VectorOperations::IsNull(args.data[0], file_is_null, count);
+	VectorOperations::Hash(args.data[0], file_hash, count);
+	if (has_fallback) {
+		VectorOperations::Hash(args.data[1], fallback_hash, count);
+		for (idx_t index = 2; index < args.ColumnCount(); index++) {
+			VectorOperations::CombineHash(fallback_hash, args.data[index], count);
+		}
+	}
+
+	file_is_null.Flatten(count);
+	file_hash.Flatten(count);
+	if (has_fallback) {
+		fallback_hash.Flatten(count);
+	}
+	const auto file_is_null_values = FlatVector::GetData<bool>(file_is_null);
+	const auto file_hash_values = FlatVector::GetData<hash_t>(file_hash);
+	const auto fallback_hash_values = has_fallback ? FlatVector::GetData<hash_t>(fallback_hash) : nullptr;
+	auto result_values = FlatVector::GetData<hash_t>(partition_hash);
+	auto &local_state = ExecuteFunctionState::GetFunctionState(state)->Cast<DuckLakeMergePartitionLocalState>();
+	for (idx_t row = 0; row < count; row++) {
+		if (!file_is_null_values[row]) {
+			result_values[row] = file_hash_values[row];
+			continue;
+		}
+		auto row_hash = Hash<idx_t>(local_state.row_offset + row);
+		result_values[row] = has_fallback ? CombineHash(fallback_hash_values[row], row_hash) : row_hash;
+	}
+	local_state.row_offset += count;
+	result.Reference(partition_hash);
+}
 
 struct DuckLakeDistributedRowDeltaSourceState {
 	string scan_file_path;
@@ -294,26 +347,26 @@ BuildSourceStates(ClientContext &context, const vector<DuckLakeFileListExtendedE
 	return result;
 }
 
-static void ValidateDistributedUpdateCopyShape(const PhysicalCopyToFile &copy) {
+static void ValidateDistributedRowDeltaCopyShape(const PhysicalCopyToFile &copy) {
 	auto partitioned = copy.partition_output && copy.write_empty_file && !copy.rotate && !copy.per_thread_output;
 	auto rotating = !copy.partition_output && !copy.write_empty_file && copy.rotate && !copy.per_thread_output &&
 	                copy.file_size_bytes.IsValid();
 	if (!partitioned && !rotating) {
 		throw NotImplementedException(
-		    "Distributed DuckLake UPDATE requires the canonical partitioned or rotating COPY writer");
+		    "Distributed DuckLake row mutations require the canonical partitioned or rotating COPY writer");
 	}
 	if (copy.use_tmp_file) {
-		throw NotImplementedException("Distributed DuckLake UPDATE does not support temporary COPY output");
+		throw NotImplementedException("Distributed DuckLake row mutations do not support temporary COPY output");
 	}
 	if (copy.partition_output && (!copy.hive_file_pattern || copy.partition_columns.empty())) {
-		throw NotImplementedException("Distributed DuckLake UPDATE requires Hive partition paths");
+		throw NotImplementedException("Distributed DuckLake row mutations require Hive partition paths");
 	}
 	auto statistics_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
 	if (copy.return_type != CopyFunctionReturnType::WRITTEN_FILE_STATISTICS || copy.types != statistics_types) {
-		throw SerializationException("Distributed DuckLake UPDATE COPY must return written-file statistics");
+		throw SerializationException("Distributed DuckLake row mutation COPY must return written-file statistics");
 	}
 	if (copy.names.size() != copy.expected_types.size()) {
-		throw SerializationException("Distributed DuckLake UPDATE COPY names and types have different widths");
+		throw SerializationException("Distributed DuckLake row mutation COPY names and types have different widths");
 	}
 }
 
@@ -452,7 +505,7 @@ static DuckLakeDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 	BinaryDeserializer deserializer(stream);
 	deserializer.Begin();
 	auto kind = deserializer.ReadProperty<uint8_t>(1, "kind");
-	if (kind > static_cast<uint8_t>(DuckLakeDistributedRowDeltaKind::UPDATE)) {
+	if (kind > static_cast<uint8_t>(DuckLakeDistributedRowDeltaKind::MERGE_INSERT)) {
 		throw SerializationException("DuckLake distributed row mutation has an invalid operation kind");
 	}
 	DuckLakeDistributedRowDeltaBind result;
@@ -483,22 +536,29 @@ static DuckLakeDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 	deserializer.End();
 
 	ValidateBindIdentity(result);
-	if (result.data_path.empty() || result.artifact_path.empty() || result.row_id_indexes.size() != 2 ||
-	    result.new_delete_snapshot == 0) {
+	if (result.data_path.empty() || result.artifact_path.empty() || result.new_delete_snapshot == 0) {
 		throw SerializationException("DuckLake distributed row mutation bind data is invalid");
 	}
-	if (result.kind == DuckLakeDistributedRowDeltaKind::UPDATE &&
-	    (result.copy_operator.empty() || result.copy_column_count == 0)) {
-		throw SerializationException("DuckLake distributed UPDATE bind is missing its COPY writer");
+	if (result.kind == DuckLakeDistributedRowDeltaKind::DELETE) {
+		if (result.row_id_indexes.size() != 2 || !result.copy_operator.empty() || result.copy_column_count != 0) {
+			throw SerializationException("DuckLake distributed DELETE bind has an invalid worker shape");
+		}
+	} else if (result.copy_operator.empty() || result.copy_column_count == 0) {
+		throw SerializationException("DuckLake distributed row mutation bind is missing its COPY writer");
+	} else if (result.kind == DuckLakeDistributedRowDeltaKind::UPDATE && result.row_id_indexes.size() != 2) {
+		throw SerializationException("DuckLake distributed UPDATE bind has invalid row identifiers");
+	} else if (result.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT && !result.row_id_indexes.empty()) {
+		throw SerializationException("DuckLake distributed MERGE INSERT bind has unexpected row identifiers");
 	}
-	if (result.kind == DuckLakeDistributedRowDeltaKind::DELETE &&
-	    (!result.copy_operator.empty() || result.copy_column_count != 0)) {
-		throw SerializationException("DuckLake distributed DELETE bind unexpectedly contains a COPY writer");
+	if (result.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT && !result.delete_sources.empty()) {
+		throw SerializationException("DuckLake distributed MERGE INSERT bind has invalid source state");
 	}
-	if (result.source_is_statically_empty && !result.delete_sources.empty()) {
+	if (result.kind != DuckLakeDistributedRowDeltaKind::MERGE_INSERT && result.source_is_statically_empty &&
+	    !result.delete_sources.empty()) {
 		throw SerializationException("DuckLake distributed row mutation has invalid statically-empty source state");
 	}
-	if (!result.source_is_statically_empty && result.delete_sources.empty()) {
+	if (result.kind != DuckLakeDistributedRowDeltaKind::MERGE_INSERT && !result.source_is_statically_empty &&
+	    result.delete_sources.empty()) {
 		throw SerializationException("DuckLake distributed row mutation is missing its planned source files");
 	}
 	unordered_set<string> paths;
@@ -515,7 +575,7 @@ static DuckLakeDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 static unique_ptr<PhysicalOperator> DeserializeShallowCopy(ClientContext &context, PhysicalPlan &physical_plan,
                                                            const string &bytes) {
 	if (bytes.empty()) {
-		throw SerializationException("DuckLake distributed UPDATE COPY operator is empty");
+		throw SerializationException("DuckLake distributed row mutation COPY operator is empty");
 	}
 	auto stream = StreamFromBytes(bytes);
 	BinaryDeserializer deserializer(stream);
@@ -524,9 +584,9 @@ static unique_ptr<PhysicalOperator> DeserializeShallowCopy(ClientContext &contex
 	auto result = PhysicalOperator::Deserialize(deserializer, physical_plan);
 	deserializer.End();
 	if (result->type != PhysicalOperatorType::COPY_TO_FILE || !result->children.empty()) {
-		throw SerializationException("DuckLake distributed UPDATE worker bind is not a shallow COPY operator");
+		throw SerializationException("DuckLake distributed row mutation worker bind is not a shallow COPY operator");
 	}
-	ValidateDistributedUpdateCopyShape(result->Cast<PhysicalCopyToFile>());
+	ValidateDistributedRowDeltaCopyShape(result->Cast<PhysicalCopyToFile>());
 	return result;
 }
 
@@ -632,12 +692,12 @@ public:
 	                                       const DistributedWriteTaskContext &task)
 	    : bind(std::move(bind_p)), copy_plan(Allocator::Get(context)) {
 		attempt_root = DuckLakeDistributedAttemptRoot(context, bind.artifact_path, task.task_attempt_id);
-		if (bind.kind == DuckLakeDistributedRowDeltaKind::UPDATE) {
+		if (bind.kind != DuckLakeDistributedRowDeltaKind::DELETE) {
 			copy_holder = DeserializeShallowCopy(context, copy_plan, bind.copy_operator);
 			copy = &copy_holder->Cast<PhysicalCopyToFile>();
 			copy->file_path = attempt_root;
 			if (copy->expected_types.size() != bind.copy_column_count) {
-				throw SerializationException("DuckLake distributed UPDATE COPY input width changed during transport");
+				throw SerializationException("DuckLake distributed COPY input width changed during transport");
 			}
 		}
 		auto &file_system = FileSystem::GetFileSystem(context);
@@ -673,6 +733,49 @@ public:
 	idx_t affected_rows = 0;
 };
 
+static void SinkRowDeltaCopy(ExecutionContext &context, DuckLakeDistributedRowDeltaGlobalState &global_state,
+                             DuckLakeDistributedRowDeltaLocalState &local_state, DataChunk &input,
+                             bool has_row_identifiers) {
+	if (!global_state.copy) {
+		throw InternalException("DuckLake distributed row mutation COPY writer is missing");
+	}
+	auto extra_column_count = has_row_identifiers ? 2 : 0;
+	if (global_state.bind.copy_column_count > input.ColumnCount() ||
+	    input.ColumnCount() - global_state.bind.copy_column_count != extra_column_count) {
+		throw InvalidInputException("DuckLake distributed COPY input does not match its worker column contract");
+	}
+	if (has_row_identifiers && (global_state.bind.row_id_indexes[0] != global_state.bind.copy_column_count ||
+	                            global_state.bind.row_id_indexes[1] != global_state.bind.copy_column_count + 1)) {
+		throw InvalidInputException("DuckLake distributed UPDATE row identifiers have invalid positions");
+	}
+	for (idx_t index = 0; index < global_state.bind.copy_column_count; index++) {
+		if (input.data[index].GetType() != global_state.copy->expected_types[index]) {
+			throw InvalidInputException("DuckLake distributed COPY input does not match its column types");
+		}
+	}
+	{
+		lock_guard<mutex> guard(global_state.copy_lock);
+		if (!global_state.copy_sink_initialized) {
+			global_state.copy->sink_state = global_state.copy->GetGlobalSinkState(context.client);
+			global_state.copy_sink_initialized = true;
+		}
+	}
+	if (!local_state.copy_state) {
+		local_state.copy_state = global_state.copy->GetLocalSinkState(context);
+	}
+	DataChunk copy_chunk;
+	copy_chunk.InitializeEmpty(global_state.copy->expected_types);
+	for (idx_t index = 0; index < global_state.bind.copy_column_count; index++) {
+		copy_chunk.data[index].Reference(input.data[index]);
+	}
+	copy_chunk.SetCardinality(input.size());
+	InterruptState interrupt_state;
+	OperatorSinkInput sink_input {*global_state.copy->sink_state, *local_state.copy_state, interrupt_state};
+	if (global_state.copy->Sink(context, copy_chunk, sink_input) != SinkResultType::NEED_MORE_INPUT) {
+		throw InternalException("DuckLake distributed COPY stopped before consuming its input");
+	}
+}
+
 static unique_ptr<DistributedWriteGlobalState>
 DuckLakeRowDeltaInitializeGlobal(ClientContext &context, const DistributedExtensionWriteInfo &info,
                                  const DistributedWriteTaskContext &task) {
@@ -698,6 +801,11 @@ static void DuckLakeRowDeltaSink(ExecutionContext &context, const DistributedExt
 			throw InvalidInputException(
 			    "DuckLake distributed row mutation received rows from a statically empty source");
 		}
+		return;
+	}
+	if (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT) {
+		SinkRowDeltaCopy(context, global_state, local_state, input, false);
+		local_state.affected_rows = CheckedAdd(local_state.affected_rows, input.size(), "worker affected row count");
 		return;
 	}
 	auto input_row_count = input.size();
@@ -746,38 +854,7 @@ static void DuckLakeRowDeltaSink(ExecutionContext &context, const DistributedExt
 	input.Slice(selection, selection_count);
 
 	if (global_state.copy) {
-		if (global_state.bind.copy_column_count > input.ColumnCount() ||
-		    input.ColumnCount() - global_state.bind.copy_column_count != 2 ||
-		    global_state.bind.row_id_indexes[0] != global_state.bind.copy_column_count ||
-		    global_state.bind.row_id_indexes[1] != global_state.bind.copy_column_count + 1) {
-			throw InvalidInputException("DuckLake distributed UPDATE input does not match its worker column contract");
-		}
-		for (idx_t index = 0; index < global_state.bind.copy_column_count; index++) {
-			if (input.data[index].GetType() != global_state.copy->expected_types[index]) {
-				throw InvalidInputException("DuckLake distributed UPDATE input does not match its COPY column types");
-			}
-		}
-		{
-			lock_guard<mutex> guard(global_state.copy_lock);
-			if (!global_state.copy_sink_initialized) {
-				global_state.copy->sink_state = global_state.copy->GetGlobalSinkState(context.client);
-				global_state.copy_sink_initialized = true;
-			}
-		}
-		if (!local_state.copy_state) {
-			local_state.copy_state = global_state.copy->GetLocalSinkState(context);
-		}
-		DataChunk copy_chunk;
-		copy_chunk.InitializeEmpty(global_state.copy->expected_types);
-		for (idx_t index = 0; index < global_state.bind.copy_column_count; index++) {
-			copy_chunk.data[index].Reference(input.data[index]);
-		}
-		copy_chunk.SetCardinality(input.size());
-		InterruptState interrupt_state;
-		OperatorSinkInput sink_input {*global_state.copy->sink_state, *local_state.copy_state, interrupt_state};
-		if (global_state.copy->Sink(context, copy_chunk, sink_input) != SinkResultType::NEED_MORE_INPUT) {
-			throw InternalException("DuckLake distributed UPDATE COPY stopped before consuming its input");
-		}
+		SinkRowDeltaCopy(context, global_state, local_state, input, true);
 	}
 
 	for (idx_t row = 0; row < input.size(); row++) {
@@ -802,7 +879,7 @@ static void DuckLakeRowDeltaCombine(ExecutionContext &context, const Distributed
 		OperatorSinkCombineInput combine_input {*global_state.copy->sink_state, *local_state.copy_state,
 		                                        interrupt_state};
 		if (global_state.copy->Combine(context, combine_input) != SinkCombineResultType::FINISHED) {
-			throw InternalException("DuckLake distributed UPDATE COPY combine did not finish synchronously");
+			throw InternalException("DuckLake distributed row mutation COPY combine did not finish synchronously");
 		}
 	}
 	lock_guard<mutex> guard(global_state.lock);
@@ -959,10 +1036,10 @@ FinalizeCopyAndReadStatistics(ClientContext &context, DuckLakeDistributedRowDelt
 		return result;
 	}
 	if (!global_state.copy_sink_initialized || !global_state.copy->sink_state) {
-		throw InternalException("DuckLake distributed UPDATE received rows without initializing its COPY writer");
+		throw InternalException("DuckLake distributed row mutation received rows without initializing its COPY writer");
 	}
 	if (global_state.copy->FinalizeInternal(context, *global_state.copy->sink_state) != SinkFinalizeType::READY) {
-		throw InternalException("DuckLake distributed UPDATE COPY finalization did not finish synchronously");
+		throw InternalException("DuckLake distributed row mutation COPY finalization did not finish synchronously");
 	}
 	auto source_global = global_state.copy->GetGlobalSourceState(context);
 	ThreadContext thread_context(context);
@@ -988,7 +1065,7 @@ FinalizeCopyAndReadStatistics(ClientContext &context, DuckLakeDistributedRowDelt
 			break;
 		}
 		if (state != SourceResultType::HAVE_MORE_OUTPUT) {
-			throw InternalException("DuckLake distributed UPDATE COPY statistics source blocked unexpectedly");
+			throw InternalException("DuckLake distributed row mutation COPY statistics source blocked unexpectedly");
 		}
 	}
 	return result;
@@ -1043,9 +1120,15 @@ static vector<DistributedWriteFragment> DuckLakeRowDeltaFinalize(ClientContext &
 		delete_rows = CheckedAdd(delete_rows, file.new_delete_count, "worker delete row count");
 		byte_count = CheckedAdd(byte_count, file.file_size_bytes, "worker byte count");
 	}
-	if (delete_rows == 0 || delete_rows > affected_rows ||
-	    (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::UPDATE &&
-	     (delete_rows != affected_rows || data_rows != affected_rows))) {
+	auto invalid_counts = false;
+	if (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT) {
+		invalid_counts = delete_rows != 0 || data_rows != affected_rows;
+	} else if (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::UPDATE) {
+		invalid_counts = delete_rows != affected_rows || data_rows != affected_rows;
+	} else {
+		invalid_counts = delete_rows == 0 || delete_rows > affected_rows || data_rows != 0;
+	}
+	if (invalid_counts) {
 		throw InternalException("DuckLake distributed row mutation worker produced inconsistent affected-row counts");
 	}
 
@@ -1118,18 +1201,55 @@ static void ValidateCopyFileValues(const distributed::DistributedCopyFileInfo &f
 	    file.footer_size_bytes.type() != expected_types[3] ||
 	    UBigIntValue::Get(file.footer_size_bytes) > file.file_size_bytes || file.column_statistics.IsNull() ||
 	    file.column_statistics.type() != expected_types[4] || file.partition_keys.type() != expected_types[5]) {
-		throw InvalidInputException("DuckLake distributed UPDATE returned invalid data-file statistics");
+		throw InvalidInputException("DuckLake distributed row mutation returned invalid data-file statistics");
 	}
 	const auto signed_max = NumericCast<idx_t>(NumericLimits<int64_t>::Maximum());
 	if (file.row_count > signed_max || file.file_size_bytes > signed_max) {
-		throw InvalidInputException("DuckLake distributed UPDATE data-file statistics exceed signed limits");
+		throw InvalidInputException("DuckLake distributed row mutation data-file statistics exceed signed limits");
 	}
 }
 
 } // namespace
 
-void ValidateDuckLakeDistributedUpdateCopyShape(const PhysicalCopyToFile &copy) {
-	ValidateDistributedUpdateCopyShape(copy);
+void ValidateDuckLakeDistributedRowDeltaCopyShape(const PhysicalCopyToFile &copy) {
+	ValidateDistributedRowDeltaCopyShape(copy);
+}
+
+ScalarFunction DuckLakeDistributedMergePartitionFunction() {
+	auto result = ScalarFunction(DUCKLAKE_MERGE_PARTITION_FUNCTION, {LogicalType::VARCHAR}, LogicalType::HASH,
+	                             DuckLakeMergePartitionHash);
+	result.varargs = LogicalType::ANY;
+	result.SetInitStateCallback(DuckLakeMergePartitionInit);
+	result.SetStability(FunctionStability::VOLATILE);
+	result.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	return result;
+}
+
+PhysicalOperator &PlanDuckLakeDistributedRowDeltaRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
+                                                             idx_t file_path_index,
+                                                             const vector<idx_t> &null_file_path_partition_indexes) {
+	if (file_path_index >= input.types.size() || input.types[file_path_index] != LogicalType::VARCHAR) {
+		throw InternalException("DuckLake distributed row mutation file-path column is invalid");
+	}
+	vector<unique_ptr<Expression>> arguments;
+	arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, file_path_index));
+	for (auto partition_index : null_file_path_partition_indexes) {
+		if (partition_index >= input.types.size() || partition_index == file_path_index) {
+			throw InternalException("DuckLake distributed row mutation fallback partition column is invalid");
+		}
+		if (input.types[partition_index].id() == LogicalTypeId::SQLNULL) {
+			continue;
+		}
+		arguments.push_back(make_uniq<BoundReferenceExpression>(input.types[partition_index], partition_index));
+	}
+	vector<ExprRef> partition_by;
+	partition_by.emplace_back(make_uniq<BoundFunctionExpression>(
+	    LogicalType::HASH, DuckLakeDistributedMergePartitionFunction(), std::move(arguments), nullptr));
+	auto repartition_spec = RepartitionSpec::create_hash(0, std::move(partition_by));
+	auto &result =
+	    planner.Make<PhysicalRepartition>(input.types, std::move(repartition_spec), input.estimated_cardinality);
+	result.children.push_back(input);
+	return result;
 }
 
 PhysicalOperator &PlanDuckLakeDistributedRowDeltaRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
@@ -1149,7 +1269,11 @@ PhysicalOperator &PlanDuckLakeDistributedRowDeltaRepartition(PhysicalPlanGenerat
 static DuckLakeDistributedRowDeltaBind BuildDuckLakeDistributedRowDeltaBind(
     ClientContext &context, const DuckLakeTableEntry &table, const vector<DuckLakeFileListExtendedEntry> &source_files,
     const string &artifact_path, bool source_is_statically_empty, DuckLakeDistributedRowDeltaKind kind) {
-	if (source_is_statically_empty != source_files.empty()) {
+	if (kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT) {
+		if (!source_files.empty()) {
+			throw InternalException("DuckLake distributed MERGE INSERT source state is inconsistent");
+		}
+	} else if (source_is_statically_empty != source_files.empty()) {
 		throw InternalException("DuckLake distributed row mutation source state is inconsistent");
 	}
 	DuckLakeDistributedRowDeltaBind bind;
@@ -1173,7 +1297,7 @@ static DuckLakeDistributedRowDeltaBind BuildDuckLakeDistributedRowDeltaBind(
 	auto &transaction = DuckLakeTransaction::Get(context, table.catalog);
 	bind.snapshot = transaction.GetSnapshot();
 	bind.new_delete_snapshot = CheckedAdd(bind.snapshot.snapshot_id, 1, "snapshot id");
-	if (!source_is_statically_empty) {
+	if (kind != DuckLakeDistributedRowDeltaKind::MERGE_INSERT && !source_is_statically_empty) {
 		bind.delete_sources = BuildSourceStates(context, source_files,
 		                                        kind == DuckLakeDistributedRowDeltaKind::DELETE ? "DELETE" : "UPDATE");
 	}
@@ -1203,6 +1327,18 @@ string BuildDuckLakeDistributedUpdateBind(ClientContext &context, const DuckLake
 	    BuildDuckLakeDistributedRowDeltaBind(context, table, source_files, artifact_path, source_is_statically_empty,
 	                                         DuckLakeDistributedRowDeltaKind::UPDATE);
 	bind.row_id_indexes = {file_path_index, row_position_index};
+	bind.copy_column_count = copy_column_count;
+	bind.copy_operator = SerializeShallowCopy(copy);
+	return SerializeBind(bind);
+}
+
+string BuildDuckLakeDistributedMergeInsertBind(ClientContext &context, const DuckLakeTableEntry &table,
+                                               const PhysicalCopyToFile &copy, idx_t copy_column_count,
+                                               const string &artifact_path, bool source_is_statically_empty) {
+	vector<DuckLakeFileListExtendedEntry> source_files;
+	auto bind =
+	    BuildDuckLakeDistributedRowDeltaBind(context, table, source_files, artifact_path, source_is_statically_empty,
+	                                         DuckLakeDistributedRowDeltaKind::MERGE_INSERT);
 	bind.copy_column_count = copy_column_count;
 	bind.copy_operator = SerializeShallowCopy(copy);
 	return SerializeBind(bind);
@@ -1283,6 +1419,9 @@ DuckLakeDistributedRowDeltaResult DecodeDuckLakeDistributedRowDeltaResults(
 			if (expected_kind == DuckLakeDistributedRowDeltaKind::DELETE && !decoded.data_files.empty()) {
 				throw InvalidInputException("DuckLake distributed DELETE returned a data-file artifact");
 			}
+			if (expected_kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT && !decoded.delete_files.empty()) {
+				throw InvalidInputException("DuckLake distributed MERGE INSERT returned a delete-file artifact");
+			}
 
 			idx_t row_count = 0;
 			idx_t delete_row_count = 0;
@@ -1294,7 +1433,7 @@ DuckLakeDistributedRowDeltaResult DecodeDuckLakeDistributedRowDeltaResults(
 			for (auto &file : decoded.data_files) {
 				const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
 				if (path.empty()) {
-					throw InvalidInputException("DuckLake distributed UPDATE returned an empty data-file path");
+					throw InvalidInputException("DuckLake distributed row mutation returned an empty data-file path");
 				}
 				ValidateCopyFileValues(file);
 				if (file.file_size_bytes > signed_max - total_artifact_bytes) {
@@ -1305,7 +1444,8 @@ DuckLakeDistributedRowDeltaResult DecodeDuckLakeDistributedRowDeltaResults(
 				auto canonical_path = ValidateAttemptArtifactPath(context, artifact_path, task_result.task_attempt_id,
 				                                                  path, file.file_size_bytes, "data file");
 				if (!artifact_paths.insert(std::move(canonical_path)).second) {
-					throw InvalidInputException("DuckLake distributed UPDATE returned a duplicate data-file path");
+					throw InvalidInputException(
+					    "DuckLake distributed row mutation returned a duplicate data-file path");
 				}
 				row_count = CheckedAdd(row_count, file.row_count, "fragment data row count");
 				byte_count = CheckedAdd(byte_count, file.file_size_bytes, "fragment byte count");
@@ -1359,10 +1499,16 @@ DuckLakeDistributedRowDeltaResult DecodeDuckLakeDistributedRowDeltaResults(
 				expected_artifact_ids.push_back("delete:" + to_string(delete_artifact_index++));
 				combined.delete_files.push_back(std::move(file));
 			}
-			if (delete_row_count == 0 || delete_row_count > fragment.row_count ||
-			    (expected_kind == DuckLakeDistributedRowDeltaKind::UPDATE &&
-			     (delete_row_count != fragment.row_count || row_count != fragment.row_count)) ||
-			    byte_count != fragment.byte_count || fragment.artifacts.size() != expected_artifacts.size()) {
+			auto invalid_counts = false;
+			if (expected_kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT) {
+				invalid_counts = delete_row_count != 0 || row_count != fragment.row_count;
+			} else if (expected_kind == DuckLakeDistributedRowDeltaKind::UPDATE) {
+				invalid_counts = delete_row_count != fragment.row_count || row_count != fragment.row_count;
+			} else {
+				invalid_counts = delete_row_count == 0 || delete_row_count > fragment.row_count || row_count != 0;
+			}
+			if (invalid_counts || byte_count != fragment.byte_count ||
+			    fragment.artifacts.size() != expected_artifacts.size()) {
 				throw InvalidInputException("DuckLake distributed row mutation fragment counts are inconsistent");
 			}
 			for (idx_t index = 0; index < fragment.artifacts.size(); index++) {

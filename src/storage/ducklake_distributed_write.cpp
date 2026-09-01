@@ -10,6 +10,7 @@
 #include "storage/ducklake_sort_data.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_variant_stats.hpp"
+#include "storage/ducklake_distributed_merge.hpp"
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -1044,6 +1045,8 @@ void ValidateDuckLakeDistributedDataFileArtifactsInRoot(ClientContext &context, 
 }
 
 void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader) {
+	loader.RegisterFunction(DuckLakeDistributedMergePartitionFunction());
+
 	auto register_file_write = [&](const string &name) {
 		DistributedWriteOperatorExtension extension;
 		extension.name = name;
@@ -1067,6 +1070,14 @@ void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader) {
 	};
 	register_row_delta("delete");
 	register_row_delta("update");
+
+	DistributedWriteOperatorExtension merge;
+	merge.name = "merge";
+	merge.protocol_version = 1;
+	merge.mode = DistributedWriteMode::CALLBACK;
+	merge.fragment_codec = {"ducklake.merge-fragment", 1};
+	merge.callbacks = DuckLakeDistributedMergeCallbacks();
+	DistributedWriteOperatorExtension::Register(loader, std::move(merge));
 }
 
 } // namespace duckdb

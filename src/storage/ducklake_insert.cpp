@@ -94,9 +94,11 @@ static void ValidateDistributedCopyShape(const PhysicalCopyToFile &copy, const s
 	}
 }
 
-static void AddDistributedDataFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state,
-                                    const vector<distributed::DistributedCopyFileInfo> &files,
-                                    optional_idx partition_id) {
+} // namespace
+
+void AddDuckLakeDistributedDataFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state,
+                                     const vector<distributed::DistributedCopyFileInfo> &files,
+                                     optional_idx partition_id) {
 	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
 	for (const auto &file : files) {
 		DataChunk chunk;
@@ -111,8 +113,6 @@ static void AddDistributedDataFiles(ClientContext &context, DuckLakeInsertGlobal
 		DuckLakeInsert::AddWrittenFiles(global_state, chunk, string(), partition_id);
 	}
 }
-
-} // namespace
 
 void DuckLakeInsert::InitializeDistributedWritePlan() {
 	distributed_write_plan.extension_name = "ducklake";
@@ -225,7 +225,7 @@ void DuckLakeInsert::ValidateDistributedWriteShape() const {
 		    !distributed_update_copy || !distributed_update_delete || distributed_artifact_path.empty()) {
 			throw InvalidInputException("DuckLake distributed UPDATE worker plan was not initialized");
 		}
-		ValidateDuckLakeDistributedUpdateCopyShape(*distributed_update_copy);
+		ValidateDuckLakeDistributedRowDeltaCopyShape(*distributed_update_copy);
 		if (distributed_update_source_is_statically_empty) {
 			if (distributed_update_delete->distributed_has_source_scan ||
 			    !distributed_update_delete->distributed_source_files.empty()) {
@@ -330,7 +330,7 @@ optional_ptr<distributed::ExtensionWriteTaskProvider> DuckLakeInsert::GetExtensi
 		if (distributed_write_plan.worker_bind_data.empty()) {
 			throw InvalidInputException("DuckLake distributed UPDATE is missing its frozen worker bind");
 		}
-		ValidateDuckLakeDistributedUpdateCopyShape(*distributed_update_copy);
+		ValidateDuckLakeDistributedRowDeltaCopyShape(*distributed_update_copy);
 	}
 	SelectDistributedWorkerPlan();
 	return this;
@@ -486,7 +486,7 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 			    context, distributed_update_delete->distributed_source_files, distributed_write_plan.worker_bind_data,
 			    decoded.delete_files, "UPDATE");
 			DuckLakeInsertGlobalState insert_state(target_table);
-			AddDistributedDataFiles(context, insert_state, decoded.data_files, partition_id);
+			AddDuckLakeDistributedDataFiles(context, insert_state, decoded.data_files, partition_id);
 			idx_t data_row_count = 0;
 			for (const auto &file : insert_state.written_files) {
 				if (file.row_count > NumericLimits<idx_t>::Maximum() - data_row_count) {
@@ -554,7 +554,7 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 		}
 
 		DuckLakeInsertGlobalState global_state(*target_table);
-		AddDistributedDataFiles(context, global_state, files, target_partition_id);
+		AddDuckLakeDistributedDataFiles(context, global_state, files, target_partition_id);
 		for (const auto &data_file : global_state.written_files) {
 			global_state.total_insert_count += data_file.row_count;
 		}
