@@ -1278,8 +1278,7 @@ DuckLakeDistributedRowDeltaResult DecodeDuckLakeDistributedRowDeltaResults(
 	if (bind.kind != expected_kind || bind.use_deletion_vectors != expected_deletion_vectors) {
 		throw InvalidInputException("DuckLake distributed row mutation coordinator bind does not match its target");
 	}
-	if (results.empty() && !bind.source_is_statically_empty &&
-	    expected_kind != DuckLakeDistributedRowDeltaKind::MERGE_INSERT) {
+	if (results.empty() && !bind.source_is_statically_empty) {
 		throw InvalidInputException("DuckLake distributed row mutation returned no selected task results");
 	}
 	auto &file_system = FileSystem::GetFileSystem(context);

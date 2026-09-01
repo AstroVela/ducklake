@@ -679,6 +679,7 @@ def run_mutated_worker_write(
     mutate: Callable[[dict[str, object], object], list[dict[str, object]] | None],
     selected_attempt_id: int = 0,
     artifact_data_root: Path | None = None,
+    drop_task_result: bool = False,
 ) -> tuple[dict[str, object], int]:
     import pyarrow as pa
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
@@ -691,6 +692,9 @@ def run_mutated_worker_write(
     def execute_with_mutated_result(request: object) -> object:
         nonlocal mutated_file_count
         result = fragment_executor(request)
+        if drop_task_result:
+            mutated_file_count += sum(payload.num_rows for payload in result.partition_payloads)
+            return None
         payloads = []
         for payload in result.partition_payloads:
             if payload.num_columns < 5:
@@ -1490,6 +1494,62 @@ def exercise_distributed_merges(
                 merge_attempt_ids.add(bytes.fromhex(parts[index + 1]).decode())
                 break
     require_true(len(merge_attempt_ids) > 1, "distributed MERGE did not publish multiple task attempts")
+
+    missing_result_source = connection.sql("SELECT 9000::INTEGER AS id, 'missing-result'::VARCHAR AS payload")
+    missing_result_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: missing_result_source.merge_into(
+            "lake.merge_retry_target",
+            "target.id = source.id",
+            ["WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)"],
+        ),
+    )
+    files_before_missing_result = {path for path in (root / "data").rglob("*") if path.is_file()}
+    directories_before_missing_result = distributed_artifact_directories(root)
+    missing_result_outcome, missing_result_payload_count = run_mutated_worker_write(
+        vane,
+        connection,
+        missing_result_plan,
+        lambda _row, _payload: None,
+        drop_task_result=True,
+    )
+    require_true(missing_result_payload_count > 0, "missing-result MERGE produced no worker task result")
+    require_equal(
+        missing_result_outcome.get("extension_catalog_committed"),
+        False,
+        "missing-result MERGE catalog commit",
+    )
+    require_equal(
+        missing_result_outcome.get("copy_output_outcome_unknown"),
+        True,
+        "missing-result MERGE outcome",
+    )
+    require_equal(
+        missing_result_outcome.get("extension_task_result_count"),
+        0,
+        "missing-result MERGE selected task result count",
+    )
+    require_true(
+        "no selected task results" in str(missing_result_outcome.get("copy_output_outcome_error")),
+        "missing-result MERGE outcome error",
+    )
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.merge_retry_target").fetchone(),
+        (0,),
+        "missing-result MERGE visibility",
+    )
+    require_equal(
+        {path for path in (root / "data").rglob("*") if path.is_file()},
+        files_before_missing_result,
+        "missing-result MERGE artifact cleanup",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_missing_result,
+        "missing-result MERGE artifact-root cleanup",
+    )
 
     retry_source = connection.sql("SELECT 9001::INTEGER AS id, 'retry-selected'::VARCHAR AS payload")
     retry_plan = capture_physical_write_plan(
