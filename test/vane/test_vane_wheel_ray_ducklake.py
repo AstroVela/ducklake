@@ -1667,6 +1667,24 @@ def exercise_distributed_merges(
     selected_attempt = bytes.fromhex(retry_file_parts[artifact_root_index + 1]).decode()
     require_true(selected_attempt.endswith(".1"), "selected retry MERGE task-attempt identity")
 
+    empty_delete_source = connection.sql("SELECT 9002::INTEGER AS id, 'insert-only'::VARCHAR AS payload")
+    require_write(
+        "distributed DuckLake MERGE with empty DELETE action",
+        lambda: empty_delete_source.merge_into(
+            "lake.merge_retry_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN DELETE",
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+            ],
+        ),
+    )
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.merge_retry_target ORDER BY id").fetchall(),
+        [(9001, "retry-selected"), (9002, "insert-only")],
+        "distributed MERGE empty DELETE action readback",
+    )
+
     delete_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 896 AND 1279")
     require_write(
         "unpartitioned distributed DuckLake MERGE DELETE and INSERT",

@@ -1139,7 +1139,8 @@ idx_t DuckLakeDistributedMergeInto::FinalizeDistributedWrite(ClientContext &cont
 					delete_files.push_back(std::move(file));
 				}
 			} else {
-				if (data_row_count != 0 || delete_row_count == 0 || delete_row_count > action_result.affected_rows) {
+				if (data_row_count != 0 || delete_row_count > action_result.affected_rows ||
+				    (action_result.affected_rows != 0 && delete_row_count == 0)) {
 					throw InvalidInputException("DuckLake distributed MERGE DELETE returned inconsistent artifacts");
 				}
 				auto action_delete_files = BuildDuckLakeDistributedDeleteFiles(
