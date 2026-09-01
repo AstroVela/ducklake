@@ -1824,6 +1824,49 @@ def exercise_distributed_merges(
         "zero-action distributed MERGE artifact roots",
     )
 
+    missing_error_result_plan = capture_physical_write_plan(
+        vane,
+        connection,
+        runner,
+        lambda: connection.sql("SELECT id, payload FROM lake.source WHERE id = 1").merge_into(
+            "lake.merge_noop_target",
+            "target.id = source.id",
+            ["WHEN MATCHED AND source.id < 0 THEN ERROR 'unreachable merge error'"],
+        ),
+    )
+    missing_error_result_outcome, missing_error_result_payload_count = run_mutated_worker_write(
+        vane,
+        connection,
+        missing_error_result_plan,
+        lambda _row, _payload: None,
+        drop_task_result=True,
+    )
+    require_true(missing_error_result_payload_count > 0, "error-only MERGE produced no worker task result")
+    require_equal(
+        missing_error_result_outcome.get("extension_catalog_committed"),
+        False,
+        "missing-result error-only MERGE catalog commit",
+    )
+    require_true(
+        "no selected task results" in str(missing_error_result_outcome.get("copy_output_outcome_error")),
+        "missing-result error-only MERGE outcome",
+    )
+    require_equal(
+        connection.execute("SELECT id, payload FROM lake.merge_noop_target ORDER BY id").fetchall(),
+        [(1, "noop-old"), (2, "noop-keep")],
+        "missing-result error-only MERGE visibility",
+    )
+    require_equal(
+        {path for path in (root / "data").rglob("*") if path.is_file()},
+        files_before_noop,
+        "missing-result error-only MERGE artifacts",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_noop,
+        "missing-result error-only MERGE artifact roots",
+    )
+
     files_before_error = {path for path in (root / "data").rglob("*") if path.is_file()}
     directories_before_error = distributed_artifact_directories(root)
     error_source = connection.sql("SELECT id, payload FROM lake.source WHERE id = 1")

@@ -55,6 +55,7 @@ struct DuckLakeDistributedMergeBind {
 	idx_t row_id_index = DConstants::INVALID_INDEX;
 	optional_idx source_marker;
 	vector<DuckLakeDistributedMergeActionBind> actions;
+	bool worker_plan_is_statically_empty = false;
 };
 
 struct DuckLakeEmbeddedMergeFragment {
@@ -205,6 +206,7 @@ static string SerializeMergeBind(const DuckLakeDistributedMergeBind &bind) {
 	serializer.WriteList(4, "actions", bind.actions.size(), [&](Serializer::List &list, idx_t index) {
 		list.WriteObject([&](Serializer &object) { SerializeMergeAction(object, bind.actions[index]); });
 	});
+	serializer.WriteProperty(5, "worker_plan_is_statically_empty", bind.worker_plan_is_statically_empty);
 	serializer.End();
 	return BytesFromStream(stream);
 }
@@ -224,6 +226,7 @@ static DuckLakeDistributedMergeBind DeserializeMergeBind(ClientContext &context,
 	deserializer.ReadList(4, "actions", [&](Deserializer::List &list, idx_t) {
 		list.ReadObject([&](Deserializer &object) { result.actions.push_back(DeserializeMergeAction(object)); });
 	});
+	result.worker_plan_is_statically_empty = deserializer.ReadProperty<bool>(5, "worker_plan_is_statically_empty");
 	deserializer.End();
 	if (result.input_types.empty() || result.row_id_index >= result.input_types.size() || result.actions.empty() ||
 	    (result.source_marker.IsValid() && result.source_marker.GetIndex() >= result.input_types.size())) {
@@ -699,6 +702,9 @@ DecodeDistributedMergeResults(ClientContext &context, const DistributedExtension
 		throw InvalidInputException("DuckLake distributed MERGE resolved the wrong worker protocol");
 	}
 	auto bind = DeserializeMergeBind(context, info.worker_bind_data);
+	if (results.empty() && !bind.worker_plan_is_statically_empty) {
+		throw InvalidInputException("DuckLake distributed MERGE returned no selected task results");
+	}
 	vector<vector<DistributedWriteTaskResult>> action_results(bind.actions.size());
 	set<string> task_attempt_ids;
 	set<string> fragment_ids;
@@ -879,6 +885,7 @@ void DuckLakeDistributedMergeInto::ConfigureDistributedMerge(ClientContext &cont
 	bind.input_types = worker_input_types;
 	bind.row_id_index = row_id_index;
 	bind.source_marker = source_marker;
+	bind.worker_plan_is_statically_empty = worker_plan_is_statically_empty;
 	for (auto &planned_action : actions) {
 		DuckLakeDistributedMergeActionBind action;
 		action.match_condition = planned_action.match_condition;
