@@ -55,7 +55,7 @@ public:
 	void ConfigureDistributedMerge(ClientContext &context, DuckLakeTableEntry &table,
 	                               vector<DuckLakeDistributedMergePlanAction> actions, PhysicalOperator &worker_child,
 	                               const vector<LogicalType> &worker_input_types, idx_t row_id_index,
-	                               optional_idx source_marker);
+	                               optional_idx source_marker, bool worker_plan_is_statically_empty);
 
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
 	const distributed::DistributedExtensionWritePlan &WritePlan() const override;

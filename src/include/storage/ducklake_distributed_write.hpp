@@ -115,7 +115,7 @@ string BuildDuckLakeDistributedUpdateBind(ClientContext &context, const DuckLake
 
 string BuildDuckLakeDistributedMergeInsertBind(ClientContext &context, const DuckLakeTableEntry &table,
                                                const PhysicalCopyToFile &copy, idx_t copy_column_count,
-                                               const string &artifact_path);
+                                               const string &artifact_path, bool source_is_statically_empty);
 
 void AddDuckLakeDistributedDataFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state,
                                      const vector<distributed::DistributedCopyFileInfo> &files,

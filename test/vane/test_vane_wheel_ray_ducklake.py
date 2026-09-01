@@ -440,6 +440,7 @@ def seed_tables(connection: object, root: Path) -> None:
         connection.execute("CREATE TABLE lake.merge_retry_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.merge_duplicate_update_target(id INTEGER, payload INTEGER)")
         connection.execute("CREATE TABLE lake.merge_constant_insert_target(id INTEGER, payload VARCHAR)")
+        connection.execute("CREATE TABLE lake.merge_empty_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.merge_failure_target(id INTEGER, payload VARCHAR)")
         connection.execute("CREATE TABLE lake.merge_conflict_target(id INTEGER, payload VARCHAR)")
         for file_index in range(FILE_COUNT):
@@ -1445,6 +1446,36 @@ def exercise_distributed_merges(
     require_write_count: Callable[[int, str], None],
 ) -> None:
     require_equal(len(expected_worker_nodes), WORKER_COUNT, "MERGE Ray cluster topology")
+    files_before_empty_merge = {path for path in (root / "data").rglob("*") if path.is_file()}
+    directories_before_empty_merge = distributed_artifact_directories(root)
+    empty_merge_source = connection.sql("SELECT id, payload FROM lake.source WHERE false")
+    require_write(
+        "statically empty distributed DuckLake MERGE",
+        lambda: empty_merge_source.merge_into(
+            "lake.merge_empty_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN UPDATE SET payload = source.payload",
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+            ],
+        ),
+    )
+    require_equal(
+        connection.execute("SELECT count(*) FROM lake.merge_empty_target").fetchone(),
+        (0,),
+        "statically empty distributed MERGE visibility",
+    )
+    require_equal(
+        {path for path in (root / "data").rglob("*") if path.is_file()},
+        files_before_empty_merge,
+        "statically empty distributed MERGE artifacts",
+    )
+    require_equal(
+        distributed_artifact_directories(root),
+        directories_before_empty_merge,
+        "statically empty distributed MERGE artifact roots",
+    )
+
     duplicate_update_source = connection.sql(
         "SELECT * FROM (VALUES (7000::INTEGER, 'winner'::VARCHAR, 0::INTEGER), "
         "(7000::INTEGER, 'discarded'::VARCHAR, 1::INTEGER)) AS rows(id, payload, source_order) "

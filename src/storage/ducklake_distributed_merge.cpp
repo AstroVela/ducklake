@@ -855,7 +855,8 @@ void DuckLakeDistributedMergeInto::ConfigureDistributedMerge(ClientContext &cont
                                                              vector<DuckLakeDistributedMergePlanAction> actions,
                                                              PhysicalOperator &worker_child,
                                                              const vector<LogicalType> &worker_input_types,
-                                                             idx_t row_id_index, optional_idx source_marker) {
+                                                             idx_t row_id_index, optional_idx source_marker,
+                                                             bool worker_plan_is_statically_empty) {
 	auto &catalog = table.catalog.Cast<DuckLakeCatalog>();
 	auto &schema = table.ParentSchema().Cast<DuckLakeSchemaEntry>();
 	auto &transaction = DuckLakeTransaction::Get(context, catalog);
@@ -919,9 +920,10 @@ void DuckLakeDistributedMergeInto::ConfigureDistributedMerge(ClientContext &cont
 				if (!planned_action.copy) {
 					throw InternalException("DuckLake distributed MERGE INSERT COPY writer is missing");
 				}
+				coordinator_action.source_is_statically_empty = worker_plan_is_statically_empty;
 				action.worker_bind_data = BuildDuckLakeDistributedMergeInsertBind(
 				    context, table, *planned_action.copy, planned_action.copy->expected_types.size(),
-				    distributed_artifact_path);
+				    distributed_artifact_path, worker_plan_is_statically_empty);
 				break;
 			case MergeActionType::MERGE_UPDATE:
 				if (planned_action.copy && planned_action.delete_op && coordinator_action.source_prepared) {

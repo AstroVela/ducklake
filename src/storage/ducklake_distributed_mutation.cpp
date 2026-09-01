@@ -550,8 +550,7 @@ static DuckLakeDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 	} else if (result.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT && !result.row_id_indexes.empty()) {
 		throw SerializationException("DuckLake distributed MERGE INSERT bind has unexpected row identifiers");
 	}
-	if (result.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT &&
-	    (result.source_is_statically_empty || !result.delete_sources.empty())) {
+	if (result.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT && !result.delete_sources.empty()) {
 		throw SerializationException("DuckLake distributed MERGE INSERT bind has invalid source state");
 	}
 	if (result.kind != DuckLakeDistributedRowDeltaKind::MERGE_INSERT && result.source_is_statically_empty &&
@@ -797,16 +796,16 @@ static void DuckLakeRowDeltaSink(ExecutionContext &context, const DistributedExt
                                  DistributedWriteLocalState &local_state_p, DataChunk &input) {
 	auto &global_state = global_state_p.Cast<DuckLakeDistributedRowDeltaGlobalState>();
 	auto &local_state = local_state_p.Cast<DuckLakeDistributedRowDeltaLocalState>();
-	if (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT) {
-		SinkRowDeltaCopy(context, global_state, local_state, input, false);
-		local_state.affected_rows = CheckedAdd(local_state.affected_rows, input.size(), "worker affected row count");
-		return;
-	}
 	if (global_state.bind.source_is_statically_empty) {
 		if (input.size() != 0) {
 			throw InvalidInputException(
 			    "DuckLake distributed row mutation received rows from a statically empty source");
 		}
+		return;
+	}
+	if (global_state.bind.kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT) {
+		SinkRowDeltaCopy(context, global_state, local_state, input, false);
+		local_state.affected_rows = CheckedAdd(local_state.affected_rows, input.size(), "worker affected row count");
 		return;
 	}
 	auto input_row_count = input.size();
@@ -1271,7 +1270,7 @@ static DuckLakeDistributedRowDeltaBind BuildDuckLakeDistributedRowDeltaBind(
     ClientContext &context, const DuckLakeTableEntry &table, const vector<DuckLakeFileListExtendedEntry> &source_files,
     const string &artifact_path, bool source_is_statically_empty, DuckLakeDistributedRowDeltaKind kind) {
 	if (kind == DuckLakeDistributedRowDeltaKind::MERGE_INSERT) {
-		if (source_is_statically_empty || !source_files.empty()) {
+		if (!source_files.empty()) {
 			throw InternalException("DuckLake distributed MERGE INSERT source state is inconsistent");
 		}
 	} else if (source_is_statically_empty != source_files.empty()) {
@@ -1335,10 +1334,11 @@ string BuildDuckLakeDistributedUpdateBind(ClientContext &context, const DuckLake
 
 string BuildDuckLakeDistributedMergeInsertBind(ClientContext &context, const DuckLakeTableEntry &table,
                                                const PhysicalCopyToFile &copy, idx_t copy_column_count,
-                                               const string &artifact_path) {
+                                               const string &artifact_path, bool source_is_statically_empty) {
 	vector<DuckLakeFileListExtendedEntry> source_files;
-	auto bind = BuildDuckLakeDistributedRowDeltaBind(context, table, source_files, artifact_path, false,
-	                                                 DuckLakeDistributedRowDeltaKind::MERGE_INSERT);
+	auto bind =
+	    BuildDuckLakeDistributedRowDeltaBind(context, table, source_files, artifact_path, source_is_statically_empty,
+	                                         DuckLakeDistributedRowDeltaKind::MERGE_INSERT);
 	bind.copy_column_count = copy_column_count;
 	bind.copy_operator = SerializeShallowCopy(copy);
 	return SerializeBind(bind);

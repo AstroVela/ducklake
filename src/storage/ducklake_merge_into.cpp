@@ -784,6 +784,7 @@ PhysicalOperator &DuckLakeCatalog::PlanMergeInto(ClientContext &context, Physica
 	}
 
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
+	auto worker_plan_is_statically_empty = plan.type == PhysicalOperatorType::EMPTY_RESULT;
 	optional_ptr<PhysicalOperator> worker_child = &plan;
 	if (update_delete_count != 0) {
 		vector<idx_t> null_file_path_partition_indexes;
@@ -809,7 +810,8 @@ PhysicalOperator &DuckLakeCatalog::PlanMergeInto(ClientContext &context, Physica
 	result.children.push_back(plan);
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 	result.ConfigureDistributedMerge(context, op.table.Cast<DuckLakeTableEntry>(), std::move(distributed_actions),
-	                                 *worker_child, worker_child->types, op.row_id_start, op.source_marker);
+	                                 *worker_child, worker_child->types, op.row_id_start, op.source_marker,
+	                                 worker_plan_is_statically_empty);
 #endif
 	return result;
 }
