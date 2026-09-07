@@ -6,19 +6,30 @@ on:
       - v1.5-variegata_vane
   pull_request:
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Run CI only or publish the pinned DuckLake provider candidate to TestPyPI
+        type: choice
+        options:
+          - build-only
+          - testpypi-dev
+        default: build-only
+        required: true
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ inputs.operation || 'ci' }}
+  cancel-in-progress: ${{ inputs.operation != 'testpypi-dev' }}
 
 permissions:
   contents: read
 
 jobs:
   vane-native:
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@1ca9fe2e2e9c33f7422e10055d405fe1b28f1f1c
+    if: inputs.operation != 'testpypi-dev'
+    # The called workflow verifies its exact SHA from GitHub job metadata.
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@671717e4816c21e65aa32a32dd0def8b030baa44
     with:
-      ci_tools_version: 1ca9fe2e2e9c33f7422e10055d405fe1b28f1f1c
+      ci_tools_version: 671717e4816c21e65aa32a32dd0def8b030baa44
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
@@ -109,3 +120,985 @@ jobs:
           fi
           python -m pip install --disable-pip-version-check "${wheels[0]}"
           python -I test/vane/test_vane_wheel_ray_ducklake.py
+
+  vane-provider-release-tooling:
+    if: inputs.operation != 'testpypi-dev'
+    name: Validate DuckLake provider release tooling
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Exercise the provider release and native packaging contracts
+        run: |
+          python -I test/vane/test_vane_provider_release.py
+          python -I test/vane/test_vane_dynamic_wheel.py
+
+  vane-dynamic-wheel:
+    if: inputs.operation != 'testpypi-dev'
+    name: Build signed Vane dynamic DuckLake wheel
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_DYNAMIC_BUILD_DIR: ${{ github.workspace }}/build/vane-dynamic-wheel
+      VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-dynamic-wheel-dist
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
+      VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
+      VANE_BUILD_JOBS: 12
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_BINARY_SOURCES: clear
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-dynamic-wheel-ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      - name: Checkout extension and submodules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Select manylinux CPython
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_directory=/opt/python/cp312-cp312/bin
+          test -x "$python_directory/python"
+          echo "$python_directory" >> "$GITHUB_PATH"
+          "$python_directory/python" --version
+
+      - name: Read integration manifest
+        id: manifest
+        run: |
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate exact Vane and CI-tools identities
+        shell: bash
+        env:
+          VANE_CI_TOOLS_VERSION: 671717e4816c21e65aa32a32dd0def8b030baa44
+        run: |
+          set -euo pipefail
+          actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
+          test "$actual_ci_tools" = "$VANE_CI_TOOLS_VERSION"
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools \
+            --ci-tools-source extension/vane-extension-ci-tools \
+            --expected-sha "$VANE_CI_TOOLS_VERSION"
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            identity \
+            --vane-source "$VANE_SOURCE_DIR"
+
+      - name: Install native and wheel tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y \
+            autoconf \
+            automake \
+            ccache \
+            curl \
+            file \
+            flex \
+            gcc \
+            gcc-c++ \
+            git \
+            libtool \
+            m4 \
+            make \
+            ninja-build \
+            openssl \
+            openssl-devel \
+            patch \
+            perl-IPC-Cmd \
+            perl-Time-Piece \
+            pkgconf-pkg-config \
+            tar \
+            unzip \
+            xz \
+            zip
+          python -m pip install \
+            "auditwheel>=6.4" \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            -r extension/vane-extension-ci-tools/requirements-release.txt \
+            "patchelf>=0.17.2" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0"
+
+      - name: Build pinned Bison with the exact Vane bootstrap
+        shell: bash
+        env:
+          VANE_BISON_INSTALL_PREFIX: ${{ runner.temp }}/vane-bison-3.8.2
+          VANE_BUILD_TOOLS_DIR: ${{ runner.temp }}/vane-build-tools
+        run: |
+          set -euo pipefail
+          bash "$VANE_SOURCE_DIR/scripts/bootstrap_manylinux_bison.sh"
+          echo "$VANE_BISON_INSTALL_PREFIX/bin" >> "$GITHUB_PATH"
+          printf 'VANE_BISON=%s\n' "$VANE_BISON_INSTALL_PREFIX/bin/bison" >> "$GITHUB_ENV"
+          "$VANE_BISON_INSTALL_PREFIX/bin/bison" --version
+          "$VANE_BISON_INSTALL_PREFIX/bin/bison" --help | grep -F -- '--file-prefix-map'
+
+      - name: Restore dynamic-wheel compiler cache
+        id: dynamic_wheel_ccache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: vane-ducklake-dynamic-wheel-ccache-v2-manylinux_2_28-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/vcpkg.json', 'extension/vane-extension.toml') }}
+
+      - name: Reset dynamic-wheel compiler cache statistics
+        run: ccache --zero-stats
+
+      - name: Set up extension vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.manifest.outputs.vcpkg_revision }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Remove verified run-vcpkg state marker
+        shell: bash
+        env:
+          VANE_EXTENSION_VCPKG_REVISION: ${{ steps.manifest.outputs.vcpkg_revision }}
+          VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          set -euo pipefail
+          marker="$VANE_EXTENSION_VCPKG_ROOT/vcpkgLastBuiltCommitId"
+          test -f "$marker"
+          test ! -L "$marker"
+          test "$(wc -c < "$marker")" -eq 40
+          test "$(<"$marker")" = "$VANE_EXTENSION_VCPKG_REVISION"
+          rm -- "$marker"
+          vcpkg_status="$(git -C "$VANE_EXTENSION_VCPKG_ROOT" status --porcelain --untracked-files=all)"
+          test -z "$vcpkg_status"
+
+      - name: Bootstrap exact Vane dependencies
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          test "$(command -v bison)" = "$VANE_BISON"
+          bison --help | grep -F -- '--file-prefix-map'
+          make -f extension/vane-extension-ci-tools/makefiles/vane_extension.Makefile \
+            vane_wheel_dependencies \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT" \
+            VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS"
+
+      - name: Build and verify dynamic provider wheel
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+        run: |
+          python -I extension/scripts/build_vane_dynamic_wheel.py \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
+            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
+            --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
+            --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS" \
+            --signing-profile ci-test \
+            --signing-private-key "$VANE_SOURCE_DIR/external/duckdb/test/mbedtls/private.pem" \
+            --package-local-runtime
+
+      - name: Report dynamic-wheel compiler cache
+        if: always()
+        shell: bash
+        env:
+          VANE_CCACHE_ACTION_HIT: ${{ steps.dynamic_wheel_ccache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          printf 'GitHub Actions ccache restore hit: %s\n' "${VANE_CCACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload CI-only dynamic wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-ducklake-dynamic-wheels
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  vane-dynamic-ducklake-integration:
+    if: inputs.operation != 'testpypi-dev'
+    name: Vane dynamic wheel local DuckLake integration
+    needs: vane-dynamic-wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      VANE_RUNNER: local-fast
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download verified dynamic wheels
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-ducklake-dynamic-wheels
+          path: vane-wheels
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Exercise DuckLake through the packaged provider wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-wheel-integration
+          . .venv-vane-wheel-integration/bin/activate
+          mapfile -t base_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_ai-*.whl' -print | sort)
+          mapfile -t ducklake_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_ducklake-*.whl' -print | sort)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#ducklake_wheels[@]}" -eq 1
+          python -m pip install --disable-pip-version-check \
+            "${base_wheels[0]}" "${ducklake_wheels[0]}"
+          python -I test/vane/test_vane_dynamic_ducklake.py
+
+  vane-dynamic-ray-ducklake-integration:
+    if: inputs.operation != 'testpypi-dev'
+    name: Vane dynamic wheel two-worker Ray DuckLake integration
+    needs: vane-dynamic-wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      VANE_RUNNER: ray
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
+      RAY_DEDUP_LOGS: "0"
+      VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download verified dynamic wheels
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-ducklake-dynamic-wheels
+          path: vane-wheels
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Exercise DuckLake through two Ray workers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-wheel-ray-integration
+          . .venv-vane-wheel-ray-integration/bin/activate
+          mapfile -t base_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_ai-*.whl' -print | sort)
+          mapfile -t ducklake_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_ducklake-*.whl' -print | sort)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#ducklake_wheels[@]}" -eq 1
+          python -m pip install --disable-pip-version-check \
+            "${base_wheels[0]}" "${ducklake_wheels[0]}"
+          python -I test/vane/test_vane_dynamic_ducklake.py
+
+  vane-testpypi-wheels:
+    if: inputs.operation == 'testpypi-dev'
+    name: Build signed TestPyPI DuckLake provider wheels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vane-extension-ducklake
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
+    permissions:
+      contents: read
+    outputs:
+      vane_version: ${{ steps.release.outputs.vane_version }}
+      ducklake_version: ${{ steps.release.outputs.ducklake_version }}
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_DYNAMIC_BUILD_DIR: ${{ github.workspace }}/build/vane-testpypi-wheel
+      VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-testpypi-wheel-dist
+      VANE_RUNTIME_WHEEL_DIR: ${{ github.workspace }}/build/vane-testpypi-runtime-wheels
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
+      VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
+      VANE_PYTHON: /opt/python/cp312-cp312/bin/python
+      VANE_BUILD_JOBS: 16
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-testpypi-wheel-ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      - name: Require the protected release branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/v1.5-variegata_vane
+
+      - name: Checkout extension and submodules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Read integration manifest
+        id: manifest
+        shell: bash
+        run: |
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install native and wheel tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y \
+            autoconf \
+            automake \
+            ccache \
+            curl \
+            file \
+            flex \
+            gcc \
+            gcc-c++ \
+            git \
+            libtool \
+            m4 \
+            make \
+            ninja-build \
+            openssl \
+            openssl-devel \
+            patch \
+            perl-IPC-Cmd \
+            perl-Time-Piece \
+            pkgconf-pkg-config \
+            tar \
+            unzip \
+            xz \
+            zip
+          "$VANE_PYTHON" -m pip install \
+            "auditwheel>=6.4" \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            -r extension/vane-extension-ci-tools/requirements-release.txt \
+            "patchelf>=0.17.2" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0"
+          echo "$(dirname "$VANE_PYTHON")" >> "$GITHUB_PATH"
+
+      - name: Build pinned Bison with the exact Vane bootstrap
+        shell: bash
+        env:
+          VANE_BISON_INSTALL_PREFIX: ${{ runner.temp }}/vane-bison-3.8.2
+          VANE_BUILD_TOOLS_DIR: ${{ runner.temp }}/vane-build-tools
+        run: |
+          set -euo pipefail
+          bash "$VANE_SOURCE_DIR/scripts/bootstrap_manylinux_bison.sh"
+          echo "$VANE_BISON_INSTALL_PREFIX/bin" >> "$GITHUB_PATH"
+          printf 'VANE_BISON=%s\n' "$VANE_BISON_INSTALL_PREFIX/bin/bison" >> "$GITHUB_ENV"
+          "$VANE_BISON_INSTALL_PREFIX/bin/bison" --version
+          "$VANE_BISON_INSTALL_PREFIX/bin/bison" --help | grep -F -- '--file-prefix-map'
+
+      - name: Validate exact Vane and CI-tools identities
+        shell: bash
+        env:
+          VANE_CI_TOOLS_VERSION: 671717e4816c21e65aa32a32dd0def8b030baa44
+        run: |
+          set -euo pipefail
+          actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
+          test "$actual_ci_tools" = "$VANE_CI_TOOLS_VERSION"
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools \
+            --ci-tools-source extension/vane-extension-ci-tools \
+            --expected-sha "$VANE_CI_TOOLS_VERSION"
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            identity \
+            --vane-source "$VANE_SOURCE_DIR"
+
+      - name: Restore compiler and package caches
+        id: testpypi_cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ${{ env.CCACHE_DIR }}
+            ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vane-ducklake-testpypi-wheel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/vcpkg.json', 'extension/vane-extension.toml') }}
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
+      - name: Set up extension vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.manifest.outputs.vcpkg_revision }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Remove verified run-vcpkg state marker
+        shell: bash
+        env:
+          VANE_EXTENSION_VCPKG_REVISION: ${{ steps.manifest.outputs.vcpkg_revision }}
+          VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          set -euo pipefail
+          marker="$VANE_EXTENSION_VCPKG_ROOT/vcpkgLastBuiltCommitId"
+          test -f "$marker"
+          test ! -L "$marker"
+          test "$(wc -c < "$marker")" -eq 40
+          test "$(<"$marker")" = "$VANE_EXTENSION_VCPKG_REVISION"
+          rm -- "$marker"
+          vcpkg_status="$(git -C "$VANE_EXTENSION_VCPKG_ROOT" status --porcelain --untracked-files=all)"
+          test -z "$vcpkg_status"
+
+      - name: Bootstrap exact Vane dependencies
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          VANE_BOOTSTRAP_PYTHON: ${{ env.VANE_PYTHON }}
+        run: |
+          set -euo pipefail
+          test "$(command -v bison)" = "$VANE_BISON"
+          bison --help | grep -F -- '--file-prefix-map'
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          make -f extension/vane-extension-ci-tools/makefiles/vane_extension.Makefile \
+            vane_wheel_dependencies \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT" \
+            VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
+            VANE_PYTHON="$VANE_PYTHON"
+
+      - name: Download every exact indexed Vane runtime wheel
+        id: vane_candidate
+        shell: bash
+        env:
+          INDEX_URL: https://test.pypi.org/simple/
+        run: |
+          set -euo pipefail
+          version="$(cd "$VANE_SOURCE_DIR" && "$VANE_PYTHON" -m setuptools_scm)"
+          "$VANE_PYTHON" - "$version" <<'PY'
+          import sys
+          from packaging.version import Version
+
+          raw = sys.argv[1]
+          version = Version(raw)
+          if str(version) != raw or not version.is_devrelease or version.local is not None:
+              raise SystemExit(
+                  f"Vane source did not resolve to a canonical public development version: {raw!r}"
+              )
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p "$VANE_RUNTIME_WHEEL_DIR"
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            interpreter="/opt/python/$runtime/bin/python"
+            destination="$VANE_RUNTIME_WHEEL_DIR/$runtime"
+            mkdir -p "$destination"
+            "$interpreter" -m pip download \
+              --disable-pip-version-check \
+              --no-cache-dir \
+              --no-deps \
+              --only-binary=:all: \
+              --index-url "$INDEX_URL" \
+              --dest "$destination" \
+              "vane-ai==$version"
+            test "$(find "$destination" -maxdepth 1 -type f -name 'vane_ai-*.whl' | wc -l)" -eq 1
+          done
+
+      - name: Build, sign and verify the DuckLake provider wheel matrix
+        shell: bash
+        env:
+          VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY: ${{ secrets.VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY }}
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+        run: |
+          set -euo pipefail
+          test -n "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY"
+          signing_key="$RUNNER_TEMP/vane-testpypi-extension-signing.pem"
+          cleanup() {
+            shred --force --remove "$signing_key" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          umask 077
+          printf '%s' "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY" > "$signing_key"
+          unset VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY
+
+          runtime_arguments=()
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            interpreter="/opt/python/$runtime/bin/python"
+            mapfile -t wheels < <(find "$VANE_RUNTIME_WHEEL_DIR/$runtime" -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+            test "${#wheels[@]}" -eq 1
+            runtime_arguments+=(--runtime-python "$interpreter" --runtime-wheel "${wheels[0]}")
+          done
+
+          "$VANE_PYTHON" -I extension/scripts/build_vane_dynamic_wheel.py \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
+            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
+            --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
+            --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS" \
+            --signing-profile testpypi \
+            --signing-private-key "$signing_key" \
+            --consume-signing-private-key \
+            "${runtime_arguments[@]}"
+
+      - name: Validate the immutable publishable release set
+        id: release
+        shell: bash
+        run: |
+          "$VANE_PYTHON" -I extension/vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --ci-tools-version "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)" \
+            --config extension/vane-provider-release.toml \
+            --directory "$VANE_DYNAMIC_DIST_DIR" \
+            --vane-version "${{ steps.vane_candidate.outputs.version }}" \
+            --require-testpypi-publishable \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Report compiler cache
+        if: always()
+        shell: bash
+        env:
+          VANE_CACHE_ACTION_HIT: ${{ steps.testpypi_cache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload verified DuckLake provider wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-ducklake-wheels
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble-testpypi-ducklake:
+    name: Validate, attest and sign TestPyPI DuckLake provider
+    needs: vane-testpypi-wheels
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
+      ducklake_version: ${{ needs.vane-testpypi-wheels.outputs.ducklake_version }}
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read exact Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download DuckLake provider wheels
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-ducklake-wheels
+          path: packages
+
+      - name: Revalidate the complete release set
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml \
+            --directory packages \
+            --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
+            --require-testpypi-publishable
+
+      - name: Assemble distributions and checksums
+        run: |
+          mkdir -p distributions release-assets
+          cp packages/vane_extension_ducklake-*.whl distributions/
+          (cd packages && sha256sum *.whl) > release-assets/SHA256SUMS
+
+      - name: Generate a CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: packages
+          format: cyclonedx-json
+          output-file: release-assets/vane-extension-ducklake-sbom.cdx.json
+          upload-artifact: false
+
+      - name: Attest provider provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ github.workspace }}/packages/*
+
+      - name: Preserve the provenance bundle
+        run: |
+          cp "${{ steps.provenance.outputs.bundle-path }}" \
+            release-assets/vane-extension-ducklake-build-provenance.sigstore.json
+
+      - name: Sign provider distributions with Sigstore
+        uses: sigstore/gh-action-sigstore-python@f7ad0af51a5648d09a20d00370f0a91c3bdf8f84 # v3.0.1
+        with:
+          inputs: packages/*.whl
+
+      - name: Upload DuckLake distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-ducklake-distributions
+          path: distributions/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-ducklake-supplemental
+          path: |
+            release-assets/*
+            packages/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-testpypi-ducklake:
+    name: Publish DuckLake provider to TestPyPI
+    needs: assemble-testpypi-ducklake
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vane-extension-ducklake
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download DuckLake distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-ducklake-distributions
+          path: dist
+
+      - name: Publish through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: true
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  verify-testpypi-ducklake:
+    name: Verify indexed DuckLake provider
+    needs: [assemble-testpypi-ducklake, publish-testpypi-ducklake]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read exact Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download DuckLake distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-ducklake-distributions
+          path: dist
+
+      - name: Compare the immutable indexed release
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml \
+            --provider ducklake \
+            --directory dist \
+            --version "${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}"
+
+  testpypi-local-ducklake-integration:
+    name: TestPyPI local DuckLake integration
+    needs: [assemble-testpypi-ducklake, verify-testpypi-ducklake]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VANE_RUNNER: local-fast
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
+      INDEX_URL: https://test.pypi.org/simple/
+
+    steps:
+      - name: Checkout extension tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download expected DuckLake distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-ducklake-distributions
+          path: expected/ducklake
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact indexed package graph
+        shell: bash
+        env:
+          VANE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.vane_version }}
+          DUCKLAKE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-testpypi-local
+          . .venv-vane-testpypi-local/bin/activate
+          python -m pip install --upgrade pip
+          mkdir -p indexed
+          download_exact() {
+            local requirement="$1"
+            for attempt in 1 2 3 4 5; do
+              if python -m pip download \
+                --disable-pip-version-check \
+                --no-cache-dir \
+                --no-deps \
+                --only-binary=:all: \
+                --index-url "$INDEX_URL" \
+                --dest indexed \
+                "$requirement"; then
+                return
+              fi
+              sleep 15
+            done
+            return 1
+          }
+          download_exact "vane-ai==$VANE_VERSION"
+          download_exact "vane-extension-ducklake==$DUCKLAKE_VERSION"
+
+          mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+          mapfile -t ducklake_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_ducklake-*.whl' -print)
+          mapfile -t expected_ducklake < <(find expected/ducklake -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#ducklake_wheels[@]}" -eq 1
+          test "${#expected_ducklake[@]}" -eq 1
+          cmp "${expected_ducklake[0]}" "${ducklake_wheels[0]}"
+          python -m pip install "${base_wheels[0]}" "${ducklake_wheels[0]}"
+          python -m pip check
+
+      - name: Exercise the indexed provider locally
+        run: .venv-vane-testpypi-local/bin/python -I test/vane/test_vane_dynamic_ducklake.py
+
+  testpypi-ray-ducklake-integration:
+    name: TestPyPI two-worker Ray DuckLake integration
+    needs: [assemble-testpypi-ducklake, verify-testpypi-ducklake]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    env:
+      VANE_RUNNER: ray
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
+      VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
+      RAY_DEDUP_LOGS: "0"
+      INDEX_URL: https://test.pypi.org/simple/
+
+    steps:
+      - name: Checkout extension tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download expected DuckLake distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-ducklake-distributions
+          path: expected/ducklake
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact indexed package graph
+        shell: bash
+        env:
+          VANE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.vane_version }}
+          DUCKLAKE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-testpypi-ray
+          . .venv-vane-testpypi-ray/bin/activate
+          python -m pip install --upgrade pip
+          mkdir -p indexed
+          download_exact() {
+            local requirement="$1"
+            for attempt in 1 2 3 4 5; do
+              if python -m pip download \
+                --disable-pip-version-check \
+                --no-cache-dir \
+                --no-deps \
+                --only-binary=:all: \
+                --index-url "$INDEX_URL" \
+                --dest indexed \
+                "$requirement"; then
+                return
+              fi
+              sleep 15
+            done
+            return 1
+          }
+          download_exact "vane-ai==$VANE_VERSION"
+          download_exact "vane-extension-ducklake==$DUCKLAKE_VERSION"
+
+          mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+          mapfile -t ducklake_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_ducklake-*.whl' -print)
+          mapfile -t expected_ducklake < <(find expected/ducklake -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#ducklake_wheels[@]}" -eq 1
+          test "${#expected_ducklake[@]}" -eq 1
+          cmp "${expected_ducklake[0]}" "${ducklake_wheels[0]}"
+          python -m pip install "${base_wheels[0]}" "${ducklake_wheels[0]}"
+          python -m pip check
+
+      - name: Exercise the indexed provider through two Ray workers
+        run: .venv-vane-testpypi-ray/bin/python -I test/vane/test_vane_dynamic_ducklake.py

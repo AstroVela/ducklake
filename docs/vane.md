@@ -13,6 +13,10 @@ VCPKG_TOOLCHAIN_PATH='<vcpkg>/scripts/buildsystems/vcpkg.cmake' make vane_ci
 `make vane_wheel` builds a wheel containing the statically linked DuckLake extension. The Vane pipeline verifies the
 native backend and a two-worker Ray scan from that packaged wheel.
 
+The independent `vane-extension-ducklake` provider uses the same pinned Vane
+source and shared CI tooling. See [provider releases](vane-provider-release.md)
+for dynamic-wheel qualification and the manual TestPyPI publication workflow.
+
 Distributed scans support committed, unencrypted data files and committed delete state. Inlined data,
 transaction-local changes, encrypted files, change scans, and legacy Parquet VARIANT decoding are rejected before
 worker execution. Ray execution does not fall back to a local scan.
