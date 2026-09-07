@@ -36,6 +36,14 @@ set(EXTENSION_SOURCES ${ALL_OBJECT_FILES})
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# Distributed scans call Parquet's C++ interface, which Vane does not export.
+if(DUCKLAKE_VANE_DISTRIBUTED AND EXTENSION_STATIC_BUILD)
+  if(NOT TARGET parquet_extension)
+    message(FATAL_ERROR "The self-contained DuckLake extension requires parquet_extension")
+  endif()
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} parquet_extension)
+endif()
+
 if(TARGET roaring::roaring-headers)
   target_link_libraries(${EXTENSION_NAME} roaring::roaring roaring::roaring-headers roaring::roaring-headers-cpp)
   target_link_libraries(${TARGET_NAME}_loadable_extension roaring::roaring roaring::roaring-headers roaring::roaring-headers-cpp)
