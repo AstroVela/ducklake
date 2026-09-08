@@ -4,11 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import os
 import shlex
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -100,25 +98,6 @@ class DynamicWheelTest(unittest.TestCase):
             self.assertIn("-DVANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY=OFF", arguments)
             self.assertEqual(self.builder.SIGNING_PROFILES["production"][0], "astrovela/vane")
 
-    def test_production_signing_fingerprint_is_fail_closed(self) -> None:
-        contents = bytearray(b"ephemeral-test-key")
-        for returncode, public_der in ((1, b""), (0, b"wrong-public-key")):
-            result = subprocess.CompletedProcess([], returncode, public_der, b"diagnostic")
-            with (
-                self.subTest(returncode=returncode),
-                mock.patch.object(self.builder.subprocess, "run", return_value=result),
-                self.assertRaisesRegex(self.builder.QualificationError, "reviewed astrovela/vane"),
-            ):
-                self.builder._verify_production_key(contents)
-        result = subprocess.CompletedProcess([], 0, b"reviewed-public-key", b"")
-        with (
-            mock.patch.object(self.builder.subprocess, "run", return_value=result) as run,
-            mock.patch.object(self.builder, "PRODUCTION_PUBLIC_KEY_SHA256", hashlib.sha256(result.stdout).hexdigest()),
-        ):
-            self.builder._verify_production_key(contents)
-            self.assertEqual(run.call_args.kwargs["input"], contents)
-            self.assertEqual(run.call_args.args[0], ("openssl", "pkey", "-pubout", "-outform", "DER"))
-
     def test_production_runtimes_reject_development_or_mixed_versions(self) -> None:
         def runtime(version):
             return Path("/runtime/python"), Path(f"vane_ai-{version}-cp312-cp312-manylinux_2_28_x86_64.whl")
@@ -160,7 +139,7 @@ class DynamicWheelTest(unittest.TestCase):
                 self.builder._read_signing_private_key(path, consume=True)
             self.assertTrue(path.exists())
 
-    def test_testpypi_cannot_package_an_unpublished_runtime(self) -> None:
+    def test_publishing_cannot_use_full_build_and_sign_mode(self) -> None:
         arguments = argparse.Namespace(
             jobs=12,
             package_local_runtime=True,
@@ -168,14 +147,15 @@ class DynamicWheelTest(unittest.TestCase):
             runtime_wheel=[],
             signing_profile="testpypi",
             consume_signing_private_key=True,
+            prepare_only=False,
         )
         for profile in ("testpypi", "production"):
             arguments.signing_profile = profile
             with mock.patch.object(self.builder, "_parse_arguments", return_value=arguments):
-                with self.assertRaisesRegex(self.builder.QualificationError, "indexed runtimes"):
+                with self.assertRaisesRegex(self.builder.QualificationError, "separate prepare"):
                     self.builder.main()
 
-    def test_build_failure_consumes_and_clears_the_testpypi_key(self) -> None:
+    def test_build_failure_consumes_and_clears_the_ci_test_key(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             key_path = root / "key.pem"
@@ -186,7 +166,8 @@ class DynamicWheelTest(unittest.TestCase):
                 package_local_runtime=False,
                 runtime_python=[Path("/runtime/python")],
                 runtime_wheel=[Path("/runtime/vane.whl")],
-                signing_profile="testpypi",
+                signing_profile="ci-test",
+                prepare_only=False,
                 consume_signing_private_key=True,
                 signing_private_key=key_path,
                 extension_root=ROOT,
@@ -230,6 +211,24 @@ class DynamicWheelTest(unittest.TestCase):
                 self.builder.main()
             self.assertEqual(contents, [bytearray()])
             self.assertFalse(key_path.exists())
+
+    def test_preparation_rejects_any_key_before_build_or_key_access(self) -> None:
+        for key, consume, local in ((Path("key.pem"), False, False), (None, True, False), (None, False, True)):
+            arguments = argparse.Namespace(
+                prepare_only=True,
+                signing_private_key=key,
+                consume_signing_private_key=consume,
+                package_local_runtime=local,
+            )
+            with (
+                mock.patch.object(self.builder, "_parse_arguments", return_value=arguments),
+                mock.patch.object(self.builder, "_read_signing_private_key") as read,
+                mock.patch.object(self.builder, "_run") as run,
+                self.assertRaisesRegex(self.builder.QualificationError, "must not receive signing keys"),
+            ):
+                self.builder.main()
+            read.assert_not_called()
+            run.assert_not_called()
 
     def test_toolchain_must_be_rooted_at_its_git_checkout(self) -> None:
         toolchain = Path("/repository/nested/scripts/buildsystems/vcpkg.cmake")

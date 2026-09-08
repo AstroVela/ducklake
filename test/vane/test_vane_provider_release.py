@@ -297,9 +297,11 @@ class ProviderReleaseTest(unittest.TestCase):
         for name in ("PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_TRUSTED_HOST"):
             self.assertEqual(workflow["env"][name], "")
         jobs = workflow["jobs"]
-        candidate = jobs["vane-testpypi-wheels"]
+        candidate = jobs["vane-prepare-provider"]
         self.assertIn("github.repository == 'AstroVela/ducklake'", candidate["if"])
-        self.assertIn("production-signing", candidate["environment"]["name"])
+        self.assertNotIn("environment", candidate)
+        self.assertEqual(candidate["permissions"], {"contents": "read"})
+        self.assertNotIn("secrets[", repr(candidate))
         candidate_steps = {step["name"]: index for index, step in enumerate(candidate["steps"])}
         self.assertLess(
             candidate_steps["Download every exact indexed Vane runtime before native work"],
@@ -309,22 +311,65 @@ class ProviderReleaseTest(unittest.TestCase):
         self.assertIn("merge-base --is-ancestor", preflight["run"])
         self.assertIn("033b549afcb498633fd6669b26c054c00363004e", preflight["run"])
         self.assertIn("validate_vane_version(sys.argv[1], sys.argv[2])", preflight["run"])
-        promotion = jobs["publish-pypi-ducklake"]
+        signer = jobs["vane-sign-provider"]
+        self.assertEqual(signer["needs"], "vane-prepare-provider")
+        self.assertEqual(signer["permissions"], {"contents": "read"})
+        self.assertIn("production-signing", signer["environment"]["name"])
+        for step in signer["steps"]:
+            if "run" in step:
+                self.assertTrue(step["run"].startswith("/usr/bin/python3 -I -S scripts/sign_vane_release.py "))
+                self.assertNotIn("pip", step["run"])
+                self.assertNotIn("build_vane_dynamic_wheel", step["run"])
+            if "uses" in step:
+                self.assertTrue(
+                    any(
+                        step["uses"].startswith(f"actions/{action}@")
+                        for action in (
+                            "checkout",
+                            "download-artifact",
+                            "upload-artifact",
+                        )
+                    )
+                )
+        package = jobs["vane-testpypi-wheels"]
+        self.assertEqual(set(package["needs"]), {"vane-prepare-provider", "vane-sign-provider"})
+        self.assertEqual(package["permissions"], {"contents": "read"})
+        self.assertNotIn("environment", package)
+        self.assertNotIn("secrets[", repr(package))
+        self.assertNotIn("build_vane_dynamic_wheel.py", repr(package))
+        promotion = jobs["verify-pypi-promotion"]
         self.assertEqual(promotion["if"], "inputs.operation == 'release'")
         self.assertEqual(promotion["environment"]["name"], "pypi")
+        self.assertEqual(promotion["permissions"], {"contents": "read"})
         self.assertEqual(
             set(promotion["needs"]),
             {"assemble-testpypi-ducklake", "testpypi-local-ducklake-integration", "testpypi-ray-ducklake-integration"},
         )
-        steps = promotion["steps"]
-        validation = next(index for index, step in enumerate(steps) if "verify-promotion" in step.get("run", ""))
-        publish = next(
-            index for index, step in enumerate(steps) if "pypa/gh-action-pypi-publish@" in step.get("uses", "")
-        )
-        self.assertLess(validation, publish)
-        self.assertEqual(steps[publish]["with"]["packages-dir"], "dist")
-        self.assertEqual(steps[publish]["with"]["repository-url"], "https://upload.pypi.org/legacy/")
-        self.assertFalse(any("build_vane_dynamic_wheel.py" in step.get("run", "") for step in steps))
+        self.assertTrue(any("verify-promotion" in step.get("run", "") for step in promotion["steps"]))
+        publisher = jobs["publish-pypi-ducklake"]
+        self.assertEqual(set(publisher["needs"]), {"assemble-testpypi-ducklake", "verify-pypi-promotion"})
+        self.assertEqual(publisher["environment"]["name"], "pypi")
+        self.assertEqual(publisher["permissions"], {"contents": "read", "id-token": "write"})
+        artifact_id = "${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}"
+        self.assertEqual(len(publisher["steps"]), 2)
+        download, publish = publisher["steps"]
+        self.assertTrue(download["uses"].startswith("actions/download-artifact@"))
+        self.assertEqual(download["with"]["artifact-ids"], artifact_id)
+        self.assertNotIn("name", download["with"])
+        self.assertTrue(publish["uses"].startswith("pypa/gh-action-pypi-publish@"))
+        self.assertEqual(publish["with"]["packages-dir"], "dist")
+        self.assertEqual(publish["with"]["repository-url"], "https://upload.pypi.org/legacy/")
+        self.assertFalse(any("run" in step for step in publisher["steps"]))
+        indexed = jobs["verify-pypi-ducklake"]
+        self.assertEqual(indexed["permissions"], {"contents": "read"})
+        self.assertIn("publish-pypi-ducklake", indexed["needs"])
+        self.assertIn("--index pypi", indexed["steps"][-1]["run"])
+        for job in (promotion, indexed):
+            self.assertFalse(any("upload-artifact@" in step.get("uses", "") for step in job["steps"]))
+            for step in job["steps"]:
+                if "download-artifact@" in step.get("uses", ""):
+                    self.assertEqual(step["with"]["artifact-ids"], artifact_id)
+                    self.assertNotIn("name", step["with"])
         for job in jobs.values():
             for step in job.get("steps", []):
                 if "actions/download-artifact@" in step.get("uses", ""):

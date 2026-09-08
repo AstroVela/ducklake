@@ -46,7 +46,9 @@ Publication requires a manual `Vane extension` workflow dispatch with
 `operation=testpypi-dev` on `v1.5-variegata_vane`:
 
 1. Download the exact indexed `vane-ai` runtime wheels for all five CPython
-   interpreters, then build, sign, and verify the matching DuckLake providers.
+   interpreters, then prepare unsigned native data and licenses without keys.
+   A separate protected signer signs that data, and a fresh no-secret job
+   packages and verifies the matching DuckLake providers without rebuilding.
 2. Use the shared CLI to validate the complete matrix, exact dependencies,
    upload sizes, and absent or byte-identical existing TestPyPI files.
 3. Revalidate from the assembled artifacts, create checksums, SBOM, provenance,
@@ -76,8 +78,9 @@ Before the first manual publication, configure:
 
 These repository/project settings are external prerequisites, not created by
 this source change. Keep the private key out of Git, workflow inputs, logs, and
-artifacts. The workflow provides it only to the signing build step and consumes
-the temporary private-key file after reading it.
+artifacts. Only the isolated signer receives it, removes it from the process
+environment before invoking subprocesses, and erases its private temporary file
+outside the downloaded data before the job uploads signed native files.
 
 ## Production release preparation
 
@@ -99,12 +102,18 @@ version substitution in the production lane.
 After that prerequisite, a manual `release` dispatch on this repository's
 protected `v1.5-variegata_vane` branch performs:
 
-1. Download the exact runtime matrix from PyPI, build the native extension
-   once, and sign once with trust identity `astrovela/vane`. Both the CI-test
-   and TestPyPI test-key CMake options are explicitly disabled. The signing
-   key's public DER SHA256 must equal
+1. Download the exact runtime matrix from PyPI and build the native extension
+   once in a job with no environment, secrets, or OIDC permission. Both the
+   CI-test and TestPyPI test-key CMake options are explicitly disabled. Emit
+   only unsigned native data and license texts. A protected isolated job
+   signs the fixed native artifact once with trust identity `astrovela/vane`.
+   It uses system Python with `-I -S`, the exact Vane stdlib signer, and system
+   OpenSSL: no pip installation, native loading, or build subprocesses occur
+   in the job holding the private key. The key's public DER SHA256 must equal
    `8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
-2. Validate source pins, exact dependencies, wheel sizes, and absent or
+2. Package and verify the signed data in a fresh job without secrets or OIDC,
+   using the original preparation/signing artifact IDs and exact indexed
+   runtimes; do not rebuild native code. Validate source pins, exact dependencies, wheel sizes, and absent or
    byte-identical files on both indexes using the shared release CLI. Stage
    that candidate on TestPyPI with the existing publisher.
 3. Verify the complete indexed filenames and hashes. Fresh local and
@@ -112,8 +121,14 @@ protected `v1.5-variegata_vane` branch performs:
    TestPyPI, compare the provider bytes with the build artifact, run
    `pip check`, and execute the provider-backed SQL tests.
 4. Wait for the protected `pypi` environment approval after both tests pass.
-   Re-run the shared `verify-promotion` against the complete original wheel
-   set, publish those **same files** to PyPI, and verify the indexed hashes.
+   Re-run shared `verify-promotion` in a read-only job with **no OIDC
+   permission**. A separate approval-gated publisher has OIDC permission but
+   executes only the pinned artifact-download and PyPI-publish actions. It
+   downloads the **original assembly artifact ID**, never a mutable artifact
+   name or a verifier-created artifact, and publishes those **same files**.
+   A third read-only job verifies the indexed hashes. GitHub may request a
+   second `pypi` approval for the minimal publisher after verification; keep
+   required reviewers enabled for both jobs.
    There is no rebuild, re-signing, repackaging, or dependency rewriting after
    qualification. A retry may skip existing files only after their exact
    identities pass the shared gate.
@@ -136,6 +151,15 @@ This change does not configure environments or secrets, create tags, or
 upload packages. No provider tag is required: the manually selected protected
 branch commit and the reviewed exact Vane/CI-tools pins are the release inputs.
 
+`build_vane_dynamic_wheel.py` retains a full build/sign/package mode only for
+the public `ci-test` key. Both publishing profiles require `--prepare-only`,
+which rejects key arguments. The isolated signer reads the selected manifest
+from the committed repository tree, validates the exact official Vane pin,
+and accepts only a regular unsigned `artifacts/ducklake.duckdb_extension`
+bounded to 384 MiB. It does not trust builder-supplied source repository/ref
+outputs or execute downloaded code. License files travel separately as data
+under `licenses/ducklake/`; only signed native files leave the signer.
+
 ## Focused development checks
 
 With Python 3.11 or newer:
@@ -145,6 +169,7 @@ git submodule update --init vane-extension-ci-tools
 python -m pip install -r vane-extension-ci-tools/requirements-release.txt "PyYAML>=6.0"
 python -I test/vane/test_vane_provider_release.py
 python -I test/vane/test_vane_dynamic_wheel.py
+python -I test/vane/test_vane_release_signing.py
 ```
 
 To validate an already-built candidate matrix, use the exact clean Vane source

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import platform
 import re
@@ -27,7 +26,13 @@ SIGNING_PROFILES = {
     "testpypi": ("astrovela/vane-testpypi", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"),
     "production": ("astrovela/vane", None),
 }
-PRODUCTION_PUBLIC_KEY_SHA256 = "8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb"
+LICENSE_NAMES = (
+    "DuckLake-MIT.txt",
+    "Vane-Apache-2.0.txt",
+    "Vane-NOTICE.txt",
+    "DuckDB-static-engine-licenses.txt",
+    "vcpkg-binary-dependencies.txt",
+)
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND ISC AND MIT AND "
     "Unicode-DFS-2015 AND Zlib AND curl"
@@ -476,7 +481,10 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output-directory", required=True, type=Path)
     parser.add_argument("--jobs", default=8, type=int)
     parser.add_argument("--signing-profile", required=True, choices=tuple(SIGNING_PROFILES))
-    parser.add_argument("--signing-private-key", required=True, type=Path)
+    parser.add_argument("--signing-private-key", type=Path)
+    parser.add_argument(
+        "--prepare-only", action="store_true", help="Emit unsigned native data and licenses without a key"
+    )
     parser.add_argument(
         "--consume-signing-private-key",
         action="store_true",
@@ -510,18 +518,6 @@ def _clear_key(contents: bytearray) -> None:
     contents.clear()
 
 
-def _verify_production_key(contents: bytearray) -> None:
-    result = subprocess.run(
-        ("openssl", "pkey", "-pubout", "-outform", "DER"),
-        input=contents,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode or hashlib.sha256(result.stdout).hexdigest() != PRODUCTION_PUBLIC_KEY_SHA256:
-        raise QualificationError("production signing key does not match the reviewed astrovela/vane public key")
-
-
 def _require_production_runtimes(runtimes: tuple[tuple[Path, Path], ...]) -> None:
     versions = set()
     for _python, wheel in runtimes:
@@ -544,6 +540,17 @@ def _require_production_runtimes(runtimes: tuple[tuple[Path, Path], ...]) -> Non
 
 def main() -> int:
     arguments = _parse_arguments()
+    if arguments.prepare_only:
+        if (
+            arguments.signing_private_key is not None
+            or arguments.consume_signing_private_key
+            or arguments.package_local_runtime
+        ):
+            raise QualificationError("native preparation must not receive signing keys or package a local runtime")
+    elif arguments.signing_profile != "ci-test":
+        raise QualificationError("publishing requires separate prepare, isolated signing, and packaging jobs")
+    elif arguments.signing_private_key is None:
+        raise QualificationError("CI-only full builds require the public integration-test private key")
     if arguments.jobs <= 0:
         raise QualificationError("--jobs must be a positive integer")
     if arguments.package_local_runtime and arguments.runtime_wheel:
@@ -552,10 +559,6 @@ def main() -> int:
         raise QualificationError("--runtime-python and --runtime-wheel must be supplied the same number of times")
     if not arguments.package_local_runtime and not arguments.runtime_python:
         raise QualificationError("at least one indexed runtime pair is required")
-    if arguments.signing_profile in {"testpypi", "production"}:
-        if not arguments.consume_signing_private_key or arguments.package_local_runtime:
-            raise QualificationError("publication requires indexed runtimes and --consume-signing-private-key")
-
     extension_root = _require_directory(arguments.extension_root, "extension root")
     manifest_path = _require_file(extension_root / arguments.manifest, "integration manifest")
     vane_source = _require_directory(arguments.vane_source, "Vane source")
@@ -589,6 +592,8 @@ def main() -> int:
     output_directory = arguments.output_directory.expanduser().resolve()
     build_directory.mkdir(parents=True, exist_ok=True)
     output_directory.mkdir(parents=True, exist_ok=True)
+    if arguments.prepare_only and any(output_directory.iterdir()):
+        raise QualificationError("native preparation output directory must be empty")
     if tuple(output_directory.glob("*.whl")):
         raise QualificationError("output directory already contains a wheel")
     trust_identity, signing_cmake_option = SIGNING_PROFILES[arguments.signing_profile]
@@ -603,10 +608,12 @@ def main() -> int:
     )
 
     with ExitStack() as cleanup:
-        key = _read_signing_private_key(arguments.signing_private_key, consume=arguments.consume_signing_private_key)
+        key = bytearray()
+        if not arguments.prepare_only:
+            key = _read_signing_private_key(
+                arguments.signing_private_key, consume=arguments.consume_signing_private_key
+            )
         cleanup.callback(_clear_key, key)
-        if arguments.signing_profile == "production":
-            _verify_production_key(key)
         base_output = Path(
             cleanup.enter_context(tempfile.TemporaryDirectory(prefix="vane-base-wheel-", dir=build_directory.parent))
         )
@@ -640,6 +647,23 @@ def main() -> int:
         )
         unsigned = _require_file(build_directory / "vane_extensions/ducklake.duckdb_extension", "DuckLake artifact")
         _require_no_undefined_duckdb_symbols(unsigned)
+        licenses = _stage_license_files(
+            extension_root=extension_root,
+            manifest_path=manifest_path,
+            vane_source=vane_source,
+            build_directory=build_directory,
+        )
+        if arguments.prepare_only:
+            artifacts = output_directory / "artifacts"
+            artifacts.mkdir()
+            shutil.copyfile(unsigned, artifacts / unsigned.name)
+            license_directory = output_directory / "licenses/ducklake"
+            license_directory.mkdir(parents=True)
+            if tuple(path.name for path in licenses) != LICENSE_NAMES:
+                raise QualificationError("native preparation license set differs from the reviewed contract")
+            for license_file in licenses:
+                shutil.copyfile(license_file, license_directory / license_file.name)
+            return 0
         signed_directory = build_directory / "signed-vane-extensions"
         signed_directory.mkdir(parents=True, exist_ok=True)
         signed = signed_directory / unsigned.name
@@ -666,12 +690,6 @@ def main() -> int:
             if ephemeral_key.exists():
                 _destroy_file(ephemeral_key)
 
-        licenses = _stage_license_files(
-            extension_root=extension_root,
-            manifest_path=manifest_path,
-            vane_source=vane_source,
-            build_directory=build_directory,
-        )
         staging = Path(
             cleanup.enter_context(
                 tempfile.TemporaryDirectory(prefix="vane-qualified-wheels-", dir=output_directory.parent)

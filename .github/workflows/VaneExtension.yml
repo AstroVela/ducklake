@@ -165,6 +165,7 @@ jobs:
         run: |
           python -I test/vane/test_vane_provider_release.py
           python -I test/vane/test_vane_dynamic_wheel.py
+          python -I test/vane/test_vane_release_signing.py
 
   vane-dynamic-wheel:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -474,21 +475,18 @@ jobs:
             "${base_wheels[0]}" "${ducklake_wheels[0]}"
           python -I test/vane/test_vane_dynamic_ducklake.py
 
-  vane-testpypi-wheels:
+  vane-prepare-provider:
     if: github.repository == 'AstroVela/ducklake' && github.event_name == 'workflow_dispatch' && (inputs.operation == 'testpypi-dev' || inputs.operation == 'release')
-    name: Build signed DuckLake candidate wheels once
+    name: Prepare unsigned DuckLake native data without signing authority
     runs-on: ubuntu-24.04
     timeout-minutes: 240
-    environment:
-      name: ${{ inputs.operation == 'release' && 'production-signing' || 'testpypi' }}
-      url: https://test.pypi.org/p/vane-extension-ducklake
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
     permissions:
       contents: read
     outputs:
-      vane_version: ${{ steps.release.outputs.vane_version }}
-      ducklake_version: ${{ steps.release.outputs.ducklake_version }}
+      vane_version: ${{ steps.vane_candidate.outputs.version }}
+      prepared_artifact_id: ${{ steps.prepared.outputs.artifact-id }}
     env:
       VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
       VANE_MANIFEST: ${{ github.workspace }}/extension/${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
@@ -712,24 +710,13 @@ jobs:
             VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
             VANE_PYTHON="$VANE_PYTHON"
 
-      - name: Build, sign and verify the DuckLake provider wheel matrix
+      - name: Build and audit unsigned native data without a key
         shell: bash
         env:
-          VANE_SIGNING_PRIVATE_KEY: ${{ secrets[inputs.operation == 'release' && 'VANE_EXTENSION_SIGNING_PRIVATE_KEY' || 'VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY'] }}
           VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
           VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
         run: |
           set -euo pipefail
-          test -n "$VANE_SIGNING_PRIVATE_KEY"
-          signing_key="$RUNNER_TEMP/vane-extension-signing.pem"
-          cleanup() {
-            shred --force --remove "$signing_key" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          umask 077
-          printf '%s' "$VANE_SIGNING_PRIVATE_KEY" > "$signing_key"
-          unset VANE_SIGNING_PRIVATE_KEY
-
           runtime_arguments=()
           for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
             interpreter="/opt/python/$runtime/bin/python"
@@ -749,29 +736,8 @@ jobs:
             --output-directory "$VANE_DYNAMIC_DIST_DIR" \
             --jobs "$VANE_BUILD_JOBS" \
             --signing-profile "$VANE_SIGNING_PROFILE" \
-            --signing-private-key "$signing_key" \
-            --consume-signing-private-key \
+            --prepare-only \
             "${runtime_arguments[@]}"
-
-      - name: Validate the immutable publishable release set
-        id: release
-        shell: bash
-        run: |
-          set -euo pipefail
-          publication_arguments=(--require-publishable-on testpypi)
-          if [ "$VANE_RELEASE_CHANNEL" = release ]; then
-            publication_arguments+=(--require-publishable-on pypi)
-          fi
-          "$VANE_PYTHON" -I extension/vane-extension-ci-tools/scripts/vane_provider_release.py validate \
-            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
-            --vane-source "$VANE_SOURCE_DIR" \
-            --ci-tools-version "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)" \
-            --config extension/vane-provider-release.toml \
-            --directory "$VANE_DYNAMIC_DIST_DIR" \
-            --vane-version "${{ steps.vane_candidate.outputs.version }}" \
-            --channel "$VANE_RELEASE_CHANNEL" \
-            "${publication_arguments[@]}" \
-            --github-output "$GITHUB_OUTPUT"
 
       - name: Report compiler cache
         if: always()
@@ -782,11 +748,175 @@ jobs:
           printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
           ccache --show-stats
 
-      - name: Upload verified DuckLake provider wheels
+      - name: Upload unsigned native data and license bundle
+        id: prepared
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-ducklake-prepared-native
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  vane-sign-provider:
+    name: Sign fixed native data in an isolated protected job
+    needs: vane-prepare-provider
+    runs-on: ubuntu-24.04
+    environment:
+      name: ${{ inputs.operation == 'release' && 'production-signing' || 'testpypi' }}
+    permissions:
+      contents: read
+    outputs:
+      signed_artifact_id: ${{ steps.signed.outputs.artifact-id }}
+    steps:
+      - name: Checkout the reviewed signer and committed manifest
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Read only the committed official Vane pin
+        id: manifest
+        run: |
+          /usr/bin/python3 -I -S scripts/sign_vane_release.py manifest \
+            --manifest "$VANE_RELEASE_MANIFEST" --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout the exact original stdlib-only Vane signer
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download the original preparation artifact by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-prepare-provider.outputs.prepared_artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: incoming
+
+      - name: Sign data only with the selected channel key
+        env:
+          VANE_SIGNING_PRIVATE_KEY: ${{ secrets[inputs.operation == 'release' && 'VANE_EXTENSION_SIGNING_PRIVATE_KEY' || 'VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY'] }}
+        run: |
+          /usr/bin/python3 -I -S scripts/sign_vane_release.py sign \
+            --manifest "$VANE_RELEASE_MANIFEST" --profile "$VANE_SIGNING_PROFILE" \
+            --vane-source vane --incoming incoming --output signed
+
+      - name: Upload only the signed native data
+        id: signed
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-ducklake-signed-native
+          path: signed/ducklake.duckdb_extension
+          if-no-files-found: error
+          retention-days: 30
+
+  vane-testpypi-wheels:
+    name: Package and qualify signed native data without secrets or OIDC
+    needs: [vane-prepare-provider, vane-sign-provider]
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
+    permissions:
+      contents: read
+    outputs:
+      vane_version: ${{ steps.release.outputs.vane_version }}
+      ducklake_version: ${{ steps.release.outputs.ducklake_version }}
+      wheels_artifact_id: ${{ steps.wheels.outputs.artifact-id }}
+    env:
+      VANE_PYTHON: /opt/python/cp312-cp312/bin/python
+      VANE_VERSION: ${{ needs.vane-prepare-provider.outputs.vane_version }}
+    steps:
+      - name: Checkout packaging and validation tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Initialize the pinned release validator
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Read the committed Vane source pin
+        id: manifest
+        run: |
+          "$VANE_PYTHON" -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane packaging tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install no-secret wheel validation dependencies
+        run: |
+          "$VANE_PYTHON" -m pip install --disable-pip-version-check \
+            -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Download the original unsigned and license bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-prepare-provider.outputs.prepared_artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: prepared
+
+      - name: Download the isolated signer's native artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-sign-provider.outputs.signed_artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: signed
+
+      - name: Download exact runtimes and package the signed native data
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_arguments=()
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            interpreter="/opt/python/$runtime/bin/python"
+            destination="$GITHUB_WORKSPACE/runtimes/$runtime"
+            mkdir -p "$destination"
+            "$interpreter" -m pip download --disable-pip-version-check --no-cache-dir \
+              --no-deps --only-binary=:all: --index-url "$VANE_RUNTIME_INDEX" \
+              --dest "$destination" "vane-ai==$VANE_VERSION"
+            mapfile -t wheels < <(find "$destination" -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+            test "${#wheels[@]}" -eq 1
+            runtime_arguments+=(--runtime-python "$interpreter" --runtime-wheel "${wheels[0]}")
+          done
+          "$VANE_PYTHON" -I scripts/package_prepared_vane_wheel.py \
+            --vane-source vane --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --profile "$VANE_SIGNING_PROFILE" --prepared prepared --signed signed \
+            --output dist "${runtime_arguments[@]}"
+
+      - name: Validate the complete immutable provider matrix
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          publication_arguments=(--require-publishable-on testpypi)
+          if [ "$VANE_RELEASE_CHANNEL" = release ]; then
+            publication_arguments+=(--require-publishable-on pypi)
+          fi
+          "$VANE_PYTHON" -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --directory dist \
+            --vane-version "$VANE_VERSION" --channel "$VANE_RELEASE_CHANNEL" \
+            "${publication_arguments[@]}" --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload verified provider wheels
+        id: wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-testpypi-ducklake-wheels
-          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/*.whl
+          path: dist/*.whl
           if-no-files-found: error
           retention-days: 30
 
@@ -801,6 +931,7 @@ jobs:
     outputs:
       vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
       ducklake_version: ${{ needs.vane-testpypi-wheels.outputs.ducklake_version }}
+      distributions_artifact_id: ${{ steps.distributions.outputs.artifact-id }}
 
     steps:
       - name: Checkout release tooling
@@ -840,7 +971,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-ducklake-wheels
+          artifact-ids: ${{ needs.vane-testpypi-wheels.outputs.wheels_artifact_id }}
+          merge-multiple: true
           path: packages
 
       - name: Revalidate the complete release set
@@ -891,6 +1023,7 @@ jobs:
           inputs: packages/*.whl
 
       - name: Upload DuckLake distributions
+        id: distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-testpypi-ducklake-distributions
@@ -924,7 +1057,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-ducklake-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Publish through trusted publishing
@@ -980,7 +1114,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-ducklake-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Compare the immutable indexed release
@@ -1018,7 +1153,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-ducklake-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
           path: expected/ducklake
 
       - name: Set up Python
@@ -1096,7 +1232,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-ducklake-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
           path: expected/ducklake
 
       - name: Set up Python
@@ -1149,8 +1286,8 @@ jobs:
       - name: Exercise the indexed provider through two Ray workers
         run: .venv-vane-testpypi-ray/bin/python -I test/vane/test_vane_dynamic_ducklake.py
 
-  publish-pypi-ducklake:
-    name: Approve and promote the qualified DuckLake wheels to PyPI
+  verify-pypi-promotion:
+    name: Approve and revalidate the immutable DuckLake promotion without OIDC
     if: inputs.operation == 'release'
     needs:
       - assemble-testpypi-ducklake
@@ -1162,7 +1299,6 @@ jobs:
       url: https://pypi.org/p/vane-extension-ducklake
     permissions:
       contents: read
-      id-token: write
 
     steps:
       - name: Require the protected release branch
@@ -1212,7 +1348,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-ducklake-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Recheck the complete immutable promotion after approval
@@ -1225,6 +1362,26 @@ jobs:
             --directory dist \
             --vane-version "${{ needs.assemble-testpypi-ducklake.outputs.vane_version }}"
 
+  publish-pypi-ducklake:
+    name: Publish only the approved immutable DuckLake artifact
+    if: inputs.operation == 'release'
+    needs: [assemble-testpypi-ducklake, verify-pypi-promotion]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/vane-extension-ducklake
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download the original assembly artifact by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
+          path: dist
+
       - name: Publish the unchanged wheels through trusted publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
@@ -1232,6 +1389,55 @@ jobs:
           packages-dir: dist
           repository-url: https://upload.pypi.org/legacy/
           skip-existing: true
+
+  verify-pypi-ducklake:
+    name: Verify the published DuckLake files without OIDC
+    if: inputs.operation == 'release'
+    needs: [assemble-testpypi-ducklake, publish-pypi-ducklake]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read exact production Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for index verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the original assembly artifact by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
+          path: dist
 
       - name: Verify the exact PyPI filenames and hashes
         run: |
