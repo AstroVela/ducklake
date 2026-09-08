@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import shlex
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,7 +27,7 @@ class DynamicWheelTest(unittest.TestCase):
 
     def test_vcpkg_comes_from_the_integration_manifest(self) -> None:
         self.assertEqual(
-            self.builder._vcpkg_revision(ROOT),
+            self.builder._vcpkg_revision(ROOT / "vane-extension.toml"),
             "84bab45d415d22042bd0b9081aea57f362da3f35",
         )
         with tempfile.TemporaryDirectory() as value:
@@ -37,7 +39,7 @@ class DynamicWheelTest(unittest.TestCase):
             ):
                 (root / "vane-extension.toml").write_text(manifest)
                 with self.subTest(manifest=manifest), self.assertRaises(self.builder.QualificationError):
-                    self.builder._vcpkg_revision(root)
+                    self.builder._vcpkg_revision(root / "vane-extension.toml")
 
     def test_build_environment_selects_only_dynamic_ducklake(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -72,12 +74,62 @@ class DynamicWheelTest(unittest.TestCase):
                 "-DENABLE_EXTENSION_AUTOLOADING=OFF",
                 "-DENABLE_EXTENSION_AUTOINSTALL=OFF",
                 "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+                "-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON",
+                "-DVANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY=OFF",
             ):
                 self.assertIn(argument, arguments)
             self.assertNotIn("DUCKDB_ICEBERG_DIRECTORY", result)
             self.assertNotIn("SETUPTOOLS_SCM_PRETEND_VERSION", result)
             self.assertEqual(result["DUCKDB_DUCKLAKE_DIRECTORY"], str(ROOT))
             self.assertEqual(result["CMAKE_BUILD_PARALLEL_LEVEL"], "12")
+
+    def test_production_disables_both_testing_trust_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            with mock.patch.object(self.builder, "_require_file"):
+                environment = self.builder._build_environment(
+                    extension_root=ROOT,
+                    build_directory=root,
+                    vane_vcpkg_installed=root,
+                    vcpkg_toolchain=root / "vcpkg.cmake",
+                    jobs=12,
+                    signing_cmake_option=self.builder.SIGNING_PROFILES["production"][1],
+                )
+            arguments = shlex.split(environment["CMAKE_ARGS"])
+            self.assertIn("-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=OFF", arguments)
+            self.assertIn("-DVANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY=OFF", arguments)
+            self.assertEqual(self.builder.SIGNING_PROFILES["production"][0], "astrovela/vane")
+
+    def test_production_signing_fingerprint_is_fail_closed(self) -> None:
+        contents = bytearray(b"ephemeral-test-key")
+        for returncode, public_der in ((1, b""), (0, b"wrong-public-key")):
+            result = subprocess.CompletedProcess([], returncode, public_der, b"diagnostic")
+            with (
+                self.subTest(returncode=returncode),
+                mock.patch.object(self.builder.subprocess, "run", return_value=result),
+                self.assertRaisesRegex(self.builder.QualificationError, "reviewed astrovela/vane"),
+            ):
+                self.builder._verify_production_key(contents)
+        result = subprocess.CompletedProcess([], 0, b"reviewed-public-key", b"")
+        with (
+            mock.patch.object(self.builder.subprocess, "run", return_value=result) as run,
+            mock.patch.object(self.builder, "PRODUCTION_PUBLIC_KEY_SHA256", hashlib.sha256(result.stdout).hexdigest()),
+        ):
+            self.builder._verify_production_key(contents)
+            self.assertEqual(run.call_args.kwargs["input"], contents)
+            self.assertEqual(run.call_args.args[0], ("openssl", "pkey", "-pubout", "-outform", "DER"))
+
+    def test_production_runtimes_reject_development_or_mixed_versions(self) -> None:
+        def runtime(version):
+            return Path("/runtime/python"), Path(f"vane_ai-{version}-cp312-cp312-manylinux_2_28_x86_64.whl")
+
+        for versions in (("0.2.0.dev612",), ("0.2.0+local",), ("0.2",), ("0.2.0", "0.3.0"), ()):
+            with self.subTest(versions=versions), self.assertRaises(self.builder.QualificationError):
+                self.builder._require_production_runtimes(tuple(runtime(version) for version in versions))
+        self.builder._require_production_runtimes((runtime("0.2.0"), runtime("0.2.0")))
+        for name in ("not-a-wheel.whl", "duckdb-0.2.0-cp312-cp312-manylinux_2_28_x86_64.whl"):
+            with self.subTest(name=name), self.assertRaises(self.builder.QualificationError):
+                self.builder._require_production_runtimes(((Path("/runtime/python"), Path(name)),))
 
     def test_consumed_key_is_private_and_removed(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -117,9 +169,11 @@ class DynamicWheelTest(unittest.TestCase):
             signing_profile="testpypi",
             consume_signing_private_key=True,
         )
-        with mock.patch.object(self.builder, "_parse_arguments", return_value=arguments):
-            with self.assertRaisesRegex(self.builder.QualificationError, "indexed runtimes"):
-                self.builder.main()
+        for profile in ("testpypi", "production"):
+            arguments.signing_profile = profile
+            with mock.patch.object(self.builder, "_parse_arguments", return_value=arguments):
+                with self.assertRaisesRegex(self.builder.QualificationError, "indexed runtimes"):
+                    self.builder.main()
 
     def test_build_failure_consumes_and_clears_the_testpypi_key(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -136,6 +190,7 @@ class DynamicWheelTest(unittest.TestCase):
                 consume_signing_private_key=True,
                 signing_private_key=key_path,
                 extension_root=ROOT,
+                manifest=Path("vane-extension.toml"),
                 vane_source=root,
                 vane_revision="a" * 40,
                 vane_vcpkg_installed=root,
@@ -152,6 +207,8 @@ class DynamicWheelTest(unittest.TestCase):
                 return result
 
             def run(command, **kwargs):
+                if "identity" in command or "verify-ci-tools" in command:
+                    self.assertEqual(command[command.index("--manifest") + 1], str(ROOT / arguments.manifest))
                 if "build" in command:
                     self.assertFalse(key_path.exists())
                     self.assertEqual(contents[0], b"test-key")
@@ -204,13 +261,13 @@ class DynamicWheelTest(unittest.TestCase):
                 path = share / name / "copyright"
                 path.parent.mkdir()
                 path.write_text(f"{name} license")
-            bundle = self.builder._render_vcpkg_license_bundle(ROOT, share)
+            bundle = self.builder._render_vcpkg_license_bundle(ROOT / "vane-extension.toml", share)
             self.assertIn("roaring license", bundle)
             extra = share / "unexpected" / "copyright"
             extra.parent.mkdir()
             extra.write_text("unknown license")
             with self.assertRaisesRegex(self.builder.QualificationError, "unexpected"):
-                self.builder._render_vcpkg_license_bundle(ROOT, share)
+                self.builder._render_vcpkg_license_bundle(ROOT / "vane-extension.toml", share)
 
 
 if __name__ == "__main__":

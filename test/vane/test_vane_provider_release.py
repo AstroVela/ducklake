@@ -20,6 +20,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPOSITORY_ROOT / "vane-provider-release.toml"
 VANE_VERSION = "0.2.0.dev612"
@@ -39,10 +41,12 @@ def load_validator():
     return module
 
 
-def write_wheels(directory: Path, provider: str, *, vane_requirement: str | None = None) -> list[Path]:
+def write_wheels(
+    directory: Path, provider: str, *, vane_requirement: str | None = None, vane_version: str = VANE_VERSION
+) -> list[Path]:
     distribution = f"vane_extension_{provider}"
     version = VERSIONS[provider]
-    requirements = [vane_requirement or f"vane-ai==={VANE_VERSION}"]
+    requirements = [vane_requirement or f"vane-ai==={vane_version}"]
     metadata = (
         "Metadata-Version: 2.4\n"
         f"Name: vane-extension-{provider}\n"
@@ -57,10 +61,10 @@ def write_wheels(directory: Path, provider: str, *, vane_requirement: str | None
     return paths
 
 
-def source_arguments(directory: Path) -> list[str]:
+def source_arguments(directory: Path, *, manifest: str = "vane-extension.toml") -> list[str]:
     return [
         "--manifest",
-        str(REPOSITORY_ROOT / "vane-extension.toml"),
+        str(REPOSITORY_ROOT / manifest),
         "--extension-root",
         str(REPOSITORY_ROOT),
         "--vane-source",
@@ -105,9 +109,12 @@ class ProviderReleaseTest(unittest.TestCase):
             command += [
                 "--vane-version",
                 VANE_VERSION,
+                "--channel",
+                "testpypi-dev",
                 "--github-output",
                 str(outputs),
-                "--require-testpypi-publishable",
+                "--require-publishable-on",
+                "testpypi",
             ]
             output = io.StringIO()
             with (
@@ -133,7 +140,14 @@ class ProviderReleaseTest(unittest.TestCase):
             for requirement in ("vane-ai>=0.2", "vane-ai===0.2.0.dev611"):
                 with self.subTest(requirement=requirement):
                     write_wheels(directory, "ducklake", vane_requirement=requirement)
-                    command = ["validate", *source_arguments(directory), "--vane-version", VANE_VERSION]
+                    command = [
+                        "validate",
+                        *source_arguments(directory),
+                        "--channel",
+                        "testpypi-dev",
+                        "--vane-version",
+                        VANE_VERSION,
+                    ]
                     with mock.patch.object(self.validator, "verify_sources"), redirect_stderr(io.StringIO()):
                         self.assertEqual(self.validator.main(command), 2)
 
@@ -155,7 +169,18 @@ class ProviderReleaseTest(unittest.TestCase):
                     ]
                 }
                 command = ["verify-index", *source_arguments(directory)]
-                command += ["--provider", provider, "--version", version, "--attempts", "1", "--delay-seconds", "0"]
+                command += [
+                    "--index",
+                    "testpypi",
+                    "--provider",
+                    provider,
+                    "--version",
+                    version,
+                    "--attempts",
+                    "1",
+                    "--delay-seconds",
+                    "0",
+                ]
                 with (
                     mock.patch.object(self.validator, "verify_sources") as verify,
                     mock.patch.object(self.validator, "_request_json", return_value=(200, document)) as query,
@@ -166,12 +191,75 @@ class ProviderReleaseTest(unittest.TestCase):
                 )
                 query.assert_called_once_with(f"https://test.pypi.org/pypi/vane-extension-{provider}/{version}/json")
 
+    def test_release_rejects_the_existing_dev_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            write_wheels(directory, "ducklake")
+            command = [
+                "validate",
+                *source_arguments(directory, manifest="vane-extension-release.toml"),
+                "--channel",
+                "release",
+                "--vane-version",
+                VANE_VERSION,
+            ]
+            with mock.patch.object(self.validator, "verify_sources"), redirect_stderr(io.StringIO()):
+                self.assertEqual(self.validator.main(command), 2)
+
+    def test_release_promotes_only_the_complete_identical_testpypi_set(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            paths = write_wheels(directory, "ducklake", vane_version="0.2.0")
+            document = {
+                "urls": [
+                    {
+                        "filename": path.name,
+                        "packagetype": "bdist_wheel",
+                        "digests": {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+                        "yanked": False,
+                    }
+                    for path in paths
+                ]
+            }
+            command = [
+                "verify-promotion",
+                *source_arguments(directory, manifest="vane-extension-release.toml"),
+                "--vane-version",
+                "0.2.0",
+                "--attempts",
+                "1",
+                "--delay-seconds",
+                "0",
+            ]
+
+            def query(url):
+                if url.startswith("https://test.pypi.org/"):
+                    return 200, document
+                self.assertTrue(url.startswith("https://pypi.org/"))
+                return 404, None
+
+            with (
+                mock.patch.object(self.validator, "verify_sources") as verify,
+                mock.patch.object(self.validator, "_request_json", side_effect=query),
+            ):
+                self.assertEqual(self.validator.main(command), 0)
+                verify.assert_called_once_with(
+                    REPOSITORY_ROOT / "vane-extension-release.toml", REPOSITORY_ROOT, directory / "vane", "a" * 40
+                )
+                document["urls"][0]["digests"]["sha256"] = "0" * 64
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.validator.main(command), 2)
+
     def test_integration_source_pins(self) -> None:
         manifest = tomllib.loads((REPOSITORY_ROOT / "vane-extension.toml").read_text())
         self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["vane"]["repository"], "AstroVela/vane")
         self.assertEqual(manifest["vane"]["revision"], "472df75ab51fd3eac2642f6646545075549e5921")
         self.assertEqual(manifest["vcpkg"]["revision"], "84bab45d415d22042bd0b9081aea57f362da3f35")
+        release_manifest = tomllib.loads((REPOSITORY_ROOT / "vane-extension-release.toml").read_text())
+        self.assertEqual(release_manifest["vane"]["revision"], "033b549afcb498633fd6669b26c054c00363004e")
+        release_manifest["vane"]["revision"] = manifest["vane"]["revision"]
+        self.assertEqual(release_manifest, manifest)
         entry = subprocess.check_output(
             ["git", "-C", str(REPOSITORY_ROOT), "ls-files", "--stage", "vane-extension-ci-tools"], text=True
         ).split()
@@ -188,13 +276,65 @@ class ProviderReleaseTest(unittest.TestCase):
     def test_shared_release_gates_and_explicit_publication(self) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/VaneExtension.yml").read_text()
         self.assertEqual(workflow.count("scripts/vane_provider_release.py validate"), 2)
-        self.assertEqual(workflow.count("scripts/vane_provider_release.py verify-index"), 1)
+        self.assertEqual(workflow.count("scripts/vane_provider_release.py verify-index"), 2)
         self.assertIn("HEAD:vane-extension-ci-tools", workflow)
         self.assertIn("refs/heads/v1.5-variegata_vane", workflow)
         self.assertIn('test "$GITHUB_EVENT_NAME" = workflow_dispatch', workflow)
         self.assertIn("repository-url: https://test.pypi.org/legacy/", workflow)
         self.assertIn("skip-existing: true", workflow)
-        self.assertEqual(workflow.count("--require-testpypi-publishable"), 2)
+        self.assertEqual(workflow.count("--require-publishable-on testpypi"), 2)
+        self.assertEqual(workflow.count("--require-publishable-on pypi"), 2)
+        self.assertNotIn("--require-testpypi-publishable", workflow)
+
+    def test_workflow_requires_both_qualifications_before_immutable_promotion(self) -> None:
+        workflow = yaml.load(
+            (REPOSITORY_ROOT / ".github/workflows/VaneExtension.yml").read_text(), Loader=yaml.BaseLoader
+        )
+        dispatch = workflow["on"]["workflow_dispatch"]["inputs"]["operation"]
+        self.assertEqual(dispatch["default"], "build-only")
+        self.assertEqual(dispatch["options"], ["build-only", "testpypi-dev", "release"])
+        self.assertEqual(workflow["env"]["PIP_CONFIG_FILE"], "/dev/null")
+        for name in ("PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_TRUSTED_HOST"):
+            self.assertEqual(workflow["env"][name], "")
+        jobs = workflow["jobs"]
+        candidate = jobs["vane-testpypi-wheels"]
+        self.assertIn("github.repository == 'AstroVela/ducklake'", candidate["if"])
+        self.assertIn("production-signing", candidate["environment"]["name"])
+        candidate_steps = {step["name"]: index for index, step in enumerate(candidate["steps"])}
+        self.assertLess(
+            candidate_steps["Download every exact indexed Vane runtime before native work"],
+            candidate_steps["Install native and wheel tooling"],
+        )
+        preflight = candidate["steps"][candidate_steps["Download every exact indexed Vane runtime before native work"]]
+        self.assertIn("merge-base --is-ancestor", preflight["run"])
+        self.assertIn("033b549afcb498633fd6669b26c054c00363004e", preflight["run"])
+        self.assertIn("validate_vane_version(sys.argv[1], sys.argv[2])", preflight["run"])
+        promotion = jobs["publish-pypi-ducklake"]
+        self.assertEqual(promotion["if"], "inputs.operation == 'release'")
+        self.assertEqual(promotion["environment"]["name"], "pypi")
+        self.assertEqual(
+            set(promotion["needs"]),
+            {"assemble-testpypi-ducklake", "testpypi-local-ducklake-integration", "testpypi-ray-ducklake-integration"},
+        )
+        steps = promotion["steps"]
+        validation = next(index for index, step in enumerate(steps) if "verify-promotion" in step.get("run", ""))
+        publish = next(
+            index for index, step in enumerate(steps) if "pypa/gh-action-pypi-publish@" in step.get("uses", "")
+        )
+        self.assertLess(validation, publish)
+        self.assertEqual(steps[publish]["with"]["packages-dir"], "dist")
+        self.assertEqual(steps[publish]["with"]["repository-url"], "https://upload.pypi.org/legacy/")
+        self.assertFalse(any("build_vane_dynamic_wheel.py" in step.get("run", "") for step in steps))
+        for job in jobs.values():
+            for step in job.get("steps", []):
+                if "actions/download-artifact@" in step.get("uses", ""):
+                    self.assertIn("3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", step["uses"])
+                    self.assertEqual(step["with"]["digest-mismatch"], "error")
+        for name in ("testpypi-local-ducklake-integration", "testpypi-ray-ducklake-integration"):
+            scripts = "\n".join(step.get("run", "") for step in jobs[name]["steps"])
+            self.assertIn('download_exact "vane-ai==$VANE_VERSION" "$VANE_RUNTIME_INDEX"', scripts)
+            self.assertIn('cmp "${expected_ducklake[0]}" "${ducklake_wheels[0]}"', scripts)
+            self.assertIn("astrovela/vane'", jobs[name]["env"]["VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"])
 
 
 if __name__ == "__main__":

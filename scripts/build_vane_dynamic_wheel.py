@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import platform
 import re
@@ -19,11 +20,14 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from packaging.tags import sys_tags
+from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 
 SIGNING_PROFILES = {
     "ci-test": ("vane-ci-test-key", "VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY"),
     "testpypi": ("astrovela/vane-testpypi", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"),
+    "production": ("astrovela/vane", None),
 }
+PRODUCTION_PUBLIC_KEY_SHA256 = "8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb"
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND ISC AND MIT AND "
     "Unicode-DFS-2015 AND Zlib AND curl"
@@ -172,11 +176,11 @@ def _compiler_launcher_arguments() -> list[str]:
     return ["-DCMAKE_C_COMPILER_LAUNCHER=ccache", "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"]
 
 
-def _vcpkg_revision(extension_root: Path) -> str:
-    manifest = tomllib.loads((extension_root / "vane-extension.toml").read_text(encoding="utf-8"))
+def _vcpkg_revision(manifest_path: Path) -> str:
+    manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
     vcpkg = manifest.get("vcpkg")
     if manifest.get("schema_version") != 2 or not isinstance(vcpkg, dict):
-        raise QualificationError("vane-extension.toml must use schema 2 with an explicit vcpkg table")
+        raise QualificationError("integration manifest must use schema 2 with an explicit vcpkg table")
     revision = vcpkg.get("revision")
     if (
         vcpkg.get("repository") != "microsoft/vcpkg"
@@ -210,7 +214,7 @@ def _build_environment(
     vane_vcpkg_installed: Path,
     vcpkg_toolchain: Path,
     jobs: int,
-    signing_cmake_option: str,
+    signing_cmake_option: str | None,
 ) -> dict[str, str]:
     target_triplet = "x64-linux"
     dependency_prefix = vane_vcpkg_installed / target_triplet
@@ -231,7 +235,10 @@ def _build_environment(
         "-DENABLE_EXTENSION_AUTOINSTALL=OFF",
         "-DEXTENSION_STATIC_BUILD=ON",
         "-DDUCKLAKE_VANE_DISTRIBUTED=ON",
-        f"-D{signing_cmake_option}=ON",
+        "-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY="
+        + ("ON" if signing_cmake_option == "VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY" else "OFF"),
+        "-DVANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY="
+        + ("ON" if signing_cmake_option == "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY" else "OFF"),
         "-DVANE_LOADABLE_EXTENSIONS=ducklake",
         f"-DVANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY={staged_extensions}",
         "-DVCPKG_BUILD=ON",
@@ -287,8 +294,8 @@ def _build_environment(
     return environment
 
 
-def _render_vcpkg_license_bundle(extension_root: Path, share_directory: Path) -> str:
-    baseline = _vcpkg_revision(extension_root)
+def _render_vcpkg_license_bundle(manifest_path: Path, share_directory: Path) -> str:
+    baseline = _vcpkg_revision(manifest_path)
     records = sorted(
         (path for path in share_directory.glob("*/copyright") if not path.parent.name.startswith("vcpkg-")),
         key=lambda path: path.parent.name,
@@ -374,14 +381,16 @@ def _copy_license(source: Path, destination: Path) -> Path:
     return destination
 
 
-def _stage_license_files(*, extension_root: Path, vane_source: Path, build_directory: Path) -> tuple[Path, ...]:
+def _stage_license_files(
+    *, extension_root: Path, manifest_path: Path, vane_source: Path, build_directory: Path
+) -> tuple[Path, ...]:
     directory = build_directory / "dynamic-extension-licenses"
     directory.mkdir(parents=True, exist_ok=True)
     duckdb = directory / "DuckDB-static-engine-licenses.txt"
     duckdb.write_text(_render_duckdb_license_bundle(vane_source), encoding="utf-8")
     dependencies = directory / "vcpkg-binary-dependencies.txt"
     dependencies.write_text(
-        _render_vcpkg_license_bundle(extension_root, build_directory / "vcpkg_installed/x64-linux/share"),
+        _render_vcpkg_license_bundle(manifest_path, build_directory / "vcpkg_installed/x64-linux/share"),
         encoding="utf-8",
     )
     return (
@@ -458,6 +467,7 @@ def _build_provider_wheel(
 def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--extension-root", required=True, type=Path)
+    parser.add_argument("--manifest", type=Path, default=Path("vane-extension.toml"))
     parser.add_argument("--vane-source", required=True, type=Path)
     parser.add_argument("--vane-revision", required=True)
     parser.add_argument("--vane-vcpkg-installed", required=True, type=Path)
@@ -500,6 +510,38 @@ def _clear_key(contents: bytearray) -> None:
     contents.clear()
 
 
+def _verify_production_key(contents: bytearray) -> None:
+    result = subprocess.run(
+        ("openssl", "pkey", "-pubout", "-outform", "DER"),
+        input=contents,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode or hashlib.sha256(result.stdout).hexdigest() != PRODUCTION_PUBLIC_KEY_SHA256:
+        raise QualificationError("production signing key does not match the reviewed astrovela/vane public key")
+
+
+def _require_production_runtimes(runtimes: tuple[tuple[Path, Path], ...]) -> None:
+    versions = set()
+    for _python, wheel in runtimes:
+        try:
+            distribution, version, _build, _tags = parse_wheel_filename(wheel.name)
+        except InvalidWheelFilename as error:
+            raise QualificationError(f"invalid production runtime wheel filename: {wheel.name}") from error
+        if (
+            distribution != "vane-ai"
+            or version.is_devrelease
+            or version.local is not None
+            or version.epoch != 0
+            or len(version.release) != 3
+        ):
+            raise QualificationError("production requires exact canonical non-development Vane runtime wheels")
+        versions.add(version)
+    if len(versions) != 1:
+        raise QualificationError("production runtime wheels must all have the same exact Vane version")
+
+
 def main() -> int:
     arguments = _parse_arguments()
     if arguments.jobs <= 0:
@@ -510,14 +552,15 @@ def main() -> int:
         raise QualificationError("--runtime-python and --runtime-wheel must be supplied the same number of times")
     if not arguments.package_local_runtime and not arguments.runtime_python:
         raise QualificationError("at least one indexed runtime pair is required")
-    if arguments.signing_profile == "testpypi":
+    if arguments.signing_profile in {"testpypi", "production"}:
         if not arguments.consume_signing_private_key or arguments.package_local_runtime:
-            raise QualificationError("TestPyPI requires indexed runtimes and --consume-signing-private-key")
+            raise QualificationError("publication requires indexed runtimes and --consume-signing-private-key")
 
     extension_root = _require_directory(arguments.extension_root, "extension root")
+    manifest_path = _require_file(extension_root / arguments.manifest, "integration manifest")
     vane_source = _require_directory(arguments.vane_source, "Vane source")
     vane_vcpkg_installed = _require_directory(arguments.vane_vcpkg_installed, "Vane vcpkg installation")
-    toolchain = _require_vcpkg_toolchain(arguments.vcpkg_toolchain, _vcpkg_revision(extension_root))
+    toolchain = _require_vcpkg_toolchain(arguments.vcpkg_toolchain, _vcpkg_revision(manifest_path))
     _require_git_revision(vane_source, arguments.vane_revision, "Vane")
     tools = extension_root / "vane-extension-ci-tools"
     tools_revision = _capture(("git", "rev-parse", "HEAD:vane-extension-ci-tools"), cwd=extension_root)
@@ -526,7 +569,7 @@ def main() -> int:
         "-I",
         str(tools / "scripts/vane_extension.py"),
         "--manifest",
-        str(extension_root / "vane-extension.toml"),
+        str(manifest_path),
         "--extension-root",
         str(extension_root),
     )
@@ -537,6 +580,8 @@ def main() -> int:
         (_require_file(python, "runtime interpreter"), _require_file(wheel, "indexed runtime wheel"))
         for python, wheel in zip(arguments.runtime_python, arguments.runtime_wheel, strict=True)
     )
+    if arguments.signing_profile == "production":
+        _require_production_runtimes(runtimes)
     for python, _wheel in runtimes:
         if not os.access(python, os.X_OK):
             raise QualificationError(f"runtime interpreter is not executable: {python}")
@@ -560,6 +605,8 @@ def main() -> int:
     with ExitStack() as cleanup:
         key = _read_signing_private_key(arguments.signing_private_key, consume=arguments.consume_signing_private_key)
         cleanup.callback(_clear_key, key)
+        if arguments.signing_profile == "production":
+            _verify_production_key(key)
         base_output = Path(
             cleanup.enter_context(tempfile.TemporaryDirectory(prefix="vane-base-wheel-", dir=build_directory.parent))
         )
@@ -621,6 +668,7 @@ def main() -> int:
 
         licenses = _stage_license_files(
             extension_root=extension_root,
+            manifest_path=manifest_path,
             vane_source=vane_source,
             build_directory=build_directory,
         )

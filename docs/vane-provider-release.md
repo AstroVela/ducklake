@@ -79,13 +79,70 @@ this source change. Keep the private key out of Git, workflow inputs, logs, and
 artifacts. The workflow provides it only to the signing build step and consumes
 the temporary private-key file after reading it.
 
+## Production release preparation
+
+The same top-level `VaneExtension.yml` also offers `operation=release`;
+`build-only` remains the default. Production preparation does not change
+`vane-extension.toml`, the existing `0.2.0.dev612` runtime dependency, or any
+already-published TestPyPI wheels.
+
+Production instead uses `vane-extension-release.toml`. Its current exact Vane
+pin, `033b549afcb498633fd6669b26c054c00363004e`, contains the production public
+key but **is not a released runtime**. A release dispatch therefore fails at
+the read-only version gate, before native dependency builds, signing, or
+publication. First release a canonical non-development Vane version to PyPI,
+then update this separate manifest to its exact source commit by reviewed PR.
+The source must descend from the production-key commit, and all five matching
+runtime wheels must exist on PyPI. There is no TestPyPI runtime fallback or
+version substitution in the production lane.
+
+After that prerequisite, a manual `release` dispatch on this repository's
+protected `v1.5-variegata_vane` branch performs:
+
+1. Download the exact runtime matrix from PyPI, build the native extension
+   once, and sign once with trust identity `astrovela/vane`. Both the CI-test
+   and TestPyPI test-key CMake options are explicitly disabled. The signing
+   key's public DER SHA256 must equal
+   `8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
+2. Validate source pins, exact dependencies, wheel sizes, and absent or
+   byte-identical files on both indexes using the shared release CLI. Stage
+   that candidate on TestPyPI with the existing publisher.
+3. Verify the complete indexed filenames and hashes. Fresh local and
+   two-worker Ray jobs install the runtime from PyPI and provider from
+   TestPyPI, compare the provider bytes with the build artifact, run
+   `pip check`, and execute the provider-backed SQL tests.
+4. Wait for the protected `pypi` environment approval after both tests pass.
+   Re-run the shared `verify-promotion` against the complete original wheel
+   set, publish those **same files** to PyPI, and verify the indexed hashes.
+   There is no rebuild, re-signing, repackaging, or dependency rewriting after
+   qualification. A retry may skip existing files only after their exact
+   identities pass the shared gate.
+
+Before enabling a real release, configure these external prerequisites:
+
+- A `production-signing` GitHub environment restricted to the protected
+  default branch, with required reviewers and the
+  `VANE_EXTENSION_SIGNING_PRIVATE_KEY` secret. This is the production key,
+  separate from the existing `testpypi` secret; keep it out of workflow inputs,
+  logs, Git, and artifacts.
+- A `pypi` GitHub environment restricted to that branch, with **required
+  reviewers** and self-review prevention. Declaring an environment in YAML
+  does not configure its approval protection; configure it before dispatch.
+- A PyPI Trusted Publisher for project `vane-extension-ducklake`, owner
+  `AstroVela`, repository `ducklake`, workflow `VaneExtension.yml`, environment
+  `pypi`. The existing TestPyPI publisher remains unchanged.
+
+This change does not configure environments or secrets, create tags, or
+upload packages. No provider tag is required: the manually selected protected
+branch commit and the reviewed exact Vane/CI-tools pins are the release inputs.
+
 ## Focused development checks
 
 With Python 3.11 or newer:
 
 ```sh
 git submodule update --init vane-extension-ci-tools
-python -m pip install -r vane-extension-ci-tools/requirements-release.txt
+python -m pip install -r vane-extension-ci-tools/requirements-release.txt "PyYAML>=6.0"
 python -I test/vane/test_vane_provider_release.py
 python -I test/vane/test_vane_dynamic_wheel.py
 ```
@@ -100,10 +157,11 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev612 --require-testpypi-publishable
+  --vane-version 0.2.0.dev612 --channel testpypi-dev \
+  --require-publishable-on testpypi
 ```
 
 Source verification is read-only and rejects mismatched or dirty Vane/tools
 checkouts. After publication, `verify-index` accepts the same source/config
-flags plus `--provider ducklake --version <exact-provider-version>` and the
+flags plus `--index testpypi --provider ducklake --version <exact-provider-version>` and the
 directory containing the five assembled provider wheels.
