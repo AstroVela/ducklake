@@ -38,7 +38,7 @@ def load_dynamic_ducklake(vane: object, connection: object) -> dict[str, object]
     from vane.extensions import LocalExtensionProvider
 
     trust_identity = os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY")
-    if trust_identity not in {"vane-ci-test-key", "astrovela/vane-testpypi"}:
+    if trust_identity not in {"vane-ci-test-key", "astrovela/vane-testpypi", "astrovela/vane"}:
         raise AssertionError("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY must select the explicit qualification trust root")
     matches = [
         candidate
