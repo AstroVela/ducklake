@@ -1,8 +1,35 @@
 #include "functions/ducklake_table_functions.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#include "duckdb/function/distributed_table_function.hpp"
+#endif
 
 namespace duckdb {
+
+unique_ptr<FunctionData> MetadataBindData::Copy() const {
+	auto result = make_uniq<MetadataBindData>();
+	result->rows = rows;
+	return std::move(result);
+}
+
+bool MetadataBindData::Equals(const FunctionData &other) const {
+	return rows == other.Cast<MetadataBindData>().rows;
+}
+
+void MetadataBindData::Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                                 const TableFunction &) {
+	serializer.WriteProperty(100, "rows", bind_data->Cast<MetadataBindData>().rows);
+}
+
+unique_ptr<FunctionData> MetadataBindData::Deserialize(Deserializer &deserializer, TableFunction &) {
+	auto result = make_uniq<MetadataBindData>();
+	result->rows = deserializer.ReadProperty<vector<vector<Value>>>(100, "rows");
+	return std::move(result);
+}
 
 Catalog &DuckLakeBaseMetadataFunction::GetCatalog(ClientContext &context, const Value &input) {
 	if (input.IsNull()) {
@@ -61,6 +88,12 @@ static void MetadataFunctionExecute(ClientContext &context, TableFunctionInput &
 
 DuckLakeBaseMetadataFunction::DuckLakeBaseMetadataFunction(string name_p, table_function_bind_t bind)
     : TableFunction(std::move(name_p), {LogicalType::VARCHAR}, MetadataFunctionExecute, bind, MetadataFunctionInit) {
+	serialize = MetadataBindData::Serialize;
+	deserialize = MetadataBindData::Deserialize;
+#ifdef DUCKLAKE_VANE_DISTRIBUTED
+	// MetadataBindData contains completed rows, with no live catalog dependency.
+	SetDistributedScanCallbacks(MakeDistributedSingletonSourceCallbacks());
+#endif
 }
 
 } // namespace duckdb

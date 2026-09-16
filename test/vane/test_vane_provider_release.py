@@ -254,10 +254,10 @@ class ProviderReleaseTest(unittest.TestCase):
         manifest = tomllib.loads((REPOSITORY_ROOT / "vane-extension.toml").read_text())
         self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["vane"]["repository"], "AstroVela/vane")
-        self.assertEqual(manifest["vane"]["revision"], "472df75ab51fd3eac2642f6646545075549e5921")
+        self.assertEqual(manifest["vane"]["revision"], "3c9ed18e29c586e9d5448c74440e8ea55469a749")
         self.assertEqual(manifest["vcpkg"]["revision"], "84bab45d415d22042bd0b9081aea57f362da3f35")
         release_manifest = tomllib.loads((REPOSITORY_ROOT / "vane-extension-release.toml").read_text())
-        self.assertEqual(release_manifest["vane"]["revision"], "033b549afcb498633fd6669b26c054c00363004e")
+        self.assertEqual(release_manifest["vane"]["revision"], "3c9ed18e29c586e9d5448c74440e8ea55469a749")
         release_manifest["vane"]["revision"] = manifest["vane"]["revision"]
         self.assertEqual(release_manifest, manifest)
         entry = subprocess.check_output(
@@ -343,7 +343,7 @@ class ProviderReleaseTest(unittest.TestCase):
         self.assertEqual(promotion["permissions"], {"contents": "read"})
         self.assertEqual(
             set(promotion["needs"]),
-            {"assemble-testpypi-ducklake", "testpypi-local-ducklake-integration", "testpypi-ray-ducklake-integration"},
+            {"assemble-testpypi-ducklake", "testpypi-smoke-ducklake-integration", "testpypi-ray-ducklake-integration"},
         )
         self.assertTrue(any("verify-promotion" in step.get("run", "") for step in promotion["steps"]))
         publisher = jobs["publish-pypi-ducklake"]
@@ -375,7 +375,7 @@ class ProviderReleaseTest(unittest.TestCase):
                 if "actions/download-artifact@" in step.get("uses", ""):
                     self.assertIn("3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", step["uses"])
                     self.assertEqual(step["with"]["digest-mismatch"], "error")
-        for name in ("testpypi-local-ducklake-integration", "testpypi-ray-ducklake-integration"):
+        for name in ("testpypi-smoke-ducklake-integration", "testpypi-ray-ducklake-integration"):
             scripts = "\n".join(step.get("run", "") for step in jobs[name]["steps"])
             self.assertIn('download_exact "vane-ai==$VANE_VERSION" "$VANE_RUNTIME_INDEX"', scripts)
             self.assertIn('cmp "${expected_ducklake[0]}" "${ducklake_wheels[0]}"', scripts)

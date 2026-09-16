@@ -3,12 +3,12 @@
 `vane-extension-ducklake` packages DuckLake as a signed dynamic Vane provider,
 separate from the `vane-ai` runtime. The initial candidate targets the exact
 Vane source recorded in `vane-extension.toml`, corresponding to
-`vane-ai==0.2.0.dev612`. Each provider wheel requires that exact runtime version;
+`vane-ai==0.2.0.dev657`. Each provider wheel requires that exact runtime version;
 the wheel is not interchangeable with arbitrary Vane or upstream DuckDB builds.
 
 The existing native and statically linked Vane-wheel integration lanes remain
 in place. The new provider lane builds an independent dynamic extension and
-qualifies it with local execution and two Ray workers. Initial dynamic
+qualifies it with default Ray CRUD and two-worker scans. Initial dynamic
 qualification uses DuckLake's DuckDB metadata catalog and filesystem-backed
 data, with no SQLite or PostgreSQL provider package dependency.
 
@@ -39,8 +39,10 @@ vcpkg revision remains `84bab45d415d22042bd0b9081aea57f362da3f35`.
 Normal PR and branch CI do not publish packages. They exercise lightweight
 packaging/release tests and build a CI-test-signed provider plus its exact Vane
 runtime wheel. Separate clean jobs install those artifacts and run
-`test/vane/test_vane_dynamic_ducklake.py` under `VANE_RUNNER=local-fast` and
-`VANE_RUNNER=ray`. The original statically linked tests remain independent.
+`test/vane/test_vane_dynamic_ducklake.py --smoke` for CRUD and the same script
+without `--smoke` for two-worker coverage. All public integration tests leave
+`VANE_RUNNER` unset, avoid runner-selection APIs, and verify the default Ray
+runner. The statically linked suite also uses the default Ray runner.
 
 Publication requires a manual `Vane extension` workflow dispatch with
 `operation=testpypi-dev` on `v1.5-variegata_vane`:
@@ -55,7 +57,7 @@ Publication requires a manual `Vane extension` workflow dispatch with
    and Sigstore evidence, then publish through Trusted Publishing.
 4. Compare the five indexed filenames and SHA256 hashes with the exact upload
    artifacts. Partial or conflicting indexed sets fail verification.
-5. Download the indexed runtime/provider graph in fresh local and two-worker
+5. Download the indexed runtime/provider graph in fresh default Ray smoke and two-worker
    Ray jobs. Compare the provider bytes with the upload artifact, install the
    exact graph, run `pip check`, and exercise the dynamic-provider SQL tests.
 
@@ -86,11 +88,11 @@ outside the downloaded data before the job uploads signed native files.
 
 The same top-level `VaneExtension.yml` also offers `operation=release`;
 `build-only` remains the default. Production preparation does not change
-`vane-extension.toml`, the existing `0.2.0.dev612` runtime dependency, or any
+`vane-extension.toml`, the existing `0.2.0.dev657` runtime dependency, or any
 already-published TestPyPI wheels.
 
 Production instead uses `vane-extension-release.toml`. Its current exact Vane
-pin, `033b549afcb498633fd6669b26c054c00363004e`, contains the production public
+pin, `3c9ed18e29c586e9d5448c74440e8ea55469a749`, contains the production public
 key but **is not a released runtime**. A release dispatch therefore fails at
 the read-only version gate, before native dependency builds, signing, or
 publication. First release a canonical non-development Vane version to PyPI,
@@ -116,7 +118,7 @@ protected `v1.5-variegata_vane` branch performs:
    runtimes; do not rebuild native code. Validate source pins, exact dependencies, wheel sizes, and absent or
    byte-identical files on both indexes using the shared release CLI. Stage
    that candidate on TestPyPI with the existing publisher.
-3. Verify the complete indexed filenames and hashes. Fresh local and
+3. Verify the complete indexed filenames and hashes. Fresh default Ray smoke and
    two-worker Ray jobs install the runtime from PyPI and provider from
    TestPyPI, compare the provider bytes with the build artifact, run
    `pip check`, and execute the provider-backed SQL tests.
@@ -182,7 +184,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev612 --channel testpypi-dev \
+  --vane-version 0.2.0.dev657 --channel testpypi-dev \
   --require-publishable-on testpypi
 ```
 
@@ -190,3 +192,18 @@ Source verification is read-only and rejects mismatched or dirty Vane/tools
 checkouts. After publication, `verify-index` accepts the same source/config
 flags plus `--index testpypi --provider ducklake --version <exact-provider-version>` and the
 directory containing the five assembled provider wheels.
+
+## Latest-main default Ray qualification
+
+Both manifests pin Vane `3c9ed18e29c586e9d5448c74440e8ea55469a749`
+(`0.2.0.dev657`). This is a development qualification, not a production release.
+Fixtures, SQL statements, Relations and readback use the default Ray runner.
+Test-owned clusters reserve capacity for concurrent writes without changing
+Vane's runner selection. Internal SQLite assertions use Python's `sqlite3`
+module independently of the Vane execution path.
+
+DuckLake metadata functions share a portable completed-row binding. Their rows
+are copied and serialized once per bound plan, including `ducklake_options()`;
+Ray runs one metadata fragment and retries retain the same rows. Creating a new
+query observes current catalog metadata. This does not declare live catalog
+objects to be worker-safe or add any execution fallback.

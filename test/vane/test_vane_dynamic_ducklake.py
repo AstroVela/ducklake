@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Qualify the installed DuckLake provider locally or on two Ray workers."""
+"""Qualify the installed DuckLake provider using the default Ray runner."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -29,9 +30,9 @@ def load_test_helpers(name: str) -> object:
     return module
 
 
-local_helpers = load_test_helpers("test_vane_wheel_ducklake")
-require_equal = local_helpers.require_equal
-sql_string = local_helpers.sql_string
+smoke_helpers = load_test_helpers("test_vane_wheel_ducklake")
+require_equal = smoke_helpers.require_equal
+sql_string = smoke_helpers.sql_string
 
 
 def load_dynamic_ducklake(vane: object, connection: object) -> dict[str, object]:
@@ -96,7 +97,7 @@ def provider_connection(vane: object) -> tuple[object, dict[str, object]]:
         raise
 
 
-def seed_local_lake(vane: object, root: Path, *, scan_fixture: bool) -> dict[str, object]:
+def seed_lake(vane: object, root: Path, *, scan_fixture: bool) -> dict[str, object]:
     connection, descriptor = provider_connection(vane)
     try:
         connection.execute(
@@ -110,7 +111,7 @@ def seed_local_lake(vane: object, root: Path, *, scan_fixture: bool) -> dict[str
         require_equal(
             connection.sql("SELECT id, payload FROM lake.items ORDER BY id").fetchall(),
             [(2, "updated"), (3, "three")],
-            "provider-backed local CRUD",
+            "provider-backed default Ray CRUD",
         )
         if scan_fixture:
             connection.execute("CREATE TABLE lake.source(id INTEGER, payload VARCHAR)")
@@ -143,7 +144,7 @@ class AnnotateWorkerNode:
         return pa.table({"id": table.column("id"), "worker_node_id": [node_id] * table.num_rows})
 
 
-def exercise_ray_scan(vane: object, root: Path, descriptor: dict[str, object]) -> None:
+def exercise_ray_scan(vane: object, root: Path, *, smoke: bool) -> None:
     import ray
     from vane import runners
 
@@ -156,19 +157,17 @@ def exercise_ray_scan(vane: object, root: Path, descriptor: dict[str, object]) -
     original_run_iter_tables = None
     try:
         expected_nodes = helpers.execution_node_ids(ray)
-        vane.set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
-        require_equal(getattr(runner, "name", None), "ray", "configured runner")
-        os.environ["VANE_RUNNER"] = "local-fast"
-        try:
-            connection, loaded_descriptor = provider_connection(vane)
-            require_equal(loaded_descriptor, descriptor, "reopened provider identity")
-            connection.execute(
-                f"ATTACH {sql_string('ducklake:' + str(root / 'metadata.ducklake'))} AS lake "
-                f"(DATA_PATH {sql_string(root / 'data')}, READ_ONLY)"
-            )
-        finally:
-            os.environ["VANE_RUNNER"] = "ray"
+        require_equal(getattr(runner, "name", None), "ray", "default runner")
+        descriptor = seed_lake(vane, root, scan_fixture=not smoke)
+        if smoke:
+            return
+        connection, loaded_descriptor = provider_connection(vane)
+        require_equal(loaded_descriptor, descriptor, "reopened provider identity")
+        connection.execute(
+            f"ATTACH {sql_string('ducklake:' + str(root / 'metadata.ducklake'))} AS lake "
+            f"(DATA_PATH {sql_string(root / 'data')}, READ_ONLY)"
+        )
         plan = helpers.make_physical_plan(vane, connection, "SELECT id, payload FROM lake.source")
         require_equal(
             sum(len(batches) for batches in plan.scan_split_batch_map().values()),
@@ -180,10 +179,11 @@ def exercise_ray_scan(vane: object, root: Path, descriptor: dict[str, object]) -
         dispatch_count = 0
         original_run_iter_tables = runner.run_iter_tables
 
-        def record_distributed_read(*args: object, **kwargs: object) -> object:
+        def record_distributed_read(logical_plan: object) -> object:
             nonlocal dispatch_count
+            require_equal(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), True, "bound Ray read plan")
             dispatch_count += 1
-            return original_run_iter_tables(*args, **kwargs)
+            return original_run_iter_tables(logical_plan)
 
         runner.run_iter_tables = record_distributed_read
         require_equal(
@@ -228,25 +228,16 @@ def exercise_ray_scan(vane: object, root: Path, descriptor: dict[str, object]) -
 
 
 def main() -> None:
-    runner_kind = os.environ.get("VANE_RUNNER")
-    if runner_kind not in {"local-fast", "ray"}:
-        raise RuntimeError("dynamic DuckLake qualification requires VANE_RUNNER=local-fast or ray")
+    if "VANE_RUNNER" in os.environ:
+        raise RuntimeError("leave VANE_RUNNER unset to qualify the default Ray runner")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke", action="store_true", help="Run the default Ray CRUD smoke only")
+    arguments = parser.parse_args()
     os.environ["VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION"] = "1"
-    os.environ["VANE_RUNNER"] = "local-fast"
     import vane
 
-    try:
-        with tempfile.TemporaryDirectory(prefix="vane-dynamic-ducklake-") as value:
-            root = Path(value)
-            try:
-                descriptor = seed_local_lake(vane, root, scan_fixture=runner_kind == "ray")
-            finally:
-                vane.teardown_runner()
-            os.environ["VANE_RUNNER"] = runner_kind
-            if runner_kind == "ray":
-                exercise_ray_scan(vane, root, descriptor)
-    finally:
-        os.environ["VANE_RUNNER"] = runner_kind
+    with tempfile.TemporaryDirectory(prefix="vane-dynamic-ducklake-") as value:
+        exercise_ray_scan(vane, Path(value), smoke=arguments.smoke)
 
 
 if __name__ == "__main__":

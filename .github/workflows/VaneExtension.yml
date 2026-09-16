@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Build only, publish dev612 to TestPyPI, or qualify and promote a production release
+        description: Build only, publish dev657 to TestPyPI, or qualify and promote a production release
         type: choice
         options:
           - build-only
@@ -48,15 +48,12 @@ jobs:
       run_native_tests: true
 
   vane-wheel-ducklake-integration:
-    name: Vane wheel local DuckLake integration
+    name: Vane wheel default Ray DuckLake smoke integration
     needs: vane-native
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
-    env:
-      VANE_RUNNER: local-fast
-
     steps:
       - name: Checkout extension
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -98,7 +95,6 @@ jobs:
     permissions:
       contents: read
     env:
-      VANE_RUNNER: ray
       RAY_DEDUP_LOGS: "0"
       VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION: "1"
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
@@ -385,14 +381,13 @@ jobs:
 
   vane-dynamic-ducklake-integration:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
-    name: Vane dynamic wheel local DuckLake integration
+    name: Vane dynamic wheel default Ray DuckLake smoke integration
     needs: vane-dynamic-wheel
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
     env:
-      VANE_RUNNER: local-fast
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
 
     steps:
@@ -426,7 +421,7 @@ jobs:
           test "${#ducklake_wheels[@]}" -eq 1
           python -m pip install --disable-pip-version-check \
             "${base_wheels[0]}" "${ducklake_wheels[0]}"
-          python -I test/vane/test_vane_dynamic_ducklake.py
+          python -I test/vane/test_vane_dynamic_ducklake.py --smoke
 
   vane-dynamic-ray-ducklake-integration:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -437,7 +432,6 @@ jobs:
     permissions:
       contents: read
     env:
-      VANE_RUNNER: ray
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
       RAY_DEDUP_LOGS: "0"
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
@@ -1130,15 +1124,14 @@ jobs:
             --directory dist \
             --version "${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}"
 
-  testpypi-local-ducklake-integration:
-    name: TestPyPI local DuckLake integration
+  testpypi-smoke-ducklake-integration:
+    name: TestPyPI default Ray DuckLake smoke integration
     needs: [assemble-testpypi-ducklake, verify-testpypi-ducklake]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
     env:
-      VANE_RUNNER: local-fast
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
       INDEX_URL: https://test.pypi.org/simple/
 
@@ -1169,8 +1162,8 @@ jobs:
           DUCKLAKE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}
         run: |
           set -euo pipefail
-          python -m venv .venv-vane-testpypi-local
-          . .venv-vane-testpypi-local/bin/activate
+          python -m venv .venv-vane-testpypi-smoke
+          . .venv-vane-testpypi-smoke/bin/activate
           python -m pip install --upgrade pip
           mkdir -p indexed
           download_exact() {
@@ -1204,8 +1197,8 @@ jobs:
           python -m pip install "${base_wheels[0]}" "${ducklake_wheels[0]}"
           python -m pip check
 
-      - name: Exercise the indexed provider locally
-        run: .venv-vane-testpypi-local/bin/python -I test/vane/test_vane_dynamic_ducklake.py
+      - name: Exercise the indexed provider with default Ray
+        run: .venv-vane-testpypi-smoke/bin/python -I test/vane/test_vane_dynamic_ducklake.py --smoke
 
   testpypi-ray-ducklake-integration:
     name: TestPyPI two-worker Ray DuckLake integration
@@ -1215,7 +1208,6 @@ jobs:
     permissions:
       contents: read
     env:
-      VANE_RUNNER: ray
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
       RAY_DEDUP_LOGS: "0"
@@ -1291,7 +1283,7 @@ jobs:
     if: inputs.operation == 'release'
     needs:
       - assemble-testpypi-ducklake
-      - testpypi-local-ducklake-integration
+      - testpypi-smoke-ducklake-integration
       - testpypi-ray-ducklake-integration
     runs-on: ubuntu-24.04
     environment:

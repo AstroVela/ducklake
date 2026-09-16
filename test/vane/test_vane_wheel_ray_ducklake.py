@@ -33,6 +33,11 @@ def require_true(value: bool, description: str) -> None:
         raise AssertionError(description)
 
 
+def metadata_row(root: Path, query: str) -> tuple[object, ...] | None:
+    with sqlite3.connect(root / "metadata.sqlite") as metadata_connection:
+        return metadata_connection.execute(query).fetchone()
+
+
 def distributed_artifact_roots(connection: object, table_name: str) -> set[str]:
     rows = connection.execute(f"SELECT data_file FROM ducklake_list_files('lake', '{table_name}')").fetchall()
     roots = set()
@@ -86,7 +91,8 @@ def create_two_worker_cluster(ray: object) -> object:
         for _ in range(WORKER_COUNT):
             cluster.add_node(
                 include_dashboard=False,
-                num_cpus=1,
+                # Leave capacity for the competing Ray write while a UDF is blocked.
+                num_cpus=2,
                 num_gpus=0,
                 object_store_memory=100 * 1024 * 1024,
             )
@@ -400,174 +406,189 @@ def seed_tables(connection: object, root: Path) -> None:
         journal_mode = metadata_connection.execute("PRAGMA journal_mode=WAL").fetchone()
     require_equal(journal_mode, ("wal",), "SQLite metadata journal mode")
 
-    configured_runner = os.environ.get("VANE_RUNNER")
-    os.environ["VANE_RUNNER"] = "local-fast"
-    try:
+    connection.execute(
+        f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
+        f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0, BUSY_TIMEOUT 30000)"
+    )
+    connection.execute("CREATE TABLE lake.source(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.empty_source(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.inlined_delete_source(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.mapped_source(old_id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.stale_source(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.schema_source(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.write_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.row_count_write_target(id INTEGER NOT NULL, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.schema_write_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.duplicate_path_write_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.footer_stats_write_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.inexact_stats_write_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.nested_write_target(payload STRUCT(value INTEGER), items INTEGER[])")
+    connection.execute("CREATE TABLE lake.not_null_nested_target(payload STRUCT(value INTEGER) NOT NULL)")
+    connection.execute("CREATE TABLE lake.rollback_write_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
+    connection.execute("ALTER TABLE lake.partitioned_write_target SET PARTITIONED BY (category)")
+    connection.execute("CREATE TABLE lake.concurrent_write_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.mutation_unpartitioned(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.mutation_partitioned(id INTEGER, category VARCHAR, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.mutation_legacy_mapping(old_id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.mutation_duplicate_delete(id INTEGER)")
+    connection.execute("ALTER TABLE lake.mutation_partitioned SET PARTITIONED BY (category)")
+    connection.execute("CREATE TABLE lake.merge_update_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.merge_delete_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.merge_partitioned_target(id INTEGER, category VARCHAR, payload VARCHAR)")
+    connection.execute("ALTER TABLE lake.merge_partitioned_target SET PARTITIONED BY (category)")
+    connection.execute("CREATE TABLE lake.merge_noop_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.merge_by_source_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.merge_retry_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.merge_duplicate_update_target(id INTEGER, payload INTEGER)")
+    connection.execute("CREATE TABLE lake.merge_constant_insert_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.merge_empty_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.merge_failure_target(id INTEGER, payload VARCHAR)")
+    connection.execute("CREATE TABLE lake.merge_conflict_target(id INTEGER, payload VARCHAR)")
+    for file_index in range(FILE_COUNT):
+        start = file_index * ROWS_PER_FILE
+        stop = start + ROWS_PER_FILE
         connection.execute(
-            f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
-            f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0, BUSY_TIMEOUT 30000)"
+            "INSERT INTO lake.source "
+            "SELECT i::INTEGER, ('value-' || i::VARCHAR)::VARCHAR "
+            f"FROM range({start}, {stop}) AS rows(i)"
         )
-        connection.execute("CREATE TABLE lake.source(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.empty_source(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.inlined_delete_source(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.mapped_source(old_id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.stale_source(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.schema_source(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.write_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.not_null_write_target(id INTEGER NOT NULL, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.row_count_write_target(id INTEGER NOT NULL, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.schema_write_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.duplicate_path_write_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.footer_stats_write_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.inexact_stats_write_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.nested_write_target(payload STRUCT(value INTEGER), items INTEGER[])")
-        connection.execute("CREATE TABLE lake.not_null_nested_target(payload STRUCT(value INTEGER) NOT NULL)")
-        connection.execute("CREATE TABLE lake.rollback_write_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.partitioned_write_target(id INTEGER, category VARCHAR, payload VARCHAR)")
-        connection.execute("ALTER TABLE lake.partitioned_write_target SET PARTITIONED BY (category)")
-        connection.execute("CREATE TABLE lake.concurrent_write_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.mutation_unpartitioned(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.mutation_partitioned(id INTEGER, category VARCHAR, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.mutation_legacy_mapping(old_id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.mutation_duplicate_delete(id INTEGER)")
-        connection.execute("ALTER TABLE lake.mutation_partitioned SET PARTITIONED BY (category)")
-        connection.execute("CREATE TABLE lake.merge_update_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.merge_delete_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.merge_partitioned_target(id INTEGER, category VARCHAR, payload VARCHAR)")
-        connection.execute("ALTER TABLE lake.merge_partitioned_target SET PARTITIONED BY (category)")
-        connection.execute("CREATE TABLE lake.merge_noop_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.merge_by_source_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.merge_retry_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.merge_duplicate_update_target(id INTEGER, payload INTEGER)")
-        connection.execute("CREATE TABLE lake.merge_constant_insert_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.merge_empty_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.merge_failure_target(id INTEGER, payload VARCHAR)")
-        connection.execute("CREATE TABLE lake.merge_conflict_target(id INTEGER, payload VARCHAR)")
-        for file_index in range(FILE_COUNT):
-            start = file_index * ROWS_PER_FILE
-            stop = start + ROWS_PER_FILE
-            connection.execute(
-                "INSERT INTO lake.source "
-                "SELECT i::INTEGER, ('value-' || i::VARCHAR)::VARCHAR "
-                f"FROM range({start}, {stop}) AS rows(i)"
-            )
-        for file_index in range(4):
-            start = file_index * 128
-            stop = start + 128
-            connection.execute(
-                "INSERT INTO lake.mutation_unpartitioned "
-                "SELECT i::INTEGER, ('mutation-' || i::VARCHAR)::VARCHAR "
-                f"FROM range({start}, {stop}) AS rows(i)"
-            )
-            connection.execute(
-                "INSERT INTO lake.mutation_partitioned "
-                "SELECT i::INTEGER, ('category-' || (i % 4)::VARCHAR)::VARCHAR, "
-                "('partitioned-' || i::VARCHAR)::VARCHAR "
-                f"FROM range({start}, {stop}) AS rows(i)"
-            )
-            connection.execute(
-                "INSERT INTO lake.merge_update_target "
-                "SELECT i::INTEGER, ('merge-old-' || i::VARCHAR)::VARCHAR "
-                f"FROM range({start}, {stop}) AS rows(i)"
-            )
-            connection.execute(
-                "INSERT INTO lake.merge_failure_target "
-                "SELECT i::INTEGER, ('failure-old-' || i::VARCHAR)::VARCHAR "
-                f"FROM range({start + 512}, {stop + 512}) AS rows(i)"
-            )
-            connection.execute(
-                "INSERT INTO lake.merge_conflict_target "
-                "SELECT i::INTEGER, ('conflict-old-' || i::VARCHAR)::VARCHAR "
-                f"FROM range({start + 100}, {stop + 100}) AS rows(i)"
-            )
-            constant_start = 10000 + file_index * 128
-            connection.execute(
-                "INSERT INTO lake.merge_constant_insert_target "
-                "SELECT i::INTEGER, 'seed'::VARCHAR "
-                f"FROM range({constant_start}, {constant_start + 128}) AS rows(i)"
-            )
-        for file_index in range(4):
-            start = 768 + file_index * 96
-            stop = start + 96
-            connection.execute(
-                "INSERT INTO lake.merge_delete_target "
-                "SELECT i::INTEGER, ('delete-old-' || i::VARCHAR)::VARCHAR "
-                f"FROM range({start}, {stop}) AS rows(i)"
-            )
+    for file_index in range(4):
+        start = file_index * 128
+        stop = start + 128
         connection.execute(
-            "INSERT INTO lake.merge_partitioned_target "
+            "INSERT INTO lake.mutation_unpartitioned "
+            "SELECT i::INTEGER, ('mutation-' || i::VARCHAR)::VARCHAR "
+            f"FROM range({start}, {stop}) AS rows(i)"
+        )
+        connection.execute(
+            "INSERT INTO lake.mutation_partitioned "
             "SELECT i::INTEGER, ('category-' || (i % 4)::VARCHAR)::VARCHAR, "
-            "('partition-old-' || i::VARCHAR)::VARCHAR FROM range(1280, 1664) AS rows(i)"
+            "('partitioned-' || i::VARCHAR)::VARCHAR "
+            f"FROM range({start}, {stop}) AS rows(i)"
         )
-        connection.execute("DELETE FROM lake.source WHERE id = 17")
-        connection.execute("DELETE FROM lake.mutation_unpartitioned WHERE id = 17")
-        connection.execute("DELETE FROM lake.mutation_partitioned WHERE id = 18")
-        connection.execute("DELETE FROM lake.merge_update_target WHERE id = 18")
-        connection.execute("INSERT INTO lake.mutation_legacy_mapping VALUES (42, 'legacy'), (43, 'delete-me')")
-        connection.execute("ALTER TABLE lake.mutation_legacy_mapping RENAME COLUMN old_id TO id")
         connection.execute(
-            "UPDATE __ducklake_metadata_lake.ducklake_data_file SET mapping_id = NULL "
-            "WHERE table_id = (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table "
+            "INSERT INTO lake.merge_update_target "
+            "SELECT i::INTEGER, ('merge-old-' || i::VARCHAR)::VARCHAR "
+            f"FROM range({start}, {stop}) AS rows(i)"
+        )
+        connection.execute(
+            "INSERT INTO lake.merge_failure_target "
+            "SELECT i::INTEGER, ('failure-old-' || i::VARCHAR)::VARCHAR "
+            f"FROM range({start + 512}, {stop + 512}) AS rows(i)"
+        )
+        connection.execute(
+            "INSERT INTO lake.merge_conflict_target "
+            "SELECT i::INTEGER, ('conflict-old-' || i::VARCHAR)::VARCHAR "
+            f"FROM range({start + 100}, {stop + 100}) AS rows(i)"
+        )
+        constant_start = 10000 + file_index * 128
+        connection.execute(
+            "INSERT INTO lake.merge_constant_insert_target "
+            "SELECT i::INTEGER, 'seed'::VARCHAR "
+            f"FROM range({constant_start}, {constant_start + 128}) AS rows(i)"
+        )
+    for file_index in range(4):
+        start = 768 + file_index * 96
+        stop = start + 96
+        connection.execute(
+            "INSERT INTO lake.merge_delete_target "
+            "SELECT i::INTEGER, ('delete-old-' || i::VARCHAR)::VARCHAR "
+            f"FROM range({start}, {stop}) AS rows(i)"
+        )
+    connection.execute(
+        "INSERT INTO lake.merge_partitioned_target "
+        "SELECT i::INTEGER, ('category-' || (i % 4)::VARCHAR)::VARCHAR, "
+        "('partition-old-' || i::VARCHAR)::VARCHAR FROM range(1280, 1664) AS rows(i)"
+    )
+    connection.execute("DELETE FROM lake.source WHERE id = 17")
+    connection.execute("DELETE FROM lake.mutation_unpartitioned WHERE id = 17")
+    connection.execute("DELETE FROM lake.mutation_partitioned WHERE id = 18")
+    connection.execute("DELETE FROM lake.merge_update_target WHERE id = 18")
+    connection.execute("INSERT INTO lake.mutation_legacy_mapping VALUES (42, 'legacy'), (43, 'delete-me')")
+    connection.execute("ALTER TABLE lake.mutation_legacy_mapping RENAME COLUMN old_id TO id")
+    with sqlite3.connect(root / "metadata.sqlite") as metadata_connection:
+        metadata_connection.execute(
+            "UPDATE ducklake_data_file SET mapping_id = NULL "
+            "WHERE table_id = (SELECT table_id FROM ducklake_table "
             "WHERE table_name = 'mutation_legacy_mapping')"
         )
-        connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (10)")
-        connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (20), (30)")
-        connection.execute(
-            "INSERT INTO lake.inlined_delete_source "
-            "SELECT i::INTEGER, ('inline-' || i::VARCHAR)::VARCHAR FROM range(32) AS rows(i)"
-        )
-        connection.execute("CALL lake.set_option('data_inlining_row_limit', 10, table_name => 'inlined_delete_source')")
-        connection.execute("DELETE FROM lake.inlined_delete_source WHERE id = 5")
+    connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (10)")
+    connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (20), (30)")
+    connection.execute(
+        "INSERT INTO lake.inlined_delete_source "
+        "SELECT i::INTEGER, ('inline-' || i::VARCHAR)::VARCHAR FROM range(32) AS rows(i)"
+    )
+    connection.execute("CALL lake.set_option('data_inlining_row_limit', 10, table_name => 'inlined_delete_source')")
+    connection.execute("DELETE FROM lake.inlined_delete_source WHERE id = 5")
 
-        external_file = root / "mapped-source.parquet"
-        connection.execute(
-            "COPY (SELECT 42::INTEGER AS old_id, 'mapped'::VARCHAR AS payload) "
-            f"TO {sql_string(external_file)} (FORMAT PARQUET)"
-        )
-        connection.execute(f"CALL ducklake_add_data_files('lake', 'mapped_source', {sql_string(external_file)})")
-        connection.execute("ALTER TABLE lake.mapped_source RENAME COLUMN old_id TO id")
-        connection.execute("ALTER TABLE lake.mapped_source ADD COLUMN added INTEGER DEFAULT 7")
-        connection.execute("INSERT INTO lake.mapped_source VALUES (43, 'new', 9)")
-        connection.execute("INSERT INTO lake.stale_source VALUES (1, 'old')")
-        connection.execute("INSERT INTO lake.schema_source VALUES (1, 'old')")
-        connection.execute("INSERT INTO lake.concurrent_write_target VALUES (-1, 'seed')")
-        connection.execute("INSERT INTO lake.merge_noop_target VALUES (1, 'noop-old'), (2, 'noop-keep')")
-        connection.execute("INSERT INTO lake.merge_by_source_target VALUES (10, 'remove'), (11, 'keep')")
-        connection.execute("INSERT INTO lake.merge_duplicate_update_target VALUES (7000, 0)")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    external_file = root / "mapped-source.parquet"
+    pq.write_table(pa.table({"old_id": pa.array([42], type=pa.int32()), "payload": ["mapped"]}), external_file)
+    connection.execute(f"CALL ducklake_add_data_files('lake', 'mapped_source', {sql_string(external_file)})")
+    connection.execute("ALTER TABLE lake.mapped_source RENAME COLUMN old_id TO id")
+    connection.execute("ALTER TABLE lake.mapped_source ADD COLUMN added INTEGER DEFAULT 7")
+    connection.execute("INSERT INTO lake.mapped_source VALUES (43, 'new', 9)")
+    connection.execute("INSERT INTO lake.stale_source VALUES (1, 'old')")
+    connection.execute("INSERT INTO lake.schema_source VALUES (1, 'old')")
+    connection.execute("INSERT INTO lake.concurrent_write_target VALUES (-1, 'seed')")
+    connection.execute("INSERT INTO lake.merge_noop_target VALUES (1, 'noop-old'), (2, 'noop-keep')")
+    connection.execute("INSERT INTO lake.merge_by_source_target VALUES (10, 'remove'), (11, 'keep')")
+    connection.execute("INSERT INTO lake.merge_duplicate_update_target VALUES (7000, 0)")
+
+
+def exercise_metadata(vane: object, connection: object, runner: object, root: Path) -> None:
+    latest = metadata_row(root, "SELECT max(snapshot_id) FROM ducklake_snapshot")[0]
+    cases = [
+        ("SELECT id FROM ducklake_current_snapshot('lake')", [(latest,)]),
+        ("SELECT max(snapshot_id) FROM ducklake_snapshots('lake')", [(latest,)]),
+        ("SELECT count(*) FROM ducklake_list_files('lake', 'source')", [(FILE_COUNT,)]),
+        ("SELECT catalog_type FROM ducklake_settings('lake')", [("sqlite",)]),
+        (
+            "SELECT value FROM ducklake_options('lake') WHERE option_name = 'data_inlining_row_limit' "
+            "AND scope = 'TABLE'",
+            [("10",)],
+        ),
+    ]
+    original_read = runner.run_iter_tables
+    calls = 0
+
+    def record(logical_plan: object) -> object:
+        nonlocal calls
+        require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "bound metadata plan")
+        calls += 1
+        return original_read(logical_plan)
+
+    runner.run_iter_tables = record
+    try:
+        for query, expected in cases:
+            before = calls
+            require_equal(connection.execute(query).fetchall(), expected, "metadata SQL result")
+            require_equal(connection.sql(query).fetchall(), expected, "metadata Relation result")
+            require_equal(calls, before + 2, "metadata reaches Ray on both APIs")
+            require_equal(scan_split_count(vane, connection, query), 1, "singleton metadata source")
     finally:
-        if configured_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = configured_runner
+        runner.run_iter_tables = original_read
 
 
 def reopen_lake_read_only(connection: object, root: Path) -> None:
-    configured_runner = os.environ.get("VANE_RUNNER")
-    os.environ["VANE_RUNNER"] = "local-fast"
-    try:
-        connection.execute("DETACH lake")
-        connection.execute(
-            f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
-            f"(DATA_PATH {sql_string(root / 'data')}, READ_ONLY, BUSY_TIMEOUT 30000)"
-        )
-    finally:
-        if configured_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = configured_runner
+    connection.execute("DETACH lake")
+    connection.execute(
+        f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
+        f"(DATA_PATH {sql_string(root / 'data')}, READ_ONLY, BUSY_TIMEOUT 30000)"
+    )
 
 
 def capture_write_plan(vane: object, runner: object, operation: Callable[[], object]) -> object:
     captured = []
     original_run_write = runner.run_write
 
-    def capture(relation: object) -> dict[str, object]:
-        captured.append(
-            vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                relation,
-                f"vane-ducklake-stale-{uuid.uuid4().hex}",
-            )
-        )
+    def capture(logical_plan: object) -> dict[str, object]:
+        require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "captured bound write plan")
+        captured.append(logical_plan)
         return {}
 
     runner.run_write = capture
@@ -664,7 +685,7 @@ def require_concurrent_write_conflict(
         raise AssertionError("distributed DuckLake conflict write did not stop")
     if coordination_error is not None:
         raise coordination_error
-    require_write_count(1, f"{description} Ray dispatch count")
+    require_write_count(2, f"{description} original and competing Ray writes")
     require_equal(len(errors), 1, f"{description} failure count")
     require_true(
         "snapshot" in str(errors[0]).lower(),
@@ -1077,14 +1098,15 @@ def require_forged_min_max_replaced(
     )
     require_true(forged_file_count > 0, "forged min/max write produced no worker files")
     require_equal(
-        connection.execute(
+        metadata_row(
+            root,
             "SELECT stats.min_value, stats.max_value "
-            "FROM __ducklake_metadata_lake.ducklake_table_column_stats stats "
-            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
-            "JOIN __ducklake_metadata_lake.ducklake_column columns USING (table_id, column_id) "
+            "FROM ducklake_table_column_stats stats "
+            "JOIN ducklake_table tables USING (table_id) "
+            "JOIN ducklake_column columns USING (table_id, column_id) "
             "WHERE tables.table_name = 'footer_stats_write_target' AND tables.end_snapshot IS NULL "
-            "AND columns.column_name = 'id' AND columns.end_snapshot IS NULL"
-        ).fetchone(),
+            "AND columns.column_name = 'id' AND columns.end_snapshot IS NULL",
+        ),
         ("100", "127"),
         "footer-derived min/max metadata",
     )
@@ -1102,14 +1124,15 @@ def require_forged_min_max_replaced(
         lambda: inexact_source.insert_into("lake.inexact_stats_write_target"),
     )
     require_equal(
-        connection.execute(
+        metadata_row(
+            root,
             "SELECT stats.min_value, stats.max_value "
-            "FROM __ducklake_metadata_lake.ducklake_table_column_stats stats "
-            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
-            "JOIN __ducklake_metadata_lake.ducklake_column columns USING (table_id, column_id) "
+            "FROM ducklake_table_column_stats stats "
+            "JOIN ducklake_table tables USING (table_id) "
+            "JOIN ducklake_column columns USING (table_id, column_id) "
             "WHERE tables.table_name = 'inexact_stats_write_target' AND tables.end_snapshot IS NULL "
-            "AND columns.column_name = 'payload' AND columns.end_snapshot IS NULL"
-        ).fetchone(),
+            "AND columns.column_name = 'payload' AND columns.end_snapshot IS NULL",
+        ),
         (None, None),
         "inexact footer min/max omission",
     )
@@ -1164,11 +1187,12 @@ def exercise_distributed_mutations(
     )
 
     require_equal(
-        connection.execute(
-            "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file files "
-            "JOIN __ducklake_metadata_lake.ducklake_table tables USING (table_id) "
-            "WHERE tables.table_name = 'mutation_legacy_mapping' AND files.mapping_id IS NULL"
-        ).fetchone(),
+        metadata_row(
+            root,
+            "SELECT count(*) FROM ducklake_data_file files "
+            "JOIN ducklake_table tables USING (table_id) "
+            "WHERE tables.table_name = 'mutation_legacy_mapping' AND files.mapping_id IS NULL",
+        ),
         (1,),
         "legacy mutation source mapping state",
     )
@@ -1388,15 +1412,8 @@ def exercise_distributed_mutations(
         runner,
         lambda: delete_rows("lake.mutation_partitioned", "id = 333"),
     )
-    configured_runner = os.environ.get("VANE_RUNNER")
-    os.environ["VANE_RUNNER"] = "local-fast"
-    try:
-        connection.execute("INSERT INTO lake.stale_source VALUES (4, 'mutation-snapshot')")
-    finally:
-        if configured_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = configured_runner
+    connection.execute("INSERT INTO lake.stale_source VALUES (4, 'mutation-snapshot')")
+    require_write_count(1, "competing snapshot Ray write")
     stale_directories = distributed_artifact_directories(root)
     physical_plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     try:
@@ -1418,21 +1435,19 @@ def exercise_distributed_mutations(
         "stale distributed DELETE artifact cleanup",
     )
 
-    native_unpartitioned = connection.execute(
-        "SELECT id, payload FROM lake.mutation_unpartitioned ORDER BY id"
-    ).fetchall()
+    sql_unpartitioned = connection.execute("SELECT id, payload FROM lake.mutation_unpartitioned ORDER BY id").fetchall()
     require_equal(
         connection.sql("SELECT id, payload FROM lake.mutation_unpartitioned ORDER BY id").fetchall(),
-        native_unpartitioned,
-        "Vane and native unpartitioned mutation readback",
+        sql_unpartitioned,
+        "Relation and SQL unpartitioned mutation readback",
     )
-    native_partitioned = connection.execute(
+    sql_partitioned = connection.execute(
         "SELECT id, category, payload FROM lake.mutation_partitioned ORDER BY id"
     ).fetchall()
     require_equal(
         connection.sql("SELECT id, category, payload FROM lake.mutation_partitioned ORDER BY id").fetchall(),
-        native_partitioned,
-        "Vane and native partitioned mutation readback",
+        sql_partitioned,
+        "Relation and SQL partitioned mutation readback",
     )
 
 
@@ -1964,11 +1979,11 @@ def exercise_distributed_merges(
         ("merge_by_source_target", "id, payload"),
         ("merge_partitioned_target", "id, category, payload"),
     ):
-        native_rows = connection.execute(f"SELECT {columns} FROM lake.{table_name} ORDER BY id").fetchall()
+        sql_rows = connection.execute(f"SELECT {columns} FROM lake.{table_name} ORDER BY id").fetchall()
         require_equal(
             connection.sql(f"SELECT {columns} FROM lake.{table_name} ORDER BY id").fetchall(),
-            native_rows,
-            f"Vane and native {table_name} MERGE readback",
+            sql_rows,
+            f"Relation and SQL {table_name} MERGE readback",
         )
 
 
@@ -1999,7 +2014,7 @@ def exercise_distributed_writes(
     require_equal(
         connection.execute("SELECT count(*)::BIGINT, sum(id)::BIGINT FROM lake.write_target").fetchone(),
         (expected_rows, ROW_COUNT * (ROW_COUNT - 1) // 2 - 17),
-        "native readback after distributed INSERT",
+        "SQL readback after distributed INSERT",
     )
     file_count = connection.execute("SELECT count(*) FROM ducklake_list_files('lake', 'write_target')").fetchone()[0]
     require_true(
@@ -2055,7 +2070,7 @@ def exercise_distributed_writes(
     require_equal(
         connection.execute("SELECT count(*)::BIGINT, sum(id)::BIGINT FROM lake.ctas_target").fetchone(),
         (767, 768 * 767 // 2 - 17),
-        "native readback after distributed CTAS",
+        "SQL readback after distributed CTAS",
     )
     require_equal(
         len(distributed_artifact_roots(connection, "ctas_target")),
@@ -2089,7 +2104,7 @@ def exercise_distributed_writes(
     require_equal(
         connection.execute("SELECT count(*)::BIGINT FROM lake.partitioned_ctas_target").fetchone(),
         (383,),
-        "native readback after partitioned distributed CTAS",
+        "SQL readback after partitioned distributed CTAS",
     )
     require_equal(
         connection.execute(
@@ -2247,6 +2262,7 @@ def exercise_distributed_writes(
         lambda: stale_snapshot_source.insert_into("lake.concurrent_write_target"),
     )
     connection.execute("INSERT INTO lake.stale_source VALUES (3, 'snapshot')")
+    require_write_count(1, "competing snapshot Ray write")
     physical_plan_runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     try:
         require_error(
@@ -2275,8 +2291,8 @@ def exercise_distributed_writes(
 
 
 def main() -> None:
-    if os.environ.get("VANE_RUNNER") != "ray":
-        raise RuntimeError("the distributed wheel integration test requires VANE_RUNNER=ray")
+    if "VANE_RUNNER" in os.environ:
+        raise RuntimeError("leave VANE_RUNNER unset to qualify the default Ray runner")
     os.environ["VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION"] = "1"
 
     import ray
@@ -2293,9 +2309,8 @@ def main() -> None:
     original_run_write = None
     try:
         expected_nodes = execution_node_ids(ray)
-        vane.set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
-        require_equal(getattr(runner, "name", None), "ray", "configured Vane runner")
+        require_equal(getattr(runner, "name", None), "ray", "default Vane runner")
 
         connection = vane.connect(
             ":memory:",
@@ -2309,15 +2324,17 @@ def main() -> None:
         with tempfile.TemporaryDirectory(prefix="vane-ducklake-ray-") as temporary_directory:
             root = Path(temporary_directory)
             seed_tables(connection, root)
+            exercise_metadata(vane, connection, runner, root)
 
             write_dispatch_count = 0
             write_dispatch_checkpoint = 0
             original_run_write = runner.run_write
 
-            def record_distributed_write(*args: object, **kwargs: object) -> object:
+            def record_distributed_write(logical_plan: object) -> object:
                 nonlocal write_dispatch_count
+                require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "bound Ray write plan")
                 write_dispatch_count += 1
-                return original_run_write(*args, **kwargs)
+                return original_run_write(logical_plan)
 
             def require_write_count(expected: int, description: str) -> None:
                 nonlocal write_dispatch_checkpoint
@@ -2381,10 +2398,11 @@ def main() -> None:
             dispatch_count = 0
             original_run_iter_tables = runner.run_iter_tables
 
-            def record_distributed_read(*args: object, **kwargs: object) -> object:
+            def record_distributed_read(logical_plan: object) -> object:
                 nonlocal dispatch_count
+                require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "bound Ray read plan")
                 dispatch_count += 1
-                return original_run_iter_tables(*args, **kwargs)
+                return original_run_iter_tables(logical_plan)
 
             runner.run_iter_tables = record_distributed_read
 
