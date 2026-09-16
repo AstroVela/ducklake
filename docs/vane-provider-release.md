@@ -100,7 +100,7 @@ The same top-level `VaneExtension.yml` also offers `operation=release`;
 already-published TestPyPI wheels.
 
 Production instead uses `vane-extension-release.toml`. Its current exact Vane
-pin, `4a85ae05d89b0194ac57f18bbfe22593cdec00c8`, contains the production public
+pin, `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`, contains the production public
 key but **is not a released runtime**. A release dispatch therefore fails at
 the read-only version gate, before native dependency builds, signing, or
 publication. First release a canonical non-development Vane version to PyPI,
@@ -207,17 +207,14 @@ the ten assembled provider wheels (five interpreters per provider).
 
 ## Latest-main default Ray qualification
 
-Both manifests pin Vane `4a85ae05d89b0194ac57f18bbfe22593cdec00c8`
-(`0.2.0.dev660`). This development qualification extends main
-`3c9ed18e29c586e9d5448c74440e8ea55469a749` with the NULL extension-setting
-transport correction from [Vane #825](https://github.com/AstroVela/vane/pull/825)
-and the late source-EOF correction tracked in
-[Vane #828](https://github.com/AstroVela/vane/issues/828), without changing
-DuckDB sources. It is not a production release.
+Both manifests pin merged Vane main `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`
+(`0.2.0.dev660`), including the NULL extension-setting transport, late
+source-EOF, ordered task production, and schema-only chunk corrections.
+This is a development qualification, not a production release.
 
-Ordered distributed INSERT has a separately reproduced FTE resource-state
-failure ([Vane #826](https://github.com/AstroVela/vane/issues/826)). The
-single-file scan fixtures use VALUES batches and do not qualify that path.
+The ordered INSERT regression covers zero, 256 and 8193 rows, validates every
+row after publication, and checks empty writes publish no files. The
+single-file scan fixtures retain VALUES batches to control file boundaries.
 SQL statements, Relations, mutations and readback use the default Ray runner.
 Test-owned clusters reserve capacity for concurrent writes without changing
 Vane's runner selection. Controlled legacy mapping and inlined-delete fixtures
@@ -231,6 +228,11 @@ are copied and serialized once per bound plan, including `ducklake_options()`;
 Ray runs one metadata fragment and retries retain the same rows. Creating a new
 query observes current catalog metadata. This does not declare live catalog
 objects to be worker-safe or add any execution fallback.
+
+The native MinIO fixture pins both upstream Quay images by release tag and
+digest. Readiness and bucket initialization have finite timeouts; failures stop
+the job, and cleanup removes only this fixture project's containers and volume.
+The SQLite-backed Ray tests remain a same-host, two-worker qualification.
 
 ## SQLite dependency checks
 

@@ -1,34 +1,36 @@
-if test ! -f "./scripts/docker-compose.yml"
-then
-  # in CI
-  echo "Please run from duckdb root."
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+cleanup_on_failure() {
+  status=$?
+  if (( status != 0 )); then
+    docker compose logs || true
+    docker compose down --volumes --remove-orphans || true
+  fi
+  exit "$status"
+}
+trap cleanup_on_failure EXIT
+
+# Reset only this fixture project's containers and data volume.
+docker compose down --volumes --remove-orphans
+docker compose --profile setup pull
+docker compose up --detach minio
+
+ready=false
+for _ in {1..60}; do
+  if curl --connect-timeout 1 --max-time 2 --fail --silent --show-error \
+    http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+    ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$ready" != true ]]; then
+  echo "MinIO did not become ready" >&2
   exit 1
 fi
 
-# cd into scripts where docker-compose file is.
-cd scripts
-
-# need to have this happen in the background
-set -ex
-
-docker compose kill
-docker compose rm -f
-
-# Remove named volumes
-docker volume rm $(docker volume ls -q --filter name=scripts_) || true
-
-#  clean bind-mounted data directory
-rm -rf ../data/*
-
-docker compose up --detach
-
-# Wait until MinIO is ready to accept requests
-echo "Waiting for MinIO to become ready..."
-for i in {1..30}; do
-  if curl -s -o /dev/null http://127.0.0.1:9000/minio/health/ready; then
-    echo "MinIO is ready"
-    break
-  fi
-  echo "Still waiting for MinIO..."
-  sleep 10
-done
+# A failed or hung bucket initialization must fail the test setup.
+timeout 60s docker compose run --rm --no-deps --interactive=false -T mc

@@ -214,6 +214,7 @@ class CaptureWorkerPlanBackend:
         self.vane = vane
         self.fragments: dict[str, object] = {}
         self.handles: list[NoOutputHandle] = []
+        self.finished_queries: list[str] = []
 
     def register_query_owner(self, query_id: str, owner_query_id: str) -> None:
         require_true(bool(query_id) and bool(owner_query_id), "captured query identity")
@@ -243,6 +244,9 @@ class CaptureWorkerPlanBackend:
 
     def task_input_stream_exhausted(self, query_id: str, source_node_ids: object) -> list[object]:
         return []
+
+    def task_production_finished(self, query_id: str) -> None:
+        self.finished_queries.append(query_id)
 
     def fte_query_status(self, query_id: str) -> dict[str, object]:
         return {
@@ -312,6 +316,7 @@ def capture_worker_fragment(vane: object, connection: object, plan: object, node
         asyncio.run(collect_result_stream_async(runner.run_plan(plan, connection)))
     finally:
         runner.shutdown()
+    require_equal(backend.finished_queries, [plan.idx()], "captured root task production completed once")
     fragment = backend.fragments.get(node_id)
     if fragment is None:
         raise AssertionError(f"worker fragment for scan node {node_id} was not captured")
@@ -2120,6 +2125,23 @@ def exercise_distributed_writes(
     require_write: Callable[[str, Callable[[], object]], None],
     require_write_count: Callable[[int, str], None],
 ) -> None:
+    for row_count in (0, 256, 8193):
+        table = f"ordered_write_{row_count}"
+        connection.execute(f"CREATE TABLE lake.{table}(id INTEGER)")
+        require_write(
+            f"ordered distributed DuckLake INSERT ({row_count} rows)",
+            lambda: connection.execute(
+                f"INSERT INTO lake.{table} SELECT i::INTEGER FROM range({row_count}) t(i) ORDER BY i DESC"
+            ),
+        )
+        require_equal(
+            connection.execute(f"SELECT id FROM lake.{table} ORDER BY id").fetchall(),
+            [(value,) for value in range(row_count)],
+            "ordered INSERT exact readback",
+        )
+        file_count = connection.execute(f"SELECT count(*) FROM ducklake_list_files('lake', '{table}')").fetchone()[0]
+        require_true(file_count > 0 if row_count else file_count == 0, "ordered INSERT published file count")
+
     expected_rows = ROW_COUNT - 1
     first_half = connection.sql("SELECT id, payload FROM lake.source WHERE id < 1024")
     require_write(
