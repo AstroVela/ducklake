@@ -288,10 +288,10 @@ class ProviderReleaseTest(unittest.TestCase):
         manifest = tomllib.loads((REPOSITORY_ROOT / "vane-extension.toml").read_text())
         self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["vane"]["repository"], "AstroVela/vane")
-        self.assertEqual(manifest["vane"]["revision"], "3c9ed18e29c586e9d5448c74440e8ea55469a749")
+        self.assertEqual(manifest["vane"]["revision"], "4a85ae05d89b0194ac57f18bbfe22593cdec00c8")
         self.assertEqual(manifest["vcpkg"]["revision"], "84bab45d415d22042bd0b9081aea57f362da3f35")
         release_manifest = tomllib.loads((REPOSITORY_ROOT / "vane-extension-release.toml").read_text())
-        self.assertEqual(release_manifest["vane"]["revision"], "3c9ed18e29c586e9d5448c74440e8ea55469a749")
+        self.assertEqual(release_manifest["vane"]["revision"], "4a85ae05d89b0194ac57f18bbfe22593cdec00c8")
         release_manifest["vane"]["revision"] = manifest["vane"]["revision"]
         self.assertEqual(release_manifest, manifest)
         entry = subprocess.check_output(
@@ -310,7 +310,7 @@ class ProviderReleaseTest(unittest.TestCase):
     def test_shared_release_gates_and_explicit_publication(self) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/VaneExtension.yml").read_text()
         self.assertEqual(workflow.count("scripts/vane_provider_release.py validate"), 2)
-        self.assertEqual(workflow.count("scripts/vane_provider_release.py verify-index"), 2)
+        self.assertEqual(workflow.count("scripts/vane_provider_release.py verify-index"), 4)
         self.assertIn("HEAD:vane-extension-ci-tools", workflow)
         self.assertIn("refs/heads/v1.5-variegata_vane", workflow)
         self.assertIn('test "$GITHUB_EVENT_NAME" = workflow_dispatch', workflow)

@@ -148,10 +148,10 @@ def seed_lake(vane: object, root: Path, *, scan_fixture: bool) -> list[dict[str,
             connection.execute("CREATE TABLE lake.source(id INTEGER, payload VARCHAR)")
             for file_index in range(FILE_COUNT):
                 start = file_index * ROWS_PER_FILE
-                connection.sql(
-                    "SELECT i::INTEGER AS id, ('value-' || i::VARCHAR)::VARCHAR AS payload "
-                    f"FROM range({start}, {start + ROWS_PER_FILE}) AS rows(i)"
-                ).repartition(num_partitions=1).insert_into("lake.source")
+                # VALUES supplies one input batch, preserving the fixture's
+                # single-file layout while the INSERT still executes on Ray.
+                rows = ", ".join(f"({i}, 'value-{i}')" for i in range(start, start + ROWS_PER_FILE))
+                connection.execute(f"INSERT INTO lake.source VALUES {rows}")
             require_equal(
                 connection.execute("SELECT count(*) FROM ducklake_list_files('lake', 'source')").fetchone(),
                 (FILE_COUNT,),

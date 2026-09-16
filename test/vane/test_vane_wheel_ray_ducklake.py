@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import json
 import os
-import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -33,9 +36,32 @@ def require_true(value: bool, description: str) -> None:
         raise AssertionError(description)
 
 
+def metadata_sql(root: Path, *statements: tuple[str, tuple]) -> list[list[tuple]]:
+    # Keep Python's SQLite library out of the process that has loaded the
+    # native SQLite provider. Each fixture transaction owns a separate process.
+    script = """
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=30) as connection:
+    results = [connection.execute(sql, parameters).fetchall()
+               for sql, parameters in json.load(sys.stdin)]
+print(json.dumps(results))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(root / "metadata.sqlite")],
+        input=json.dumps(statements),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=35,
+    )
+    if result.returncode:
+        raise AssertionError(f"SQLite fixture transaction failed: {result.stderr.strip()}")
+    return [[tuple(row) for row in rows] for rows in json.loads(result.stdout)]
+
+
 def metadata_row(root: Path, query: str) -> tuple[object, ...] | None:
-    with sqlite3.connect(root / "metadata.sqlite") as metadata_connection:
-        return metadata_connection.execute(query).fetchone()
+    rows = metadata_sql(root, (query, ()))[0]
+    return rows[0] if rows else None
 
 
 def distributed_artifact_roots(connection: object, table_name: str) -> set[str]:
@@ -61,7 +87,19 @@ def sql_string(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def verify_extension_is_wheel_linked(connection: object) -> None:
+def load_test_extensions(connection: object) -> None:
+    if os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY"):
+        import vane
+
+        path = Path(__file__).with_name("test_vane_dynamic_ducklake.py")
+        specification = importlib.util.spec_from_file_location("test_vane_dynamic_ducklake", path)
+        if specification is None or specification.loader is None:
+            raise AssertionError(f"cannot load dynamic qualification helpers: {path}")
+        helpers = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(helpers)
+        helpers.load_dynamic_ducklake(vane, connection)
+        return
+
     extension = connection.execute(
         "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = 'ducklake'"
     ).fetchone()
@@ -288,7 +326,7 @@ def worker_connection(vane: object) -> object:
             "autoload_known_extensions": "false",
         },
     )
-    verify_extension_is_wheel_linked(connection)
+    load_test_extensions(connection)
     require_equal(
         connection.execute("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'lake'").fetchone(),
         (0,),
@@ -401,9 +439,80 @@ def verify_stale_split_rejected(
             worker.close()
 
 
+def install_scan_metadata_fixtures(connection: object, root: Path) -> None:
+    """Prepare legacy mapping and inlined-delete states through SQLite/PyArrow."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    mapped_files = connection.execute("SELECT data_file FROM ducklake_list_files('lake', 'mapped_source')").fetchall()
+    require_equal(len(mapped_files), 1, "mapped fixture file count")
+    mapped_path = Path(mapped_files[0][0])
+    connection.execute("DETACH lake")
+    # A plain Parquet writer omits DuckLake field IDs, requiring the explicit
+    # name map even after the catalog column is renamed below.
+    pq.write_table(pa.table({"old_id": pa.array([42], type=pa.int32()), "payload": ["mapped"]}), mapped_path)
+    file_size = mapped_path.stat().st_size
+    # DuckLake stores the serialized metadata length, excluding the 8-byte
+    # Parquet trailer containing that length and the magic bytes.
+    footer_size = pq.read_metadata(mapped_path).serialized_size
+    snapshot, mapping_id = metadata_row(
+        root, "SELECT snapshot_id, next_file_id FROM ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1"
+    )
+    mapped_table = metadata_row(
+        root, "SELECT table_id FROM ducklake_table WHERE table_name = 'mapped_source' AND end_snapshot IS NULL"
+    )[0]
+    inline_table = metadata_row(
+        root, "SELECT table_id FROM ducklake_table WHERE table_name = 'inlined_delete_source' AND end_snapshot IS NULL"
+    )[0]
+    file_rows, columns, inline_files = metadata_sql(
+        root,
+        (
+            "SELECT data_file_id, file_size_bytes FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
+            (mapped_table,),
+        ),
+        (
+            "SELECT column_id, column_name FROM ducklake_column WHERE table_id = ? AND end_snapshot IS NULL ORDER BY column_order",
+            (mapped_table,),
+        ),
+        ("SELECT data_file_id FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL", (inline_table,)),
+    )
+    require_equal(len(file_rows), 1, "mapped metadata fixture file count")
+    require_equal(len(inline_files), 1, "inlined delete fixture file count")
+    file_id, old_size = file_rows[0]
+    statements = [("INSERT INTO ducklake_column_mapping VALUES (?, ?, 'map_by_name')", (mapping_id, mapped_table))]
+    statements.extend(
+        ("INSERT INTO ducklake_name_mapping VALUES (?, ?, ?, ?, NULL, 0)", (mapping_id, ordinal, name, field_id))
+        for ordinal, (field_id, name) in enumerate(columns)
+    )
+    statements.extend(
+        [
+            (
+                "UPDATE ducklake_data_file SET mapping_id = ?, file_size_bytes = ?, footer_size = ? WHERE data_file_id = ?",
+                (mapping_id, file_size, footer_size, file_id),
+            ),
+            (
+                "UPDATE ducklake_table_stats SET file_size_bytes = file_size_bytes + ? WHERE table_id = ?",
+                (file_size - old_size, mapped_table),
+            ),
+            ("UPDATE ducklake_snapshot SET next_file_id = ? WHERE snapshot_id = ?", (mapping_id + 1, snapshot)),
+            (
+                f"CREATE TABLE ducklake_inlined_delete_{inline_table}(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)",
+                (),
+            ),
+            (f"INSERT INTO ducklake_inlined_delete_{inline_table} VALUES (?, 5, ?)", (inline_files[0][0], snapshot)),
+            ("UPDATE ducklake_table_stats SET record_count = 31 WHERE table_id = ?", (inline_table,)),
+            ("INSERT INTO ducklake_metadata VALUES ('data_inlining_row_limit', '10', 'table', ?)", (inline_table,)),
+        ]
+    )
+    metadata_sql(root, *statements)
+    connection.execute(
+        f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
+        f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0, BUSY_TIMEOUT 30000)"
+    )
+
+
 def seed_tables(connection: object, root: Path) -> None:
-    with sqlite3.connect(root / "metadata.sqlite") as metadata_connection:
-        journal_mode = metadata_connection.execute("PRAGMA journal_mode=WAL").fetchone()
+    journal_mode = metadata_row(root, "PRAGMA journal_mode=WAL")
     require_equal(journal_mode, ("wal",), "SQLite metadata journal mode")
 
     connection.execute(
@@ -449,11 +558,10 @@ def seed_tables(connection: object, root: Path) -> None:
     for file_index in range(FILE_COUNT):
         start = file_index * ROWS_PER_FILE
         stop = start + ROWS_PER_FILE
-        connection.execute(
-            "INSERT INTO lake.source "
-            "SELECT i::INTEGER, ('value-' || i::VARCHAR)::VARCHAR "
-            f"FROM range({start}, {stop}) AS rows(i)"
-        )
+        # Keep one physical file per fixture batch through the default Ray
+        # INSERT path; a range scan can split each batch across workers.
+        rows = ", ".join(f"({i}, 'value-{i}')" for i in range(start, stop))
+        connection.execute(f"INSERT INTO lake.source VALUES {rows}")
     for file_index in range(4):
         start = file_index * 128
         stop = start + 128
@@ -508,27 +616,21 @@ def seed_tables(connection: object, root: Path) -> None:
     connection.execute("DELETE FROM lake.merge_update_target WHERE id = 18")
     connection.execute("INSERT INTO lake.mutation_legacy_mapping VALUES (42, 'legacy'), (43, 'delete-me')")
     connection.execute("ALTER TABLE lake.mutation_legacy_mapping RENAME COLUMN old_id TO id")
-    with sqlite3.connect(root / "metadata.sqlite") as metadata_connection:
-        metadata_connection.execute(
+    metadata_sql(
+        root,
+        (
             "UPDATE ducklake_data_file SET mapping_id = NULL "
             "WHERE table_id = (SELECT table_id FROM ducklake_table "
-            "WHERE table_name = 'mutation_legacy_mapping')"
-        )
+            "WHERE table_name = 'mutation_legacy_mapping')",
+            (),
+        ),
+    )
     connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (10)")
     connection.execute("INSERT INTO lake.mutation_duplicate_delete VALUES (20), (30)")
-    connection.execute(
-        "INSERT INTO lake.inlined_delete_source "
-        "SELECT i::INTEGER, ('inline-' || i::VARCHAR)::VARCHAR FROM range(32) AS rows(i)"
-    )
-    connection.execute("CALL lake.set_option('data_inlining_row_limit', 10, table_name => 'inlined_delete_source')")
-    connection.execute("DELETE FROM lake.inlined_delete_source WHERE id = 5")
-
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    external_file = root / "mapped-source.parquet"
-    pq.write_table(pa.table({"old_id": pa.array([42], type=pa.int32()), "payload": ["mapped"]}), external_file)
-    connection.execute(f"CALL ducklake_add_data_files('lake', 'mapped_source', {sql_string(external_file)})")
+    inline_rows = ", ".join(f"({i}, 'inline-{i}')" for i in range(32))
+    connection.execute(f"INSERT INTO lake.inlined_delete_source VALUES {inline_rows}")
+    connection.execute("INSERT INTO lake.mapped_source VALUES (42, 'mapped')")
+    install_scan_metadata_fixtures(connection, root)
     connection.execute("ALTER TABLE lake.mapped_source RENAME COLUMN old_id TO id")
     connection.execute("ALTER TABLE lake.mapped_source ADD COLUMN added INTEGER DEFAULT 7")
     connection.execute("INSERT INTO lake.mapped_source VALUES (43, 'new', 9)")
@@ -584,16 +686,23 @@ def reopen_lake_read_only(connection: object, root: Path) -> None:
 
 def capture_write_plan(vane: object, runner: object, operation: Callable[[], object]) -> object:
     captured = []
+
+    class PlanCaptured(Exception):
+        pass
+
     original_run_write = runner.run_write
 
-    def capture(logical_plan: object) -> dict[str, object]:
+    def capture(logical_plan: object) -> None:
         require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "captured bound write plan")
         captured.append(logical_plan)
-        return {}
+        raise PlanCaptured
 
     runner.run_write = capture
     try:
-        operation()
+        try:
+            operation()
+        except PlanCaptured:
+            pass
     finally:
         runner.run_write = original_run_write
     require_equal(len(captured), 1, "captured DuckLake write plan count")
@@ -617,6 +726,7 @@ def require_concurrent_write_conflict(
     require_write_count: Callable[[int, str], None],
     operation: Callable[[object], None],
     conflict_sql: str,
+    conflict_table: str,
     description: str,
 ) -> None:
     CONFLICT_STARTED_PATH.unlink(missing_ok=True)
@@ -647,6 +757,7 @@ def require_concurrent_write_conflict(
     coordination_error = None
     conflict_connection = None
     files_after_conflict_commit = None
+    committed_directories = set()
     try:
         deadline = time.monotonic() + 90
         while not CONFLICT_STARTED_PATH.exists():
@@ -664,12 +775,25 @@ def require_concurrent_write_conflict(
                 "autoload_known_extensions": "false",
             },
         )
-        verify_extension_is_wheel_linked(conflict_connection)
+        load_test_extensions(conflict_connection)
         conflict_connection.execute(
             f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
             f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0, BUSY_TIMEOUT 30000)"
         )
         conflict_connection.execute(conflict_sql)
+        # The competing write also uses Ray and owns persistent artifact and
+        # receipt directories. Derive these from committed metadata so that
+        # temporary directories from the losing write remain forbidden.
+        committed_files = conflict_connection.execute(
+            f"SELECT data_file FROM ducklake_list_files('lake', {sql_string(conflict_table)})"
+        ).fetchall()
+        for (data_file,) in committed_files:
+            artifact_roots = [
+                parent for parent in Path(data_file).parents if parent.name.startswith(DISTRIBUTED_ARTIFACT_PREFIX)
+            ]
+            require_equal(len(artifact_roots), 1, "competing write committed artifact root")
+            artifact_root = artifact_roots[0]
+            committed_directories.update((artifact_root, Path(str(artifact_root) + ".duckdb_commit")))
         files_after_conflict_commit = set((root / "data").rglob("*.parquet"))
     except BaseException as error:
         coordination_error = error
@@ -698,7 +822,7 @@ def require_concurrent_write_conflict(
     )
     require_equal(
         distributed_artifact_directories(root),
-        directories_before_write,
+        directories_before_write | committed_directories,
         f"{description} artifact-root cleanup",
     )
 
@@ -1059,6 +1183,7 @@ def require_forged_min_max_replaced(
     vane: object,
     connection: object,
     runner: object,
+    root: Path,
     require_write: Callable[[str, Callable[[], object]], None],
 ) -> None:
     source = connection.sql(
@@ -1247,10 +1372,8 @@ def exercise_distributed_mutations(
         lambda: delete_rows("lake.mutation_unpartitioned", "id % 11 = 0"),
     )
     require_equal(
-        connection.execute(
-            "SELECT count(*), count(*) FILTER (WHERE id % 11 = 0) FROM lake.mutation_unpartitioned"
-        ).fetchone(),
-        (initial_unpartitioned_count - unpartitioned_delete_count, 0),
+        connection.execute("SELECT id, payload FROM lake.mutation_unpartitioned ORDER BY id").fetchall(),
+        [(i, f"mutation-{i}") for i in range(512) if i != 17 and i % 11 != 0],
         "unpartitioned distributed DELETE readback",
     )
 
@@ -1275,7 +1398,6 @@ def exercise_distributed_mutations(
         "unpartitioned distributed UPDATE readback",
     )
 
-    initial_partitioned_count = connection.execute("SELECT count(*) FROM lake.mutation_partitioned").fetchone()[0]
     partitioned_update_count = connection.execute(
         "SELECT count(*) FROM lake.mutation_partitioned " "WHERE id BETWEEN 64 AND 319 AND id % 13 <> 0"
     ).fetchone()[0]
@@ -1310,11 +1432,16 @@ def exercise_distributed_mutations(
         ),
     )
     require_equal(
-        connection.execute(
-            "SELECT count(*), count(*) FILTER (WHERE id BETWEEN 128 AND 447 AND id % 17 = 0) "
-            "FROM lake.mutation_partitioned"
-        ).fetchone(),
-        (initial_partitioned_count - partitioned_delete_count, 0),
+        connection.execute("SELECT id, category, payload FROM lake.mutation_partitioned ORDER BY id").fetchall(),
+        [
+            (
+                i,
+                f"category-{i % 4}",
+                f"partition-updated-{i}" if 64 <= i <= 319 and i % 13 != 0 else f"partitioned-{i}",
+            )
+            for i in range(512)
+            if i != 18 and not (128 <= i <= 447 and i % 17 == 0)
+        ],
         "partitioned distributed DELETE readback",
     )
     require_equal(
@@ -1327,8 +1454,8 @@ def exercise_distributed_mutations(
     )
 
     state_before_failure = connection.execute(
-        "SELECT count(*), sum(id), sum(length(payload)) FROM lake.mutation_unpartitioned"
-    ).fetchone()
+        "SELECT id, payload FROM lake.mutation_unpartitioned ORDER BY id"
+    ).fetchall()
     files_before_failure = {path for path in (root / "data").rglob("*") if path.is_file()}
     directories_before_failure = distributed_artifact_directories(root)
     require_error(
@@ -1342,9 +1469,7 @@ def exercise_distributed_mutations(
     )
     require_write_count(1, "failed UPDATE Ray dispatch count")
     require_equal(
-        connection.execute(
-            "SELECT count(*), sum(id), sum(length(payload)) FROM lake.mutation_unpartitioned"
-        ).fetchone(),
+        connection.execute("SELECT id, payload FROM lake.mutation_unpartitioned ORDER BY id").fetchall(),
         state_before_failure,
         "failed UPDATE table visibility",
     )
@@ -1513,6 +1638,12 @@ def exercise_distributed_merges(
         "duplicate-match distributed MERGE UPDATE readback",
     )
 
+    constant_insert_files_before = {
+        row[0]
+        for row in connection.execute(
+            "SELECT data_file FROM ducklake_list_files('lake', 'merge_constant_insert_target')"
+        ).fetchall()
+    }
     constant_insert_source = connection.sql("SELECT id FROM lake.source WHERE id < 640")
     require_write(
         "constant-value distributed DuckLake MERGE INSERT",
@@ -1536,6 +1667,8 @@ def exercise_distributed_merges(
     for (data_file,) in connection.execute(
         "SELECT data_file FROM ducklake_list_files('lake', 'merge_constant_insert_target')"
     ).fetchall():
+        if data_file in constant_insert_files_before:
+            continue
         parts = Path(data_file).parts
         for index, part in enumerate(parts):
             if part.startswith(DISTRIBUTED_ARTIFACT_PREFIX):
@@ -1576,6 +1709,12 @@ def exercise_distributed_merges(
         sum(len(batches) for batches in update_plan.scan_split_batch_map().values()) > 1,
         "distributed MERGE did not preserve multiple source-file splits",
     )
+    merge_update_files_before = {
+        row[0]
+        for row in connection.execute(
+            "SELECT data_file FROM ducklake_list_files('lake', 'merge_update_target')"
+        ).fetchall()
+    }
     require_write(
         "unpartitioned distributed DuckLake MERGE UPDATE and INSERT",
         lambda: update_source().merge_into(
@@ -1585,13 +1724,8 @@ def exercise_distributed_merges(
         ),
     )
     require_equal(
-        connection.execute(
-            "SELECT count(*), "
-            "count(*) FILTER (WHERE id = 17 AND payload = 'merge-old-17'), "
-            "count(*) FILTER (WHERE id <> 17 AND payload = 'value-' || id::VARCHAR) "
-            "FROM lake.merge_update_target"
-        ).fetchone(),
-        (640, 1, 639),
+        connection.execute("SELECT id, payload FROM lake.merge_update_target ORDER BY id").fetchall(),
+        [(i, "merge-old-17" if i == 17 else f"value-{i}") for i in range(640)],
         "distributed MERGE UPDATE and INSERT readback",
     )
     merge_attempt_ids = set()
@@ -1599,6 +1733,8 @@ def exercise_distributed_merges(
     for (data_file,) in connection.execute(
         "SELECT data_file FROM ducklake_list_files('lake', 'merge_update_target')"
     ).fetchall():
+        if data_file in merge_update_files_before:
+            continue
         contains_insert = connection.execute(
             f"SELECT count(*) > 0 FROM read_parquet({sql_string(data_file)}) WHERE id = 18 OR id >= 512"
         ).fetchone()[0]
@@ -1744,13 +1880,8 @@ def exercise_distributed_merges(
         ),
     )
     require_equal(
-        connection.execute(
-            "SELECT count(*), min(id), max(id), "
-            "count(*) FILTER (WHERE id BETWEEN 896 AND 1151), "
-            "count(*) FILTER (WHERE id >= 1152 AND payload = 'value-' || id::VARCHAR) "
-            "FROM lake.merge_delete_target"
-        ).fetchone(),
-        (256, 768, 1279, 0, 128),
+        connection.execute("SELECT id, payload FROM lake.merge_delete_target ORDER BY id").fetchall(),
+        [(i, f"delete-old-{i}") for i in range(768, 896)] + [(i, f"value-{i}") for i in range(1152, 1280)],
         "distributed MERGE DELETE and INSERT readback",
     )
 
@@ -1792,12 +1923,8 @@ def exercise_distributed_merges(
         ),
     )
     require_equal(
-        connection.execute(
-            "SELECT count(*), "
-            "count(*) FILTER (WHERE id >= 1408 AND payload = 'value-' || id::VARCHAR), "
-            "count(DISTINCT category) FROM lake.merge_partitioned_target"
-        ).fetchone(),
-        (512, 384, 4),
+        connection.execute("SELECT id, category, payload FROM lake.merge_partitioned_target ORDER BY id").fetchall(),
+        [(i, f"category-{i % 4}", f"partition-old-{i}" if i < 1408 else f"value-{i}") for i in range(1280, 1792)],
         "partitioned distributed MERGE readback",
     )
     require_equal(
@@ -1915,8 +2042,8 @@ def exercise_distributed_merges(
     )
 
     state_before_failure = connection.execute(
-        "SELECT count(*), sum(id), sum(length(payload)) FROM lake.merge_failure_target"
-    ).fetchone()
+        "SELECT id, payload FROM lake.merge_failure_target ORDER BY id"
+    ).fetchall()
     files_before_failure = {path for path in (root / "data").rglob("*") if path.is_file()}
     directories_before_failure = distributed_artifact_directories(root)
     failing_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 256 AND 1279")
@@ -1935,7 +2062,7 @@ def exercise_distributed_merges(
     )
     require_write_count(1, "failed MERGE Ray dispatch count")
     require_equal(
-        connection.execute("SELECT count(*), sum(id), sum(length(payload)) FROM lake.merge_failure_target").fetchone(),
+        connection.execute("SELECT id, payload FROM lake.merge_failure_target ORDER BY id").fetchall(),
         state_before_failure,
         "failed MERGE atomic visibility",
     )
@@ -1962,14 +2089,12 @@ def exercise_distributed_merges(
             update_clauses,
         ),
         "INSERT INTO lake.merge_conflict_target VALUES (-2, 'concurrent')",
+        "merge_conflict_target",
         "concurrent MERGE conflict",
     )
     require_equal(
-        connection.execute(
-            "SELECT count(*), count(*) FILTER (WHERE id = -2 AND payload = 'concurrent'), "
-            "count(*) FILTER (WHERE payload LIKE 'value-%') FROM lake.merge_conflict_target"
-        ).fetchone(),
-        (513, 1, 0),
+        connection.execute("SELECT id, payload FROM lake.merge_conflict_target ORDER BY id").fetchall(),
+        [(-2, "concurrent")] + [(i, f"conflict-old-{i}") for i in range(100, 612)],
         "concurrent MERGE conflict visibility",
     )
 
@@ -2175,7 +2300,7 @@ def exercise_distributed_writes(
     require_forged_row_count_rejected(vane, connection, runner, root)
     require_forged_parquet_schema_rejected(vane, connection, runner, root)
     require_duplicate_artifact_rejected(vane, connection, runner, root)
-    require_forged_min_max_replaced(vane, connection, runner, require_write)
+    require_forged_min_max_replaced(vane, connection, runner, root, require_write)
 
     files_before_missing_stats = set((root / "data").rglob("*.parquet"))
     artifact_directories_before_missing_stats = distributed_artifact_directories(root)
@@ -2206,12 +2331,19 @@ def exercise_distributed_writes(
 
     files_before_commit_failure = set((root / "data").rglob("*.parquet"))
     artifact_directories_before_commit_failure = distributed_artifact_directories(root)
-    connection.execute("CALL lake.set_option('require_commit_message', true)")
+    metadata_sql(
+        root,
+        (
+            "CREATE TRIGGER reject_fixture_commit BEFORE INSERT ON ducklake_snapshot "
+            "BEGIN SELECT RAISE(ABORT, 'injected metadata commit failure'); END",
+            (),
+        ),
+    )
     commit_failure_source = connection.sql("SELECT id, payload FROM lake.source WHERE id < 64")
     try:
         require_error(
             lambda: commit_failure_source.insert_into("lake.rollback_write_target"),
-            "commit information",
+            "injected metadata commit failure",
             "distributed DuckLake transaction commit failure",
         )
         require_write_count(1, "transaction commit failure Ray dispatch count")
@@ -2231,7 +2363,7 @@ def exercise_distributed_writes(
             "transaction commit failure artifact-root cleanup",
         )
     finally:
-        connection.execute("CALL lake.set_option('require_commit_message', false)")
+        metadata_sql(root, ("DROP TRIGGER reject_fixture_commit", ()))
 
     stale_source = connection.sql("SELECT id, payload FROM lake.source WHERE id BETWEEN 800 AND 900")
     stale_plan = capture_write_plan(
@@ -2286,6 +2418,7 @@ def exercise_distributed_writes(
         require_write_count,
         lambda source: source.insert_into("lake.concurrent_write_target"),
         "INSERT INTO lake.concurrent_write_target VALUES (-2, 'concurrent')",
+        "concurrent_write_target",
         "concurrent INSERT conflict",
     )
 
@@ -2319,7 +2452,7 @@ def main() -> None:
                 "autoload_known_extensions": "false",
             },
         )
-        verify_extension_is_wheel_linked(connection)
+        load_test_extensions(connection)
 
         with tempfile.TemporaryDirectory(prefix="vane-ducklake-ray-") as temporary_directory:
             root = Path(temporary_directory)

@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Build only, publish dev657 to TestPyPI, or qualify and promote a production release
+        description: Build only, publish the pinned development runtime to TestPyPI, or qualify and promote a production release
         type: choice
         options:
           - build-only

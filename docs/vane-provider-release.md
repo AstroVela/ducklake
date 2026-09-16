@@ -3,7 +3,7 @@
 `vane-extension-ducklake` packages DuckLake as a signed dynamic Vane provider,
 separate from the `vane-ai` runtime. The initial candidate targets the exact
 Vane source recorded in `vane-extension.toml`, corresponding to
-`vane-ai==0.2.0.dev657`. Each provider wheel requires that exact runtime version;
+`vane-ai==0.2.0.dev660`. Each provider wheel requires that exact runtime version;
 the wheel is not interchangeable with arbitrary Vane or upstream DuckDB builds.
 
 The existing native and statically linked Vane-wheel integration lanes remain
@@ -96,11 +96,11 @@ outside the downloaded data before the job uploads signed native files.
 
 The same top-level `VaneExtension.yml` also offers `operation=release`;
 `build-only` remains the default. Production preparation does not change
-`vane-extension.toml`, the existing `0.2.0.dev657` runtime dependency, or any
+`vane-extension.toml`, the existing `0.2.0.dev660` runtime dependency, or any
 already-published TestPyPI wheels.
 
 Production instead uses `vane-extension-release.toml`. Its current exact Vane
-pin, `3c9ed18e29c586e9d5448c74440e8ea55469a749`, contains the production public
+pin, `4a85ae05d89b0194ac57f18bbfe22593cdec00c8`, contains the production public
 key but **is not a released runtime**. A release dispatch therefore fails at
 the read-only version gate, before native dependency builds, signing, or
 publication. First release a canonical non-development Vane version to PyPI,
@@ -153,9 +153,10 @@ Before enabling a real release, configure these external prerequisites:
 - A `pypi` GitHub environment restricted to that branch, with **required
   reviewers** and self-review prevention. Declaring an environment in YAML
   does not configure its approval protection; configure it before dispatch.
-- A PyPI Trusted Publisher for projects `vane-extension-ducklake` and `vane-extension-sqlite-scanner`, owner
-  `AstroVela`, repository `ducklake`, workflow `VaneExtension.yml`, environment
-  `pypi`. The existing TestPyPI publisher remains unchanged.
+- PyPI Trusted Publishers for projects `vane-extension-ducklake` and
+  `vane-extension-sqlite-scanner`, both with owner `AstroVela`, repository
+  `ducklake`, workflow `VaneExtension.yml`, environment `pypi`. Configure both
+  projects on TestPyPI with environment `testpypi` as described above.
 
 This change does not configure environments or secrets, create tags, or
 upload packages. No provider tag is required: the manually selected protected
@@ -165,10 +166,12 @@ branch commit and the reviewed exact Vane/CI-tools pins are the release inputs.
 the public `ci-test` key. Both publishing profiles require `--prepare-only`,
 which rejects key arguments. The isolated signer reads the selected manifest
 from the committed repository tree, validates the exact official Vane pin,
-and accepts only a regular unsigned `artifacts/ducklake.duckdb_extension`
-bounded to 384 MiB. It does not trust builder-supplied source repository/ref
-outputs or execute downloaded code. License files travel separately as data
-under `licenses/ducklake/`; only signed native files leave the signer.
+and requires exactly two regular unsigned files under `artifacts/`:
+`sqlite_scanner.duckdb_extension` and `ducklake.duckdb_extension`, each bounded
+to 384 MiB. It does not trust builder-supplied source repository/ref outputs
+or execute downloaded code. License files travel separately as data under
+`licenses/sqlite_scanner/` and `licenses/ducklake/`; only signed native files
+leave the signer.
 
 ## Focused development checks
 
@@ -192,23 +195,36 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev657 --channel testpypi-dev \
+  --vane-version 0.2.0.dev660 --channel testpypi-dev \
   --require-publishable-on testpypi
 ```
 
 Source verification is read-only and rejects mismatched or dirty Vane/tools
 checkouts. After publication, `verify-index` accepts the same source/config
-flags plus `--index testpypi --provider ducklake --version <exact-provider-version>` and the
-directory containing the five assembled provider wheels.
+flags plus `--index testpypi --provider <name> --version <exact-provider-version>`.
+Run it for both `sqlite_scanner` and `ducklake`, using the directory containing
+the ten assembled provider wheels (five interpreters per provider).
 
 ## Latest-main default Ray qualification
 
-Both manifests pin Vane `3c9ed18e29c586e9d5448c74440e8ea55469a749`
-(`0.2.0.dev657`). This is a development qualification, not a production release.
-Fixtures, SQL statements, Relations and readback use the default Ray runner.
+Both manifests pin Vane `4a85ae05d89b0194ac57f18bbfe22593cdec00c8`
+(`0.2.0.dev660`). This development qualification extends main
+`3c9ed18e29c586e9d5448c74440e8ea55469a749` with the NULL extension-setting
+transport correction from [Vane #825](https://github.com/AstroVela/vane/pull/825)
+and the late source-EOF correction tracked in
+[Vane #828](https://github.com/AstroVela/vane/issues/828), without changing
+DuckDB sources. It is not a production release.
+
+Ordered distributed INSERT has a separately reproduced FTE resource-state
+failure ([Vane #826](https://github.com/AstroVela/vane/issues/826)). The
+single-file scan fixtures use VALUES batches and do not qualify that path.
+SQL statements, Relations, mutations and readback use the default Ray runner.
 Test-owned clusters reserve capacity for concurrent writes without changing
-Vane's runner selection. Internal SQLite assertions use Python's `sqlite3`
-module independently of the Vane execution path.
+Vane's runner selection. Controlled legacy mapping and inlined-delete fixtures
+use PyArrow and isolated Python `sqlite3` processes. SQLite inspection and
+failure-injection triggers use the same independent fixture path, without
+loading a local Vane runner. These fixtures qualify scans and write recovery;
+they do not imply Ray support for DuckLake maintenance `CALL` statements.
 
 DuckLake metadata functions share a portable completed-row binding. Their rows
 are copied and serialized once per bound plan, including `ducklake_options()`;

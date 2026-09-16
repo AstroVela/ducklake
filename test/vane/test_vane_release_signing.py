@@ -166,18 +166,20 @@ class SigningTest(unittest.TestCase):
         builder = packager.load_builder()
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
-            unsigned = root / "prepared/artifacts/ducklake.duckdb_extension"
-            unsigned.parent.mkdir(parents=True)
-            unsigned.write_bytes(b"native payload" + b"\0" * 256)
-            signed = root / "signed/ducklake.duckdb_extension"
-            signed.parent.mkdir()
-            signed.write_bytes(b"native payload" + b"s" * 256)
-            licenses = root / "prepared/licenses/ducklake"
-            licenses.mkdir(parents=True)
-            for name in builder.LICENSE_NAMES:
-                (licenses / name).write_text("license data")
-            wheel = root / "provider.whl"
-            wheel.write_bytes(b"verified wheel fixture")
+            for extension_name in builder.EXTENSION_NAMES:
+                unsigned = root / f"prepared/artifacts/{extension_name}.duckdb_extension"
+                unsigned.parent.mkdir(parents=True, exist_ok=True)
+                unsigned.write_bytes(b"native payload" + b"\0" * 256)
+                signed = root / f"signed/{extension_name}.duckdb_extension"
+                signed.parent.mkdir(exist_ok=True)
+                signed.write_bytes(b"native payload" + b"s" * 256)
+                licenses = root / "prepared/licenses" / extension_name
+                licenses.mkdir(parents=True)
+                for name in builder.PROVIDER_LICENSE_NAMES[extension_name]:
+                    (licenses / name).write_text("license data")
+            wheels = [root / f"{name}.whl" for name in builder.EXTENSION_NAMES]
+            for wheel in wheels:
+                wheel.write_bytes(b"verified wheel fixture")
             runtime = root / "vane.whl"
             runtime.touch()
             args = [
@@ -204,13 +206,16 @@ class SigningTest(unittest.TestCase):
                 mock.patch.object(packager, "load_builder", return_value=builder),
                 mock.patch.object(builder, "_require_git_revision"),
                 mock.patch.object(builder, "_builder_python", return_value=(mock.Mock(), Path(sys.executable))),
-                mock.patch.object(builder, "_build_provider_wheel", return_value=wheel),
+                mock.patch.object(builder, "_build_provider_wheel", side_effect=wheels) as build,
                 mock.patch.object(builder, "_run") as run,
             ):
                 self.assertEqual(packager.main(), 0)
             self.assertEqual(run.call_count, 1)
             self.assertIn("verify_extension_wheel.py", repr(run.call_args))
-            self.assertEqual((root / "dist/provider.whl").read_bytes(), wheel.read_bytes())
+            self.assertEqual(build.call_args.kwargs["dependency_wheel"], wheels[0])
+            self.assertIn(str(wheels[0]), run.call_args.args[0])
+            for wheel in wheels:
+                self.assertEqual((root / "dist" / wheel.name).read_bytes(), wheel.read_bytes())
 
 
 if __name__ == "__main__":

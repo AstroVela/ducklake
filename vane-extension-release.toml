@@ -8,7 +8,7 @@ native_test_selection = "test/sql/vane/*"
 
 [vane]
 repository = "AstroVela/vane"
-revision = "3c9ed18e29c586e9d5448c74440e8ea55469a749"
+revision = "4a85ae05d89b0194ac57f18bbfe22593cdec00c8"
 
 [vcpkg]
 repository = "microsoft/vcpkg"
