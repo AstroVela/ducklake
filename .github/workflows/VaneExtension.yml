@@ -417,10 +417,12 @@ jobs:
           . .venv-vane-wheel-integration/bin/activate
           mapfile -t base_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_ai-*.whl' -print | sort)
           mapfile -t ducklake_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_ducklake-*.whl' -print | sort)
+          mapfile -t sqlite_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_sqlite_scanner-*.whl' -print | sort)
           test "${#base_wheels[@]}" -eq 1
           test "${#ducklake_wheels[@]}" -eq 1
+          test "${#sqlite_wheels[@]}" -eq 1
           python -m pip install --disable-pip-version-check \
-            "${base_wheels[0]}" "${ducklake_wheels[0]}"
+            "${base_wheels[0]}" "${sqlite_wheels[0]}" "${ducklake_wheels[0]}"
           python -I test/vane/test_vane_dynamic_ducklake.py --smoke
 
   vane-dynamic-ray-ducklake-integration:
@@ -463,10 +465,12 @@ jobs:
           . .venv-vane-wheel-ray-integration/bin/activate
           mapfile -t base_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_ai-*.whl' -print | sort)
           mapfile -t ducklake_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_ducklake-*.whl' -print | sort)
+          mapfile -t sqlite_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_sqlite_scanner-*.whl' -print | sort)
           test "${#base_wheels[@]}" -eq 1
           test "${#ducklake_wheels[@]}" -eq 1
+          test "${#sqlite_wheels[@]}" -eq 1
           python -m pip install --disable-pip-version-check \
-            "${base_wheels[0]}" "${ducklake_wheels[0]}"
+            "${base_wheels[0]}" "${sqlite_wheels[0]}" "${ducklake_wheels[0]}"
           python -I test/vane/test_vane_dynamic_ducklake.py
 
   vane-prepare-provider:
@@ -802,7 +806,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-ducklake-signed-native
-          path: signed/ducklake.duckdb_extension
+          path: signed/*.duckdb_extension
           if-no-files-found: error
           retention-days: 30
 
@@ -817,6 +821,7 @@ jobs:
     outputs:
       vane_version: ${{ steps.release.outputs.vane_version }}
       ducklake_version: ${{ steps.release.outputs.ducklake_version }}
+      sqlite_scanner_version: ${{ steps.release.outputs.sqlite_scanner_version }}
       wheels_artifact_id: ${{ steps.wheels.outputs.artifact-id }}
     env:
       VANE_PYTHON: /opt/python/cp312-cp312/bin/python
@@ -925,6 +930,7 @@ jobs:
     outputs:
       vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
       ducklake_version: ${{ needs.vane-testpypi-wheels.outputs.ducklake_version }}
+      sqlite_scanner_version: ${{ needs.vane-testpypi-wheels.outputs.sqlite_scanner_version }}
       distributions_artifact_id: ${{ steps.distributions.outputs.artifact-id }}
 
     steps:
@@ -989,7 +995,7 @@ jobs:
       - name: Assemble distributions and checksums
         run: |
           mkdir -p distributions release-assets
-          cp packages/vane_extension_ducklake-*.whl distributions/
+          cp packages/vane_extension_ducklake-*.whl packages/vane_extension_sqlite_scanner-*.whl distributions/
           (cd packages && sha256sum *.whl) > release-assets/SHA256SUMS
 
       - name: Generate a CycloneDX SBOM
@@ -1036,7 +1042,7 @@ jobs:
           retention-days: 30
 
   publish-testpypi-ducklake:
-    name: Publish DuckLake provider to TestPyPI
+    name: Publish SQLite and DuckLake providers to TestPyPI
     needs: assemble-testpypi-ducklake
     runs-on: ubuntu-24.04
     environment:
@@ -1123,6 +1129,15 @@ jobs:
             --index testpypi \
             --directory dist \
             --version "${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}"
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml \
+            --provider sqlite_scanner \
+            --index testpypi \
+            --directory dist \
+            --version "${{ needs.assemble-testpypi-ducklake.outputs.sqlite_scanner_version }}"
 
   testpypi-smoke-ducklake-integration:
     name: TestPyPI default Ray DuckLake smoke integration
@@ -1160,6 +1175,7 @@ jobs:
         env:
           VANE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.vane_version }}
           DUCKLAKE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}
+          SQLITE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.sqlite_scanner_version }}
         run: |
           set -euo pipefail
           python -m venv .venv-vane-testpypi-smoke
@@ -1185,16 +1201,22 @@ jobs:
             return 1
           }
           download_exact "vane-ai==$VANE_VERSION" "$VANE_RUNTIME_INDEX"
+          download_exact "vane-extension-sqlite-scanner==$SQLITE_VERSION" "$INDEX_URL"
           download_exact "vane-extension-ducklake==$DUCKLAKE_VERSION" "$INDEX_URL"
 
           mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
           mapfile -t ducklake_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_ducklake-*.whl' -print)
-          mapfile -t expected_ducklake < <(find expected/ducklake -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          mapfile -t sqlite_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_sqlite_scanner-*.whl' -print)
+          mapfile -t expected_ducklake < <(find expected/ducklake -maxdepth 1 -type f -name 'vane_extension_ducklake-*-cp312-none-manylinux_2_28_x86_64.whl' -print)
           test "${#base_wheels[@]}" -eq 1
           test "${#ducklake_wheels[@]}" -eq 1
+          test "${#sqlite_wheels[@]}" -eq 1
           test "${#expected_ducklake[@]}" -eq 1
+          mapfile -t expected_sqlite < <(find expected/ducklake -maxdepth 1 -type f -name 'vane_extension_sqlite_scanner-*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          test "${#expected_sqlite[@]}" -eq 1
+          cmp "${expected_sqlite[0]}" "${sqlite_wheels[0]}"
           cmp "${expected_ducklake[0]}" "${ducklake_wheels[0]}"
-          python -m pip install "${base_wheels[0]}" "${ducklake_wheels[0]}"
+          python -m pip install "${base_wheels[0]}" "${sqlite_wheels[0]}" "${ducklake_wheels[0]}"
           python -m pip check
 
       - name: Exercise the indexed provider with default Ray
@@ -1238,6 +1260,7 @@ jobs:
         env:
           VANE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.vane_version }}
           DUCKLAKE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}
+          SQLITE_VERSION: ${{ needs.assemble-testpypi-ducklake.outputs.sqlite_scanner_version }}
         run: |
           set -euo pipefail
           python -m venv .venv-vane-testpypi-ray
@@ -1263,16 +1286,22 @@ jobs:
             return 1
           }
           download_exact "vane-ai==$VANE_VERSION" "$VANE_RUNTIME_INDEX"
+          download_exact "vane-extension-sqlite-scanner==$SQLITE_VERSION" "$INDEX_URL"
           download_exact "vane-extension-ducklake==$DUCKLAKE_VERSION" "$INDEX_URL"
 
           mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
           mapfile -t ducklake_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_ducklake-*.whl' -print)
-          mapfile -t expected_ducklake < <(find expected/ducklake -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          mapfile -t sqlite_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_sqlite_scanner-*.whl' -print)
+          mapfile -t expected_ducklake < <(find expected/ducklake -maxdepth 1 -type f -name 'vane_extension_ducklake-*-cp312-none-manylinux_2_28_x86_64.whl' -print)
           test "${#base_wheels[@]}" -eq 1
           test "${#ducklake_wheels[@]}" -eq 1
+          test "${#sqlite_wheels[@]}" -eq 1
           test "${#expected_ducklake[@]}" -eq 1
+          mapfile -t expected_sqlite < <(find expected/ducklake -maxdepth 1 -type f -name 'vane_extension_sqlite_scanner-*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          test "${#expected_sqlite[@]}" -eq 1
+          cmp "${expected_sqlite[0]}" "${sqlite_wheels[0]}"
           cmp "${expected_ducklake[0]}" "${ducklake_wheels[0]}"
-          python -m pip install "${base_wheels[0]}" "${ducklake_wheels[0]}"
+          python -m pip install "${base_wheels[0]}" "${sqlite_wheels[0]}" "${ducklake_wheels[0]}"
           python -m pip check
 
       - name: Exercise the indexed provider through two Ray workers
@@ -1355,7 +1384,7 @@ jobs:
             --vane-version "${{ needs.assemble-testpypi-ducklake.outputs.vane_version }}"
 
   publish-pypi-ducklake:
-    name: Publish only the approved immutable DuckLake artifact
+    name: Publish the approved immutable SQLite and DuckLake graph
     if: inputs.operation == 'release'
     needs: [assemble-testpypi-ducklake, verify-pypi-promotion]
     runs-on: ubuntu-24.04
@@ -1442,3 +1471,12 @@ jobs:
             --index pypi \
             --provider ducklake \
             --version "${{ needs.assemble-testpypi-ducklake.outputs.ducklake_version }}"
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml \
+            --directory dist \
+            --index pypi \
+            --provider sqlite_scanner \
+            --version "${{ needs.assemble-testpypi-ducklake.outputs.sqlite_scanner_version }}"

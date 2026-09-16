@@ -26,6 +26,7 @@ def verify_extension_is_wheel_linked(connection: object) -> None:
         raise AssertionError("the packaged Vane wheel does not contain ducklake")
     require_equal(extension[1], "STATICALLY_LINKED", "ducklake install mode before LOAD")
     connection.execute("LOAD parquet")
+    connection.execute("LOAD sqlite_scanner")
     connection.execute("LOAD ducklake")
     loaded = connection.execute(
         "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = 'ducklake'"
@@ -73,7 +74,7 @@ def exercise_crud(vane: object) -> None:
         try:
             verify_extension_is_wheel_linked(connection)
             connection.execute(
-                f"ATTACH 'ducklake:{root / 'metadata.ducklake'}' AS lake "
+                f"ATTACH 'ducklake:sqlite:{root / 'metadata.sqlite'}' AS lake "
                 f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0)"
             )
             connection.execute("CREATE TABLE lake.items(id INTEGER, payload VARCHAR)")

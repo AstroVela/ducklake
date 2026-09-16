@@ -31,7 +31,7 @@ class DynamicWheelTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             for manifest in (
-                'schema_version = 1',
+                "schema_version = 1",
                 'schema_version = 2\n[vcpkg]\nrepository = "fork/vcpkg"\nrevision = "' + "a" * 40 + '"',
                 'schema_version = 2\n[vcpkg]\nrepository = "microsoft/vcpkg"\nrevision = "main"',
             ):
@@ -39,7 +39,7 @@ class DynamicWheelTest(unittest.TestCase):
                 with self.subTest(manifest=manifest), self.assertRaises(self.builder.QualificationError):
                     self.builder._vcpkg_revision(root / "vane-extension.toml")
 
-    def test_build_environment_selects_only_dynamic_ducklake(self) -> None:
+    def test_build_environment_selects_dynamic_sqlite_and_ducklake(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             dependencies = root / "deps"
@@ -66,7 +66,7 @@ class DynamicWheelTest(unittest.TestCase):
                 )
             arguments = shlex.split(result["CMAKE_ARGS"])
             for argument in (
-                "-DVANE_LOADABLE_EXTENSIONS=ducklake",
+                "-DVANE_LOADABLE_EXTENSIONS=sqlite_scanner;ducklake",
                 "-DEXTENSION_STATIC_BUILD=ON",
                 "-DDUCKLAKE_VANE_DISTRIBUTED=ON",
                 "-DENABLE_EXTENSION_AUTOLOADING=OFF",
@@ -213,7 +213,11 @@ class DynamicWheelTest(unittest.TestCase):
             self.assertFalse(key_path.exists())
 
     def test_preparation_rejects_any_key_before_build_or_key_access(self) -> None:
-        for key, consume, local in ((Path("key.pem"), False, False), (None, True, False), (None, False, True)):
+        for key, consume, local in (
+            (Path("key.pem"), False, False),
+            (None, True, False),
+            (None, False, True),
+        ):
             arguments = argparse.Namespace(
                 prepare_only=True,
                 signing_private_key=key,

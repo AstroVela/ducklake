@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated, stdlib-only signer for the fixed DuckLake native data artifact."""
+"""Isolated, stdlib-only signer for the fixed SQLite and DuckLake native data artifacts."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+EXTENSION_NAMES = ("sqlite_scanner", "ducklake")
 MAX_ARTIFACT_BYTES = 384 * 1024 * 1024
 FINGERPRINTS = {
     "production": "8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb",
@@ -77,10 +78,13 @@ def sign(args: argparse.Namespace, contents: bytearray) -> None:
     if actual != revision or status:
         raise ValueError("signer Vane checkout must match the clean committed pin")
     incoming = args.incoming.resolve()
-    artifact = incoming / "artifacts/ducklake.duckdb_extension"
-    if (incoming / "artifacts").is_symlink() or not artifact.resolve(strict=True).is_relative_to(incoming):
+    artifacts = incoming / "artifacts"
+    if artifacts.is_symlink() or not artifacts.resolve(strict=True).is_relative_to(incoming):
         raise ValueError("signing input must remain within the immutable incoming data bundle")
-    require_artifact(artifact)
+    if {path.name for path in artifacts.iterdir()} != {f"{name}.duckdb_extension" for name in EXTENSION_NAMES}:
+        raise ValueError("signer requires the complete fixed SQLite and DuckLake artifact set")
+    for name in EXTENSION_NAMES:
+        require_artifact(artifacts / f"{name}.duckdb_extension")
     require_key(contents, args.profile)
     temporary_root = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
     if temporary_root.is_relative_to(incoming):
@@ -97,21 +101,22 @@ def sign(args: argparse.Namespace, contents: bytearray) -> None:
                 destination.write(contents)
                 destination.flush()
                 os.fsync(destination.fileno())
-            subprocess.run(
-                [
-                    "/usr/bin/python3",
-                    "-I",
-                    "-S",
-                    str(args.vane_source.resolve() / "scripts/sign_test_dynamic_extension.py"),
-                    "--private-key",
-                    str(key),
-                    str(artifact),
-                    str(output / artifact.name),
-                ],
-                env=SYSTEM_ENV,
-                check=True,
-                timeout=120,
-            )
+            for name in EXTENSION_NAMES:
+                subprocess.run(
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-S",
+                        str(args.vane_source.resolve() / "scripts/sign_test_dynamic_extension.py"),
+                        "--private-key",
+                        str(key),
+                        str(artifacts / f"{name}.duckdb_extension"),
+                        str(output / f"{name}.duckdb_extension"),
+                    ],
+                    env=SYSTEM_ENV,
+                    check=True,
+                    timeout=120,
+                )
         finally:
             if key.exists():
                 with key.open("r+b", buffering=0) as destination:

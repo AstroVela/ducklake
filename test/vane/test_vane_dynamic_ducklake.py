@@ -35,7 +35,7 @@ require_equal = smoke_helpers.require_equal
 sql_string = smoke_helpers.sql_string
 
 
-def load_dynamic_ducklake(vane: object, connection: object) -> dict[str, object]:
+def load_dynamic_ducklake(vane: object, connection: object) -> list[dict[str, object]]:
     from vane.extensions import LocalExtensionProvider
 
     trust_identity = os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY")
@@ -54,7 +54,21 @@ def load_dynamic_ducklake(vane: object, connection: object) -> dict[str, object]
     descriptor = import_module(entry_point.module).descriptor()
     require_equal(descriptor.name, "ducklake", "provider extension name")
     require_equal(descriptor.trust_identity, trust_identity, "provider trust root")
-    require_equal(descriptor.dependencies, (), "dynamic provider dependencies")
+    sqlite_entries = [
+        candidate
+        for candidate in entry_points(group="vane.dynamic_extension_providers")
+        if candidate.name == "sqlite_scanner"
+    ]
+    require_equal(len(sqlite_entries), 1, "installed SQLite provider count")
+    sqlite_descriptor = import_module(sqlite_entries[0].module).descriptor()
+    require_equal(sqlite_descriptor.trust_identity, trust_identity, "SQLite provider trust root")
+    require_equal(sqlite_descriptor.vane_version, vane.__version__, "SQLite exact runtime")
+    require_equal(sqlite_descriptor.dependencies, (), "SQLite provider dependency closure")
+    require_equal(
+        [entry.identity for entry in descriptor.dependencies],
+        [sqlite_descriptor.identity],
+        "exact DuckLake SQLite dependency",
+    )
     require_equal(descriptor.vane_version, vane.__version__, "provider runtime version")
     artifact = provider.find(descriptor.identity)
     if artifact is None or artifact.descriptor != descriptor:
@@ -72,15 +86,32 @@ def load_dynamic_ducklake(vane: object, connection: object) -> dict[str, object]
     state = connection.execute(query).fetchone()
     if state not in (None, (False, False, "NOT_INSTALLED")):
         raise AssertionError(f"DuckLake must not be installed or statically linked before provider loading: {state!r}")
+    sqlite_query = (
+        "SELECT loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name = 'sqlite_scanner'"
+    )
+    require_equal(
+        connection.execute(sqlite_query).fetchone(),
+        (False, False, "NOT_INSTALLED"),
+        "SQLite is absent from the base wheel",
+    )
     resolved = vane.load_installed_extension("ducklake", connection=connection)
     require_equal(resolved.descriptor, descriptor, "loaded provider descriptor")
     require_equal(connection.execute(query).fetchone(), (True, False, "NOT_INSTALLED"), "dynamic DuckLake load state")
     manifest = [json.loads(entry) for entry in connection._export_dynamic_extension_snapshot_entries()]
-    require_equal(manifest, [descriptor.to_dict()], "trusted dynamic extension snapshot")
-    return descriptor.to_dict()
+    require_equal(
+        connection.execute(sqlite_query).fetchone(),
+        (True, False, "NOT_INSTALLED"),
+        "dependency automatically loaded from its installed provider",
+    )
+    require_equal(
+        manifest,
+        [sqlite_descriptor.to_dict(), descriptor.to_dict()],
+        "trusted dynamic extension snapshot in dependency order",
+    )
+    return manifest
 
 
-def provider_connection(vane: object) -> tuple[object, dict[str, object]]:
+def provider_connection(vane: object) -> tuple[object, list[dict[str, object]]]:
     connection = vane.connect(
         ":memory:",
         config={
@@ -97,11 +128,11 @@ def provider_connection(vane: object) -> tuple[object, dict[str, object]]:
         raise
 
 
-def seed_lake(vane: object, root: Path, *, scan_fixture: bool) -> dict[str, object]:
+def seed_lake(vane: object, root: Path, *, scan_fixture: bool) -> list[dict[str, object]]:
     connection, descriptor = provider_connection(vane)
     try:
         connection.execute(
-            f"ATTACH {sql_string('ducklake:' + str(root / 'metadata.ducklake'))} AS lake "
+            f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
             f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0)"
         )
         connection.execute("CREATE TABLE lake.items(id INTEGER, payload VARCHAR)")
@@ -117,10 +148,10 @@ def seed_lake(vane: object, root: Path, *, scan_fixture: bool) -> dict[str, obje
             connection.execute("CREATE TABLE lake.source(id INTEGER, payload VARCHAR)")
             for file_index in range(FILE_COUNT):
                 start = file_index * ROWS_PER_FILE
-                connection.execute(
-                    "INSERT INTO lake.source SELECT i::INTEGER, ('value-' || i::VARCHAR)::VARCHAR "
+                connection.sql(
+                    "SELECT i::INTEGER AS id, ('value-' || i::VARCHAR)::VARCHAR AS payload "
                     f"FROM range({start}, {start + ROWS_PER_FILE}) AS rows(i)"
-                )
+                ).repartition(num_partitions=1).insert_into("lake.source")
             require_equal(
                 connection.execute("SELECT count(*) FROM ducklake_list_files('lake', 'source')").fetchone(),
                 (FILE_COUNT,),
@@ -165,7 +196,7 @@ def exercise_ray_scan(vane: object, root: Path, *, smoke: bool) -> None:
         connection, loaded_descriptor = provider_connection(vane)
         require_equal(loaded_descriptor, descriptor, "reopened provider identity")
         connection.execute(
-            f"ATTACH {sql_string('ducklake:' + str(root / 'metadata.ducklake'))} AS lake "
+            f"ATTACH {sql_string('ducklake:sqlite:' + str(root / 'metadata.sqlite'))} AS lake "
             f"(DATA_PATH {sql_string(root / 'data')}, READ_ONLY)"
         )
         plan = helpers.make_physical_plan(vane, connection, "SELECT id, payload FROM lake.source")
@@ -174,7 +205,7 @@ def exercise_ray_scan(vane: object, root: Path, *, smoke: bool) -> None:
             FILE_COUNT,
             "independently schedulable DuckLake file splits",
         )
-        require_equal(plan.__getstate__()[6]["dynamic_extensions"], [descriptor], "worker preparation manifest")
+        require_equal(plan.__getstate__()[6]["dynamic_extensions"], descriptor, "worker preparation manifest")
 
         dispatch_count = 0
         original_run_iter_tables = runner.run_iter_tables
@@ -205,7 +236,9 @@ def exercise_ray_scan(vane: object, root: Path, *, smoke: bool) -> None:
             .fetchall()
         )
         require_equal(
-            sorted(row[0] for row in annotated_rows), list(range(ROW_COUNT)), "complete distributed row coverage"
+            sorted(row[0] for row in annotated_rows),
+            list(range(ROW_COUNT)),
+            "complete distributed row coverage",
         )
         require_equal({str(row[1]) for row in annotated_rows}, expected_nodes, "two-worker provider scan topology")
         if dispatch_count < 2:

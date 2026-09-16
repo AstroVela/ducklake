@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exercise the shared release CLI with this repository's single-provider contract."""
+"""Exercise the shared release CLI with this repository's SQLite and DuckLake dependency graph."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import yaml
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPOSITORY_ROOT / "vane-provider-release.toml"
 VANE_VERSION = "0.2.0.dev612"
-VERSIONS = {"ducklake": "0.2.0.0.612.1"}
+VERSIONS = {"sqlite_scanner": "0.2.0.0.612.2", "ducklake": "0.2.0.0.612.1"}
 INTERPRETERS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 PLATFORM = "manylinux_2_28_x86_64"
 
@@ -42,14 +42,21 @@ def load_validator():
 
 
 def write_wheels(
-    directory: Path, provider: str, *, vane_requirement: str | None = None, vane_version: str = VANE_VERSION
+    directory: Path,
+    provider: str,
+    *,
+    vane_requirement: str | None = None,
+    vane_version: str = VANE_VERSION,
+    sqlite_requirement: str | None = None,
 ) -> list[Path]:
     distribution = f"vane_extension_{provider}"
     version = VERSIONS[provider]
     requirements = [vane_requirement or f"vane-ai==={vane_version}"]
+    if provider == "ducklake":
+        requirements.append(sqlite_requirement or f"vane-extension-sqlite-scanner==={VERSIONS['sqlite_scanner']}")
     metadata = (
         "Metadata-Version: 2.4\n"
-        f"Name: vane-extension-{provider}\n"
+        f"Name: vane-extension-{provider.replace('_', '-')}\n"
         f"Version: {version}\n" + "".join(f"Requires-Dist: {requirement}\n" for requirement in requirements) + "\n"
     )
     paths = []
@@ -94,7 +101,10 @@ class ProviderReleaseTest(unittest.TestCase):
         self.assertEqual(self.config.max_wheel_bytes, 100000000)
         self.assertEqual(
             [(provider.name, provider.distribution, provider.dependencies) for provider in self.config.providers],
-            [("ducklake", "vane-extension-ducklake", ())],
+            [
+                ("sqlite_scanner", "vane-extension-sqlite-scanner", ()),
+                ("ducklake", "vane-extension-ducklake", ("sqlite_scanner",)),
+            ],
         )
 
     def test_complete_release_cli_outputs(self) -> None:
@@ -126,7 +136,7 @@ class ProviderReleaseTest(unittest.TestCase):
             verify.assert_called_once_with(
                 REPOSITORY_ROOT / "vane-extension.toml", REPOSITORY_ROOT, directory / "vane", "a" * 40
             )
-            self.assertEqual(query.call_count, 1)
+            self.assertEqual(query.call_count, len(VERSIONS))
             expected = {
                 "vane_version": VANE_VERSION,
                 **{f"{name}_version": version for name, version in VERSIONS.items()},
@@ -137,6 +147,7 @@ class ProviderReleaseTest(unittest.TestCase):
     def test_provider_requires_the_exact_vane_version(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vane-ducklake-dependency-") as value:
             directory = Path(value)
+            write_wheels(directory, "sqlite_scanner")
             for requirement in ("vane-ai>=0.2", "vane-ai===0.2.0.dev611"):
                 with self.subTest(requirement=requirement):
                     write_wheels(directory, "ducklake", vane_requirement=requirement)
@@ -151,10 +162,23 @@ class ProviderReleaseTest(unittest.TestCase):
                     with mock.patch.object(self.validator, "verify_sources"), redirect_stderr(io.StringIO()):
                         self.assertEqual(self.validator.main(command), 2)
 
+    def test_ducklake_requires_the_exact_sqlite_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            write_wheels(directory, "sqlite_scanner")
+            for requirement in ("vane-extension-sqlite-scanner>=0.2", "vane-extension-sqlite-scanner===0.1"):
+                with self.subTest(requirement=requirement):
+                    write_wheels(directory, "ducklake", sqlite_requirement=requirement)
+                    with self.assertRaisesRegex(self.validator.ReleaseValidationError, "exact"):
+                        self.validator.validate_release(directory, VANE_VERSION, self.config, channel="testpypi-dev")
+
     def test_index_cli_accepts_each_assembled_provider_directory(self) -> None:
         # Verify the same complete artifact set that the upload job consumes.
         for provider, version in VERSIONS.items():
-            with self.subTest(provider=provider), tempfile.TemporaryDirectory(prefix="vane-ducklake-index-") as value:
+            with (
+                self.subTest(provider=provider),
+                tempfile.TemporaryDirectory(prefix="vane-ducklake-index-") as value,
+            ):
                 directory = Path(value)
                 paths = write_wheels(directory, provider)
                 document = {
@@ -189,7 +213,9 @@ class ProviderReleaseTest(unittest.TestCase):
                 verify.assert_called_once_with(
                     REPOSITORY_ROOT / "vane-extension.toml", REPOSITORY_ROOT, directory / "vane", "a" * 40
                 )
-                query.assert_called_once_with(f"https://test.pypi.org/pypi/vane-extension-{provider}/{version}/json")
+                query.assert_called_once_with(
+                    f"https://test.pypi.org/pypi/vane-extension-{provider.replace('_', '-')}/{version}/json"
+                )
 
     def test_release_rejects_the_existing_dev_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -209,7 +235,7 @@ class ProviderReleaseTest(unittest.TestCase):
     def test_release_promotes_only_the_complete_identical_testpypi_set(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             directory = Path(value)
-            paths = write_wheels(directory, "ducklake", vane_version="0.2.0")
+            paths = [path for provider in VERSIONS for path in write_wheels(directory, provider, vane_version="0.2.0")]
             document = {
                 "urls": [
                     {
@@ -234,7 +260,12 @@ class ProviderReleaseTest(unittest.TestCase):
 
             def query(url):
                 if url.startswith("https://test.pypi.org/"):
-                    return 200, document
+                    prefix = (
+                        "vane_extension_sqlite_scanner-"
+                        if "/vane-extension-sqlite-scanner/" in url
+                        else "vane_extension_ducklake-"
+                    )
+                    return 200, {"urls": [entry for entry in document["urls"] if entry["filename"].startswith(prefix)]}
                 self.assertTrue(url.startswith("https://pypi.org/"))
                 return 404, None
 
@@ -244,7 +275,10 @@ class ProviderReleaseTest(unittest.TestCase):
             ):
                 self.assertEqual(self.validator.main(command), 0)
                 verify.assert_called_once_with(
-                    REPOSITORY_ROOT / "vane-extension-release.toml", REPOSITORY_ROOT, directory / "vane", "a" * 40
+                    REPOSITORY_ROOT / "vane-extension-release.toml",
+                    REPOSITORY_ROOT,
+                    directory / "vane",
+                    "a" * 40,
                 )
                 document["urls"][0]["digests"]["sha256"] = "0" * 64
                 with redirect_stderr(io.StringIO()):
@@ -343,7 +377,11 @@ class ProviderReleaseTest(unittest.TestCase):
         self.assertEqual(promotion["permissions"], {"contents": "read"})
         self.assertEqual(
             set(promotion["needs"]),
-            {"assemble-testpypi-ducklake", "testpypi-smoke-ducklake-integration", "testpypi-ray-ducklake-integration"},
+            {
+                "assemble-testpypi-ducklake",
+                "testpypi-smoke-ducklake-integration",
+                "testpypi-ray-ducklake-integration",
+            },
         )
         self.assertTrue(any("verify-promotion" in step.get("run", "") for step in promotion["steps"]))
         publisher = jobs["publish-pypi-ducklake"]

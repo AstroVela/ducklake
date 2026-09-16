@@ -26,6 +26,8 @@ SIGNING_PROFILES = {
     "testpypi": ("astrovela/vane-testpypi", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"),
     "production": ("astrovela/vane", None),
 }
+EXTENSION_NAMES = ("sqlite_scanner", "ducklake")
+SQLITE_REVISION = "f79b1db7d7730b18d0f8400d3650ffa6b45168d8"
 LICENSE_NAMES = (
     "DuckLake-MIT.txt",
     "Vane-Apache-2.0.txt",
@@ -36,6 +38,18 @@ LICENSE_NAMES = (
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND ISC AND MIT AND "
     "Unicode-DFS-2015 AND Zlib AND curl"
+)
+SQLITE_LICENSE_NAMES = (
+    "DuckDB-SQLite-MIT.txt",
+    "SQLite-blessing.txt",
+    "Vane-Apache-2.0.txt",
+    "Vane-NOTICE.txt",
+    "DuckDB-static-engine-licenses.txt",
+)
+PROVIDER_LICENSE_NAMES = {"sqlite_scanner": SQLITE_LICENSE_NAMES, "ducklake": LICENSE_NAMES}
+SQLITE_LICENSE_EXPRESSION = (
+    "0BSD AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND ISC AND MIT AND "
+    "Unicode-DFS-2015 AND Zlib AND blessing"
 )
 EXPECTED_DUCKDB_LICENSE_PATTERNS = (
     "external/duckdb/LICENSE",
@@ -244,7 +258,7 @@ def _build_environment(
         + ("ON" if signing_cmake_option == "VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY" else "OFF"),
         "-DVANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY="
         + ("ON" if signing_cmake_option == "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY" else "OFF"),
-        "-DVANE_LOADABLE_EXTENSIONS=ducklake",
+        "-DVANE_LOADABLE_EXTENSIONS=sqlite_scanner;ducklake",
         f"-DVANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY={staged_extensions}",
         "-DVCPKG_BUILD=ON",
         f"-DCMAKE_TOOLCHAIN_FILE={vcpkg_toolchain}",
@@ -407,6 +421,27 @@ def _stage_license_files(
     )
 
 
+def _stage_sqlite_licenses(vane_source: Path, build_directory: Path) -> tuple[Path, ...]:
+    # FetchContent uses Vane's reviewed upstream pin; ambient directory overrides
+    # are removed by _build_environment before configuring the build.
+    source = build_directory / "_deps/sqlite_scanner_extension_fc-src"
+    _require_git_revision(source, SQLITE_REVISION, "DuckDB SQLite")
+    directory = build_directory / "dynamic-extension-licenses"
+    header = _require_file(source / "src/sqlite/sqlite3.h", "SQLite source notice").read_text(encoding="utf-8")
+    notice = header.split("*************************************************************************", 1)[0]
+    if not notice.startswith("/*") or "The author disclaims copyright" not in notice:
+        raise QualificationError("SQLite's source notice differs from the reviewed blessing")
+    blessing = directory / "SQLite-blessing.txt"
+    blessing.write_text(notice + "*/\n", encoding="utf-8")
+    return (
+        _copy_license(source / "LICENSE", directory / "DuckDB-SQLite-MIT.txt"),
+        blessing,
+        directory / "Vane-Apache-2.0.txt",
+        directory / "Vane-NOTICE.txt",
+        directory / "DuckDB-static-engine-licenses.txt",
+    )
+
+
 def _builder_python(
     interpreter: Path,
     base_wheel: Path,
@@ -441,6 +476,7 @@ def _build_provider_wheel(
     platform_tag: str,
     trust_identity: str,
     license_files: Iterable[Path],
+    dependency_wheel: Path | None = None,
 ) -> Path:
     command = [
         str(python),
@@ -457,10 +493,12 @@ def _build_provider_wheel(
         "--trust-identity",
         trust_identity,
         "--license-expression",
-        LICENSE_EXPRESSION,
+        SQLITE_LICENSE_EXPRESSION if extension_name == "sqlite_scanner" else LICENSE_EXPRESSION,
     ]
     for license_file in license_files:
         command.extend(("--license-file", str(license_file)))
+    if dependency_wheel is not None:
+        command.extend(("--dependency-wheel", str(dependency_wheel), "--dependency-trust-identity", trust_identity))
     _run(command)
     return _one_wheel(
         output_directory,
@@ -576,7 +614,16 @@ def main() -> int:
         "--extension-root",
         str(extension_root),
     )
-    _run((*source_command, "verify-ci-tools", "--ci-tools-source", str(tools), "--expected-sha", tools_revision))
+    _run(
+        (
+            *source_command,
+            "verify-ci-tools",
+            "--ci-tools-source",
+            str(tools),
+            "--expected-sha",
+            tools_revision,
+        )
+    )
     _run((*source_command, "identity", "--vane-source", str(vane_source)))
 
     runtimes = tuple(
@@ -645,28 +692,38 @@ def main() -> int:
             cwd=extension_root,
             environment=environment,
         )
-        unsigned = _require_file(build_directory / "vane_extensions/ducklake.duckdb_extension", "DuckLake artifact")
-        _require_no_undefined_duckdb_symbols(unsigned)
-        licenses = _stage_license_files(
+        unsigned_artifacts = {
+            name: _require_file(build_directory / f"vane_extensions/{name}.duckdb_extension", f"{name} artifact")
+            for name in EXTENSION_NAMES
+        }
+        for artifact in unsigned_artifacts.values():
+            _require_no_undefined_duckdb_symbols(artifact)
+        ducklake_licenses = _stage_license_files(
             extension_root=extension_root,
             manifest_path=manifest_path,
             vane_source=vane_source,
             build_directory=build_directory,
         )
+        licenses = {
+            "sqlite_scanner": _stage_sqlite_licenses(vane_source, build_directory),
+            "ducklake": ducklake_licenses,
+        }
         if arguments.prepare_only:
             artifacts = output_directory / "artifacts"
             artifacts.mkdir()
-            shutil.copyfile(unsigned, artifacts / unsigned.name)
-            license_directory = output_directory / "licenses/ducklake"
-            license_directory.mkdir(parents=True)
-            if tuple(path.name for path in licenses) != LICENSE_NAMES:
-                raise QualificationError("native preparation license set differs from the reviewed contract")
-            for license_file in licenses:
-                shutil.copyfile(license_file, license_directory / license_file.name)
+            for name in EXTENSION_NAMES:
+                artifact = unsigned_artifacts[name]
+                shutil.copyfile(artifact, artifacts / artifact.name)
+                license_directory = output_directory / "licenses" / name
+                license_directory.mkdir(parents=True)
+                if tuple(path.name for path in licenses[name]) != PROVIDER_LICENSE_NAMES[name]:
+                    raise QualificationError(f"{name} preparation license set differs from the reviewed contract")
+                for license_file in licenses[name]:
+                    shutil.copyfile(license_file, license_directory / license_file.name)
             return 0
         signed_directory = build_directory / "signed-vane-extensions"
         signed_directory.mkdir(parents=True, exist_ok=True)
-        signed = signed_directory / unsigned.name
+        signed_artifacts = {name: signed_directory / artifact.name for name, artifact in unsigned_artifacts.items()}
         descriptor, key_path = tempfile.mkstemp(prefix=".vane-signing-", suffix=".pem", dir=signed_directory)
         ephemeral_key = Path(key_path)
         try:
@@ -675,16 +732,17 @@ def main() -> int:
                 destination.write(key)
                 destination.flush()
                 os.fsync(destination.fileno())
-            _run(
-                (
-                    sys.executable,
-                    str(vane_source / "scripts/sign_test_dynamic_extension.py"),
-                    "--private-key",
-                    str(ephemeral_key),
-                    str(unsigned),
-                    str(signed),
+            for name in EXTENSION_NAMES:
+                _run(
+                    (
+                        sys.executable,
+                        str(vane_source / "scripts/sign_test_dynamic_extension.py"),
+                        "--private-key",
+                        str(ephemeral_key),
+                        str(unsigned_artifacts[name]),
+                        str(signed_artifacts[name]),
+                    )
                 )
-            )
         finally:
             _clear_key(key)
             if ephemeral_key.exists():
@@ -720,15 +778,26 @@ def main() -> int:
             provider_directory.mkdir()
             builder_environment, builder_python = _builder_python(runtime_python, runtime_wheel, build_directory.parent)
             try:
+                sqlite_wheel = _build_provider_wheel(
+                    python=builder_python,
+                    vane_source=vane_source,
+                    artifact=signed_artifacts["sqlite_scanner"],
+                    extension_name="sqlite_scanner",
+                    output_directory=provider_directory,
+                    platform_tag=platform_tag,
+                    trust_identity=trust_identity,
+                    license_files=licenses["sqlite_scanner"],
+                )
                 wheel = _build_provider_wheel(
                     python=builder_python,
                     vane_source=vane_source,
-                    artifact=signed,
+                    artifact=signed_artifacts["ducklake"],
                     extension_name="ducklake",
                     output_directory=provider_directory,
                     platform_tag=platform_tag,
                     trust_identity=trust_identity,
-                    license_files=licenses,
+                    license_files=licenses["ducklake"],
+                    dependency_wheel=sqlite_wheel,
                 )
                 _run(
                     (
@@ -739,13 +808,17 @@ def main() -> int:
                         str(runtime_wheel),
                         "--extension-wheel",
                         str(wheel),
+                        "--dependency-wheel",
+                        str(sqlite_wheel),
+                        "--dependency-trust-identity",
+                        trust_identity,
                         "--extension-name",
                         "ducklake",
                         "--trust-identity",
                         trust_identity,
                     )
                 )
-                emitted.append(wheel)
+                emitted.extend((sqlite_wheel, wheel))
             finally:
                 builder_environment.cleanup()
         if len({wheel.name for wheel in emitted}) != len(emitted):
