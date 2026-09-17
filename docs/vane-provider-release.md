@@ -100,7 +100,7 @@ The same top-level `VaneExtension.yml` also offers `operation=release`;
 already-published TestPyPI wheels.
 
 Production instead uses `vane-extension-release.toml`. Its current exact Vane
-pin, `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`, contains the production public
+pin, `d1460a580455f01485e2e508e05d0049cb18a105`, contains the production public
 key but **is not a released runtime**. A release dispatch therefore fails at
 the read-only version gate, before native dependency builds, signing, or
 publication. First release a canonical non-development Vane version to PyPI,
@@ -208,7 +208,7 @@ the ten assembled provider wheels (five interpreters per provider).
 ## Latest-main default Ray qualification
 
 The development manifest pins merged Vane main `d1460a580455f01485e2e508e05d0049cb18a105`
-(`0.2.0.dev663`); the production preparation manifest retains `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`.
+(`0.2.0.dev663`); the production preparation manifest also pins `d1460a580455f01485e2e508e05d0049cb18a105`.
 The development runtime includes the NULL extension-setting transport, late
 source-EOF, ordered task production, and schema-only chunk corrections.
 This is a development qualification, not a production release.

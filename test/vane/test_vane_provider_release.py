@@ -291,7 +291,7 @@ class ProviderReleaseTest(unittest.TestCase):
         self.assertEqual(manifest["vane"]["revision"], "d1460a580455f01485e2e508e05d0049cb18a105")
         self.assertEqual(manifest["vcpkg"]["revision"], "84bab45d415d22042bd0b9081aea57f362da3f35")
         release_manifest = tomllib.loads((REPOSITORY_ROOT / "vane-extension-release.toml").read_text())
-        self.assertEqual(release_manifest["vane"]["revision"], "4e12994a2fed5b872a7bdb44df72c1b9c5653cdc")
+        self.assertEqual(release_manifest["vane"]["revision"], "d1460a580455f01485e2e508e05d0049cb18a105")
         release_manifest["vane"]["revision"] = manifest["vane"]["revision"]
         self.assertEqual(release_manifest, manifest)
         entry = subprocess.check_output(
