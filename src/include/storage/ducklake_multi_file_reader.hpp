@@ -43,6 +43,12 @@ public:
 	void BindOptions(MultiFileOptions &options, MultiFileList &files, vector<LogicalType> &return_types,
 	                 vector<string> &names, MultiFileReaderBindData &bind_data) override;
 
+	unique_ptr<MultiFileReaderGlobalState>
+	InitializeGlobalState(ClientContext &context, const MultiFileOptions &file_options,
+	                      const MultiFileReaderBindData &bind_data, const MultiFileList &file_list,
+	                      const vector<MultiFileColumnDefinition> &global_columns,
+	                      const vector<ColumnIndex> &global_column_ids) override;
+
 	ReaderInitializeType InitializeReader(MultiFileReaderData &reader_data, const MultiFileBindData &bind_data,
 	                                      const vector<MultiFileColumnDefinition> &global_columns,
 	                                      const vector<ColumnIndex> &global_column_ids,
@@ -82,22 +88,13 @@ private:
 	shared_ptr<BaseFileReader> TryCreateInlinedDataReader(const OpenFileInfo &file);
 	//! For deletion scans we need to get the snapshot_id values using per-row snapshot information
 	void GatherDeletionScanSnapshots(BaseFileReader &reader, const MultiFileReaderData &reader_data, DataChunk &chunk,
-	                                 optional_idx rowid_col_override = optional_idx()) const;
+	                                 optional_idx snapshot_col_idx, optional_idx rowid_col_idx) const;
 
 private:
 	unique_ptr<MultiFileColumnDefinition> row_id_column;
 	unique_ptr<MultiFileColumnDefinition> snapshot_id_column;
 	//! Inlined transaction-local data
 	shared_ptr<DuckLakeInlinedData> transaction_local_data;
-	//! For deletion scans: output_chunk column index of snapshot_id in global_column_ids order, if projected
-	//! (set in CreateMapping).
-	optional_idx deletion_scan_snapshot_col;
-	//! For deletion scans: output_chunk column index of rowid in global_column_ids order, if projected.
-	//! Same semantics as deletion_scan_snapshot_col.
-	optional_idx deletion_scan_rowid_col;
-	//! Whether row_id was internally projected (not in user's query)
-	//! This is necessary for DCF queries over inlined deletions
-	bool internally_projected_rowid = false;
 };
 
 } // namespace duckdb
