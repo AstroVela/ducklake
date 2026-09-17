@@ -1,6 +1,6 @@
 # DuckLake Extension for Vane
 
-[Project overview](README.md) · [DuckDB guide](DUCKDB_README.md)
+[Project overview](README.md) · [DuckDB guide](docs/DUCKDB_README.md)
 
 Create, modify, and query DuckLake tables through Vane's SQL and Python Relation
 APIs. Supported data operations use the default Ray runner. Leave `VANE_RUNNER`
@@ -187,7 +187,7 @@ connection.sql("""
 
 This historical data scan also uses Ray. Retain the snapshot and its data
 files while queries are running. For other native DuckLake features, see the
-[DuckDB guide](DUCKDB_README.md); they are not all part of the distributed contract.
+[DuckDB guide](docs/DUCKDB_README.md); they are not all part of the distributed contract.
 
 ## Execution and storage boundaries
 

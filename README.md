@@ -6,7 +6,7 @@ for distributed execution on Ray.
 
 | Runtime | Guide | Execution |
 | --- | --- | --- |
-| DuckDB | [DUCKDB_README.md](DUCKDB_README.md) | Native DuckDB extension |
+| DuckDB | [DUCKDB_README.md](docs/DUCKDB_README.md) | Native DuckDB extension |
 | Vane | [VANE_README.md](VANE_README.md) | Default Ray runner, with distributed scans and writes |
 
 The Vane guide starts with CTAS, INSERT, UPDATE, DELETE, and MERGE, then shows
