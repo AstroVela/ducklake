@@ -3,14 +3,21 @@
 `vane-extension-ducklake` packages DuckLake as a signed dynamic Vane provider,
 separate from the `vane-ai` runtime. The initial candidate targets the exact
 Vane source recorded in `vane-extension.toml`, corresponding to
-`vane-ai==0.2.0.dev612`. Each provider wheel requires that exact runtime version;
+`vane-ai==0.2.0.dev660`. Each provider wheel requires that exact runtime version;
 the wheel is not interchangeable with arbitrary Vane or upstream DuckDB builds.
 
 The existing native and statically linked Vane-wheel integration lanes remain
 in place. The new provider lane builds an independent dynamic extension and
-qualifies it with local execution and two Ray workers. Initial dynamic
-qualification uses DuckLake's DuckDB metadata catalog and filesystem-backed
-data, with no SQLite or PostgreSQL provider package dependency.
+qualifies it with default Ray CRUD and two-worker scans. The delivery includes
+`vane-extension-sqlite-scanner`, built from Vane's pinned DuckDB SQLite source
+`f79b1db7d7730b18d0f8400d3650ffa6b45168d8`. DuckLake's descriptor and Python
+requirements pin that exact provider. Loading DuckLake loads SQLite first;
+neither extension is statically linked into the base Vane wheel.
+
+The tests attach `ducklake:sqlite:<absolute metadata.sqlite path>` and use
+filesystem-backed data. SQLite lets the client and Ray driver share a catalog
+across processes on the same host. This local two-worker-node qualification
+does not certify a SQLite catalog shared across multiple physical hosts.
 
 ## Ownership and release contract
 
@@ -24,8 +31,8 @@ Release-matrix and TestPyPI index validation are shared through the pinned
 `vane-provider-release.toml` declares:
 
 - CPython 3.10 through 3.14, `none` ABI, `manylinux_2_28_x86_64`;
-- one `vane-extension-ducklake` wheel per interpreter;
-- an exact `vane-ai` dependency and no other provider dependencies;
+- one `vane-extension-ducklake` and one `vane-extension-sqlite-scanner` wheel per interpreter;
+- exact `vane-ai` requirements for both, plus DuckLake's exact SQLite provider dependency;
 - a 100,000,000-byte per-wheel upload budget, independent of Vane's native
   artifact safety limits.
 
@@ -39,8 +46,10 @@ vcpkg revision remains `84bab45d415d22042bd0b9081aea57f362da3f35`.
 Normal PR and branch CI do not publish packages. They exercise lightweight
 packaging/release tests and build a CI-test-signed provider plus its exact Vane
 runtime wheel. Separate clean jobs install those artifacts and run
-`test/vane/test_vane_dynamic_ducklake.py` under `VANE_RUNNER=local-fast` and
-`VANE_RUNNER=ray`. The original statically linked tests remain independent.
+`test/vane/test_vane_dynamic_ducklake.py --smoke` for CRUD and the same script
+without `--smoke` for two-worker coverage. All public integration tests leave
+`VANE_RUNNER` unset, avoid runner-selection APIs, and verify the default Ray
+runner. The statically linked suite also uses the default Ray runner.
 
 Publication requires a manual `Vane extension` workflow dispatch with
 `operation=testpypi-dev` on `v1.5-variegata_vane`:
@@ -48,14 +57,14 @@ Publication requires a manual `Vane extension` workflow dispatch with
 1. Download the exact indexed `vane-ai` runtime wheels for all five CPython
    interpreters, then prepare unsigned native data and licenses without keys.
    A separate protected signer signs that data, and a fresh no-secret job
-   packages and verifies the matching DuckLake providers without rebuilding.
+   packages and verifies the matching SQLite and DuckLake providers without rebuilding.
 2. Use the shared CLI to validate the complete matrix, exact dependencies,
    upload sizes, and absent or byte-identical existing TestPyPI files.
 3. Revalidate from the assembled artifacts, create checksums, SBOM, provenance,
    and Sigstore evidence, then publish through Trusted Publishing.
-4. Compare the five indexed filenames and SHA256 hashes with the exact upload
+4. Compare all ten indexed filenames and SHA256 hashes with the exact upload
    artifacts. Partial or conflicting indexed sets fail verification.
-5. Download the indexed runtime/provider graph in fresh local and two-worker
+5. Download the indexed runtime/provider graph in fresh default Ray smoke and two-worker
    Ray jobs. Compare the provider bytes with the upload artifact, install the
    exact graph, run `pip check`, and exercise the dynamic-provider SQL tests.
 
@@ -72,7 +81,8 @@ Before the first manual publication, configure:
 - its `VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY` secret, containing the
   existing private key for trust identity `astrovela/vane-testpypi`; the pinned
   Vane candidate already embeds the matching public key;
-- a TestPyPI Trusted Publisher for project `vane-extension-ducklake`, with
+- TestPyPI Trusted Publishers for projects `vane-extension-ducklake` and
+  `vane-extension-sqlite-scanner`, both with
   owner `AstroVela`, repository `ducklake`, workflow `VaneExtension.yml`, and
   environment `testpypi`.
 
@@ -86,11 +96,11 @@ outside the downloaded data before the job uploads signed native files.
 
 The same top-level `VaneExtension.yml` also offers `operation=release`;
 `build-only` remains the default. Production preparation does not change
-`vane-extension.toml`, the existing `0.2.0.dev612` runtime dependency, or any
+`vane-extension.toml`, the existing `0.2.0.dev660` runtime dependency, or any
 already-published TestPyPI wheels.
 
 Production instead uses `vane-extension-release.toml`. Its current exact Vane
-pin, `033b549afcb498633fd6669b26c054c00363004e`, contains the production public
+pin, `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`, contains the production public
 key but **is not a released runtime**. A release dispatch therefore fails at
 the read-only version gate, before native dependency builds, signing, or
 publication. First release a canonical non-development Vane version to PyPI,
@@ -116,7 +126,7 @@ protected `v1.5-variegata_vane` branch performs:
    runtimes; do not rebuild native code. Validate source pins, exact dependencies, wheel sizes, and absent or
    byte-identical files on both indexes using the shared release CLI. Stage
    that candidate on TestPyPI with the existing publisher.
-3. Verify the complete indexed filenames and hashes. Fresh local and
+3. Verify the complete indexed filenames and hashes. Fresh default Ray smoke and
    two-worker Ray jobs install the runtime from PyPI and provider from
    TestPyPI, compare the provider bytes with the build artifact, run
    `pip check`, and execute the provider-backed SQL tests.
@@ -143,9 +153,10 @@ Before enabling a real release, configure these external prerequisites:
 - A `pypi` GitHub environment restricted to that branch, with **required
   reviewers** and self-review prevention. Declaring an environment in YAML
   does not configure its approval protection; configure it before dispatch.
-- A PyPI Trusted Publisher for project `vane-extension-ducklake`, owner
-  `AstroVela`, repository `ducklake`, workflow `VaneExtension.yml`, environment
-  `pypi`. The existing TestPyPI publisher remains unchanged.
+- PyPI Trusted Publishers for projects `vane-extension-ducklake` and
+  `vane-extension-sqlite-scanner`, both with owner `AstroVela`, repository
+  `ducklake`, workflow `VaneExtension.yml`, environment `pypi`. Configure both
+  projects on TestPyPI with environment `testpypi` as described above.
 
 This change does not configure environments or secrets, create tags, or
 upload packages. No provider tag is required: the manually selected protected
@@ -155,10 +166,12 @@ branch commit and the reviewed exact Vane/CI-tools pins are the release inputs.
 the public `ci-test` key. Both publishing profiles require `--prepare-only`,
 which rejects key arguments. The isolated signer reads the selected manifest
 from the committed repository tree, validates the exact official Vane pin,
-and accepts only a regular unsigned `artifacts/ducklake.duckdb_extension`
-bounded to 384 MiB. It does not trust builder-supplied source repository/ref
-outputs or execute downloaded code. License files travel separately as data
-under `licenses/ducklake/`; only signed native files leave the signer.
+and requires exactly two regular unsigned files under `artifacts/`:
+`sqlite_scanner.duckdb_extension` and `ducklake.duckdb_extension`, each bounded
+to 384 MiB. It does not trust builder-supplied source repository/ref outputs
+or execute downloaded code. License files travel separately as data under
+`licenses/sqlite_scanner/` and `licenses/ducklake/`; only signed native files
+leave the signer.
 
 ## Focused development checks
 
@@ -182,11 +195,51 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev612 --channel testpypi-dev \
+  --vane-version 0.2.0.dev660 --channel testpypi-dev \
   --require-publishable-on testpypi
 ```
 
 Source verification is read-only and rejects mismatched or dirty Vane/tools
 checkouts. After publication, `verify-index` accepts the same source/config
-flags plus `--index testpypi --provider ducklake --version <exact-provider-version>` and the
-directory containing the five assembled provider wheels.
+flags plus `--index testpypi --provider <name> --version <exact-provider-version>`.
+Run it for both `sqlite_scanner` and `ducklake`, using the directory containing
+the ten assembled provider wheels (five interpreters per provider).
+
+## Latest-main default Ray qualification
+
+Both manifests pin merged Vane main `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`
+(`0.2.0.dev660`), including the NULL extension-setting transport, late
+source-EOF, ordered task production, and schema-only chunk corrections.
+This is a development qualification, not a production release.
+
+The ordered INSERT regression covers zero, 256 and 8193 rows, validates every
+row after publication, and checks empty writes publish no files. The
+single-file scan fixtures retain VALUES batches to control file boundaries.
+SQL statements, Relations, mutations and readback use the default Ray runner.
+Test-owned clusters reserve capacity for concurrent writes without changing
+Vane's runner selection. Controlled legacy mapping and inlined-delete fixtures
+use PyArrow and isolated Python `sqlite3` processes. SQLite inspection and
+failure-injection triggers use the same independent fixture path, without
+loading a local Vane runner. These fixtures qualify scans and write recovery;
+they do not imply Ray support for DuckLake maintenance `CALL` statements.
+
+DuckLake metadata functions share a portable completed-row binding. Their rows
+are copied and serialized once per bound plan, including `ducklake_options()`;
+Ray runs one metadata fragment and retries retain the same rows. Creating a new
+query observes current catalog metadata. This does not declare live catalog
+objects to be worker-safe or add any execution fallback.
+
+The native MinIO fixture pins both upstream Quay images by release tag and
+digest. Readiness and bucket initialization have finite timeouts; failures stop
+the job, and cleanup removes only this fixture project's containers and volume.
+The SQLite-backed Ray tests remain a same-host, two-worker qualification.
+
+## SQLite dependency checks
+
+The signer accepts exactly two unsigned artifacts and signs both with the
+selected channel key. Packaging checks both signed payloads against preparation,
+collects the SQLite extension's MIT license and SQLite's blessing notice, and
+passes the SQLite wheel to Vane's dependency-aware builder and verifier.
+Assembly, index byte checks, and immutable promotion cover the complete graph;
+the existing `testpypi` and `pypi` publishing environments serve both projects.
+Register the additional SQLite project publisher before any manual publication.

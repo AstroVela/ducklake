@@ -4,6 +4,10 @@ platforms = ["manylinux_2_28_x86_64"]
 # TestPyPI upload budget, independent of Vane's native artifact safety limits.
 max_wheel_bytes = 100000000
 
+[providers.sqlite_scanner]
+distribution = "vane-extension-sqlite-scanner"
+dependencies = []
+
 [providers.ducklake]
 distribution = "vane-extension-ducklake"
-dependencies = []
+dependencies = ["sqlite_scanner"]

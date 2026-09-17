@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise native DuckLake scans from a packaged Vane wheel."""
+"""Exercise DuckLake CRUD from a packaged wheel with the default Ray runner."""
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import tempfile
 from pathlib import Path
@@ -25,6 +26,7 @@ def verify_extension_is_wheel_linked(connection: object) -> None:
         raise AssertionError("the packaged Vane wheel does not contain ducklake")
     require_equal(extension[1], "STATICALLY_LINKED", "ducklake install mode before LOAD")
     connection.execute("LOAD parquet")
+    connection.execute("LOAD sqlite_scanner")
     connection.execute("LOAD ducklake")
     loaded = connection.execute(
         "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = 'ducklake'"
@@ -33,12 +35,34 @@ def verify_extension_is_wheel_linked(connection: object) -> None:
 
 
 def main() -> None:
-    if os.environ.get("VANE_RUNNER") != "local-fast":
-        raise RuntimeError("the wheel integration test requires VANE_RUNNER=local-fast")
+    if "VANE_RUNNER" in os.environ:
+        raise RuntimeError("leave VANE_RUNNER unset to qualify the default Ray runner")
 
+    import ray
     import vane
+    from vane import runners
 
-    with tempfile.TemporaryDirectory(prefix="vane-ducklake-local-") as temporary_directory:
+    specification = importlib.util.spec_from_file_location(
+        "ray_helpers", Path(__file__).with_name("test_vane_wheel_ray_ducklake.py")
+    )
+    helpers = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(helpers)
+    if ray.is_initialized():
+        raise RuntimeError("the wheel smoke must own its Ray cluster")
+    cluster = helpers.create_two_worker_cluster(ray)
+    try:
+        require_equal(getattr(runners.get_or_create_runner(), "name", None), "ray", "default runner")
+        exercise_crud(vane)
+    finally:
+        try:
+            vane.teardown_runner()
+        finally:
+            ray.shutdown()
+            cluster.shutdown()
+
+
+def exercise_crud(vane: object) -> None:
+    with tempfile.TemporaryDirectory(prefix="vane-ducklake-smoke-") as temporary_directory:
         root = Path(temporary_directory)
         connection = vane.connect(
             ":memory:",
@@ -50,7 +74,7 @@ def main() -> None:
         try:
             verify_extension_is_wheel_linked(connection)
             connection.execute(
-                f"ATTACH 'ducklake:{root / 'metadata.ducklake'}' AS lake "
+                f"ATTACH 'ducklake:sqlite:{root / 'metadata.sqlite'}' AS lake "
                 f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 0)"
             )
             connection.execute("CREATE TABLE lake.items(id INTEGER, payload VARCHAR)")
@@ -59,7 +83,7 @@ def main() -> None:
             require_equal(
                 connection.sql("SELECT id, payload FROM lake.items ORDER BY id").fetchall(),
                 [(1, "one"), (3, "three")],
-                "native DuckLake readback",
+                "default Ray DuckLake readback",
             )
         finally:
             connection.close()

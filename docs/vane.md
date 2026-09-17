@@ -14,7 +14,8 @@ VCPKG_TOOLCHAIN_PATH='<vcpkg>/scripts/buildsystems/vcpkg.cmake' make vane_ci
 native backend and a two-worker Ray scan from that packaged wheel.
 
 The independent `vane-extension-ducklake` provider uses the same pinned Vane
-source and shared CI tooling. See [provider releases](vane-provider-release.md)
+source and shared CI tooling, and requires the exact `vane-extension-sqlite-scanner`
+provider for its metadata backend. See [provider releases](vane-provider-release.md)
 for dynamic-wheel qualification and the manual TestPyPI publication workflow.
 
 Distributed scans support committed, unencrypted data files and committed delete state. Inlined data,
@@ -24,3 +25,9 @@ worker execution. Ray execution does not fall back to a local scan.
 When a local DuckDB file stores the metadata catalog, attach DuckLake read-only before Ray queries so the coordinator
 and Ray driver can open the catalog concurrently. Workers receive only the serialized scan state and never attach the
 metadata catalog.
+
+For default Ray reads and writes, load the installed DuckLake provider and attach
+`ducklake:sqlite:/absolute/path/metadata.sqlite`. The provider dependency loads
+SQLite automatically. The local qualification shares this file between the
+client and Ray driver processes on one physical host; a DuckDB metadata file
+opened for writing cannot provide that cross-process access.

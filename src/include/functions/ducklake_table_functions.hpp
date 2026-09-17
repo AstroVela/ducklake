@@ -32,6 +32,11 @@ struct MetadataBindData : public TableFunctionData {
 	}
 
 	vector<vector<Value>> rows;
+
+	unique_ptr<FunctionData> Copy() const override;
+	bool Equals(const FunctionData &other) const override;
+	static void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data, const TableFunction &);
+	static unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, TableFunction &);
 };
 
 class DuckLakeBaseMetadataFunction : public TableFunction {

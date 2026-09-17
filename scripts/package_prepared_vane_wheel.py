@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package already-signed DuckLake native data without keys or native builds."""
+"""Package already-signed SQLite and DuckLake native data without keys or native builds."""
 
 from __future__ import annotations
 
@@ -48,14 +48,26 @@ def main() -> int:
     if args.profile == "production":
         builder._require_production_runtimes(runtimes)
     builder._require_git_revision(args.vane_source, args.vane_revision, "Vane")
-    artifact = regular_file(args.signed / "ducklake.duckdb_extension", 384 * 1024 * 1024)
-    unsigned = regular_file(args.prepared / "artifacts/ducklake.duckdb_extension", 384 * 1024 * 1024)
-    if artifact.read_bytes()[:-256] != unsigned.read_bytes()[:-256]:
-        raise ValueError("the signed native payload differs from the original preparation artifact")
-    license_directory = args.prepared / "licenses/ducklake"
-    if {path.name for path in license_directory.iterdir()} != set(builder.LICENSE_NAMES):
-        raise ValueError("prepared license data differs from the reviewed DuckLake contract")
-    licenses = tuple(regular_file(license_directory / name, 16 * 1024 * 1024) for name in builder.LICENSE_NAMES)
+    expected_artifacts = {f"{name}.duckdb_extension" for name in builder.EXTENSION_NAMES}
+    for directory in (args.signed, args.prepared / "artifacts"):
+        if directory.is_symlink() or {path.name for path in directory.iterdir()} != expected_artifacts:
+            raise ValueError("packaging requires the complete fixed SQLite and DuckLake artifact set")
+    artifacts, licenses = {}, {}
+    for name in builder.EXTENSION_NAMES:
+        artifact = regular_file(args.signed / f"{name}.duckdb_extension", 384 * 1024 * 1024)
+        unsigned = regular_file(args.prepared / f"artifacts/{name}.duckdb_extension", 384 * 1024 * 1024)
+        if artifact.read_bytes()[:-256] != unsigned.read_bytes()[:-256]:
+            raise ValueError(f"the signed {name} payload differs from the original preparation artifact")
+        artifacts[name] = artifact
+        license_directory = args.prepared / "licenses" / name
+        if license_directory.is_symlink() or {path.name for path in license_directory.iterdir()} != set(
+            builder.PROVIDER_LICENSE_NAMES[name]
+        ):
+            raise ValueError(f"prepared license data differs from the reviewed {name} contract")
+        licenses[name] = tuple(
+            regular_file(license_directory / filename, 16 * 1024 * 1024)
+            for filename in builder.PROVIDER_LICENSE_NAMES[name]
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     if any(args.output.iterdir()):
         raise ValueError("provider wheel output must be empty")
@@ -69,15 +81,26 @@ def main() -> int:
             try:
                 provider = staging / f"provider-{index}"
                 provider.mkdir()
+                sqlite_wheel = builder._build_provider_wheel(
+                    python=python,
+                    vane_source=args.vane_source.resolve(),
+                    artifact=artifacts["sqlite_scanner"].resolve(),
+                    extension_name="sqlite_scanner",
+                    output_directory=provider,
+                    platform_tag=builder.PROVIDER_PLATFORM_TAG,
+                    trust_identity=identity,
+                    license_files=[path.resolve() for path in licenses["sqlite_scanner"]],
+                )
                 wheel = builder._build_provider_wheel(
                     python=python,
                     vane_source=args.vane_source.resolve(),
-                    artifact=artifact.resolve(),
+                    artifact=artifacts["ducklake"].resolve(),
                     extension_name="ducklake",
                     output_directory=provider,
                     platform_tag=builder.PROVIDER_PLATFORM_TAG,
                     trust_identity=identity,
-                    license_files=[path.resolve() for path in licenses],
+                    license_files=[path.resolve() for path in licenses["ducklake"]],
+                    dependency_wheel=sqlite_wheel,
                 )
                 builder._run(
                     (
@@ -88,16 +111,21 @@ def main() -> int:
                         str(runtime_wheel.resolve()),
                         "--extension-wheel",
                         str(wheel),
+                        "--dependency-wheel",
+                        str(sqlite_wheel),
+                        "--dependency-trust-identity",
+                        identity,
                         "--extension-name",
                         "ducklake",
                         "--trust-identity",
                         identity,
                     )
                 )
-                destination = args.output / wheel.name
-                if destination.exists():
-                    raise ValueError("runtime targets produced a duplicate provider wheel")
-                shutil.copyfile(wheel, destination)
+                for artifact_wheel in (sqlite_wheel, wheel):
+                    destination = args.output / artifact_wheel.name
+                    if destination.exists():
+                        raise ValueError("runtime targets produced a duplicate provider wheel")
+                    shutil.copyfile(artifact_wheel, destination)
             finally:
                 environment.cleanup()
     return 0

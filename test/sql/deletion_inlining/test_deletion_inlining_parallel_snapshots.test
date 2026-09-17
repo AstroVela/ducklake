@@ -1,0 +1,77 @@
+# name: test/sql/deletion_inlining/test_deletion_inlining_parallel_snapshots.test
+# description: Parallel deletion scans preserve per-row snapshots while opening other files
+# group: [deletion_inlining]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+SET threads=8
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS dl (DATA_PATH '${DATA_PATH}/parallel_delete_snapshots', DATA_INLINING_ROW_LIMIT 4, METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+USE dl
+
+statement ok
+CREATE TABLE t (i BIGINT)
+
+# Snapshots 2-33: enough small files for file mapping and chunk output to overlap.
+loop file 0 32
+
+statement ok
+INSERT INTO t SELECT 16 * ${file} + range FROM range(16)
+
+endloop
+
+query I
+SELECT count(*) FROM ducklake_meta.ducklake_data_file WHERE table_id = 1
+----
+32
+
+# Each file has deletions from both snapshot 34 and snapshot 35.
+statement ok
+DELETE FROM t WHERE i % 16 = 0
+
+statement ok
+DELETE FROM t WHERE i % 16 = 1
+
+# Reopen the files with different projections. Omitting rowid exercises the
+# internally projected rowid; both explicit orders exercise the direct output.
+loop attempt 0 30
+
+query II
+SELECT count(*), count(*) FILTER (WHERE snapshot_id != 34 + i % 16)
+FROM ducklake_table_deletions('dl', 'main', 't', 34, 35)
+----
+64	0
+
+query III
+SELECT sum(snapshot_id), sum(rowid), sum(i)
+FROM ducklake_table_deletions('dl', 'main', 't', 34, 35)
+----
+2208	15904	15904
+
+query III
+SELECT sum(rowid), sum(snapshot_id), sum(i)
+FROM ducklake_table_deletions('dl', 'main', 't', 34, 35)
+----
+15904	2208	15904
+
+endloop
+
+# Narrow snapshot ranges must still select the correct deletion from every file.
+query III
+SELECT count(*), min(snapshot_id), max(snapshot_id)
+FROM ducklake_table_deletions('dl', 'main', 't', 35, 35)
+----
+32	35	35
+
+statement ok
+RESET threads
