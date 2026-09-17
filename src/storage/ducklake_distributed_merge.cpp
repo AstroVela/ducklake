@@ -242,7 +242,7 @@ static DistributedExtensionWriteInfo RowDeltaInfo(const DistributedExtensionWrit
                                                   const string &worker_bind_data) {
 	DistributedExtensionWriteInfo result;
 	result.capability = merge_info.capability;
-	result.mode = DistributedWriteMode::CALLBACK;
+	result.mode = DistributedWriteMode::CALLBACK_SINK;
 	result.fragment_codec = DUCKLAKE_ROW_DELTA_FRAGMENT_CODEC;
 	result.worker_bind_data = worker_bind_data;
 	return result;
@@ -671,7 +671,10 @@ static vector<DistributedWriteFragment> DuckLakeMergeFinalize(ClientContext &con
 		}
 		row_count = CheckedAdd(row_count, fragments[0].row_count, "worker affected row count");
 		byte_count = CheckedAdd(byte_count, fragments[0].byte_count, "worker byte count");
-		embedded.push_back(DuckLakeEmbeddedMergeFragment {index, std::move(fragments[0])});
+		DuckLakeEmbeddedMergeFragment entry;
+		entry.action_index = index;
+		entry.fragment = std::move(fragments[0]);
+		embedded.push_back(std::move(entry));
 	}
 	if (row_count == 0) {
 		return {};
@@ -696,7 +699,7 @@ DecodeDistributedMergeResults(ClientContext &context, const DistributedExtension
                               const vector<DistributedWriteTaskResult> &results, const string &data_path,
                               const string &artifact_path, bool use_deletion_vectors) {
 	info.Validate();
-	if (info.mode != DistributedWriteMode::CALLBACK ||
+	if (info.mode != DistributedWriteMode::CALLBACK_SINK ||
 	    info.fragment_codec !=
 	        DistributedPayloadCodec {DUCKLAKE_MERGE_FRAGMENT_CODEC, DUCKLAKE_MERGE_PROTOCOL_VERSION}) {
 		throw InvalidInputException("DuckLake distributed MERGE resolved the wrong worker protocol");
