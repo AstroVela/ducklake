@@ -154,8 +154,8 @@ print(connection.sql("""
 Use `.show()` for display and `.fetchall()` when application code needs Python
 rows. Both execute supported data relations on Ray. Row order is unspecified
 without ORDER BY. The bounded detail previews use `.fetchall()` because
-`.show()` adds a limit that can trigger a batch-index error in the tested
-runtime; aggregate displays above are supported.
+`.show()` adds a limit whose execution failed in the tested runtime;
+aggregate displays above are supported.
 
 ### Use the Relation API
 
