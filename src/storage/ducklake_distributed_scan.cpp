@@ -1569,7 +1569,7 @@ void ConfigureDuckLakeDistributedScan(TableFunction &function) {
 	TableFunctionDistributedScanCallbacks callbacks;
 	callbacks.protocol_version = DUCKLAKE_DISTRIBUTED_SCAN_PROTOCOL_VERSION;
 	callbacks.split_codec = {DUCKLAKE_DISTRIBUTED_SCAN_SPLIT_CODEC, DUCKLAKE_DISTRIBUTED_SCAN_PROTOCOL_VERSION};
-	callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::REQUIRED;
+	callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED;
 	callbacks.plan_splits = DuckLakePlanDistributedScanSplits;
 	callbacks.create_worker_bind = DuckLakeCreateDistributedWorkerBind;
 	callbacks.apply_splits = DuckLakeApplyDistributedScanSplits;

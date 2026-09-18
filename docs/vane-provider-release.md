@@ -1,9 +1,9 @@
 # Vane DuckLake provider releases
 
 `vane-extension-ducklake` packages DuckLake as a signed dynamic Vane provider,
-separate from the `vane-ai` runtime. The initial candidate targets the exact
+separate from the `vane-ai` runtime. The development candidate targets the exact
 Vane source recorded in `vane-extension.toml`, corresponding to
-`vane-ai==0.2.0.dev660`. Each provider wheel requires that exact runtime version;
+`vane-ai==0.2.0.dev663`. Each provider wheel requires that exact runtime version;
 the wheel is not interchangeable with arbitrary Vane or upstream DuckDB builds.
 
 The existing native and statically linked Vane-wheel integration lanes remain
@@ -96,11 +96,11 @@ outside the downloaded data before the job uploads signed native files.
 
 The same top-level `VaneExtension.yml` also offers `operation=release`;
 `build-only` remains the default. Production preparation does not change
-`vane-extension.toml`, the existing `0.2.0.dev660` runtime dependency, or any
+`vane-extension.toml`, the existing `0.2.0.dev663` runtime dependency, or any
 already-published TestPyPI wheels.
 
 Production instead uses `vane-extension-release.toml`. Its current exact Vane
-pin, `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`, contains the production public
+pin, `d1460a580455f01485e2e508e05d0049cb18a105`, contains the production public
 key but **is not a released runtime**. A release dispatch therefore fails at
 the read-only version gate, before native dependency builds, signing, or
 publication. First release a canonical non-development Vane version to PyPI,
@@ -195,7 +195,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev660 --channel testpypi-dev \
+  --vane-version 0.2.0.dev663 --channel testpypi-dev \
   --require-publishable-on testpypi
 ```
 
@@ -207,8 +207,9 @@ the ten assembled provider wheels (five interpreters per provider).
 
 ## Latest-main default Ray qualification
 
-Both manifests pin merged Vane main `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`
-(`0.2.0.dev660`), including the NULL extension-setting transport, late
+The development manifest pins merged Vane main `d1460a580455f01485e2e508e05d0049cb18a105`
+(`0.2.0.dev663`); the production preparation manifest also pins `d1460a580455f01485e2e508e05d0049cb18a105`.
+The development runtime includes the NULL extension-setting transport, late
 source-EOF, ordered task production, and schema-only chunk corrections.
 This is a development qualification, not a production release.
 

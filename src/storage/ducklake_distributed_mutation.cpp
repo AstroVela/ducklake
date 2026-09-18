@@ -1359,7 +1359,7 @@ DuckLakeDistributedRowDeltaResult DecodeDuckLakeDistributedRowDeltaResults(
     const DistributedExtensionWriteInfo &info, const vector<DistributedWriteTaskResult> &results,
     DuckLakeDistributedRowDeltaKind expected_kind, bool expected_deletion_vectors) {
 	info.Validate();
-	if (info.mode != DistributedWriteMode::CALLBACK ||
+	if (info.mode != DistributedWriteMode::CALLBACK_SINK ||
 	    info.fragment_codec !=
 	        DistributedPayloadCodec {DUCKLAKE_ROW_DELTA_FRAGMENT_CODEC, DUCKLAKE_ROW_DELTA_PROTOCOL_VERSION}) {
 		throw InvalidInputException("DuckLake distributed row mutation coordinator resolved the wrong worker protocol");

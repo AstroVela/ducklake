@@ -1063,7 +1063,7 @@ void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader) {
 		DistributedWriteOperatorExtension extension;
 		extension.name = name;
 		extension.protocol_version = 1;
-		extension.mode = DistributedWriteMode::CALLBACK;
+		extension.mode = DistributedWriteMode::CALLBACK_SINK;
 		extension.fragment_codec = {"ducklake.row-delta-fragment", 1};
 		extension.callbacks = DuckLakeDistributedRowDeltaCallbacks();
 		DistributedWriteOperatorExtension::Register(loader, std::move(extension));
@@ -1074,7 +1074,7 @@ void RegisterDuckLakeDistributedWrites(ExtensionLoader &loader) {
 	DistributedWriteOperatorExtension merge;
 	merge.name = "merge";
 	merge.protocol_version = 1;
-	merge.mode = DistributedWriteMode::CALLBACK;
+	merge.mode = DistributedWriteMode::CALLBACK_SINK;
 	merge.fragment_codec = {"ducklake.merge-fragment", 1};
 	merge.callbacks = DuckLakeDistributedMergeCallbacks();
 	DistributedWriteOperatorExtension::Register(loader, std::move(merge));
