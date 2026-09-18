@@ -235,35 +235,3 @@ The static wheel is a separate installation path from the provider recipe.
 Use non-editable installs. See [provider releases](docs/vane-provider-release.md)
 and the [Ray integration suite](test/vane/test_vane_wheel_ray_ducklake.py)
 for artifact qualification and broader mutation/failure coverage.
-
-## Tested examples
-
-All nine Python blocks above were executed sequentially on 2026-09-17 with
-Python 3.12, non-editable provider wheels, and `vane-ai==0.2.0.dev663` from
-Vane revision `d1460a580455f01485e2e508e05d0049cb18a105`. DuckLake was rebuilt from this branch with the current distributed callback
-enums and C++11-compatible MERGE initialization. The matching SQLite provider
-was installed as well; the engine source ID was `d8a9d61d59`.
-
-The test left `VANE_RUNNER` unset, asserted the default Ray runner, and used
-an owned cluster with two CPU execution nodes on one physical host. All blocks
-passed in 71.10 seconds, with five Ray writes and nine Ray reads including
-additional assertions. Checks compared all final rows after the mutations,
-both aggregate totals, and every row of the original historical snapshot.
-
-This validates the local provider walkthrough, not cloud storage, multi-host
-metadata access, or the source-build recipe. Installation used matching local
-wheels; replace the TestPyPI placeholders with published versions.
-
-## Re-run the walkthrough test
-
-With matching provider and Vane wheels installed, run the checked-in test from
-this extension's checkout. Leave `VANE_RUNNER` and `RAY_ADDRESS` unset:
-
-```bash
-python -m pip install pytest
-python -I -m pytest -q -s test/vane/test_vane_readme.py
-```
-
-The test executes the Python blocks from this guide in a fresh temporary
-directory, asserts the default Ray runner, checks the resulting data, and owns
-and cleans up a same-host Ray cluster with two CPU execution nodes.
