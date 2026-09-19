@@ -833,6 +833,13 @@ jobs:
           persist-credentials: false
           submodules: false
 
+      - name: Mark the container checkout as a safe Git directory
+        run: |
+          # This job runs in a manylinux container where the checkout is
+          # owned by the host runner uid. Mark it safe before any git
+          # command; checkout's credential cleanup does not cover this.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Initialize the pinned release validator
         run: git submodule update --init vane-extension-ci-tools
 
