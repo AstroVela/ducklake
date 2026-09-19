@@ -1,9 +1,9 @@
 # Vane DuckLake provider releases
 
 `vane-extension-ducklake` packages DuckLake as a signed dynamic Vane provider,
-separate from the `vane-ai` runtime. The development candidate targets the exact
+separate from the `vane-ai` runtime. The development build targets the exact
 Vane source recorded in `vane-extension.toml`, corresponding to
-`vane-ai==0.2.0.dev663`. Each provider wheel requires that exact runtime version;
+`vane-ai==0.2.0`. Each provider wheel requires that exact runtime version;
 the wheel is not interchangeable with arbitrary Vane or upstream DuckDB builds.
 
 The existing native and statically linked Vane-wheel integration lanes remain
@@ -51,8 +51,15 @@ without `--smoke` for two-worker coverage. All public integration tests leave
 `VANE_RUNNER` unset, avoid runner-selection APIs, and verify the default Ray
 runner. The statically linked suite also uses the default Ray runner.
 
-Publication requires a manual `Vane extension` workflow dispatch with
-`operation=testpypi-dev` on `v1.5-variegata_vane`:
+Build-only CI enables the public CI test key in its locally built runtime and
+packages a matching runtime/provider set. These are test artifacts even though
+the runtime reports `0.2.0`; do not mix them with the PyPI runtime or publish them.
+
+Use `build-only` for PRs and `release` for production. With the stable pin,
+`testpypi-dev` deliberately rejects `0.2.0`; a future development publication
+requires a separately reviewed pin to its exact TestPyPI runtime. That channel
+uses a manual `Vane extension` dispatch with `operation=testpypi-dev` on
+`v1.5-variegata_vane`:
 
 1. Download the exact indexed `vane-ai` runtime wheels for all five CPython
    interpreters, then prepare unsigned native data and licenses without keys.
@@ -73,14 +80,14 @@ There is no central publishing service, runtime download, compatibility
 selection, or fallback path added by this integration. No packages are
 published merely by merging its implementation PR.
 
-## First TestPyPI setup
+## Development TestPyPI setup
 
-Before the first manual publication, configure:
+For future development publications with a matching development runtime, configure:
 
 - a protected GitHub environment named `testpypi` in `AstroVela/ducklake`;
 - its `VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY` secret, containing the
-  existing private key for trust identity `astrovela/vane-testpypi`; the pinned
-  Vane candidate already embeds the matching public key;
+  existing private key for trust identity `astrovela/vane-testpypi`; that
+  development runtime must embed the matching public key. Vane v0.2.0 does not;
 - TestPyPI Trusted Publishers for projects `vane-extension-ducklake` and
   `vane-extension-sqlite-scanner`, both with
   owner `AstroVela`, repository `ducklake`, workflow `VaneExtension.yml`, and
@@ -92,22 +99,17 @@ artifacts. Only the isolated signer receives it, removes it from the process
 environment before invoking subprocesses, and erases its private temporary file
 outside the downloaded data before the job uploads signed native files.
 
-## Production release preparation
+## Production release
 
 The same top-level `VaneExtension.yml` also offers `operation=release`;
-`build-only` remains the default. Production preparation does not change
-`vane-extension.toml`, the existing `0.2.0.dev663` runtime dependency, or any
-already-published TestPyPI wheels.
+`build-only` remains the default. Both manifests pin Vane v0.2.0 at
+`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`.
 
-Production instead uses `vane-extension-release.toml`. Its current exact Vane
-pin, `d1460a580455f01485e2e508e05d0049cb18a105`, contains the production public
-key but **is not a released runtime**. A release dispatch therefore fails at
-the read-only version gate, before native dependency builds, signing, or
-publication. First release a canonical non-development Vane version to PyPI,
-then update this separate manifest to its exact source commit by reviewed PR.
-The source must descend from the production-key commit, and all five matching
-runtime wheels must exist on PyPI. There is no TestPyPI runtime fallback or
-version substitution in the production lane.
+Production uses `vane-extension-release.toml`, exact PyPI runtime wheels and
+the production signer. The source must descend from the production-key commit,
+and all five matching runtime wheels must exist on PyPI. There is no TestPyPI
+runtime fallback or version substitution. Updating the pin does not publish
+providers or establish production qualification.
 
 After that prerequisite, a manual `release` dispatch on this repository's
 protected `v1.5-variegata_vane` branch performs:
@@ -190,13 +192,13 @@ checkout selected by the manifest:
 
 ```sh
 python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
-  --manifest vane-extension.toml --extension-root . \
+  --manifest vane-extension-release.toml --extension-root . \
   --vane-source ../vane \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev663 --channel testpypi-dev \
-  --require-publishable-on testpypi
+  --vane-version 0.2.0 --channel release \
+  --require-publishable-on testpypi --require-publishable-on pypi
 ```
 
 Source verification is read-only and rejects mismatched or dirty Vane/tools
@@ -205,13 +207,11 @@ flags plus `--index testpypi --provider <name> --version <exact-provider-version
 Run it for both `sqlite_scanner` and `ducklake`, using the directory containing
 the ten assembled provider wheels (five interpreters per provider).
 
-## Latest-main default Ray qualification
+## Default Ray qualification
 
-The development manifest pins merged Vane main `d1460a580455f01485e2e508e05d0049cb18a105`
-(`0.2.0.dev663`); the production preparation manifest also pins `d1460a580455f01485e2e508e05d0049cb18a105`.
-The development runtime includes the NULL extension-setting transport, late
-source-EOF, ordered task production, and schema-only chunk corrections.
-This is a development qualification, not a production release.
+Both manifests pin Vane v0.2.0,
+`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`. Build-only tests qualify the
+test-key runtime/provider set; production qualification uses the PyPI runtime.
 
 The ordered INSERT regression covers zero, 256 and 8193 rows, validates every
 row after publication, and checks empty writes publish no files. The
