@@ -8,33 +8,22 @@ unset; no runner-selection call is needed.
 
 ## Install a provider package
 
-Install `vane-extension-ducklake` with its exact matching `vane-ai` and
+Install `vane-extension-ducklake` from PyPI with its exact matching `vane-ai` and
 `vane-extension-sqlite-scanner` dependencies. Use the same wheels on the
 application, Ray coordinator, and workers. Provider versions include an
 artifact identity and differ from the base runtime version.
-
-The following development-channel recipe downloads only the three matching
-artifacts from TestPyPI, then installs ordinary dependencies from PyPI. Replace
-the placeholders with published matching versions for your interpreter and
-platform, and use a fresh wheel directory:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-DUCKLAKE_VERSION='<provider-version>'
-SQLITE_VERSION='<matching-sqlite-provider-version>'
-VANE_VERSION='<matching-vane-version>'
-python -m pip download --no-deps --only-binary=:all: \
-  --index-url https://test.pypi.org/simple/ --dest ducklake-wheels \
-  "vane-extension-ducklake==$DUCKLAKE_VERSION" \
-  "vane-extension-sqlite-scanner==$SQLITE_VERSION" "vane-ai==$VANE_VERSION"
-python -m pip install --index-url https://pypi.org/simple/ \
-  ./ducklake-wheels/*.whl grpcio
+python -m pip install vane-extension-ducklake grpcio
 python -m pip check
 ```
 
-See the [provider release guide](docs/vane-provider-release.md) for package
+`pip` resolves the exact matching dependencies from package metadata. Pin
+exact versions (for example `"vane-extension-ducklake==<version>"`) for
+reproducible deployments. See the [provider release guide](docs/vane-provider-release.md) for package
 identities and release channels. Load the installed provider:
 
 ```python
