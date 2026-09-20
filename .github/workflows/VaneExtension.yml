@@ -1048,8 +1048,43 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  publish-testpypi-sqlite-scanner:
+    name: Publish SQLite provider to TestPyPI
+    needs: assemble-testpypi-ducklake
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi-sqlite-scanner
+      url: https://test.pypi.org/p/vane-extension-sqlite-scanner
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download DuckLake distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
+          path: dist
+
+      - name: Select only the SQLite provider files
+        run: |
+          set -euo pipefail
+          mkdir -p dist-sqlite
+          mv dist/vane_extension_sqlite_scanner-* dist-sqlite/
+          test "$(find dist-sqlite -maxdepth 1 -type f | wc -l)" -gt 0
+
+      - name: Publish through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: true
+          packages-dir: dist-sqlite
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
   publish-testpypi-ducklake:
-    name: Publish SQLite and DuckLake providers to TestPyPI
+    name: Publish DuckLake provider to TestPyPI
     needs: assemble-testpypi-ducklake
     runs-on: ubuntu-24.04
     environment:
@@ -1068,17 +1103,24 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Select only the DuckLake provider files
+        run: |
+          set -euo pipefail
+          mkdir -p dist-ducklake
+          mv dist/vane_extension_ducklake-* dist-ducklake/
+          test "$(find dist-ducklake -maxdepth 1 -type f | wc -l)" -gt 0
+
       - name: Publish through trusted publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           attestations: true
-          packages-dir: dist
+          packages-dir: dist-ducklake
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
 
   verify-testpypi-ducklake:
     name: Verify indexed DuckLake provider
-    needs: [assemble-testpypi-ducklake, publish-testpypi-ducklake]
+    needs: [assemble-testpypi-ducklake, publish-testpypi-sqlite-scanner, publish-testpypi-ducklake]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -1390,8 +1432,43 @@ jobs:
             --directory dist \
             --vane-version "${{ needs.assemble-testpypi-ducklake.outputs.vane_version }}"
 
+  publish-pypi-sqlite-scanner:
+    name: Publish the approved immutable SQLite provider graph
+    if: inputs.operation == 'release'
+    needs: [assemble-testpypi-ducklake, verify-pypi-promotion]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi-sqlite-scanner
+      url: https://pypi.org/p/vane-extension-sqlite-scanner
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download the original assembly artifact by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}
+          merge-multiple: true
+          path: dist
+
+      - name: Select only the SQLite provider files
+        run: |
+          set -euo pipefail
+          mkdir -p dist-sqlite
+          mv dist/vane_extension_sqlite_scanner-* dist-sqlite/
+          test "$(find dist-sqlite -maxdepth 1 -type f | wc -l)" -gt 0
+
+      - name: Publish the unchanged wheels through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: true
+          packages-dir: dist-sqlite
+          repository-url: https://upload.pypi.org/legacy/
+          skip-existing: true
+
   publish-pypi-ducklake:
-    name: Publish the approved immutable SQLite and DuckLake graph
+    name: Publish the approved immutable DuckLake graph
     if: inputs.operation == 'release'
     needs: [assemble-testpypi-ducklake, verify-pypi-promotion]
     runs-on: ubuntu-24.04
@@ -1410,18 +1487,25 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Select only the DuckLake provider files
+        run: |
+          set -euo pipefail
+          mkdir -p dist-ducklake
+          mv dist/vane_extension_ducklake-* dist-ducklake/
+          test "$(find dist-ducklake -maxdepth 1 -type f | wc -l)" -gt 0
+
       - name: Publish the unchanged wheels through trusted publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           attestations: true
-          packages-dir: dist
+          packages-dir: dist-ducklake
           repository-url: https://upload.pypi.org/legacy/
           skip-existing: true
 
   verify-pypi-ducklake:
     name: Verify the published DuckLake files without OIDC
     if: inputs.operation == 'release'
-    needs: [assemble-testpypi-ducklake, publish-pypi-ducklake]
+    needs: [assemble-testpypi-ducklake, publish-pypi-sqlite-scanner, publish-pypi-ducklake]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
