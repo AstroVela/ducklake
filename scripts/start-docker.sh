@@ -15,7 +15,7 @@ trap cleanup_on_failure EXIT
 
 # Reset only this fixture project's containers and data volume.
 docker compose down --volumes --remove-orphans
-docker compose --profile setup pull
+./build_minio_test_images.sh
 docker compose up --detach minio
 
 ready=false

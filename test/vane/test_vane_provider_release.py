@@ -384,20 +384,35 @@ class ProviderReleaseTest(unittest.TestCase):
             },
         )
         self.assertTrue(any("verify-promotion" in step.get("run", "") for step in promotion["steps"]))
-        publisher = jobs["publish-pypi-ducklake"]
-        self.assertEqual(set(publisher["needs"]), {"assemble-testpypi-ducklake", "verify-pypi-promotion"})
-        self.assertEqual(publisher["environment"]["name"], "pypi")
-        self.assertEqual(publisher["permissions"], {"contents": "read", "id-token": "write"})
         artifact_id = "${{ needs.assemble-testpypi-ducklake.outputs.distributions_artifact_id }}"
-        self.assertEqual(len(publisher["steps"]), 2)
-        download, publish = publisher["steps"]
-        self.assertTrue(download["uses"].startswith("actions/download-artifact@"))
-        self.assertEqual(download["with"]["artifact-ids"], artifact_id)
-        self.assertNotIn("name", download["with"])
-        self.assertTrue(publish["uses"].startswith("pypa/gh-action-pypi-publish@"))
-        self.assertEqual(publish["with"]["packages-dir"], "dist")
-        self.assertEqual(publish["with"]["repository-url"], "https://upload.pypi.org/legacy/")
-        self.assertFalse(any("run" in step for step in publisher["steps"]))
+        for provider, distribution, environment in (
+            ("ducklake", "ducklake", "pypi"),
+            ("sqlite-scanner", "sqlite_scanner", "pypi-sqlite-scanner"),
+        ):
+            with self.subTest(provider=provider):
+                publisher = jobs[f"publish-pypi-{provider}"]
+                self.assertEqual(set(publisher["needs"]), {"assemble-testpypi-ducklake", "verify-pypi-promotion"})
+                self.assertEqual(publisher["environment"]["name"], environment)
+                self.assertEqual(publisher["permissions"], {"contents": "read", "id-token": "write"})
+                self.assertEqual(len(publisher["steps"]), 3)
+                download, select, publish = publisher["steps"]
+                self.assertTrue(download["uses"].startswith("actions/download-artifact@"))
+                self.assertEqual(download["with"]["artifact-ids"], artifact_id)
+                self.assertNotIn("name", download["with"])
+                directory = "dist-ducklake" if provider == "ducklake" else "dist-sqlite"
+                self.assertEqual(
+                    select["run"],
+                    "set -euo pipefail\n"
+                    f"mkdir -p {directory}\n"
+                    f"mv dist/vane_extension_{distribution}-* {directory}/\n"
+                    f'test "$(find {directory} -maxdepth 1 -type f | wc -l)" -gt 0\n',
+                )
+                self.assertTrue(publish["uses"].startswith("pypa/gh-action-pypi-publish@"))
+                self.assertEqual(publish["with"]["packages-dir"], directory)
+                self.assertEqual(publish["with"]["repository-url"], "https://upload.pypi.org/legacy/")
+                self.assertTrue(publish["with"]["attestations"])
+                self.assertNotIn("run", download)
+                self.assertNotIn("run", publish)
         indexed = jobs["verify-pypi-ducklake"]
         self.assertEqual(indexed["permissions"], {"contents": "read"})
         self.assertIn("publish-pypi-ducklake", indexed["needs"])
