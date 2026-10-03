@@ -25,7 +25,7 @@ import yaml
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPOSITORY_ROOT / "vane-provider-release.toml"
 VANE_VERSION = "0.2.0.dev612"
-VERSIONS = {"sqlite_scanner": "0.2.0.0.612.2", "ducklake": "0.2.0.0.612.1"}
+VERSIONS = {"sqlite_scanner": "0.2.0.1.dev612", "ducklake": "0.2.0.1.dev612"}
 INTERPRETERS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 PLATFORM = "manylinux_2_28_x86_64"
 
@@ -50,10 +50,13 @@ def write_wheels(
     sqlite_requirement: str | None = None,
 ) -> list[Path]:
     distribution = f"vane_extension_{provider}"
-    version = VERSIONS[provider]
+    version = VERSIONS[provider].removesuffix(".dev612") if vane_version == "0.2.0" else VERSIONS[provider]
+    dependency_version = VERSIONS["sqlite_scanner"]
+    if vane_version == "0.2.0":
+        dependency_version = dependency_version.removesuffix(".dev612")
     requirements = [vane_requirement or f"vane-ai==={vane_version}"]
     if provider == "ducklake":
-        requirements.append(sqlite_requirement or f"vane-extension-sqlite-scanner==={VERSIONS['sqlite_scanner']}")
+        requirements.append(sqlite_requirement or f"vane-extension-sqlite-scanner==={dependency_version}")
     metadata = (
         "Metadata-Version: 2.4\n"
         f"Name: vane-extension-{provider.replace('_', '-')}\n"
@@ -136,7 +139,7 @@ class ProviderReleaseTest(unittest.TestCase):
             verify.assert_called_once_with(
                 REPOSITORY_ROOT / "vane-extension.toml", REPOSITORY_ROOT, directory / "vane", "a" * 40
             )
-            self.assertEqual(query.call_count, len(VERSIONS))
+            self.assertEqual(query.call_count, 2 * len(VERSIONS))
             expected = {
                 "vane_version": VANE_VERSION,
                 **{f"{name}_version": version for name, version in VERSIONS.items()},
