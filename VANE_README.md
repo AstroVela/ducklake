@@ -235,3 +235,14 @@ The static wheel is a separate installation path from the provider recipe.
 Use non-editable installs. See [provider releases](docs/vane-provider-release.md)
 and the [Ray integration suite](test/vane/test_vane_wheel_ray_ducklake.py)
 for artifact qualification and broader mutation/failure coverage.
+
+## Local UDF write qualification
+
+The development SDK in `vane-extension.toml` includes host-owned child
+planning for private COPY extensions. Rebuild the base engine and signed
+provider together when changing this native SDK. Build-only CI runs the
+[shared local connector write gate](https://github.com/AstroVela/vane-extension-ci-tools/blob/c355a85311dd15f306e6a194987f8b77139712b8/README.md#github-actions)
+with both local runner names, subprocess tasks and actors, ordinary SQL
+controls, empty and multi-batch writes, injected failures and readback
+through a fresh connection. Existing Ray lanes remain separate. The
+production manifest is independent; this CI gate does not publish wheels.
