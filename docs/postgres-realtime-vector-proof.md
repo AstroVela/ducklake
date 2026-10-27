@@ -71,5 +71,5 @@ cases kill the DuckDB client, not the PostgreSQL server.
 Writes remain serialized. Request records use the same guarded SQL recipe as
 the native baseline and do not enforce PRIMARY KEY/UNIQUE or provide a public
 ingestion API. Commit-response loss and failure during catalog commit require
-their own fault-injection proof. The [baseline guide](native-realtime-vector-proof.md)
+the [COMMIT outcome fault proof](postgres-commit-outcome-proof.md). The [baseline guide](native-realtime-vector-proof.md)
 records the remaining Vortex, ANN, and table-format adoption gates.

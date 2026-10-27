@@ -104,5 +104,9 @@ jobs:
         createdb ducklakedb
         python3 -I test/vane/test_postgres_realtime_vector.py \
           --duckdb build/release/duckdb --dsn 'dbname=ducklakedb'
+        python3 -I test/vane/test_postgres_commit_outcome.py \
+          --duckdb build/release/duckdb --dsn 'dbname=ducklakedb' \
+          --upstream-host 127.0.0.1 --upstream-port 5432 \
+          --report build/postgres-commit-outcomes.json
         build/release/test/unittest --test-config test/configs/postgres.json --test-dir ./ "test/sql/*"
 
