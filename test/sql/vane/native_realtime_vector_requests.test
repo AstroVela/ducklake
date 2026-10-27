@@ -1,0 +1,145 @@
+# name: test/sql/vane/native_realtime_vector_requests.test
+# description: single-writer request records share DuckLake vector transactions
+# group: [vane]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/requests.ducklake' AS lake (DATA_PATH '__TEST_DIR__/requests', DATA_INLINING_ROW_LIMIT 100)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT NOT NULL, embedding FLOAT[] NOT NULL, payload VARCHAR NOT NULL)
+
+statement ok
+CREATE TABLE lake.requests(request_id VARCHAR NOT NULL, payload_hash VARCHAR NOT NULL)
+
+# This is a serialized-writer recipe, not an enforced PRIMARY KEY or public API.
+statement ok
+CREATE MACRO should_apply(incoming_id, incoming_hash) AS (SELECT CASE WHEN matches = 0 THEN true WHEN matches = 1 AND stored_hash = incoming_hash THEN false ELSE error('request_id payload mismatch or duplicate record') END FROM (SELECT count(*) AS matches, min(payload_hash) AS stored_hash FROM lake.requests WHERE request_id = incoming_id))
+
+statement ok
+BEGIN
+
+statement ok
+MERGE INTO lake.items AS target USING (SELECT 1 AS id, [0, 0, 0]::FLOAT[] AS embedding, 'first' AS payload WHERE should_apply('r1', sha256('1|[0,0,0]|first'))) AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET embedding = source.embedding, payload = source.payload WHEN NOT MATCHED THEN INSERT VALUES (source.id, source.embedding, source.payload)
+
+statement ok
+INSERT INTO lake.requests SELECT 'r1', sha256('1|[0,0,0]|first') WHERE should_apply('r1', sha256('1|[0,0,0]|first'))
+
+statement ok
+COMMIT
+
+query II
+SELECT id, payload FROM lake.items
+----
+1	first
+
+# A later committed version must survive a retry of r1.
+statement ok
+BEGIN
+
+statement ok
+MERGE INTO lake.items AS target USING (SELECT 1 AS id, [9, 0, 0]::FLOAT[] AS embedding, 'second' AS payload WHERE should_apply('r2', sha256('1|[9,0,0]|second'))) AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET embedding = source.embedding, payload = source.payload WHEN NOT MATCHED THEN INSERT VALUES (source.id, source.embedding, source.payload)
+
+statement ok
+INSERT INTO lake.requests SELECT 'r2', sha256('1|[9,0,0]|second') WHERE should_apply('r2', sha256('1|[9,0,0]|second'))
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN
+
+statement ok
+MERGE INTO lake.items AS target USING (SELECT 1 AS id, [0, 0, 0]::FLOAT[] AS embedding, 'first' AS payload WHERE should_apply('r1', sha256('1|[0,0,0]|first'))) AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET embedding = source.embedding, payload = source.payload WHEN NOT MATCHED THEN INSERT VALUES (source.id, source.embedding, source.payload)
+
+statement ok
+INSERT INTO lake.requests SELECT 'r1', sha256('1|[0,0,0]|first') WHERE should_apply('r1', sha256('1|[0,0,0]|first'))
+
+statement ok
+COMMIT
+
+query III
+SELECT id, payload, list_distance(embedding, [0, 0, 0]::FLOAT[]) FROM lake.items
+----
+1	second	9
+
+query II
+SELECT count(*), count(DISTINCT request_id) FROM lake.requests
+----
+2	2
+
+statement ok
+BEGIN
+
+statement error
+SELECT should_apply('r1', sha256('1|[1,0,0]|changed'))
+----
+request_id payload mismatch
+
+statement ok
+ROLLBACK
+
+# A failure after recording the request must roll back the entire batch.
+statement ok
+BEGIN
+
+statement ok
+UPDATE lake.items SET embedding = [0, 0, 0], payload = 'uncommitted' WHERE id = 1
+
+statement ok
+INSERT INTO lake.requests VALUES ('failed', sha256('invalid-batch'))
+
+statement error
+INSERT INTO lake.items VALUES (2, [0, 0, 0], NULL)
+----
+NOT NULL constraint failed
+
+statement ok
+ROLLBACK
+
+query III
+SELECT id, payload, list_distance(embedding, [0, 0, 0]::FLOAT[]) FROM lake.items
+----
+1	second	9
+
+query I
+SELECT count(*) FROM lake.requests WHERE request_id = 'failed'
+----
+0
+
+statement ok
+CALL ducklake_flush_inlined_data('lake')
+
+restart
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/requests.ducklake' AS lake (DATA_PATH '__TEST_DIR__/requests', DATA_INLINING_ROW_LIMIT 100)
+
+statement ok
+CREATE MACRO should_apply(incoming_id, incoming_hash) AS (SELECT CASE WHEN matches = 0 THEN true WHEN matches = 1 AND stored_hash = incoming_hash THEN false ELSE error('request_id payload mismatch or duplicate record') END FROM (SELECT count(*) AS matches, min(payload_hash) AS stored_hash FROM lake.requests WHERE request_id = incoming_id))
+
+# Retry the same guarded write after database reopen and materialization.
+statement ok
+BEGIN
+
+statement ok
+MERGE INTO lake.items AS target USING (SELECT 1 AS id, [0, 0, 0]::FLOAT[] AS embedding, 'first' AS payload WHERE should_apply('r1', sha256('1|[0,0,0]|first'))) AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET embedding = source.embedding, payload = source.payload WHEN NOT MATCHED THEN INSERT VALUES (source.id, source.embedding, source.payload)
+
+statement ok
+INSERT INTO lake.requests SELECT 'r1', sha256('1|[0,0,0]|first') WHERE should_apply('r1', sha256('1|[0,0,0]|first'))
+
+statement ok
+COMMIT
+
+query III
+SELECT id, payload, list_distance(embedding, [0, 0, 0]::FLOAT[]) FROM lake.items
+----
+1	second	9
+
+query II
+SELECT count(*), count(DISTINCT request_id) FROM lake.requests
+----
+2	2
