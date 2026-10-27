@@ -2,6 +2,8 @@
 
 #include "common/ducklake_name_map.hpp"
 #include "storage/ducklake_delete_filter.hpp"
+#include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_inlined_data_reader.hpp"
 #include "storage/ducklake_metadata_info.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
@@ -33,8 +35,9 @@ namespace duckdb {
 
 namespace {
 
-static constexpr uint32_t DUCKLAKE_DISTRIBUTED_SCAN_PROTOCOL_VERSION = 2;
+static constexpr uint32_t DUCKLAKE_DISTRIBUTED_SCAN_PROTOCOL_VERSION = 3;
 static constexpr const char *DUCKLAKE_DISTRIBUTED_SCAN_SPLIT_CODEC = "ducklake.scan-file";
+static constexpr idx_t DUCKLAKE_DISTRIBUTED_INLINE_MAX_BYTES = 64 * 1024 * 1024;
 
 enum class DuckLakeDistributedBindKind : uint8_t { PLANNED = 1, WORKER = 2 };
 enum class DuckLakeDistributedScanPhase : uint8_t { PLANNED, WORKER_TEMPLATE, WORKER_ASSIGNED };
@@ -70,7 +73,15 @@ struct DuckLakeDistributedScanSplitEnvelope {
 	DuckLakeFileListEntry file;
 	DuckLakeFileListExtendedEntry mutation_file;
 	unique_ptr<DuckLakeDistributedNameMap> name_map;
+	vector<MultiFileColumnDefinition> inline_columns;
+	string inline_batch;
+	string inline_source_name;
+	idx_t source_file_index = DConstants::INVALID_INDEX;
 };
+
+static void SerializeWorkerColumn(Serializer &serializer, const MultiFileColumnDefinition &column);
+static MultiFileColumnDefinition DeserializeWorkerColumn(Deserializer &deserializer);
+static void ValidateWorkerColumns(const vector<MultiFileColumnDefinition> &columns, unordered_set<int32_t> &field_ids);
 
 static bool IsCanonicalSplitId(const string &split_id) {
 	if (split_id.empty() || (split_id.size() > 1 && split_id[0] == '0')) {
@@ -174,6 +185,18 @@ static DuckLakeFileData DeserializeFileData(Deserializer &deserializer, bool all
 }
 
 static void ValidateFileEntry(const DuckLakeFileListEntry &file) {
+	if (file.data_type == DuckLakeDataType::INLINED_DATA) {
+		if (file.file_id.IsValid() || file.data_file_id.IsValid() || file.mapping_id.IsValid() ||
+		    !file.delete_file.path.empty() || !file.inlined_file_deletions.empty() || file.max_row_count.IsValid() ||
+		    file.snapshot_filter_min.IsValid() || file.snapshot_filter_max.IsValid() || file.row_id_start.IsValid() ||
+		    file.snapshot_id.IsValid() || file.file.footer_size.IsValid() || !file.column_min_max.empty() ||
+		    file.file.file_size_bytes > DUCKLAKE_DISTRIBUTED_INLINE_MAX_BYTES) {
+			throw SerializationException("Distributed DuckLake inline split contains invalid file state");
+		}
+		ValidateFileData(file.file, false);
+		ValidateFileData(file.delete_file, true);
+		return;
+	}
 	if (file.data_type != DuckLakeDataType::DATA_FILE || !file.file_id.IsValid() ||
 	    file.file_id.index >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START) {
 		throw NotImplementedException("Distributed DuckLake scans require committed file-backed table data");
@@ -205,6 +228,14 @@ static bool FileDataMatches(const DuckLakeFileData &left, const DuckLakeFileData
 
 static void ValidateMutationFileEntry(const DuckLakeFileListEntry &file,
                                       const DuckLakeFileListExtendedEntry &mutation_file) {
+	if (file.data_type == DuckLakeDataType::INLINED_DATA) {
+		if (mutation_file.data_type != DuckLakeDataType::INLINED_DATA || mutation_file.file_id.IsValid() ||
+		    mutation_file.delete_file_id.IsValid() || mutation_file.delete_file_begin_snapshot.IsValid() ||
+		    mutation_file.row_count == 0 || mutation_file.row_count > STANDARD_VECTOR_SIZE) {
+			throw SerializationException("Distributed DuckLake inline split contains invalid batch metadata");
+		}
+		return;
+	}
 	auto mapping_matches = file.mapping_id.IsValid() == mutation_file.mapping_id.IsValid() &&
 	                       (!file.mapping_id.IsValid() || file.mapping_id.index == mutation_file.mapping_id.index);
 	if (mutation_file.data_type != DuckLakeDataType::DATA_FILE || !mutation_file.file_id.IsValid() ||
@@ -288,10 +319,11 @@ static DuckLakeFileListEntry DeserializeFileEntry(Deserializer &deserializer) {
 	}
 	result.mapping_id = has_mapping_id ? MappingIndex(mapping_id) : MappingIndex();
 	auto data_type = deserializer.ReadProperty<uint8_t>(17, "data_type");
-	if (data_type != static_cast<uint8_t>(DuckLakeDataType::DATA_FILE)) {
-		throw NotImplementedException("Distributed DuckLake scans do not support inlined table data");
+	if (data_type != static_cast<uint8_t>(DuckLakeDataType::DATA_FILE) &&
+	    data_type != static_cast<uint8_t>(DuckLakeDataType::INLINED_DATA)) {
+		throw NotImplementedException("Distributed DuckLake scans do not support transaction-local data");
 	}
-	result.data_type = DuckLakeDataType::DATA_FILE;
+	result.data_type = static_cast<DuckLakeDataType>(data_type);
 	result.file_id = DataFileIndex(deserializer.ReadProperty<idx_t>(18, "file_id"));
 	auto inlined_deletions = deserializer.ReadProperty<vector<idx_t>>(19, "inlined_file_deletions");
 	if (!std::is_sorted(inlined_deletions.begin(), inlined_deletions.end()) ||
@@ -402,7 +434,10 @@ static DuckLakeDistributedNameMap DeserializeNameMap(Deserializer &deserializer)
 
 static string SerializeScanSplit(const DuckLakeDistributedScanIdentity &identity, idx_t coordinator_file_index,
                                  const DuckLakeFileListEntry &file, const DuckLakeFileListExtendedEntry &mutation_file,
-                                 optional_ptr<const DuckLakeNameMap> native_name_map) {
+                                 optional_ptr<const DuckLakeNameMap> native_name_map,
+                                 const vector<MultiFileColumnDefinition> &inline_columns = {},
+                                 const string &inline_batch = string(), const string &inline_source_name = string(),
+                                 idx_t source_file_index = DConstants::INVALID_INDEX) {
 	ValidateIdentity(identity);
 	ValidateFileEntry(file);
 	ValidateMutationFileEntry(file, mutation_file);
@@ -442,6 +477,14 @@ static string SerializeScanSplit(const DuckLakeDistributedScanIdentity &identity
 	                         mutation_file.delete_file_id.IsValid() ? mutation_file.delete_file_id.index : 0);
 	SerializeOptionalIndex(serializer, 14, "has_delete_file_begin_snapshot", 15, "delete_file_begin_snapshot",
 	                       mutation_file.delete_file_begin_snapshot);
+	serializer.WriteList(16, "inline_columns", inline_columns.size(), [&](Serializer::List &list, idx_t index) {
+		list.WriteObject([&](Serializer &object) { SerializeWorkerColumn(object, inline_columns[index]); });
+	});
+	serializer.WriteProperty(17, "inline_batch", inline_batch);
+	serializer.WriteProperty(18, "inline_source_name", inline_source_name);
+	serializer.WriteProperty(19, "source_file_index",
+	                         source_file_index == DConstants::INVALID_INDEX ? coordinator_file_index
+	                                                                        : source_file_index);
 	serializer.End();
 	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
 }
@@ -484,6 +527,28 @@ static DuckLakeDistributedScanSplitEnvelope DeserializeScanSplit(const string &p
 	result.mutation_file.delete_file_id = has_delete_file_id ? DataFileIndex(delete_file_id) : DataFileIndex();
 	result.mutation_file.delete_file_begin_snapshot =
 	    DeserializeOptionalIndex(deserializer, 14, "has_delete_file_begin_snapshot", 15, "delete_file_begin_snapshot");
+	deserializer.ReadList(16, "inline_columns", [&](Deserializer::List &list, idx_t) {
+		list.ReadObject(
+		    [&](Deserializer &object) { result.inline_columns.push_back(DeserializeWorkerColumn(object)); });
+	});
+	result.inline_batch = deserializer.ReadProperty<string>(17, "inline_batch");
+	result.inline_source_name = deserializer.ReadProperty<string>(18, "inline_source_name");
+	result.source_file_index = deserializer.ReadProperty<idx_t>(19, "source_file_index");
+	if (result.source_file_index == DConstants::INVALID_INDEX) {
+		throw SerializationException("Distributed DuckLake scan split is missing its source file index");
+	}
+	if (result.file.data_type == DuckLakeDataType::INLINED_DATA) {
+		if (result.inline_columns.empty() || result.inline_batch.empty() ||
+		    result.inline_batch.size() != result.file.file.file_size_bytes || result.inline_source_name.empty() ||
+		    result.file.file.path != result.inline_source_name + "#" + result.split_id) {
+			throw SerializationException("Distributed DuckLake inline split is missing its frozen batch");
+		}
+		unordered_set<int32_t> field_ids;
+		ValidateWorkerColumns(result.inline_columns, field_ids);
+	} else if (!result.inline_columns.empty() || !result.inline_batch.empty() || !result.inline_source_name.empty() ||
+	           result.source_file_index != result.coordinator_file_index) {
+		throw SerializationException("Distributed DuckLake file split contains unexpected inline data");
+	}
 	deserializer.End();
 	if (!IsStrictUUID(result.split_set_id) || !IsCanonicalSplitId(result.split_id) ||
 	    !IsStrictUUID(result.table_uuid) || result.table_id == DConstants::INVALID_INDEX ||
@@ -564,6 +629,9 @@ static void ValidateWorkerColumns(const vector<MultiFileColumnDefinition> &colum
 static OpenFileInfo CreateOpenFileInfo(const DuckLakeFileListEntry &file_entry) {
 	OpenFileInfo result(file_entry.file.path);
 	auto extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+	if (file_entry.data_type == DuckLakeDataType::INLINED_DATA) {
+		extended_info->options["frozen_inline_data"] = Value::BOOLEAN(true);
+	}
 	extended_info->options["file_size"] = Value::UBIGINT(file_entry.file.file_size_bytes);
 	if (file_entry.file.footer_size.IsValid()) {
 		extended_info->options["footer_size"] = Value::UBIGINT(file_entry.file.footer_size.GetIndex());
@@ -597,6 +665,8 @@ public:
 		    : payload(std::move(payload_p)), split_id(std::move(split.split_id)),
 		      coordinator_file_index(split.coordinator_file_index), file(std::move(split.file)),
 		      mutation_file(std::move(split.mutation_file)), name_map(std::move(split.name_map)),
+		      inline_columns(std::move(split.inline_columns)), inline_batch(std::move(split.inline_batch)),
+		      inline_source_name(std::move(split.inline_source_name)), source_file_index(split.source_file_index),
 		      open_file(CreateOpenFileInfo(file)) {
 		}
 
@@ -606,6 +676,10 @@ public:
 		DuckLakeFileListEntry file;
 		DuckLakeFileListExtendedEntry mutation_file;
 		unique_ptr<DuckLakeDistributedNameMap> name_map;
+		vector<MultiFileColumnDefinition> inline_columns;
+		string inline_batch;
+		string inline_source_name;
+		idx_t source_file_index;
 		OpenFileInfo open_file;
 	};
 
@@ -683,6 +757,46 @@ public:
 			throw InternalException("Distributed DuckLake scan file index is out of bounds");
 		}
 		return files[file_index]->file;
+	}
+
+	shared_ptr<BaseFileReader> CreateInlineReader(ClientContext &context, const OpenFileInfo &file) const {
+		RequireFilesAvailable();
+		if (!file.extended_info ||
+		    file.extended_info->options.find("frozen_inline_data") == file.extended_info->options.end()) {
+			return nullptr;
+		}
+		for (const auto &entry : files) {
+			if (entry->file.file.path != file.path || entry->file.data_type != DuckLakeDataType::INLINED_DATA) {
+				continue;
+			}
+			vector<data_t> buffer(entry->inline_batch.begin(), entry->inline_batch.end());
+			MemoryStream stream(buffer.data(), buffer.size());
+			BinaryDeserializer deserializer(stream);
+			deserializer.Begin();
+			DataChunk chunk;
+			chunk.Deserialize(deserializer);
+			deserializer.End();
+			if (chunk.size() != entry->mutation_file.row_count || chunk.ColumnCount() != entry->inline_columns.size()) {
+				throw SerializationException("Distributed DuckLake inline batch has inconsistent dimensions");
+			}
+			for (idx_t index = 0; index < chunk.ColumnCount(); index++) {
+				if (chunk.data[index].GetType() != entry->inline_columns[index].type) {
+					throw SerializationException("Distributed DuckLake inline batch has inconsistent column types");
+				}
+			}
+			auto data = make_shared_ptr<DuckLakeInlinedData>();
+			data->data = make_uniq<ColumnDataCollection>(context, chunk.GetTypes());
+			data->data->Append(chunk);
+			auto source_file = file;
+			source_file.path = entry->inline_source_name;
+			return make_shared_ptr<DuckLakeInlinedDataReader>(source_file, std::move(data), entry->inline_columns);
+		}
+		return nullptr;
+	}
+
+	idx_t GetSourceFileIndex(idx_t file_index) const {
+		RequireFilesAvailable();
+		return files.at(file_index)->source_file_index;
 	}
 
 	const DuckLakeFileListExtendedEntry &GetMutationFileEntry(idx_t file_index) const {
@@ -914,6 +1028,14 @@ public:
 		return make_uniq<DuckLakeDistributedMultiFileReader>();
 	}
 
+	shared_ptr<BaseFileReader> CreateReader(ClientContext &context, GlobalTableFunctionState &gstate,
+	                                        const OpenFileInfo &file, idx_t file_idx,
+	                                        const MultiFileBindData &bind_data) override {
+		auto &file_list = bind_data.file_list->Cast<DuckLakeDistributedMultiFileList>();
+		auto reader = file_list.CreateInlineReader(context, file);
+		return reader ? reader : MultiFileReader::CreateReader(context, gstate, file, file_idx, bind_data);
+	}
+
 	shared_ptr<MultiFileList> CreateFileList(ClientContext &context, const vector<string> &paths,
 	                                         const FileGlobInput &options) override {
 		throw InternalException("Distributed DuckLake worker file lists must be assigned explicitly");
@@ -937,7 +1059,7 @@ public:
 		auto local_file_index = reader_data.reader->file_list_idx.GetIndex();
 		auto &file_entry = file_list.GetFileEntry(local_file_index);
 		auto &reader = *reader_data.reader;
-		reader.file_list_idx = optional_idx(file_list.GetCoordinatorFileIndex(local_file_index));
+		reader.file_list_idx = optional_idx(file_list.GetSourceFileIndex(local_file_index));
 		if (!file_entry.delete_file.path.empty() || file_entry.max_row_count.IsValid() ||
 		    !file_entry.inlined_file_deletions.empty()) {
 			auto delete_filter = make_uniq<DuckLakeDeleteFilter>();
@@ -1009,6 +1131,11 @@ public:
 	                                   const MultiFileReaderBindData &bind_data,
 	                                   const virtual_column_map_t &virtual_columns) override {
 		NormalizeListChildNames(reader_data.reader->columns);
+		if (reader_data.file_to_be_opened.extended_info &&
+		    reader_data.file_to_be_opened.extended_info->options.count("frozen_inline_data")) {
+			return MultiFileReader::CreateMapping(context, reader_data, global_columns, global_column_ids, filters,
+			                                      multi_file_list, bind_data, virtual_columns);
+		}
 		auto &file_list = multi_file_list.Cast<DuckLakeDistributedMultiFileList>();
 		auto coordinator_file_index = reader_data.reader->file_list_idx.GetIndex();
 		auto name_map = file_list.GetNameMapByCoordinatorFileIndex(coordinator_file_index);
@@ -1042,6 +1169,13 @@ public:
 	                           const vector<MultiFileColumnDefinition> &local_columns, idx_t &column_id,
 	                           const LogicalType &type, MultiFileLocalIndex local_index,
 	                           optional_ptr<MultiFileColumnDefinition> &global_column_reference) override {
+		if (column_id == MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER &&
+		    reader_data.file_to_be_opened.extended_info &&
+		    reader_data.file_to_be_opened.extended_info->options.count("frozen_inline_data") &&
+		    TryFindColumnByFieldId(local_columns, MultiFileReader::ROW_ID_FIELD_ID, row_id_column.get(),
+		                           global_column_reference)) {
+			return nullptr;
+		}
 		if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
 			if (TryFindColumnByFieldId(local_columns, MultiFileReader::ROW_ID_FIELD_ID, row_id_column.get(),
 			                           global_column_reference)) {
@@ -1292,6 +1426,96 @@ static DuckLakeDistributedScanIdentity GetCoordinatorIdentity(const TableFunctio
 	return result;
 }
 
+static void FreezeInlineSplits(const DuckLakeDistributedScanIdentity &identity, DuckLakeFunctionInfo &read_info,
+                               const OpenFileInfo &file, idx_t source_file_index, idx_t &inline_bytes,
+                               vector<string> &splits) {
+	auto transaction = read_info.GetTransaction();
+	auto &catalog = transaction->GetCatalog();
+	auto &manager = transaction->GetMetadataManager();
+	reference<DuckLakeTableEntry> schema_table = read_info.table;
+	auto schema_version = file.extended_info->options.at("schema_version").GetValue<idx_t>();
+	DuckLakeSnapshot schema_snapshot(
+	    catalog.GetBeginSnapshotForSchemaVersion(read_info.table_id, schema_version, *transaction), schema_version, 0,
+	    0);
+	auto entry = catalog.GetEntryById(*transaction, schema_snapshot, read_info.table_id);
+	if (!entry) {
+		throw TransactionException("DuckLake inline schema is unavailable at the scan snapshot");
+	}
+	schema_table = entry->Cast<DuckLakeTableEntry>();
+	auto columns = DuckLakeMultiFileReader::ColumnsFromFieldData(schema_table.get().GetFieldData(), true);
+	MultiFileColumnDefinition row_id("_ducklake_internal_row_id", LogicalType::BIGINT);
+	row_id.identifier = Value::INTEGER(MultiFileReader::ROW_ID_FIELD_ID);
+	MultiFileColumnDefinition snapshot_id("_ducklake_internal_snapshot_id", LogicalType::BIGINT);
+	snapshot_id.identifier = Value::INTEGER(MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID);
+	columns.insert(columns.begin(), std::move(snapshot_id));
+	columns.insert(columns.begin(), std::move(row_id));
+	vector<string> projection {"row_id", "begin_snapshot"};
+	vector<LogicalType> types {LogicalType::BIGINT, LogicalType::BIGINT};
+	auto &metadata_type = catalog.MetadataType();
+	bool needs_cast = !metadata_type.empty() && metadata_type != "duckdb" && metadata_type != "quack" &&
+	                  metadata_type != "quack_scanner";
+	for (idx_t index = 2; index < columns.size(); index++) {
+		auto &column = columns[index];
+		auto expression = KeywordHelper::WriteOptionallyQuoted(column.name);
+		if (needs_cast && column.type.id() != LogicalTypeId::VARCHAR) {
+			expression = manager.CastColumnToTarget(expression, column.type);
+		}
+		projection.push_back(std::move(expression));
+		types.push_back(column.type);
+	}
+	auto result = manager.ReadInlinedData(identity.snapshot, file.path, projection);
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to freeze DuckLake inline data: ");
+	}
+	while (auto input = result->Fetch()) {
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), types);
+		if (input->ColumnCount() != types.size() || input->size() > STANDARD_VECTOR_SIZE) {
+			throw SerializationException("DuckLake inline source returned an invalid batch shape");
+		}
+		for (idx_t index = 0; index < types.size(); index++) {
+			if (input->data[index].GetType() == types[index]) {
+				chunk.data[index].Reference(input->data[index]);
+			} else if (input->data[index].GetType().id() == LogicalTypeId::BLOB &&
+			           types[index].id() == LogicalTypeId::VARCHAR) {
+				// PostgreSQL's bytea-backed business strings use the same representation
+				// as its native DuckLake inline reader.
+				chunk.data[index].Reinterpret(input->data[index]);
+			} else {
+				throw SerializationException("DuckLake inline source returned an unexpected column type");
+			}
+		}
+		chunk.SetCardinality(input->size());
+		if (chunk.size() == 0) {
+			continue;
+		}
+		MemoryStream stream(Allocator::DefaultAllocator());
+		BinarySerializer serializer(stream);
+		serializer.Begin();
+		chunk.Serialize(serializer);
+		serializer.End();
+		auto bytes = stream.GetPosition();
+		if (bytes > DUCKLAKE_DISTRIBUTED_INLINE_MAX_BYTES - inline_bytes) {
+			throw InvalidInputException("Distributed DuckLake inline scan exceeds the 64 MiB transport limit");
+		}
+		string batch(reinterpret_cast<const char *>(stream.GetData()), bytes);
+		DuckLakeFileListEntry frozen;
+		frozen.data_type = DuckLakeDataType::INLINED_DATA;
+		frozen.file.path = file.path + "#" + std::to_string(splits.size());
+		frozen.file.file_size_bytes = bytes;
+		DuckLakeFileListExtendedEntry metadata;
+		metadata.data_type = DuckLakeDataType::INLINED_DATA;
+		metadata.row_count = chunk.size();
+		auto payload = SerializeScanSplit(identity, splits.size(), frozen, metadata, nullptr, columns, batch, file.path,
+		                                  source_file_index);
+		if (payload.size() > DUCKLAKE_DISTRIBUTED_INLINE_MAX_BYTES - inline_bytes) {
+			throw InvalidInputException("Distributed DuckLake inline scan exceeds the 64 MiB transport limit");
+		}
+		inline_bytes += payload.size();
+		splits.push_back(std::move(payload));
+	}
+}
+
 static vector<string> PlanCoordinatorSplitPayloads(const MultiFileBindData &bind_data,
                                                    const DuckLakeDistributedScanIdentity &identity,
                                                    DuckLakeFunctionInfo &read_info) {
@@ -1301,9 +1525,15 @@ static vector<string> PlanCoordinatorSplitPayloads(const MultiFileBindData &bind
 		throw InternalException("Distributed DuckLake scan returned inconsistent file counts");
 	}
 	const auto &mutation_files = file_list.GetDistributedFilesExtended(identity.snapshot);
-	if (files.size() != mutation_files.size()) {
-		throw NotImplementedException(
-		    "Distributed DuckLake scans do not support metadata-inlined or transaction-local source data");
+	if (file_list.HasTransactionLocalData()) {
+		throw NotImplementedException("Distributed DuckLake scans do not support transaction-local source data");
+	}
+	idx_t data_file_count = 0;
+	for (const auto &file : files) {
+		data_file_count += file.data_type == DuckLakeDataType::DATA_FILE;
+	}
+	if (data_file_count != mutation_files.size()) {
+		throw SerializationException("Distributed DuckLake scan returned inconsistent file metadata");
 	}
 	unordered_map<string, const DuckLakeFileListExtendedEntry *> mutation_files_by_path;
 	for (const auto &mutation_file : mutation_files) {
@@ -1312,11 +1542,17 @@ static vector<string> PlanCoordinatorSplitPayloads(const MultiFileBindData &bind
 		}
 	}
 	auto transaction = read_info.GetTransaction();
+	auto open_files = file_list.GetAllFiles();
+	idx_t inline_bytes = 0;
 	vector<string> result;
 	result.reserve(files.size());
 	unordered_set<string> paths;
 	for (idx_t index = 0; index < files.size(); index++) {
 		auto &file = files[index];
+		if (file.data_type == DuckLakeDataType::INLINED_DATA) {
+			FreezeInlineSplits(identity, read_info, open_files[index], index, inline_bytes, result);
+			continue;
+		}
 		ValidateFileEntry(file);
 		if (!paths.insert(file.file.path).second) {
 			throw InvalidInputException("Distributed DuckLake scan planned data file '%s' more than once",
@@ -1332,7 +1568,7 @@ static vector<string> PlanCoordinatorSplitPayloads(const MultiFileBindData &bind
 		if (file.mapping_id.IsValid()) {
 			name_map = transaction->GetMappingById(file.mapping_id);
 		}
-		result.push_back(SerializeScanSplit(identity, index, file, *mutation_file->second, name_map));
+		result.push_back(SerializeScanSplit(identity, result.size(), file, *mutation_file->second, name_map));
 	}
 	return result;
 }
@@ -1550,6 +1786,9 @@ bool TryGetDuckLakeDistributedMutationSource(const MultiFileBindData &bind_data,
 	source_files.reserve(file_count);
 	for (idx_t index = 0; index < file_count; index++) {
 		const auto &scan_file = file_list->GetFileEntry(index);
+		if (scan_file.data_type != DuckLakeDataType::DATA_FILE) {
+			throw NotImplementedException("Distributed DuckLake mutations require file-backed source data");
+		}
 		if (!scan_file.inlined_file_deletions.empty() || scan_file.max_row_count.IsValid() ||
 		    scan_file.snapshot_filter_min.IsValid() || scan_file.snapshot_filter_max.IsValid()) {
 			throw NotImplementedException(

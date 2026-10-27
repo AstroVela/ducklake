@@ -377,7 +377,30 @@ void DuckLakeMultiFileList::GetFilesForTable() const {
 		transaction_row_start += file.row_count;
 		files.emplace_back(std::move(file_entry));
 	}
-	inlined_data_tables = read_info.table.GetInlinedDataTables();
+	if (read_info.table_id.IsTransactionLocal()) {
+		inlined_data_tables = read_info.table.GetInlinedDataTables();
+	} else {
+		// A flush can retire an empty inline table without changing the table schema.
+		// Read the registry in the same metadata transaction as the frozen file list,
+		// rather than keeping the names from a cached catalog entry on another connection.
+		auto tables = transaction.Query(
+		    read_info.snapshot,
+		    StringUtil::Format("SELECT table_name, schema_version FROM {METADATA_CATALOG}.ducklake_inlined_data_tables "
+		                       "WHERE table_id = %llu ORDER BY schema_version, table_name",
+		                       read_info.table_id.index));
+		if (tables->HasError()) {
+			tables->GetErrorObject().Throw("Failed to read DuckLake inline table registry: ");
+		}
+		inlined_data_tables.clear();
+		while (auto chunk = tables->Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				DuckLakeInlinedTableInfo table;
+				table.table_name = chunk->GetValue(0, row).GetValue<string>();
+				table.schema_version = chunk->GetValue(1, row).GetValue<idx_t>();
+				inlined_data_tables.push_back(std::move(table));
+			}
+		}
+	}
 	for (auto &table : inlined_data_tables) {
 		DuckLakeFileListEntry file_entry;
 		file_entry.file.path = table.table_name;

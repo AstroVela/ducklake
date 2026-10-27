@@ -853,6 +853,10 @@ def run_mutated_worker_write(
         nonlocal mutated_file_count
         result = fragment_executor(request)
         if drop_task_result:
+            # Let intermediate exchanges finish so the terminal writer actually
+            # runs; this fault targets its selected commit result, not shuffle output.
+            if dict(request).get("exchange_sink_instance") is not None:
+                return result
             mutated_file_count += sum(payload.num_rows for payload in result.partition_payloads)
             return None
         payloads = []

@@ -118,7 +118,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Exercise DuckLake through two Ray workers
+      - name: Install the packaged Vane wheel for Ray qualification
+        id: ray-wheel-install
         shell: bash
         run: |
           set -euo pipefail
@@ -130,7 +131,29 @@ jobs:
             exit 1
           fi
           python -m pip install --disable-pip-version-check "${wheels[0]}"
+
+      - name: Exercise DuckLake through two Ray workers
+        shell: bash
+        run: |
+          set -euo pipefail
+          . .venv-vane-wheel-ray-integration/bin/activate
           python -I test/vane/test_vane_wheel_ray_ducklake.py
+
+      - name: Qualify realtime vectors through two Ray workers
+        if: ${{ !cancelled() && steps.ray-wheel-install.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          . .venv-vane-wheel-ray-integration/bin/activate
+          python -I test/vane/test_vane_realtime_vector.py --report ray-realtime-vector.json
+
+      - name: Preserve realtime vector qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ray-realtime-vector
+          path: ray-realtime-vector.json
+          if-no-files-found: ignore
 
   vane-provider-release-tooling:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
