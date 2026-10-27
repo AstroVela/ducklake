@@ -102,6 +102,7 @@ access. The PostgreSQL service's own durability settings must be qualified
 separately; the local run uses fsync and synchronous_commit enabled.
 
 The [PostgreSQL vector proof](postgres-realtime-vector-proof.md) records the
-independently reproduced nested-vector NOT NULL defect. This draft retains
-those failing regressions and does not change primary-table ownership,
+independently reproduced nested-vector NOT NULL defect. The native write fix
+in this branch makes those regressions pass; it does not resolve the separate
+file-backed COMMIT-response-loss failure recorded above or change primary-table ownership,
 introduce a source WAL, or enable Vortex/ANN/Ray integration.

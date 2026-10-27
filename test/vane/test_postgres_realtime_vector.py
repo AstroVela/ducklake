@@ -236,6 +236,40 @@ def exercise(probe: PostgresProbe) -> None:
     )
 
 
+def exercise_not_null(probe: PostgresProbe) -> None:
+    probe.query(
+        "CREATE TABLE lake.null_checks(id INTEGER, embedding FLOAT[] NOT NULL);"
+        "INSERT INTO lake.null_checks VALUES (1,[]),(2,[NULL]);"
+    )
+    statements = [
+        "INSERT INTO lake.null_checks VALUES (3,NULL);",
+        "UPDATE lake.null_checks SET embedding=NULL WHERE id=1;",
+        "MERGE INTO lake.null_checks AS target USING (SELECT 1 AS id) AS source ON target.id=source.id "
+        "WHEN MATCHED THEN UPDATE SET embedding=NULL;",
+        "MERGE INTO lake.null_checks AS target USING (SELECT 3 AS id) AS source ON target.id=source.id "
+        "WHEN NOT MATCHED THEN INSERT VALUES (source.id,NULL);",
+    ]
+    for statement in statements:
+        try:
+            probe.query(statement)
+        except AssertionError as error:
+            if "NOT NULL constraint failed" not in str(error):
+                raise
+        else:
+            raise AssertionError("top-level vector NULL unexpectedly accepted: " + statement)
+        require_equal(
+            probe.query(
+                "SELECT id,len(embedding) AS dimension,embedding IS NULL AS root_null,"
+                "embedding[1] IS NULL AS child_null FROM lake.null_checks ORDER BY id;"
+            ),
+            [
+                {"id": 1, "dimension": 0, "root_null": False, "child_null": True},
+                {"id": 2, "dimension": 1, "root_null": False, "child_null": True},
+            ],
+            "failed nested write leaves original rows and valid child NULL unchanged",
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", required=True, type=Path)
@@ -247,21 +281,23 @@ def main() -> None:
     args = parser.parse_args()
     if os.name != "posix":
         parser.error("this probe requires POSIX SIGKILL")
-    with tempfile.TemporaryDirectory(prefix="ducklake-postgres-vectors-") as directory:
-        probe = PostgresProbe(
-            args.duckdb.resolve(strict=True),
-            args.extension.resolve(strict=True) if args.extension else None,
-            args.postgres_extension.resolve(strict=True) if args.postgres_extension else None,
-            Path(directory),
-            args.dsn,
-        )
-        try:
-            exercise(probe)
-        finally:
-            probe.cleanup()
-        print(
-            "PASS: PostgreSQL inlined vectors, cross-process snapshots, flush, serialized retry, rollback, client death"
-        )
+    for row_limit in [100, 0]:
+        with tempfile.TemporaryDirectory(prefix="ducklake-postgres-vectors-") as directory:
+            probe = PostgresProbe(
+                args.duckdb.resolve(strict=True),
+                args.extension.resolve(strict=True) if args.extension else None,
+                args.postgres_extension.resolve(strict=True) if args.postgres_extension else None,
+                Path(directory),
+                args.dsn,
+                row_limit=row_limit,
+            )
+            try:
+                if row_limit == 100:
+                    exercise(probe)
+                exercise_not_null(probe)
+            finally:
+                probe.cleanup()
+    print("PASS: PostgreSQL vector lifecycle and nested NOT NULL for both inline and file-backed writes")
 
 
 if __name__ == "__main__":
