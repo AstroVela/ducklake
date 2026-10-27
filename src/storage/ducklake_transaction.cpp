@@ -763,13 +763,26 @@ void DuckLakeTransaction::Start() {
 }
 
 void DuckLakeTransaction::Commit() {
-	if (ChangesMade()) {
-		FlushChanges();
-	} else if (connection) {
-		connection->Commit();
-		if (!state->flushed_inlined_tables.empty()) {
-			DropEmptySupersededInlinedTablesClientSide();
+	try {
+		if (ChangesMade()) {
+			FlushChanges();
+		} else if (connection) {
+			connection->Commit();
+			if (!state->flushed_inlined_tables.empty()) {
+				DropEmptySupersededInlinedTablesClientSide();
+			}
 		}
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (state->commit_outcome == DuckLakeCommitOutcome::UNKNOWN) {
+			error.Throw("DuckLake commit outcome is unknown; transaction files were retained. "
+			            "Check the catalog from a new connection before retrying or reclaiming files. ");
+		}
+		if (state->commit_outcome == DuckLakeCommitOutcome::COMMITTED) {
+			error.Throw(
+			    "DuckLake metadata commit succeeded but finalization failed; transaction files were retained. ");
+		}
+		throw;
 	}
 	connection.reset();
 	state->local_changes.Clear();
@@ -779,7 +792,9 @@ void DuckLakeTransaction::Commit() {
 void DuckLakeTransaction::Rollback() {
 	if (connection) {
 		// rollback any changes made to the metadata catalog
-		connection->Rollback();
+		if (connection->context->transaction.HasActiveTransaction()) {
+			connection->Rollback();
+		}
 		connection.reset();
 	}
 	state->CleanupFiles();
@@ -1353,10 +1368,15 @@ void DuckLakeTransaction::FlushChanges() {
 }
 
 void DuckLakeTransaction::ApplyServerSideCommit(idx_t schema_version) {
+	state->commit_outcome = DuckLakeCommitOutcome::COMMITTED;
 	catalog_version = schema_version;
 	if (connection) {
 		connection->Commit();
 	}
+}
+
+void DuckLakeTransaction::MarkCommitAttempted() {
+	state->commit_outcome = DuckLakeCommitOutcome::UNKNOWN;
 }
 
 void DuckLakeTransaction::DropEmptySupersededInlinedTablesClientSide() {
@@ -1398,7 +1418,8 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		}
 	};
 	context.commit_connection = [&]() {
-		connection->Commit();
+		auto &metadata_catalog = Catalog::GetCatalog(*connection->context, ducklake_catalog.MetadataDatabaseName());
+		state->CommitMetadataConnection(*connection, metadata_catalog);
 	};
 	context.try_rollback = [&]() {
 		if (connection->context->transaction.HasActiveTransaction()) {

@@ -333,6 +333,7 @@ public:
 	void RunCommitLoop(DuckLakeSnapshot transaction_snapshot, const TransactionChangeInformation &transaction_changes,
 	                   const DuckLakeRetryConfig &retry_config);
 	void ApplyServerSideCommit(idx_t schema_version);
+	void MarkCommitAttempted();
 	//! Post-commit cleanup of empty inlined-data tables superseded by later schema versions.
 	void DropEmptySupersededInlinedTablesClientSide();
 
