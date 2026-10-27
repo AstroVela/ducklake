@@ -102,5 +102,7 @@ jobs:
         mkdir -p "$EXT_DIR"
         cp "$REPO_DIR/postgres_scanner.duckdb_extension" "$EXT_DIR/"
         createdb ducklakedb
+        python3 -I test/vane/test_postgres_realtime_vector.py \
+          --duckdb build/release/duckdb --dsn 'dbname=ducklakedb'
         build/release/test/unittest --test-config test/configs/postgres.json --test-dir ./ "test/sql/*"
 
