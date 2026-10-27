@@ -258,6 +258,7 @@ public:
 };
 
 SinkResultType DuckLakeMergeInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
+	insert.Cast<DuckLakeInsert>().table->VerifyNotNull(chunk);
 	auto &local_state = input.local_state.Cast<DuckLakeMergeIntoLocalState>();
 	ProjectAndCastForCopy(context.client, chunk, copy, local_state.expression_executor.get(), local_state.chunk,
 	                      local_state.cast_chunk);
@@ -270,7 +271,6 @@ SinkCombineResultType DuckLakeMergeInsert::Combine(ExecutionContext &context, Op
 	OperatorSinkCombineInput combine_input {*copy.sink_state, *local_state.copy_sink_state, input.interrupt_state};
 	return copy.Combine(context, combine_input);
 }
-
 
 namespace {
 
@@ -297,8 +297,9 @@ public:
 } // namespace
 
 // Scan copy operator source and sink into insert operator — shared by MergeInsert and MergeUpdate
-static SinkFinalizeType FinalizeCopyToInsert(Pipeline &pipeline, Event &event, ClientContext &context, PhysicalOperator &copy_op,
-                                 PhysicalOperator &insert_op, InterruptState &interrupt_state) {
+static SinkFinalizeType FinalizeCopyToInsert(Pipeline &pipeline, Event &event, ClientContext &context,
+                                             PhysicalOperator &copy_op, PhysicalOperator &insert_op,
+                                             InterruptState &interrupt_state) {
 	OperatorSinkFinalizeInput copy_finalize {*copy_op.sink_state, interrupt_state};
 	CaptureEvent capture_event(pipeline.executor);
 	auto finalize_result = copy_op.Finalize(pipeline, capture_event, context, copy_finalize);

@@ -26,25 +26,31 @@ database's public schema. The DBMS Catalog Tests workflow runs it before the
 existing PostgreSQL SQL suite, using the already provisioned service and built
 scanner. The native DuckDB-catalog proof remains independently runnable.
 
-## Observed blocker: vector NOT NULL
+## Baseline blocker: vector NOT NULL
 
-The fork currently accepts `INSERT INTO items VALUES (1, NULL)` for an
+The unpatched fork accepts `INSERT INTO items VALUES (1, NULL)` for an
 `embedding FLOAT[] NOT NULL` column. `DESCRIBE` still reports the column as
 non-nullable, and a fresh process reads the persisted null vector. This
 reproduces with both DuckDB and PostgreSQL catalogs and with inlining limits
 100 and 0 (inlined and file-backed writes).
 
-Two SQL regressions retain the required behavior and intentionally fail on
-the current implementation:
+Two SQL regressions retain the required behavior and fail on the baseline:
 
 ```sh
 build/release/test/unittest 'test/sql/vane/native_vector_not_null_*' --require ducklake
 ```
 
-The PostgreSQL transaction probe uses a scalar category NOT NULL violation
-to independently qualify rollback. That passing scenario does not resolve
-the nested-vector constraint defect. This draft stays unmerged while the
-failing regressions and adoption decision are reviewed.
+The native write fix in this branch checks the root vector's validity before
+data enters the inline buffer or file writer. It covers INSERT, UPDATE, and
+MERGE while continuing to allow empty lists, lists with NULL children, and
+non-null structs/maps containing NULL children. The two original regressions
+and the added nested-write test pass with the fix.
+
+The PostgreSQL probe separately checks INSERT, UPDATE, MERGE UPDATE, and MERGE
+INSERT against both inline and file-backed catalogs, including reads from
+fresh processes. Scalar category constraints still independently exercise
+batch rollback. This validates the native write path; distributed writer
+validation and table-format adoption remain separate decisions.
 
 ## Assertions
 
