@@ -9,6 +9,9 @@ The proof exercises committed inlined data before file generation, the same
 logical rows after materialization, and recovery after process termination.
 The source data remains under DuckLake's transaction protocol throughout.
 
+The [PostgreSQL proof](postgres-realtime-vector-proof.md) separately qualifies
+the remote catalog path and independent native client processes.
+
 ## Run the proof
 
 Initialize the pinned submodules and build the ordinary extension with the
