@@ -87,9 +87,12 @@ Reproduce only this blocking case with the same arguments above plus:
 --row-limit 0 --mode ack_lost
 ```
 
-This result blocks accepting the current fork's file-backed uncertain-commit
-recovery contract. Fixing the cleanup protocol and rerunning the proof are
-separate work; passing the inline case does not qualify file-backed writes.
+This baseline result blocks accepting the unpatched fork's file-backed
+uncertain-commit recovery contract. The [file-retention repair](uncertain-commit-file-retention.md)
+in this branch preserves files at that boundary and returns an explicit
+unknown-outcome error. The probe also checks that it reports uncertainty
+and that it does not remove any prepared files. The original proof branch
+retains the failing case for comparison.
 
 The JSON report preserves each injection boundary, the client's exit status,
 and whether all state/retry/history checks passed. All four cases run even
