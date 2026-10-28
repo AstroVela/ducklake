@@ -65,6 +65,72 @@ public:
 
 	string Execute(const vector<string> &args) {
 		const auto &op = args.at(1);
+		if (op == "build") {
+			auto result = SQL(writer, "SELECT * FROM ducklake_build_vortex_index('lake','main','items'," +
+			                              Value(args.at(2)).ToSQLString() + "," + Value(args.at(3)).ToSQLString() +
+			                              ",8," + args.at(4) + ")");
+			ViewJSON json;
+			auto value = json.Object();
+			json.Number(value, "revision", result->GetValue(0, 0).GetValue<idx_t>());
+			json.Text(value, "generation", StringValue::Get(result->GetValue(1, 0)));
+			return json.Finish(value);
+		}
+		if (op == "cancel-build" || op == "fail-build" || op == "crash-build") {
+			Connection builder(database);
+			return DuckLakeVortexIndex::BuildAndPublish(
+			           *builder.context, "lake", "main", "items", "knn", args.at(3), 8, std::stoull(args.at(4)),
+			           [&](const string &stage) {
+				           if (stage != args.at(2)) {
+					           return;
+				           }
+				           if (op == "cancel-build") {
+					           builder.Interrupt();
+				           } else if (op == "fail-build") {
+					           throw InvalidInputException("Injected native build failure");
+				           } else {
+					           Write(root + "/build-" + stage + ".ready", "ready");
+					           string line;
+					           std::getline(std::cin, line);
+					           throw InvalidInputException("Build crash fixture resumed without SIGKILL");
+				           }
+			           })
+			    .ToJSON();
+		}
+		if (op == "split-build" || op == "mutate-build") {
+			Connection builder(database);
+			Pause pause;
+			auto pending = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::BuildAndPublish(*builder.context, "lake", "main", "items", "knn",
+				                                            args.at(2), 8, std::stoull(args.at(3)),
+				                                            [&](const string &stage) {
+					                                            if (stage == args.at(4)) {
+						                                            pause.Stop();
+					                                            }
+				                                            });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			DuckLakeVortexSearchRequest request;
+			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
+			request.k = 10;
+			string before;
+			if (op == "split-build") {
+				auto rows = DuckLakeVortexSearch::Execute(*writer.context, Options("knn"), request);
+				before = SearchJSON(rows.rows, rows.diagnostics);
+			}
+			SQL(writer, ReadText(args.at(5)));
+			string during;
+			if (op == "split-build") {
+				auto rows = DuckLakeVortexSearch::Execute(*writer.context, Options("knn"), request);
+				during = SearchJSON(rows.rows, rows.diagnostics);
+			}
+			pause.Release();
+			auto published = pending.get();
+			if (op == "mutate-build") {
+				return published.ToJSON();
+			}
+			return "{\"published\":" + published.ToJSON() + ",\"before\":" + before + ",\"during\":" + during + "}";
+		}
 		if (op == "binary-rejections") {
 			Connection reader(database);
 			auto view = DuckLakeVortexReadView::AcquireQuery(reader, Options("knn"));
@@ -239,15 +305,20 @@ public:
 			Save(args.at(5), pending.get());
 			return published.ToJSON();
 		}
-		if (op == "race") {
+		if (op == "race" || op == "race-build") {
 			std::promise<void> release;
 			auto start = release.get_future().share();
 			auto publish = [&](const string &path) {
 				start.wait();
 				Connection owner(database);
 				try {
-					DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), path,
-					                             std::stoull(args.at(5)));
+					if (op == "race-build") {
+						DuckLakeVortexIndex::BuildAndPublish(*owner.context, "lake", "main", "items", args.at(2), path,
+						                                     8, std::stoull(args.at(5)));
+					} else {
+						DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), path,
+						                             std::stoull(args.at(5)));
+					}
 					return true;
 				} catch (const TransactionException &error) {
 					Require(string(error.what()).find("revision conflict") != string::npos,

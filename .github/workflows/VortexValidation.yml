@@ -231,6 +231,11 @@ jobs:
             --driver build/index-shell/ducklake_vortex_catalog_driver \
             --probe build/index-cargo/ci/ducklake-vortex-index-probe \
             --output-dir build/index-logs/sql-search
+      - name: Validate native index construction and F-to-B publication
+        run: |
+          python3 -I test/vane/test_native_vortex_build.py \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --output-dir build/index-logs/native-build
       - name: Validate query projections and record isolated process cost
         run: |
           python3 -I test/vane/test_native_vortex_cost.py \

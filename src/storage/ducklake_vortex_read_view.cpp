@@ -56,7 +56,8 @@ StorageLock &DuckLakeVortexReadView::AdmissionLock() {
 
 static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVortexViewOptions &options,
                                           const std::function<void(const string &)> &observe,
-                                          optional_ptr<ClientContext> owner, bool oracle_rows) {
+                                          optional_ptr<ClientContext> owner, bool oracle_rows,
+                                          bool build_files = false) {
 	const bool invalid_dimension =
 	    options.index_name.empty() ? options.dimension == 0 || options.dimension > 4096 : options.dimension != 0;
 	if (invalid_dimension || options.max_source_bytes == 0 || options.max_source_bytes > 64 * 1024 * 1024 ||
@@ -107,9 +108,13 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		json.Number(admission, "format_version", 1);
 		auto mixed = json.Object();
 		json.Number(mixed, "format_version", 1);
-		json.Add(admission, "capture", mixed);
 		auto captured = json.Object();
-		json.Add(mixed, "file_capture", captured);
+		if (build_files) {
+			json.Add(admission, "capture", captured);
+		} else {
+			json.Add(admission, "capture", mixed);
+			json.Add(mixed, "file_capture", captured);
+		}
 		json.Number(captured, "format_version", 1);
 		json.Text(captured, "table_uuid", table.GetTableUUID());
 		json.Number(captured, "snapshot_id", snapshot.snapshot_id);
@@ -203,7 +208,12 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		            KeywordHelper::WriteOptionallyQuoted(options.table);
 		checkpoint("before_rows");
 
-		if (oracle_rows) {
+		if (build_files) {
+			if (result.sources.empty()) {
+				throw InvalidInputException("Vortex index build requires materialized Vortex files");
+			}
+			result.visible_rows = physical_rows;
+		} else if (oracle_rows) {
 			auto rows = reader.SendQuery(
 			    "SELECT id, embedding, category, payload, filename, file_row_number, rowid FROM " + name +
 			    " AT (VERSION => " + to_string(snapshot.snapshot_id) + ") LIMIT " + to_string(row_limit + 1));
@@ -377,6 +387,16 @@ DuckLakeVortexReadView DuckLakeVortexReadView::AcquireQuery(Connection &reader,
                                                             const std::function<void(const string &)> &observe,
                                                             optional_ptr<ClientContext> owner) {
 	return AcquireView(reader, options, observe, owner, false);
+}
+
+DuckLakeVortexReadView DuckLakeVortexReadView::AcquireBuild(Connection &reader,
+                                                            const DuckLakeVortexViewOptions &options,
+                                                            const std::function<void(const string &)> &observe,
+                                                            optional_ptr<ClientContext> owner) {
+	if (!options.index_name.empty()) {
+		throw InvalidInputException("Build capture does not select a published index");
+	}
+	return AcquireView(reader, options, observe, owner, false, true);
 }
 
 } // namespace duckdb
