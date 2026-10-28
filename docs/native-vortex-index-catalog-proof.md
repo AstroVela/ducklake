@@ -149,5 +149,5 @@ Publication limits each reference/manifest to 1 MiB and its B source/artifact
 inventories to 64 MiB each. Local builds reused qualified DuckDB v1.5.5 engine
 objects and pinned dependencies; ON/default-OFF CMake configuration was checked
 separately. The Draft PR workflow performs clean hosted builds and runs all
-five process proofs. A production SQL vector-search operator remains a later
-integration step.
+five process proofs. The next [native SQL search proof](native-vortex-sql-search-proof.md)
+connects named discovery to an experimental in-process search table function.
