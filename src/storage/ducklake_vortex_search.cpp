@@ -12,11 +12,15 @@ struct QueryControl {
 	ClientContext &context;
 	const std::function<void(const string &)> &observe;
 	std::exception_ptr error;
+	vector<DuckLakeVortexSourceBuffer> &sources;
 };
 
 uint8_t CheckQuery(void *pointer, const uint8_t *stage, uint64_t length) {
 	auto &control = *static_cast<QueryControl *>(pointer);
 	try {
+		if (string(reinterpret_cast<const char *>(stage), length) == "source_pinned") {
+			control.sources.clear();
+		}
 		if (control.observe) {
 			control.observe(string(reinterpret_cast<const char *>(stage), length));
 		}
@@ -43,9 +47,16 @@ DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
 	}
 	Connection reader(*context.db);
 	auto view = DuckLakeVortexReadView::AcquireQuery(reader, options, observe, &context);
-	QueryControl control {context, observe, nullptr};
+	vector<DuckLakeVortexQuerySource> sources;
+	for (auto &source : view.sources) {
+		sources.push_back(
+		    {source.file_id, reinterpret_cast<const uint8_t *>(source.bytes.data()), source.bytes.size()});
+	}
+	QueryControl control {context, observe, nullptr, view.sources};
 	DuckLakeVortexQueryInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
 	                                view.admission_json.size(),
+	                                sources.data(),
+	                                sources.size(),
 	                                reinterpret_cast<const uint8_t *>(view.managed_data_path.data()),
 	                                view.managed_data_path.size(),
 	                                reinterpret_cast<const uint8_t *>(options.index_name.data()),
@@ -89,6 +100,9 @@ DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
 	json.Number(capture, "business_rows", view.captured_business_rows);
 	json.Number(capture, "oracle_bytes", view.rows_json.size());
 	json.Number(capture, "admission_bytes", view.admission_json.size());
+	json.Number(capture, "binary_source_count", sources.size());
+	json.Number(capture, "binary_source_bytes", view.source_bytes);
+	json.Number(capture, "retained_native_source_buffers", view.sources.size());
 	json.Add(details, "native_capture", capture);
 	output.diagnostics = json.Finish(details);
 	auto count = ducklake_vortex_query_count(result.get());

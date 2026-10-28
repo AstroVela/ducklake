@@ -3,9 +3,17 @@
 #include <cstdint>
 
 extern "C" {
+struct DuckLakeVortexQuerySource {
+	// Bytes live until source_pinned or return; descriptors live until return.
+	uint64_t file_id;
+	const uint8_t *data;
+	uint64_t size;
+};
 struct DuckLakeVortexQueryInput {
 	const uint8_t *admission;
 	uint64_t admission_len;
+	const DuckLakeVortexQuerySource *sources;
+	uint64_t source_count;
 	const uint8_t *data_path;
 	uint64_t data_path_len;
 	const uint8_t *index_name;

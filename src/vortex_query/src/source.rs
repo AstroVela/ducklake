@@ -105,6 +105,11 @@ struct VectorAdapter {
     session: VortexSession,
 }
 
+enum SourceInput<'a> {
+    Paths(Option<&'a BTreeMap<u64, String>>),
+    Buffers(BTreeMap<u64, ByteBuffer>),
+}
+
 impl PhysicalSource {
     pub async fn open(bytes: &[u8], session: VortexSession) -> VortexResult<Self> {
         Self::open_with_budget(bytes, session, MAX_SOURCE_BYTES).await
@@ -115,7 +120,7 @@ impl PhysicalSource {
         session: VortexSession,
         budget: usize,
     ) -> VortexResult<Self> {
-        Self::open_files(bytes, session, budget, None).await
+        Self::open_sources(bytes, session, budget, SourceInput::Paths(None)).await
     }
 
     pub async fn open_pinned(
@@ -124,14 +129,23 @@ impl PhysicalSource {
         budget: usize,
         pins: &BTreeMap<u64, String>,
     ) -> VortexResult<Self> {
-        Self::open_files(bytes, session, budget, Some(pins)).await
+        Self::open_sources(bytes, session, budget, SourceInput::Paths(Some(pins))).await
     }
 
-    async fn open_files(
+    pub async fn open_buffers(
         bytes: &[u8],
         session: VortexSession,
         budget: usize,
-        pins: Option<&BTreeMap<u64, String>>,
+        buffers: BTreeMap<u64, ByteBuffer>,
+    ) -> VortexResult<Self> {
+        Self::open_sources(bytes, session, budget, SourceInput::Buffers(buffers)).await
+    }
+
+    async fn open_sources(
+        bytes: &[u8],
+        session: VortexSession,
+        budget: usize,
+        mut input: SourceInput<'_>,
     ) -> VortexResult<Self> {
         let capture: Capture =
             serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
@@ -154,7 +168,11 @@ impl PhysicalSource {
             files: capture.files.clone(),
         };
         snapshot.validate()?;
-        if pins.is_some_and(|pins| pins.len() != snapshot.files.len()) {
+        let count = match &input {
+            SourceInput::Paths(pins) => pins.map(BTreeMap::len),
+            SourceInput::Buffers(buffers) => Some(buffers.len()),
+        };
+        if count.is_some_and(|count| count != snapshot.files.len()) {
             vortex_bail!("Admitted source inventory must match every captured file");
         }
         let mut visible = BTreeSet::new();
@@ -167,24 +185,29 @@ impl PhysicalSource {
         let mut files = BTreeMap::new();
         let mut remaining = budget.min(MAX_SOURCE_BYTES);
         for file in &snapshot.files {
-            let path = match pins {
-                Some(pins) => pins
-                    .get(&file.id)
-                    .ok_or_else(|| vortex_err!("Missing admitted source file"))?,
-                None => &file.uri,
+            let bytes = match &mut input {
+                SourceInput::Buffers(buffers) => buffers
+                    .remove(&file.id)
+                    .ok_or_else(|| vortex_err!("Missing admitted source buffer"))?,
+                SourceInput::Paths(pins) => {
+                    let path = match pins {
+                        Some(pins) => pins
+                            .get(&file.id)
+                            .ok_or_else(|| vortex_err!("Missing admitted source file"))?,
+                        None => &file.uri,
+                    };
+                    let metadata = fs::metadata(path)?;
+                    if !metadata.is_file() || metadata.len() > remaining as u64 {
+                        vortex_bail!("Physical source exceeds its local byte budget");
+                    }
+                    ByteBuffer::from(fs::read(path)?)
+                }
             };
-            let metadata = fs::metadata(path)?;
-            if !metadata.is_file() || metadata.len() > remaining as u64 {
-                vortex_bail!("Physical source exceeds its local byte budget");
-            }
-            let bytes = fs::read(path)?;
             if bytes.len() > remaining || file_version(&bytes) != file.version {
-                vortex_bail!("Physical source file version mismatch");
+                vortex_bail!("Physical source file version mismatch or byte budget exceeded");
             }
             remaining -= bytes.len();
-            let opened = session
-                .open_options()
-                .open_buffer(ByteBuffer::from(bytes))?;
+            let opened = session.open_options().open_buffer(bytes.clone())?;
             let dtype = opened.dtype().clone();
             if opened.row_count() != file.row_count {
                 vortex_bail!("Physical source row count mismatch");
@@ -227,14 +250,14 @@ impl PhysicalSource {
             let mut physical_snapshot = snapshot.clone();
             physical_snapshot.schema_fingerprint = schema_fingerprint(&dtype)?;
             physical_snapshot.files = vec![file.clone()];
-            physical_snapshot.files[0].uri = path.clone();
-            let source = LocalFileSource::open(
+            let size = bytes.len();
+            let source = LocalFileSource::from_buffers(
                 physical_snapshot,
                 dtype,
-                metadata.len() as usize,
+                BTreeMap::from([(file.id, bytes)]),
+                size,
                 session.clone(),
-            )
-            .await?;
+            )?;
             files.insert(file.id, Arc::new(source));
         }
         Ok(Self {

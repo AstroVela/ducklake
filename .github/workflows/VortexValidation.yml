@@ -34,7 +34,7 @@ jobs:
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg,readwrite
       VCPKG_MAX_CONCURRENCY: '2'
       DISABLE_EXTENSIONS_FOR_TEST: '1'
-      VORTEX_REVISION: 145f816102d6024a12164e37737ff8864faf5033
+      VORTEX_REVISION: 664e8cb733c5fbaa2945239e806df5b22e6d190d
       VORTEX_SPFRESH_NATIVE: ${{ github.workspace }}/build/spfresh/build
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -149,7 +149,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_TARGET_DIR: ${{ github.workspace }}/build/index-cargo
       VORTEX_SPFRESH_NATIVE: ${{ github.workspace }}/build/spfresh/build
-      VORTEX_REVISION: 145f816102d6024a12164e37737ff8864faf5033
+      VORTEX_REVISION: 664e8cb733c5fbaa2945239e806df5b22e6d190d
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

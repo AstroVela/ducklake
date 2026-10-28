@@ -156,7 +156,7 @@ def main():
     report = {
         "status": "running",
         "cases": [],
-        "vortex_revision": "145f816102d6024a12164e37737ff8864faf5033",
+        "vortex_revision": "664e8cb733c5fbaa2945239e806df5b22e6d190d",
         "cost_driver_sha256": BASE.digest(args.cost_driver.resolve(strict=True)),
         "baseline_driver_sha256": (
             BASE.digest(args.baseline_driver.resolve(strict=True)) if args.baseline_driver else None
@@ -215,6 +215,13 @@ def main():
                         )
                         if label == "optimized":
                             d = sample["diagnostics"]
+                            require(
+                                d["native_capture"]["binary_source_bytes"] == d["native_capture"]["source_bytes"]
+                                and d["native_capture"]["retained_native_source_buffers"] == 0
+                                and d["cost"]["binary_handoff_bytes"] == d["native_capture"]["source_bytes"]
+                                and d["cost"]["source_staging_bytes"] == 0,
+                                "SQL source bytes were not handed off and released through the binary path",
+                            )
                             require(
                                 d["native_capture"]["oracle_bytes"] == 0
                                 and d["native_capture"]["business_rows"] == inline_rows,

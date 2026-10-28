@@ -154,3 +154,7 @@ now explicitly excludes `build`; this fix is also pushed to #33 at
 `c65f90cabfa5922b64f649ffe537b8c0bd31d4d7`. Cargo metadata reproduces the failure
 before the exclusion and succeeds after it. Local ON CMake configuration now
 uses a wrapper inside the repository build directory to exercise that layout.
+
+The next [binary-source proof](native-vortex-binary-source-proof.md) replaces
+the SQL source-byte envelope and staging files with owned in-memory buffers,
+then measures the change against this implementation.
