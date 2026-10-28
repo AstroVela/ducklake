@@ -149,3 +149,7 @@ hosted builds remain an independent gate. Complete per-query source ownership,
 index reopening, local DuckDB metadata and extension-instance GC/publication
 guards remain the current scope. Out-of-core/multiprocess ownership and shared
 index caching require separate work.
+
+The next [verified-source proof](native-vortex-verified-source-proof.md) reuses
+the verified Rust reader and measures removal of the duplicate content hash
+and footer open against this binary-source implementation.

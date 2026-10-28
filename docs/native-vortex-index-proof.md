@@ -4,7 +4,7 @@ This DL3b validation draft connects DuckLake's native Vortex files to the
 existing `vortex-index` contracts and `vortex-index-spfresh` provider in
 [AstroVela/vortex, feat/vortex-index](https://github.com/AstroVela/vortex/tree/feat/vortex-index).
 The exact index core revision for this checkout's query library and validation
-probe is `664e8cb733c5fbaa2945239e806df5b22e6d190d`. The
+probe is `531fed6588d1b1b0492f1a50cad42179ce68faa5`. The
 [DL3a file proof](native-vortex-files.md) in
 [DuckLake #27](https://github.com/AstroVela/ducklake/pull/27) documents the
 separately pinned DuckDB wrapper and its Vortex core.
@@ -73,7 +73,7 @@ Prepare the existing core implementation and its pinned native backend:
 ```sh
 git init build/vortex-source
 git -C build/vortex-source fetch --depth 1 https://github.com/AstroVela/vortex.git \
-  664e8cb733c5fbaa2945239e806df5b22e6d190d
+  531fed6588d1b1b0492f1a50cad42179ce68faa5
 git -C build/vortex-source checkout --detach FETCH_HEAD
 bash build/vortex-source/vortex-index-spfresh/native/build.sh "$PWD/build/spfresh"
 export VORTEX_SPFRESH_NATIVE="$PWD/build/spfresh/build"
