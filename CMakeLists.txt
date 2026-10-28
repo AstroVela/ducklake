@@ -65,3 +65,13 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+if(DUCKLAKE_ENABLE_VORTEX AND BUILD_UNITTESTS)
+  add_executable(ducklake_vortex_view_driver EXCLUDE_FROM_ALL
+                 test/vane/native_vortex_view_driver.cpp)
+  target_link_libraries(ducklake_vortex_view_driver duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+  link_threads(ducklake_vortex_view_driver "")
+  link_extension_libraries(ducklake_vortex_view_driver "")
+  set_target_properties(ducklake_vortex_view_driver PROPERTIES
+                        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()

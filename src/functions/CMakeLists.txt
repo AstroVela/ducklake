@@ -19,6 +19,10 @@ add_library(
   ducklake_table_info.cpp
   ducklake_table_insertions.cpp
   ducklake_murmur3.cpp)
+if(DUCKLAKE_ENABLE_VORTEX)
+  target_sources(ducklake_functions PRIVATE ducklake_vortex_view_function.cpp)
+endif()
+
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:ducklake_functions>
     PARENT_SCOPE)
