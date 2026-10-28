@@ -34,6 +34,8 @@ class Worker:
             "max_views": 3,
             "max_source_bytes": 64 * 1024 * 1024,
             "max_artifact_bytes": 128 * 1024 * 1024,
+            "max_inline_rows": 4096,
+            "max_inline_bytes": 4 * 1024 * 1024,
             **limits,
         }
         self.process = subprocess.Popen(
@@ -119,7 +121,14 @@ class Worker:
 
 
 def empty_stats() -> dict:
-    return {"active_views": 0, "source_bytes": 0, "artifact_bytes": 0, "lease_directories": 0}
+    return {
+        "active_views": 0,
+        "source_bytes": 0,
+        "artifact_bytes": 0,
+        "inline_rows": 0,
+        "inline_bytes": 0,
+        "lease_directories": 0,
+    }
 
 
 def refs(rows: list[dict]) -> list[dict]:

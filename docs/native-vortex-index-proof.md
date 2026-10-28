@@ -23,8 +23,10 @@ same snapshot. File versions are complete SHA-256 digests.
 The immutable capture digest binds the Vortex index snapshot, including DuckLake
 visibility and the vector dimension. A current capture cannot open an index
 built from an older capture, even when some files are unchanged. A new source
-snapshot or compaction requires a new generation in this proof. Cross-snapshot
-coverage reuse needs a separate compatibility contract.
+snapshot or compaction requires a new generation in this proof. The separate
+[mixed top-k proof](native-vortex-mixed-proof.md) introduces an explicitly
+file-bound generation with exact immutable-file and vector-field identity
+checks for reuse across DuckLake snapshots.
 
 DuckLake compaction can also replace the physical inventory used by an existing
 historical snapshot number. A new reader must recapture that inventory and reject
