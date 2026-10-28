@@ -98,6 +98,8 @@ jobs:
       RAY_DEDUP_LOGS: "0"
       VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION: "1"
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
+      PYTHONFAULTHANDLER: "1"
+      PYTHONMALLOC: debug
 
     steps:
       - name: Checkout extension
@@ -118,7 +120,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Exercise DuckLake through two Ray workers
+      - name: Install the packaged Vane wheel for Ray qualification
+        id: ray-wheel-install
         shell: bash
         run: |
           set -euo pipefail
@@ -130,7 +133,38 @@ jobs:
             exit 1
           fi
           python -m pip install --disable-pip-version-check "${wheels[0]}"
+
+      - name: Exercise DuckLake through two Ray workers
+        shell: bash
+        run: |
+          set -euo pipefail
+          . .venv-vane-wheel-ray-integration/bin/activate
           python -I test/vane/test_vane_wheel_ray_ducklake.py
+
+      - name: Qualify realtime vectors through two Ray workers
+        if: ${{ !cancelled() && steps.ray-wheel-install.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          . .venv-vane-wheel-ray-integration/bin/activate
+          python -I test/vane/test_vane_realtime_vector.py --report ray-realtime-vector.json
+
+      - name: Preserve realtime vector qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ray-realtime-vector
+          path: ray-realtime-vector.json
+          if-no-files-found: ignore
+
+      - name: Preserve static Ray worker diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-static-ray-worker-logs
+          path: /tmp/ray/session_*/logs/**
+          retention-days: 7
+          if-no-files-found: ignore
 
   vane-provider-release-tooling:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -162,6 +196,7 @@ jobs:
           python -I test/vane/test_vane_provider_release.py
           python -I test/vane/test_vane_dynamic_wheel.py
           python -I test/vane/test_vane_release_signing.py
+          python -I test/vane/test_vane_ray_integration_cleanup.py
 
   vane-dynamic-wheel:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
@@ -437,6 +472,8 @@ jobs:
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
       RAY_DEDUP_LOGS: "0"
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
+      PYTHONFAULTHANDLER: "1"
+      PYTHONMALLOC: debug
 
     steps:
       - name: Checkout extension
@@ -472,6 +509,15 @@ jobs:
           python -m pip install --disable-pip-version-check \
             "${base_wheels[0]}" "${sqlite_wheels[0]}" "${ducklake_wheels[0]}"
           python -I test/vane/test_vane_dynamic_ducklake.py
+
+      - name: Preserve dynamic Ray worker diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-dynamic-ray-worker-logs
+          path: /tmp/ray/session_*/logs/**
+          retention-days: 7
+          if-no-files-found: ignore
 
   vane-prepare-provider:
     if: github.repository == 'AstroVela/ducklake' && github.event_name == 'workflow_dispatch' && (inputs.operation == 'testpypi-dev' || inputs.operation == 'release')

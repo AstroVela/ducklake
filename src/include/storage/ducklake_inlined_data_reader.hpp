@@ -27,6 +27,9 @@ public:
 	//! Initialize an inlined data reader over a set of data
 	DuckLakeInlinedDataReader(DuckLakeFunctionInfo &read_info, const OpenFileInfo &info,
 	                          shared_ptr<DuckLakeInlinedData> data, vector<MultiFileColumnDefinition> columns);
+	//! Read a frozen committed batch without a metadata connection.
+	DuckLakeInlinedDataReader(const OpenFileInfo &info, shared_ptr<DuckLakeInlinedData> data,
+	                          vector<MultiFileColumnDefinition> columns);
 
 public:
 	bool TryInitializeScan(ClientContext &context, GlobalTableFunctionState &gstate,
@@ -43,7 +46,7 @@ private:
 	                           const LogicalType &input_type, Vector &output_vector);
 
 	mutex lock;
-	DuckLakeFunctionInfo &read_info;
+	optional_ptr<DuckLakeFunctionInfo> read_info;
 	string table_name;
 	shared_ptr<DuckLakeInlinedData> data;
 	bool initialized_scan = false;
