@@ -106,7 +106,7 @@ a cleanup failure on an otherwise successful run fails the test. Both packaged
 Ray jobs enable Python memory-debug hooks and preserve worker logs after a
 failure for further diagnosis.
 
-The separate [Vane fairness draft #1104](https://github.com/AstroVela/vane/pull/1104)
+The separate [Vane fairness draft #1106](https://github.com/AstroVela/vane/pull/1106)
 repairs a newer-main task-admission race found in #1103's CI. Its three new
 deterministic regression cases fail on the original CI admission module, while
 177 admission and local-model task-pool cases pass with the Python fix. This is
