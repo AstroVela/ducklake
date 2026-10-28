@@ -1,5 +1,14 @@
 # This file is included by DuckDB's build system. It specifies which extension to load
 
+option(DUCKLAKE_ENABLE_VORTEX "Enable experimental native Vortex data files" OFF)
+if(DUCKLAKE_ENABLE_VORTEX)
+    duckdb_extension_load(parquet)
+    duckdb_extension_load(vortex
+        GIT_URL https://github.com/AstroVela/duckdb-vortex
+        GIT_TAG b2253585db8fef4fa490e312841c6e8fa6479fd9
+    )
+endif()
+
 # Extension from this repo
 duckdb_extension_load(ducklake
         SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}

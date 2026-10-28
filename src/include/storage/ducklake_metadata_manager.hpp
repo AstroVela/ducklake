@@ -448,12 +448,13 @@ private:
 	template <class T>
 	static string FlushDrop(const string &metadata_table_name, const string &id_name, const set<T> &dropped_entries);
 	template <class T>
-	DuckLakeFileData ReadDataFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx, bool is_encrypted);
+	DuckLakeFileData ReadDataFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx, bool is_encrypted,
+	                              bool read_format = true);
 	template <class T>
 	DuckLakeFileData ReadDeleteFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx, bool is_encrypted);
 
 	bool IsEncrypted() const;
-	string GetFileSelectList(const string &prefix);
+	string GetFileSelectList(const string &prefix, bool data_format = true);
 	string GetDeleteFileSelectList(const string &prefix);
 	FilterPushdownQueryComponents GenerateFilterPushdownComponents(const FilterPushdownInfo &filter_info,
 	                                                               TableIndex table_id);

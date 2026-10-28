@@ -1,6 +1,7 @@
 #include "common/ducklake_types.hpp"
 #include "common/ducklake_util.hpp"
 #include "storage/ducklake_table_entry.hpp"
+#include "storage/ducklake_vortex.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_scan.hpp"
@@ -343,6 +344,10 @@ case_insensitive_set_t DuckLakeTableEntry::GetNotNullFields() const {
 }
 
 unique_ptr<BaseStatistics> DuckLakeTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
+	if (DuckLakeVortex::GetFormat(*this) == DataFileFormat::VORTEX) {
+		// Vortex currently emits counts, not complete bounds for the file and its nested columns.
+		return nullptr;
+	}
 	auto table_stats = GetTableStats(context);
 	if (!table_stats) {
 		return nullptr;
@@ -1363,6 +1368,11 @@ unique_ptr<CatalogEntry> DuckLakeTableEntry::AlterTable(DuckLakeTransaction &tra
 
 unique_ptr<CatalogEntry> DuckLakeTableEntry::Alter(ClientContext &context, DuckLakeTransaction &transaction,
                                                    AlterTableInfo &info) {
+	if (DuckLakeVortex::GetFormat(*this) == DataFileFormat::VORTEX &&
+	    info.alter_table_type != AlterTableType::RENAME_TABLE &&
+	    info.alter_table_type != AlterTableType::RENAME_COLUMN) {
+		throw NotImplementedException("Experimental Vortex tables require a fixed schema and partitioning");
+	}
 	if (transaction.HasTransactionInlinedData(GetTableId())) {
 		if (info.alter_table_type != AlterTableType::ADD_COLUMN &&
 		    info.alter_table_type != AlterTableType::REMOVE_COLUMN &&
