@@ -29,6 +29,7 @@ struct DuckLakeVortexReadView {
 	idx_t inline_rows = 0;
 	string admission_json;
 	string rows_json;
+	string managed_data_path;
 
 	static DuckLakeVortexReadView Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
 	                                      const std::function<void(const string &)> &observe = nullptr,

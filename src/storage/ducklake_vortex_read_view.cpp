@@ -140,6 +140,7 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 		json.Add(admission, "sources", sources);
 		map<string, idx_t> by_path;
 		DuckLakeVortexReadView result;
+		result.managed_data_path = catalog.DataPath();
 		result.snapshot_id = snapshot.snapshot_id;
 		auto &fs = FileSystem::GetFileSystem(*reader.context);
 		idx_t physical_rows = 0;

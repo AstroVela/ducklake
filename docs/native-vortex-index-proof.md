@@ -3,7 +3,7 @@
 This DL3b validation draft connects DuckLake's native Vortex files to the
 existing `vortex-index` contracts and `vortex-index-spfresh` provider in
 [AstroVela/vortex, feat/vortex-index](https://github.com/AstroVela/vortex/tree/feat/vortex-index).
-The exact core revision is `ee085f55a705cb9b2edab18d392dd822540774d7`, also
+The exact core revision is `145f816102d6024a12164e37737ff8864faf5033`, also
 used by the [DL3a file proof](native-vortex-files.md) in
 [DuckLake #27](https://github.com/AstroVela/ducklake/pull/27).
 
@@ -62,16 +62,16 @@ translator or an optimizer integration.
 
 ## Build and run
 
-Use the DL3a ON shell with the repository's DuckDB v1.5.5 pin. The index probe
-is an independent process, so no index backend is added to that shell or to
-the default extension build.
+Use the ON shell with the repository's DuckDB v1.5.5 pin. This proof runs build
+and search in an independent probe. The later [SQL search proof](native-vortex-sql-search-proof.md)
+also links the backend into the optional native shell; default-OFF excludes it.
 
 Prepare the existing core implementation and its pinned native backend:
 
 ```sh
 git init build/vortex-source
 git -C build/vortex-source fetch --depth 1 https://github.com/AstroVela/vortex.git \
-  ee085f55a705cb9b2edab18d392dd822540774d7
+  145f816102d6024a12164e37737ff8864faf5033
 git -C build/vortex-source checkout --detach FETCH_HEAD
 bash build/vortex-source/vortex-index-spfresh/native/build.sh "$PWD/build/spfresh"
 export VORTEX_SPFRESH_NATIVE="$PWD/build/spfresh/build"
@@ -87,7 +87,7 @@ python3 -I test/vane/test_native_vortex_index.py \
 This currently requires Linux x86-64, a C++17 compiler, CMake, OpenMP and zstd
 development files. The backend's build script runs its native tests and records
 the SPFresh revision and patch digest; Cargo verifies those inputs again.
-The probe's Cargo.lock pins its Rust dependencies.
+The root workspace Cargo.lock pins the probe and shared query dependencies.
 
 The workflow first requires the DL3a ON and default-OFF gates. Its index job
 downloads the qualified ON shell, builds the existing native provider and the

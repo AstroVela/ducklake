@@ -1,0 +1,8 @@
+[workspace]
+members = ["src/vortex_query", "test/vane/vortex_index_probe"]
+resolver = "3"
+
+[profile.ci]
+inherits = "dev"
+debug = false
+opt-level = 1

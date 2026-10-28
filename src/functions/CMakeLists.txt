@@ -20,8 +20,11 @@ add_library(
   ducklake_table_insertions.cpp
   ducklake_murmur3.cpp)
 if(DUCKLAKE_ENABLE_VORTEX)
-  target_sources(ducklake_functions PRIVATE ducklake_vortex_view_function.cpp
-                                            ducklake_vortex_index_function.cpp)
+  target_sources(
+    ducklake_functions
+    PRIVATE ducklake_vortex_view_function.cpp
+            ducklake_vortex_index_function.cpp
+            ducklake_vortex_search_function.cpp)
 endif()
 
 set(ALL_OBJECT_FILES

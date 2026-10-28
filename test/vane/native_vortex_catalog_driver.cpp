@@ -7,6 +7,7 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
+#include "storage/ducklake_vortex_search.hpp"
 
 #include <iostream>
 #include <sstream>
@@ -63,6 +64,64 @@ public:
 
 	string Execute(const vector<string> &args) {
 		const auto &op = args.at(1);
+		if (op == "search") {
+			auto result = SQL(writer, ReadText(args.at(2)));
+			Require(result->ColumnCount() == 5, "SQL search must return five typed business/distance columns");
+			vector<vector<Value>> rows;
+			for (idx_t i = 0; i < result->RowCount(); i++) {
+				vector<Value> row;
+				for (idx_t col = 0; col < 5; col++) {
+					row.push_back(result->GetValue(col, i));
+				}
+				rows.push_back(std::move(row));
+			}
+			return SearchJSON(rows, "{}");
+		}
+		if (op == "core-search" || op == "cancel-search" || op == "fail-search" || op == "held-search") {
+			Connection query(database);
+			DuckLakeVortexSearchRequest request;
+			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
+			request.k = 10;
+			if (op == "core-search") {
+				auto result = DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request);
+				return SearchJSON(result.rows, result.diagnostics);
+			}
+			if (op == "cancel-search" || op == "fail-search") {
+				auto checkpoint = args.size() > 2 ? args.at(2) : "after_open";
+				if (checkpoint == "category_filter") {
+					request.filter_category = true;
+					request.category = "B";
+				}
+				DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request, [&](const string &stage) {
+					if (stage == checkpoint) {
+						if (op == "cancel-search") {
+							query.Interrupt();
+						} else {
+							throw InvalidInputException("Injected query lease failure");
+						}
+					}
+				});
+				throw InvalidInputException("Query cancellation/failure injection did not fail");
+			}
+			Pause pause;
+			auto pending = std::async(std::launch::async, [&] {
+				return DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request, [&](const string &stage) {
+					if (stage == "after_open") {
+						pause.Stop();
+					}
+				});
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			Connection publisher(database);
+			DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "knn", args.at(2),
+			                             std::stoull(args.at(3)));
+			SQL(writer, ReadText(args.at(4)));
+			FileSystem::GetFileSystem(*writer.context).RemoveDirectory(args.at(5));
+			pause.Release();
+			auto result = pending.get();
+			return SearchJSON(result.rows, result.diagnostics);
+		}
 		if (op == "raw") {
 			return Capture(args.at(2), "");
 		}
@@ -196,6 +255,34 @@ public:
 	}
 
 private:
+	string SearchJSON(const vector<vector<Value>> &rows, const string &diagnostics) {
+		ViewJSON json;
+		auto value = json.Object();
+		auto items = json.Array();
+		json.Add(value, "rows", items);
+		auto diagnostic_doc = yyjson_read(diagnostics.data(), diagnostics.size(), 0);
+		Require(diagnostic_doc != nullptr, "Invalid query diagnostics");
+		json.Add(value, "diagnostics", yyjson_val_mut_copy(json.doc.get(), yyjson_doc_get_root(diagnostic_doc)));
+		yyjson_doc_free(diagnostic_doc);
+		for (auto &row : rows) {
+			auto item = json.Object();
+			if (row[0].IsNull()) {
+				json.Add(item, "id", yyjson_mut_null(json.doc.get()));
+			} else {
+				json.Add(item, "id", yyjson_mut_sint(json.doc.get(), row[0].GetValue<int64_t>()));
+			}
+			auto vector = json.Array();
+			for (auto &component : ListValue::GetChildren(row[1])) {
+				yyjson_mut_arr_append(vector, yyjson_mut_real(json.doc.get(), component.GetValue<float>()));
+			}
+			json.Add(item, "embedding", vector);
+			json.NullableText(item, "category", row[2]);
+			json.NullableText(item, "payload", row[3]);
+			json.Add(item, "distance", yyjson_mut_real(json.doc.get(), row[4].GetValue<float>()));
+			yyjson_mut_arr_append(items, item);
+		}
+		return json.Finish(value);
+	}
 	DuckLakeVortexViewOptions Options(const string &name) {
 		return {"lake", "main", "items", 0, 64 * 1024 * 1024, 100000, name};
 	}
