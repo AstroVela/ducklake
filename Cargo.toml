@@ -1,5 +1,6 @@
 [workspace]
 members = ["src/vortex_query", "test/vane/vortex_index_probe"]
+exclude = ["build"]
 resolver = "3"
 
 [profile.ci]
