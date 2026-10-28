@@ -1,0 +1,120 @@
+# name: test/sql/vortex/native_vortex_compaction.test
+# description: Vortex compaction preserves logical row identities and historical readers
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+SET threads = 1
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_compaction.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_compaction', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT, embedding FLOAT[], label VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
+
+statement ok
+INSERT INTO lake.items VALUES (1, [1, 0, 0], 'one'), (2, [2, 0, 0], 'two')
+
+statement ok
+INSERT INTO lake.items VALUES (3, [3, 0, 0], 'three'), (4, [4, 0, 0], 'four')
+
+statement ok
+SET VARIABLE original_snapshot = (SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement ok reader
+BEGIN
+
+query I reader
+SELECT id FROM lake.items ORDER BY id
+----
+1
+2
+3
+4
+
+statement ok
+CREATE TABLE before_compaction AS SELECT rowid, id, embedding, label FROM lake.items
+
+statement ok
+CREATE TABLE input_files AS SELECT data_file_id FROM __ducklake_metadata_lake.ducklake_data_file
+
+query I
+SELECT sum(files_created) > 0 FROM ducklake_merge_adjacent_files('lake')
+----
+true
+
+query III
+SELECT id, embedding[1], label FROM lake.items ORDER BY id
+----
+1	1	one
+2	2	two
+3	3	three
+4	4	four
+
+query I
+SELECT count(*) FROM ((SELECT rowid, id, embedding, label FROM lake.items EXCEPT ALL SELECT * FROM before_compaction) UNION ALL (SELECT * FROM before_compaction EXCEPT ALL SELECT rowid, id, embedding, label FROM lake.items))
+----
+0
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL AND data_file_id IN (SELECT data_file_id FROM input_files)
+----
+0
+
+query I
+SELECT bool_and(ends_with(data_file, '.vortex')) FROM ducklake_list_files('lake', 'items')
+----
+true
+
+statement ok
+DELETE FROM lake.items WHERE id = 2
+
+statement ok
+UPDATE lake.items SET embedding = [9, 0, 0], label = 'updated' WHERE id = 3
+
+statement ok
+CREATE OR REPLACE TABLE before_compaction AS SELECT rowid, id, embedding, label FROM lake.items
+
+query I
+SELECT sum(files_created) > 0 FROM ducklake_rewrite_data_files('lake', delete_threshold => 0)
+----
+true
+
+query III
+SELECT id, embedding[1], label FROM lake.items ORDER BY id
+----
+1	1	one
+3	9	updated
+4	4	four
+
+query I
+SELECT count(*) FROM ((SELECT rowid, id, embedding, label FROM lake.items EXCEPT ALL SELECT * FROM before_compaction) UNION ALL (SELECT * FROM before_compaction EXCEPT ALL SELECT rowid, id, embedding, label FROM lake.items))
+----
+0
+
+query II
+SELECT id, embedding[1] FROM lake.items AT (VERSION => getvariable('original_snapshot')) ORDER BY id
+----
+1	1
+2	2
+3	3
+4	4
+
+query II reader
+SELECT id, embedding[1] FROM lake.items ORDER BY id
+----
+1	1
+2	2
+3	3
+4	4
+
+statement ok reader
+COMMIT

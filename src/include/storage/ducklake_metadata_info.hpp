@@ -157,6 +157,7 @@ struct DuckLakeFileInfo {
 	DataFileIndex id;
 	TableIndex table_id;
 	string file_name;
+	DataFileFormat format = DataFileFormat::PARQUET;
 	idx_t row_count;
 	idx_t file_size_bytes;
 	optional_idx footer_size;
@@ -358,6 +359,7 @@ struct DuckLakeCatalogInfo {
 
 struct DuckLakeFileData {
 	string path;
+	DataFileFormat data_format = DataFileFormat::PARQUET;
 	string encryption_key;
 	idx_t file_size_bytes = 0;
 	optional_idx footer_size;

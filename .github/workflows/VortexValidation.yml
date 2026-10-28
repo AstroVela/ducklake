@@ -1,0 +1,115 @@
+name: Native Vortex validation
+
+on:
+  pull_request:
+  push:
+    branches: [v1.5-variegata_vane]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ducklake-vortex-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native:
+    name: Native Vortex ${{ matrix.vortex }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        vortex: ['OFF', 'ON']
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      CARGO_BUILD_JOBS: '2'
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+      CCACHE_MAXSIZE: 2G
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg,readwrite
+      VCPKG_MAX_CONCURRENCY: '2'
+      DISABLE_EXTENSIONS_FOR_TEST: '1'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Initialize pinned DuckDB
+        run: git submodule update --init duckdb
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config
+          mkdir -p .cache/vcpkg build/validation-logs
+      - name: Restore native caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            .cache/ccache
+            .cache/vcpkg
+          key: ducklake-vortex-v1-${{ runner.os }}-${{ matrix.vortex }}-${{ hashFiles('vcpkg.json', 'extension_config.cmake', '.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            ducklake-vortex-v1-${{ runner.os }}-${{ matrix.vortex }}-${{ hashFiles('vcpkg.json', 'extension_config.cmake', '.gitmodules') }}-
+      - name: Set up pinned vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+          doNotCache: true
+      - name: Set up Rust
+        if: matrix.vortex == 'ON'
+        run: rustup toolchain install 1.91.0 --profile minimal
+      - name: Restore Rust cache
+        if: matrix.vortex == 'ON'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/vortex-validation/cargo/build
+          key: ducklake-vortex-rust-v1-${{ runner.os }}-${{ hashFiles('extension_config.cmake', '.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            ducklake-vortex-rust-v1-${{ runner.os }}-${{ hashFiles('extension_config.cmake', '.gitmodules') }}-
+      - name: Configure
+        run: |
+          flags=()
+          if [[ '${{ matrix.vortex }}' == ON ]]; then
+            flags=(-DDUCKLAKE_ENABLE_VORTEX=ON -DRust_TOOLCHAIN=1.91.0)
+          fi
+          cmake -S duckdb -B build/vortex-validation -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOVERRIDE_GIT_DESCRIBE="$(cat .github/duckdb-version)" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_BUILD=ON -DVCPKG_TARGET_TRIPLET=x64-linux \
+            -DVCPKG_MANIFEST_DIR="$PWD" \
+            -DBUILD_EXTENSIONS=parquet \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
+            '-DSKIP_EXTENSIONS=icu;json;tpch;jemalloc' \
+            -DEXTENSION_STATIC_BUILD=ON -DBUILD_SHELL=ON -DBUILD_UNITTESTS=ON \
+            -DENABLE_UNITTEST_CPP_TESTS=OFF \
+            -DENABLE_EXTENSION_AUTOLOADING=OFF -DENABLE_EXTENSION_AUTOINSTALL=OFF \
+            -DEXTENSION_DIRECTORIES="$PWD/build/vortex-validation/empty-extensions" \
+            -DUNITTEST_ROOT_DIRECTORY="$PWD" \
+            "${flags[@]}" 2>&1 | tee build/validation-logs/configure.log
+      - name: Build
+        run: cmake --build build/vortex-validation --target duckdb unittest 2>&1 | tee build/validation-logs/build.log
+      - name: Validate native files and recovery
+        run: |
+          python3 -I scripts/run_native_vortex_validation.py \
+            --duckdb build/vortex-validation/duckdb \
+            --unittest build/vortex-validation/test/unittest \
+            --mode '${{ matrix.vortex }}' --output-dir build/validation-logs/tests
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-vortex-${{ matrix.vortex }}
+          path: |
+            build/validation-logs/
+            build/vortex-validation/CMakeCache.txt
+          retention-days: 7

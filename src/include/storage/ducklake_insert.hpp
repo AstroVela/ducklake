@@ -42,6 +42,7 @@ public:
 	vector<DuckLakeDataFile> written_files;
 	idx_t total_insert_count;
 	case_insensitive_set_t not_null_fields;
+	DataFileFormat file_format;
 	//! Total rows flushed (used by flush_inlined_data)
 	idx_t rows_flushed = 0;
 };

@@ -174,6 +174,9 @@ static DuckLakeFileData DeserializeFileData(Deserializer &deserializer, bool all
 }
 
 static void ValidateFileEntry(const DuckLakeFileListEntry &file) {
+	if (file.file.data_format != DataFileFormat::PARQUET) {
+		throw NotImplementedException("Distributed DuckLake scans require Parquet data files");
+	}
 	if (file.data_type != DuckLakeDataType::DATA_FILE || !file.file_id.IsValid() ||
 	    file.file_id.index >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START) {
 		throw NotImplementedException("Distributed DuckLake scans require committed file-backed table data");

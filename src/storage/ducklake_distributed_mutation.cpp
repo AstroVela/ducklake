@@ -254,6 +254,9 @@ static void ValidateFileSize(ClientContext &context, const string &path, idx_t e
 }
 
 static void ValidateSourceEntry(const DuckLakeFileListExtendedEntry &file, const string &operation_name) {
+	if (file.file.data_format != DataFileFormat::PARQUET) {
+		throw NotImplementedException("Distributed DuckLake %s requires Parquet data files", operation_name);
+	}
 	if (file.data_type != DuckLakeDataType::DATA_FILE || !file.file_id.IsValid() || file.file.path.empty() ||
 	    file.file.file_size_bytes == 0 || file.row_count == 0) {
 		throw NotImplementedException("Distributed DuckLake %s supports committed non-empty data files only",

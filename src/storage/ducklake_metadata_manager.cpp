@@ -998,7 +998,7 @@ ORDER BY table_id;
 	return TransformGlobalStats(*result);
 }
 
-string DuckLakeMetadataManager::GetFileSelectList(const string &prefix) {
+string DuckLakeMetadataManager::GetFileSelectList(const string &prefix, bool data_format) {
 	static const vector<string> column_list {
 	    "path", "path_is_relative", "file_size_bytes", "footer_size", "encryption_key",
 	};
@@ -1012,21 +1012,27 @@ string DuckLakeMetadataManager::GetFileSelectList(const string &prefix) {
 		return prefix + "." + column + " AS " + prefix + "_" + column;
 	});
 
+	if (data_format) {
+		result += ", " + prefix + ".file_format";
+	}
 	return result;
 }
 
 string DuckLakeMetadataManager::GetDeleteFileSelectList(const string &prefix) {
-	return GetFileSelectList(prefix) + ", " + prefix + ".format AS " + prefix + "_format";
+	return GetFileSelectList(prefix, false) + ", " + prefix + ".format AS " + prefix + "_format";
 }
 
 template <class T>
 DuckLakeFileData DuckLakeMetadataManager::ReadDataFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx,
-                                                       bool is_encrypted) {
+                                                       bool is_encrypted, bool read_format) {
 	DuckLakeFileData data;
 	if (row.IsNull(col_idx)) {
 		// file is not there
 		col_idx += 4;
 		if (is_encrypted) {
+			col_idx++;
+		}
+		if (read_format) {
 			col_idx++;
 		}
 		return data;
@@ -1048,13 +1054,16 @@ DuckLakeFileData DuckLakeMetadataManager::ReadDataFile(DuckLakeTableEntry &table
 		}
 		data.encryption_key = Blob::FromBase64(row.template GetValue<string>(col_idx++));
 	}
+	if (read_format) {
+		data.data_format = DataFileFormatFromString(row.template GetValue<string>(col_idx++));
+	}
 	return data;
 }
 
 template <class T>
 DuckLakeFileData DuckLakeMetadataManager::ReadDeleteFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx,
                                                          bool is_encrypted) {
-	auto data = ReadDataFile(table, row, col_idx, is_encrypted);
+	auto data = ReadDataFile(table, row, col_idx, is_encrypted, false);
 	if (!row.IsNull(col_idx)) {
 		data.format = DeleteFileFormatFromString(row.template GetValue<string>(col_idx));
 	}
@@ -3120,7 +3129,7 @@ ORDER BY row_id, begin_snapshot;)",
 }
 
 string DuckLakeMetadataManager::ReadInlinedDataAggregatesSql(const string &inlined_table_name,
-                                                              const string &select_list) {
+                                                             const string &select_list) {
 	return StringUtil::Format(R"(
 SELECT %s
 FROM {METADATA_CATALOG}.%s
@@ -3540,16 +3549,16 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 		// file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id,
 		// encryption_key, mapping_id, partial_max
 		data_file_appender.BeginRow();
-		data_file_appender.Append<int64_t>(data_file_index);                            // data_file_id
-		data_file_appender.Append<int64_t>(table_id);                                   // table_id
-		data_file_appender.Append<int64_t>(begin_snapshot_val);                         // begin_snapshot
-		data_file_appender.Append(Value());                                             // end_snapshot (NULL)
-		data_file_appender.Append(Value());                                             // file_order (NULL)
-		data_file_appender.Append<string_t>(string_t(path.path));                       // path
-		data_file_appender.Append<bool>(path.path_is_relative);                         // path_is_relative
-		data_file_appender.Append<string_t>(string_t("parquet"));                       // file_format
-		data_file_appender.Append<int64_t>(static_cast<int64_t>(file.row_count));       // record_count
-		data_file_appender.Append<int64_t>(static_cast<int64_t>(file.file_size_bytes)); // file_size_bytes
+		data_file_appender.Append<int64_t>(data_file_index);                                // data_file_id
+		data_file_appender.Append<int64_t>(table_id);                                       // table_id
+		data_file_appender.Append<int64_t>(begin_snapshot_val);                             // begin_snapshot
+		data_file_appender.Append(Value());                                                 // end_snapshot (NULL)
+		data_file_appender.Append(Value());                                                 // file_order (NULL)
+		data_file_appender.Append<string_t>(string_t(path.path));                           // path
+		data_file_appender.Append<bool>(path.path_is_relative);                             // path_is_relative
+		data_file_appender.Append<string_t>(string_t(DataFileFormatToString(file.format))); // file_format
+		data_file_appender.Append<int64_t>(static_cast<int64_t>(file.row_count));           // record_count
+		data_file_appender.Append<int64_t>(static_cast<int64_t>(file.file_size_bytes));     // file_size_bytes
 		if (file.footer_size.IsValid()) {
 			data_file_appender.Append<int64_t>(static_cast<int64_t>(file.footer_size.GetIndex())); // footer_size
 		} else {

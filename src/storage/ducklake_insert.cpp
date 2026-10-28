@@ -2,6 +2,7 @@
 #include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "storage/ducklake_insert.hpp"
+#include "storage/ducklake_vortex.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
@@ -597,7 +598,8 @@ void DuckLakeInsert::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeli
 // States
 //===--------------------------------------------------------------------===//
 DuckLakeInsertGlobalState::DuckLakeInsertGlobalState(DuckLakeTableEntry &table)
-    : table(table), total_insert_count(0), not_null_fields(table.GetNotNullFields()) {
+    : table(table), total_insert_count(0), not_null_fields(table.GetNotNullFields()),
+      file_format(DuckLakeVortex::GetFormat(table)) {
 }
 
 unique_ptr<GlobalSinkState> DuckLakeInsert::GetGlobalSinkState(ClientContext &context) const {
@@ -660,6 +662,7 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		DuckLakeDataFile data_file;
 		data_file.file_name = chunk.GetValue(0, r).GetValue<string>();
+		data_file.format = global_state.file_format;
 		data_file.row_count = chunk.GetValue(1, r).GetValue<idx_t>();
 		data_file.file_size_bytes = chunk.GetValue(2, r).GetValue<idx_t>();
 		data_file.footer_size = chunk.GetValue(3, r).GetValue<idx_t>();
@@ -1010,6 +1013,10 @@ static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInp
 }
 
 DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input) {
+	if (DuckLakeVortex::GetFormat(copy_input.catalog, copy_input.schema_id, copy_input.table_id) ==
+	    DataFileFormat::VORTEX) {
+		return DuckLakeVortex::CopyOptions(context, copy_input);
+	}
 	auto info = make_uniq<CopyInfo>();
 	auto &catalog = copy_input.catalog;
 	info->file_path = copy_input.data_path;

@@ -2,8 +2,6 @@
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
-#include "duckdb/storage/table/column_segment.hpp"
-#include "duckdb/planner/table_filter_state.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete_filter.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -259,34 +257,7 @@ AsyncResult DuckLakeInlinedDataReader::Scan(ClientContext &context, GlobalTableF
 	if (scan_count == 0) {
 		return AsyncResult(SourceResultType::FINISHED);
 	}
-	if (filters || deletion_filter) {
-		SelectionVector sel;
-		idx_t approved_tuple_count = scan_count;
-		if (deletion_filter) {
-			approved_tuple_count = deletion_filter->Filter(file_row_number, approved_tuple_count, sel);
-		}
-		if (filters) {
-			for (auto &entry : filters->filters) {
-				if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
-					continue;
-				}
-				auto column_id = entry.first;
-				auto &vec = chunk.data[column_id];
-
-				UnifiedVectorFormat vdata;
-				vec.ToUnifiedFormat(chunk.size(), vdata);
-
-				auto &filter = *entry.second;
-				auto filter_state = TableFilterState::Initialize(context, filter);
-
-				approved_tuple_count = ColumnSegment::FilterSelection(sel, vec, vdata, filter, *filter_state,
-				                                                      chunk.size(), approved_tuple_count);
-			}
-		}
-		if (approved_tuple_count != chunk.size()) {
-			chunk.Slice(sel, approved_tuple_count);
-		}
-	}
+	DuckLakeMultiFileReader::ApplyRowFilters(context, *this, file_row_number, chunk);
 	file_row_number += NumericCast<int64_t>(scan_count);
 	return AsyncResult(SourceResultType::HAVE_MORE_OUTPUT);
 }

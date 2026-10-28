@@ -4,6 +4,7 @@
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_schema_entry.hpp"
+#include "storage/ducklake_vortex.hpp"
 
 namespace duckdb {
 // -------------------------------------------------------------------------//
@@ -85,7 +86,17 @@ static unique_ptr<FunctionData> DuckLakeSetOptionBind(ClientContext &context, Ta
 	auto &val = input.inputs[2];
 
 	// read the option
-	if (option == "parquet_compression") {
+	if (option == "experimental_data_file_format") {
+		value = StringUtil::Lower(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
+		DataFileFormatFromString(value);
+		auto table = input.named_parameters.find("table_name");
+		if (table == input.named_parameters.end() || table->second.IsNull()) {
+			throw BinderException("experimental_data_file_format requires table_name");
+		}
+		if (value == "vortex") {
+			DuckLakeVortex::ValidateEnabled();
+		}
+	} else if (option == "parquet_compression") {
 		auto codec = val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
 		vector<string> supported_algorithms {"uncompressed", "snappy", "gzip", "zstd", "brotli", "lz4", "lz4_raw"};
 		bool found = false;
@@ -182,6 +193,13 @@ static unique_ptr<FunctionData> DuckLakeSetOptionBind(ClientContext &context, Ta
 		auto table_catalog_entry =
 		    catalog.GetEntry<TableCatalogEntry>(context, schema, table, OnEntryNotFound::THROW_EXCEPTION);
 		auto &ducklake_table = table_catalog_entry->Cast<DuckLakeTableEntry>();
+		if (option == "experimental_data_file_format" && value == "vortex") {
+			DuckLakeVortex::ValidateTable(ducklake_table);
+		}
+		if (option == "experimental_data_file_format" && value != "vortex" &&
+		    DuckLakeVortex::GetFormat(ducklake_table) == DataFileFormat::VORTEX) {
+			throw NotImplementedException("Experimental Vortex tables cannot change their data file format");
+		}
 		config_option.table_id = ducklake_table.GetTableId();
 		if (config_option.table_id.IsTransactionLocal()) {
 			throw NotImplementedException("Settings cannot be set for transaction-local tables");

@@ -9,6 +9,14 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
+option(DUCKLAKE_ENABLE_VORTEX "Enable experimental native Vortex data files" OFF)
+if(DUCKLAKE_ENABLE_VORTEX)
+  if(DUCKLAKE_VANE_DISTRIBUTED)
+    message(FATAL_ERROR "Experimental DuckLake Vortex files require native execution")
+  endif()
+  add_definitions(-DDUCKLAKE_ENABLE_VORTEX)
+endif()
+
 option(DUCKLAKE_VANE_DISTRIBUTED
        "Build the explicit Vane distributed DuckLake scan interface" OFF)
 if(DUCKLAKE_VANE_DISTRIBUTED)
