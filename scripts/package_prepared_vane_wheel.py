@@ -106,7 +106,16 @@ def main() -> int:
                     (
                         str(python),
                         "-I",
-                        str(args.vane_source.resolve() / "scripts/verify_extension_wheel.py"),
+                        str(
+                            Path(__file__).resolve().parents[1]
+                            / "vane-extension-ci-tools/scripts/vane_provider_build.py"
+                        ),
+                        "--extension-root",
+                        str(Path(__file__).resolve().parents[1]),
+                        "--vane-source",
+                        str(args.vane_source.resolve()),
+                        "--operation",
+                        "verify",
                         "--base-wheel",
                         str(runtime_wheel.resolve()),
                         "--extension-wheel",

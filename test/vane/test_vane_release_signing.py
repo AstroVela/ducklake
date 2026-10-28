@@ -211,9 +211,11 @@ class SigningTest(unittest.TestCase):
             ):
                 self.assertEqual(packager.main(), 0)
             self.assertEqual(run.call_count, 1)
-            self.assertIn("verify_extension_wheel.py", repr(run.call_args))
+            command = run.call_args.args[0]
+            self.assertIn(str(ROOT / "vane-extension-ci-tools/scripts/vane_provider_build.py"), command)
+            self.assertEqual(command[command.index("--operation") + 1], "verify")
             self.assertEqual(build.call_args.kwargs["dependency_wheel"], wheels[0])
-            self.assertIn(str(wheels[0]), run.call_args.args[0])
+            self.assertIn(str(wheels[0]), command)
             for wheel in wheels:
                 self.assertEqual((root / "dist" / wheel.name).read_bytes(), wheel.read_bytes())
 

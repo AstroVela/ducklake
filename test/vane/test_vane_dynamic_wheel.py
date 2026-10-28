@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import os
 import shlex
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -271,6 +272,75 @@ class DynamicWheelTest(unittest.TestCase):
             extra.write_text("unknown license")
             with self.assertRaisesRegex(self.builder.QualificationError, "unexpected"):
                 self.builder._render_vcpkg_license_bundle(ROOT / "vane-extension.toml", share)
+
+    def test_signed_packaging_verifies_the_complete_graph_with_pinned_tools(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "ducklake_packager", ROOT / "scripts/package_prepared_vane_wheel.py"
+        )
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            prepared, signed, output = root / "prepared", root / "signed", root / "output"
+            signed.mkdir()
+            (prepared / "artifacts").mkdir(parents=True)
+            for name in self.builder.EXTENSION_NAMES:
+                (prepared / "artifacts" / f"{name}.duckdb_extension").write_bytes(b"payload" + b"u" * 256)
+                (signed / f"{name}.duckdb_extension").write_bytes(b"payload" + b"s" * 256)
+                directory = prepared / "licenses" / name
+                directory.mkdir(parents=True)
+                for filename in self.builder.PROVIDER_LICENSE_NAMES[name]:
+                    (directory / filename).write_text("license")
+            runtime = root / "vane_ai-0.2.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+            runtime.touch()
+            arguments = [
+                "package",
+                "--vane-source",
+                str(root / "engine"),
+                "--vane-revision",
+                "a" * 40,
+                "--profile",
+                "testpypi",
+                "--prepared",
+                str(prepared),
+                "--signed",
+                str(signed),
+                "--output",
+                str(output),
+                "--runtime-python",
+                sys.executable,
+                "--runtime-wheel",
+                str(runtime),
+            ]
+
+            def build(**options):
+                wheel = options["output_directory"] / (
+                    f"vane_extension_{options['extension_name']}-0.2.0.1-cp312-none-manylinux_2_28_x86_64.whl"
+                )
+                wheel.write_bytes(b"wheel")
+                return wheel
+
+            environment = mock.Mock()
+            with (
+                mock.patch.object(sys, "argv", arguments),
+                mock.patch.object(packager, "load_builder", return_value=self.builder),
+                mock.patch.object(self.builder, "_require_git_revision"),
+                mock.patch.object(self.builder, "_builder_python", return_value=(environment, Path(sys.executable))),
+                mock.patch.object(self.builder, "_build_provider_wheel", side_effect=build),
+                mock.patch.object(self.builder, "_run") as verify,
+            ):
+                self.assertEqual(packager.main(), 0)
+            verify.assert_called_once()
+            command = verify.call_args.args[0]
+            self.assertIn(str(ROOT / "vane-extension-ci-tools/scripts/vane_provider_build.py"), command)
+            self.assertEqual(command[command.index("--operation") + 1], "verify")
+            self.assertEqual(command[command.index("--vane-source") + 1], str(root / "engine"))
+            self.assertEqual(command[command.index("--base-wheel") + 1], str(runtime))
+            self.assertTrue(
+                Path(command[command.index("--dependency-wheel") + 1]).name.startswith("vane_extension_sqlite_scanner-")
+            )
+            self.assertEqual(len(list(output.glob("*.whl"))), 2)
+            environment.cleanup.assert_called_once()
 
 
 if __name__ == "__main__":
