@@ -89,6 +89,10 @@ still an in-memory retained view, without a held catalog transaction or a GC
 registration. Concurrent capture/admission during maintenance and out-of-core
 source ownership remain integration work.
 
+The follow-up [native admission proof](native-vortex-admission-proof.md) captures
+that view through one native transaction and verifies concurrent writes and
+physical cleanup through an explicit self-contained source handoff.
+
 ## Validation and reproduction
 
 Build the probe with the [index-proof instructions](native-vortex-index-proof.md#build-and-run),

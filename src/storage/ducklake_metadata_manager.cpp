@@ -3001,14 +3001,26 @@ string DuckLakeMetadataManager::GetInlinedDeletionTableName(TableIndex table_id,
 		return table_name;
 	}
 
-	// Check catalog-level cache (persists across transactions)
 	auto &catalog = transaction.GetCatalog();
-	auto cache_result = catalog.CheckInlinedDeletionTableCache(table_id, snapshot);
-	if (cache_result == InlinedDeletionCacheResult::EXISTS) {
-		return table_name; // known to exist (committed)
-	}
-	if (cache_result == InlinedDeletionCacheResult::DOES_NOT_EXIST && !create_if_not_exists) {
-		return string(); // known to not exist
+	if (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb") {
+		// Table existence must use this metadata transaction's catalog visibility.
+		auto entry = transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+		                                                   table_name);
+		if (entry) {
+			delete_inlined_table_cache.insert(table_id.index);
+			return table_name;
+		}
+		if (!create_if_not_exists) {
+			return string();
+		}
+	} else {
+		auto cache_result = catalog.CheckInlinedDeletionTableCache(table_id, snapshot);
+		if (cache_result == InlinedDeletionCacheResult::EXISTS) {
+			return table_name;
+		}
+		if (cache_result == InlinedDeletionCacheResult::DOES_NOT_EXIST && !create_if_not_exists) {
+			return string();
+		}
 	}
 
 	if (create_if_not_exists) {

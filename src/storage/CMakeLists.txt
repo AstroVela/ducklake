@@ -52,6 +52,10 @@ if(DUCKLAKE_VANE_DISTRIBUTED)
        $<TARGET_OBJECTS:ducklake_distributed_scan_objects>)
 endif()
 
+if(DUCKLAKE_ENABLE_VORTEX)
+  target_sources(ducklake_storage PRIVATE ducklake_vortex_read_view.cpp)
+endif()
+
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:ducklake_storage>
     PARENT_SCOPE)

@@ -1,0 +1,93 @@
+# name: test/sql/vortex/native_vortex_read_view.test
+# description: native Vortex read-view acquisition owns one committed snapshot and releases failed admissions
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+SET threads=2
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_read_view.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_read_view', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT, embedding FLOAT[], category VARCHAR, payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+INSERT INTO lake.items VALUES (1,[1,2,3],'A','中文'),(2,[2,3,4],'B',NULL),(3,[3,4,5],NULL,'third')
+
+query III
+SELECT visible_rows,inline_rows,source_bytes>0 FROM ducklake_vortex_read_view('lake','main','items',3,67108864,100000)
+----
+3	0	true
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')
+
+statement ok
+UPDATE lake.items SET payload='updated' WHERE id=1
+
+statement ok
+INSERT INTO lake.items VALUES (4,[4,5,6],'A','new')
+
+query III
+SELECT visible_rows,inline_rows,source_bytes>0 FROM ducklake_vortex_read_view('lake','main','items',3,67108864,100000)
+----
+4	2	true
+
+statement error
+SELECT * FROM ducklake_vortex_read_view('lake','main','items',3,1,100000)
+----
+source byte budget
+
+statement error
+SELECT * FROM ducklake_vortex_read_view('lake','main','items',3,67108864,1)
+----
+physical row budget
+
+statement error
+SELECT * FROM ducklake_vortex_read_view('lake','main','items',2,67108864,100000)
+----
+vector dimension
+
+statement error
+SELECT * FROM ducklake_vortex_read_view('lake','main','items',0,67108864,100000)
+----
+budgets or dimension
+
+statement error
+SELECT * FROM ducklake_vortex_read_view('lake','main','items',NULL,67108864,100000)
+----
+cannot be NULL
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.items VALUES (999,[9,9,9],'A','uncommitted')
+
+query II
+SELECT visible_rows,inline_rows FROM ducklake_vortex_read_view('lake','main','items',3,67108864,100000)
+----
+4	2
+
+statement ok
+ROLLBACK
+
+statement ok
+CALL ducklake_flush_inlined_data('lake')
+
+query II
+SELECT visible_rows,inline_rows FROM ducklake_vortex_read_view('lake','main','items',3,67108864,100000)
+----
+4	0
+
+statement ok
+DETACH lake

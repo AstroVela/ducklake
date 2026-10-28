@@ -33,6 +33,7 @@ use vortex_index::VectorSearchOptions;
 use vortex_index::file::file_version;
 use vortex_index_spfresh::SPFRESH_ID;
 
+use crate::admission;
 use crate::file_index;
 use crate::read_view::IndexLease;
 use crate::read_view::ViewBudget;
@@ -65,9 +66,9 @@ struct InlineRow {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MixedCapture {
-    format_version: u32,
-    file_capture: Capture,
+pub struct MixedCapture {
+    pub format_version: u32,
+    pub file_capture: Capture,
     inline_rows: Vec<InlineRow>,
 }
 
@@ -182,16 +183,26 @@ impl MixedView {
         leases: &Path,
         budget: ViewBudget,
         session: VortexSession,
+        admitted: bool,
     ) -> VortexResult<Self> {
         if !capture.is_absolute() || !reference.is_absolute() {
             vortex_bail!("Retained view paths must be absolute");
         }
-        if fs::metadata(capture)?.len() > 64 * 1024 * 1024 {
+        let max_bytes = if admitted { 160 } else { 64 } * 1024 * 1024;
+        if fs::metadata(capture)?.len() > max_bytes {
             vortex_bail!("Mixed capture exceeds its byte budget");
         }
         let bytes = fs::read(capture)?;
-        let captured: MixedCapture =
-            serde_json::from_slice(&bytes).map_err(|error| vortex_err!("{error}"))?;
+        let (captured, pins) = if admitted {
+            let prepared = admission::prepare(&bytes, budget.source_bytes, leases)?;
+            (prepared.capture, Some(prepared.pins))
+        } else {
+            (
+                serde_json::from_slice::<MixedCapture>(&bytes)
+                    .map_err(|error| vortex_err!("{error}"))?,
+                None,
+            )
+        };
         if captured.format_version != 1 || captured.file_capture.business_fields.is_none() {
             vortex_bail!("Mixed capture requires version 1 and business field IDs");
         }
@@ -228,15 +239,24 @@ impl MixedView {
                 vortex_bail!("Duplicate inline row address");
             }
         }
-        let source = Arc::new(
-            PhysicalSource::open_with_budget(
-                &serde_json::to_vec(&captured.file_capture)
-                    .map_err(|error| vortex_err!("{error}"))?,
-                session,
-                budget.source_bytes,
-            )
-            .await?,
-        );
+        let source_capture =
+            serde_json::to_vec(&captured.file_capture).map_err(|error| vortex_err!("{error}"))?;
+        let source = Arc::new(match &pins {
+            Some(pins) => {
+                PhysicalSource::open_pinned(
+                    &source_capture,
+                    session,
+                    budget.source_bytes,
+                    &pins.files,
+                )
+                .await?
+            }
+            None => {
+                PhysicalSource::open_with_budget(&source_capture, session, budget.source_bytes)
+                    .await?
+            }
+        });
+        drop(pins);
         let descriptor = file_index::reference_for(&source, reference)?;
         let scan_files = source
             .snapshot()
