@@ -7,6 +7,7 @@ use std::collections::BinaryHeap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -174,26 +175,39 @@ pub struct MixedView {
     visible: BTreeSet<RowAddress>,
     indexed: Snapshot,
     scan_files: Vec<u64>,
+    pub catalog_revision: Option<u64>,
+}
+
+pub enum ViewInput {
+    Mixed { reference: PathBuf },
+    Admitted { reference: PathBuf },
+    Catalogued { index_name: String },
 }
 
 impl MixedView {
     pub async fn open(
         capture: &Path,
-        reference: &Path,
+        input: ViewInput,
         leases: &Path,
         budget: ViewBudget,
         session: VortexSession,
-        admitted: bool,
     ) -> VortexResult<Self> {
-        if !capture.is_absolute() || !reference.is_absolute() {
+        if !capture.is_absolute() {
             vortex_bail!("Retained view paths must be absolute");
         }
+        let admitted = !matches!(&input, ViewInput::Mixed { .. });
         let max_bytes = if admitted { 160 } else { 64 } * 1024 * 1024;
         if fs::metadata(capture)?.len() > max_bytes {
             vortex_bail!("Mixed capture exceeds its byte budget");
         }
         let bytes = fs::read(capture)?;
-        let (captured, pins) = if admitted {
+        let mut catalog = None;
+        let (captured, pins) = if let ViewInput::Catalogued { index_name } = &input {
+            let (prepared, index) =
+                admission::prepare_catalogued(&bytes, index_name, budget.source_bytes, leases)?;
+            catalog = Some(index);
+            (prepared.capture, Some(prepared.pins))
+        } else if admitted {
             let prepared = admission::prepare(&bytes, budget.source_bytes, leases)?;
             (prepared.capture, Some(prepared.pins))
         } else {
@@ -257,7 +271,26 @@ impl MixedView {
             }
         });
         drop(pins);
-        let descriptor = file_index::reference_for(&source, reference)?;
+        let catalog_revision = catalog.as_ref().map(|index| index.revision);
+        let (descriptor, root) = match input {
+            ViewInput::Mixed { reference } | ViewInput::Admitted { reference } => {
+                if !reference.is_absolute() {
+                    vortex_bail!("Retained view paths must be absolute");
+                }
+                let descriptor = file_index::reference_for(&source, &reference)?;
+                let root = reference
+                    .parent()
+                    .ok_or_else(|| vortex_err!("Reference parent required"))?
+                    .to_path_buf();
+                (descriptor, root)
+            }
+            ViewInput::Catalogued { .. } => {
+                let index =
+                    catalog.ok_or_else(|| vortex_err!("Catalogued index record required"))?;
+                file_index::validate_reference(&source, &index.reference)?;
+                (index.reference, index.root)
+            }
+        };
         let scan_files = source
             .snapshot()
             .files
@@ -265,8 +298,8 @@ impl MixedView {
             .filter(|file| descriptor.snapshot.file(file.id).is_none())
             .map(|file| file.id)
             .collect();
-        let lease = IndexLease::open(
-            reference,
+        let lease = IndexLease::open_root(
+            &root,
             &descriptor.generation,
             &descriptor.snapshot,
             leases,
@@ -303,6 +336,7 @@ impl MixedView {
             visible,
             indexed: descriptor.snapshot,
             scan_files,
+            catalog_revision,
         })
     }
 

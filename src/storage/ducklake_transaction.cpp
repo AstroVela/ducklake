@@ -30,6 +30,11 @@
 #endif
 #include "duckdb/main/client_config.hpp"
 
+#ifdef DUCKLAKE_ENABLE_VORTEX
+#include "storage/ducklake_vortex_index_catalog.hpp"
+#include "duckdb/storage/storage_lock.hpp"
+#endif
+
 namespace duckdb {
 
 bool LocalTableDataChanges::IsEmpty() const {
@@ -765,6 +770,9 @@ void DuckLakeTransaction::Start() {
 void DuckLakeTransaction::Commit() {
 	try {
 		if (ChangesMade()) {
+#ifdef DUCKLAKE_ENABLE_VORTEX
+			auto publication_guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+#endif
 			FlushChanges();
 		} else if (connection) {
 			connection->Commit();

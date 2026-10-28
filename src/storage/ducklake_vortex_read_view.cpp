@@ -10,7 +10,8 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "mbedtls_wrapper.hpp"
-#include "yyjson.hpp"
+#include "common/ducklake_vortex_json.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,60 +20,9 @@
 namespace duckdb {
 
 using namespace duckdb_yyjson;
+using namespace vortex_detail;
 
 namespace {
-
-struct ViewJSON {
-	ViewJSON() : doc(yyjson_mut_doc_new(nullptr), yyjson_mut_doc_free) {
-		if (!doc) {
-			throw OutOfMemoryException("Cannot allocate Vortex read view JSON");
-		}
-	}
-
-	yyjson_mut_val *Object() {
-		return yyjson_mut_obj(doc.get());
-	}
-	yyjson_mut_val *Array() {
-		return yyjson_mut_arr(doc.get());
-	}
-	void Add(yyjson_mut_val *object, const char *key, yyjson_mut_val *value) {
-		yyjson_mut_obj_add_val(doc.get(), object, key, value);
-	}
-	void Number(yyjson_mut_val *object, const char *key, idx_t value) {
-		Add(object, key, yyjson_mut_uint(doc.get(), value));
-	}
-	void Text(yyjson_mut_val *object, const char *key, const string &value) {
-		Add(object, key, yyjson_mut_strncpy(doc.get(), value.data(), value.size()));
-	}
-	void NullableText(yyjson_mut_val *object, const char *key, const Value &value) {
-		if (value.IsNull()) {
-			Add(object, key, yyjson_mut_null(doc.get()));
-		} else {
-			Text(object, key, StringValue::Get(value));
-		}
-	}
-	string Finish(yyjson_mut_val *root) {
-		yyjson_mut_doc_set_root(doc.get(), root);
-		size_t length = 0;
-		std::unique_ptr<char, decltype(&free)> text(yyjson_mut_write(doc.get(), 0, &length), free);
-		if (!text) {
-			throw OutOfMemoryException("Cannot serialize Vortex read view");
-		}
-		return string(text.get(), length);
-	}
-	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> doc;
-};
-
-string Hex(const string &bytes) {
-	static const char digits[] = "0123456789abcdef";
-	string result(bytes.size() * 2, '0');
-	for (idx_t i = 0; i < bytes.size(); i++) {
-		auto value = static_cast<uint8_t>(bytes[i]);
-		result[i * 2] = digits[value >> 4];
-		result[i * 2 + 1] = digits[value & 15];
-	}
-	return result;
-}
 
 yyjson_mut_val *Business(ViewJSON &json, const vector<Value> &values, uint32_t dimension) {
 	auto row = json.Object();
@@ -107,8 +57,10 @@ StorageLock &DuckLakeVortexReadView::AdmissionLock() {
 DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
                                                        const std::function<void(const string &)> &observe,
                                                        optional_ptr<ClientContext> owner) {
-	if (options.dimension == 0 || options.dimension > 4096 || options.max_source_bytes == 0 ||
-	    options.max_source_bytes > 64 * 1024 * 1024 || options.max_rows == 0 || options.max_rows > 100000) {
+	const bool invalid_dimension =
+	    options.index_name.empty() ? options.dimension == 0 || options.dimension > 4096 : options.dimension != 0;
+	if (invalid_dimension || options.max_source_bytes == 0 || options.max_source_bytes > 64 * 1024 * 1024 ||
+	    options.max_rows == 0 || options.max_rows > 100000) {
 		throw InvalidInputException("Invalid native Vortex read view budgets or dimension");
 	}
 	if (reader.context->transaction.HasActiveTransaction()) {
@@ -135,8 +87,23 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 		auto entry = catalog.GetEntry(*reader.context, CatalogType::TABLE_ENTRY, options.schema, options.table,
 		                              OnEntryNotFound::THROW_EXCEPTION);
 		auto &table = entry->Cast<DuckLakeTableEntry>();
+		unique_ptr<DuckLakeVortexIndex> index;
+		auto dimension = options.dimension;
+		if (!options.index_name.empty()) {
+			index = make_uniq<DuckLakeVortexIndex>(DuckLakeVortexIndex::Lookup(transaction, table, options.index_name));
+			dimension = index->dimension;
+		}
 		ViewJSON json;
 		auto admission = json.Object();
+		if (index) {
+			auto record = index->ToJSON();
+			std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> parsed(yyjson_read(record.data(), record.size(), 0),
+			                                                               yyjson_doc_free);
+			if (!parsed) {
+				throw InvalidInputException("Invalid catalog index record");
+			}
+			json.Add(admission, "index", yyjson_val_mut_copy(json.doc.get(), yyjson_doc_get_root(parsed.get())));
+		}
 		json.Number(admission, "format_version", 1);
 		auto mixed = json.Object();
 		json.Number(mixed, "format_version", 1);
@@ -147,7 +114,7 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 		json.Text(captured, "table_uuid", table.GetTableUUID());
 		json.Number(captured, "snapshot_id", snapshot.snapshot_id);
 		json.Number(captured, "schema_version", snapshot.schema_version);
-		json.Number(captured, "dimension", options.dimension);
+		json.Number(captured, "dimension", dimension);
 		auto business = json.Object();
 		json.Add(captured, "business_fields", business);
 		for (auto &name : {"id", "embedding", "category", "payload"}) {
@@ -176,7 +143,8 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 		result.snapshot_id = snapshot.snapshot_id;
 		auto &fs = FileSystem::GetFileSystem(*reader.context);
 		idx_t physical_rows = 0;
-		const auto row_limit = MinValue<idx_t>(options.max_rows, 64 * 1024 * 1024 / sizeof(float) / options.dimension);
+		vector<DuckLakeVortexIndexFile> identities;
+		const auto row_limit = MinValue<idx_t>(options.max_rows, 64 * 1024 * 1024 / sizeof(float) / dimension);
 		for (auto &file : files) {
 			if (file.data_type != DuckLakeDataType::DATA_FILE) {
 				continue;
@@ -202,7 +170,9 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 			auto descriptor = json.Object();
 			json.Number(descriptor, "id", file.file_id.index);
 			json.Text(descriptor, "uri", file.file.path);
-			json.Text(descriptor, "version", "sha256:" + Hex(duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes)));
+			auto version = "sha256:" + Hex(duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes));
+			json.Text(descriptor, "version", version);
+			identities.push_back({file.file_id.index, file.file.path, version, file.row_count});
 			json.Number(descriptor, "row_count", file.row_count);
 			yyjson_mut_arr_append(inventory, descriptor);
 			auto source = json.Object();
@@ -213,6 +183,9 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 				throw InvalidInputException("Duplicate native read view file path");
 			}
 			checkpoint("after_pin");
+		}
+		if (index) {
+			index->ValidateCoverage(identities);
 		}
 		auto visible = json.Array();
 		auto inlined = json.Array();
@@ -242,7 +215,7 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 				for (idx_t col = 0; col < 4; col++) {
 					values.push_back(chunk->GetValue(col, row_idx));
 				}
-				idx_t row_bytes = options.dimension * sizeof(float) + 64;
+				idx_t row_bytes = dimension * sizeof(float) + 64;
 				for (idx_t col = 2; col < 4; col++) {
 					if (!values[col].IsNull()) {
 						row_bytes += StringValue::Get(values[col]).size();
@@ -274,7 +247,7 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 					json.Number(address, "row_id", chunk->GetValue(6, row_idx).GetValue<idx_t>());
 					auto value = json.Object();
 					json.Add(value, "row_ref", address);
-					json.Add(value, "row", Business(json, values, options.dimension));
+					json.Add(value, "row", Business(json, values, dimension));
 					yyjson_mut_arr_append(inlined, value);
 					result.inline_rows++;
 					oracle.Text(oracle_address, "kind", "inline");
@@ -285,7 +258,7 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 				}
 				auto value = oracle.Object();
 				oracle.Add(value, "row_ref", oracle_address);
-				oracle.Add(value, "row", Business(oracle, values, options.dimension));
+				oracle.Add(value, "row", Business(oracle, values, dimension));
 				yyjson_mut_arr_append(expected, value);
 			}
 		}
