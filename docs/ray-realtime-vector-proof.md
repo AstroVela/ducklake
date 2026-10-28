@@ -82,6 +82,36 @@ default release-wheel extension profile remains open.
 
 ## Open validation gates
 
+Packaged-wheel CI run [40598873925](https://github.com/AstroVela/ducklake/actions/runs/40598873925)
+passed the realtime vector proof and the dynamic-wheel integration. The static
+wheel's complete two-worker integration failed with a worker `SIGSEGV` in
+`malloc` while Ray serialized a result. That crash remains unresolved; the local
+integration pass above does not qualify this CI path.
+
+Follow-up uses the original CI wheel, Python 3.12.15, Ray 2.59.0, Arrow 26.0.0,
+and msgpack 1.2.4. One full run instead hung on the first ordered read after an
+intentionally failed UPDATE: all four ORDER BY sample tasks had finished, but
+the driver waited for an unavailable Ray ObjectRef. Thread stacks and resource
+snapshots were retained locally. A smaller failed-UPDATE/ordered-read probe
+passed 30 consecutive iterations with Python memory debugging enabled. Neither
+observation establishes the cause of the SIGSEGV.
+
+A subsequent complete integration run of that same static CI wheel passed with
+Python memory debugging enabled. This confirms the failure is intermittent in
+the tested setup; it is not a repair or successful recovery qualification.
+
+The integration harness now prints its execution phase and preserves a primary
+query exception when teardown also fails. All cleanup steps are still attempted;
+a cleanup failure on an otherwise successful run fails the test. Both packaged
+Ray jobs enable Python memory-debug hooks and preserve worker logs after a
+failure for further diagnosis.
+
+The separate [Vane fairness draft #1104](https://github.com/AstroVela/vane/pull/1104)
+repairs a newer-main task-admission race found in #1103's CI. Its three new
+deterministic regression cases fail on the original CI admission module, while
+177 admission and local-model task-pool cases pass with the Python fix. This is
+independent of the native worker crash; the development runtime pin is unchanged.
+
 The optional `--kill-node` experiment fails after removing an execution node
 while a UDF holds a query at the snapshot boundary. The runtime reports
 `failed to quiesce FTE worker side effects before retry`, followed by session
