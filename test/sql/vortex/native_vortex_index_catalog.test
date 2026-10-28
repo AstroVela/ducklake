@@ -1,0 +1,69 @@
+# name: test/sql/vortex/native_vortex_index_catalog.test
+# description: named index catalog initialization is explicit and unavailable references fail closed
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_index_catalog.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_index_catalog', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+INSERT INTO lake.items VALUES(1,[1,2,3],'A','first')
+
+statement error
+SELECT * FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+----
+catalog is not initialized
+
+query I
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+----
+true
+
+statement error
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+----
+already exists
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
+----
+0
+
+statement error
+SELECT * FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+----
+No published Vortex index
+
+statement error
+SELECT * FROM ducklake_publish_vortex_index('lake','main','items','knn','/missing-vortex-reference.json',0)
+----
+paths must be canonical
+
+statement error
+SELECT * FROM ducklake_vortex_index_view('lake','main','items','',67108864,100000)
+----
+name cannot be empty
+
+statement error
+SELECT * FROM ducklake_publish_vortex_index('lake','main','items',NULL,'unused',0)
+----
+cannot be NULL
+
+query II
+SELECT visible_rows,inline_rows FROM ducklake_vortex_read_view('lake','main','items',3,67108864,100000)
+----
+1	0
+
+statement ok
+DETACH lake
