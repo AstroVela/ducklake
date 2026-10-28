@@ -97,8 +97,8 @@ passed 30 consecutive iterations with Python memory debugging enabled. Neither
 observation establishes the cause of the SIGSEGV.
 
 A subsequent complete integration run of that same static CI wheel passed with
-Python memory debugging enabled. This confirms the failure is intermittent in
-the tested setup; it is not a repair or successful recovery qualification.
+Python memory debugging enabled. The crash and non-debug hang were not reproduced
+in that run; this is not a repair or successful recovery qualification.
 
 The integration harness now prints its execution phase and preserves a primary
 query exception when teardown also fails. All cleanup steps are still attempted;
