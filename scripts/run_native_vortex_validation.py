@@ -124,6 +124,7 @@ def main() -> None:
                 "merge/*",
                 "constraints/*",
                 "metadata/appender_data_files.test",
+                "deletion_inlining/inlined_delete_metadata_snapshot.test",
                 "virtualcolumns/*",
                 "rowid/*",
                 "time_travel/*",

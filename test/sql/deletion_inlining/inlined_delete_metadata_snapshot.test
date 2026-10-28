@@ -1,0 +1,45 @@
+# name: test/sql/deletion_inlining/inlined_delete_metadata_snapshot.test
+# description: a reader predating deletion-table creation uses its own metadata catalog snapshot
+# group: [deletion_inlining]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/inlined_delete_metadata_snapshot.ducklake' AS lake (DATA_PATH '__TEST_DIR__/inlined_delete_metadata_snapshot', DATA_INLINING_ROW_LIMIT 100)
+
+statement ok
+CREATE TABLE lake.items AS SELECT i FROM range(128) t(i)
+
+statement ok reader
+BEGIN
+
+query I reader
+SELECT sum(i) FROM lake.items
+----
+8128
+
+statement ok writer
+DELETE FROM lake.items WHERE i=1
+
+query I newer
+SELECT sum(i) FROM lake.items
+----
+8127
+
+query I reader
+SELECT sum(i) FROM lake.items
+----
+8128
+
+statement ok reader
+COMMIT
+
+query I reader
+SELECT sum(i) FROM lake.items
+----
+8127
+
+statement ok
+DETACH lake
