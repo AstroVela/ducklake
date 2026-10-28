@@ -104,6 +104,18 @@ class Proof:
         snapshot: int | None = None,
         read_vectors: bool = True,
     ) -> tuple[Path, list[dict]]:
+        capture, rows = self.capture_rows(directory, snapshot, read_vectors)
+        require(
+            all(not row["filename"].startswith("ducklake_inlined_data_") for row in rows),
+            "inlined rows require the separate mixed-query gate",
+        )
+        target = self.root / f"{name}.capture.json"
+        target.write_text(json.dumps(capture, sort_keys=True, separators=(",", ":")) + "\n")
+        return target, rows
+
+    def capture_rows(
+        self, directory: Path, snapshot: int | None = None, read_vectors: bool = True
+    ) -> tuple[dict, list[dict]]:
         if snapshot is None:
             snapshot = self.sql(directory, "SELECT max(snapshot_id) AS id FROM lake.snapshots();")[0]["id"]
         valid = f"begin_snapshot <= {snapshot} AND (end_snapshot IS NULL OR end_snapshot > {snapshot})"
@@ -173,14 +185,13 @@ class Proof:
         vector_projection = "embedding" if read_vectors else "NULL::FLOAT[] AS embedding"
         rows = self.sql(
             directory,
-            f"SELECT id, {vector_projection}, category, payload, filename, file_row_number AS row_offset "
+            f"SELECT id, {vector_projection}, category, payload, filename, file_row_number AS row_offset, "
+            "rowid AS logical_row_id "
             f"FROM lake.items AT (VERSION => {snapshot}) ORDER BY filename, file_row_number;",
         )
         for row in rows:
-            require(
-                not row["filename"].startswith("ducklake_inlined_data_"),
-                "inlined rows require the separate mixed-query gate",
-            )
+            if row["filename"].startswith("ducklake_inlined_data_"):
+                continue
             filename = str(Path(row["filename"]).resolve(strict=True))
             require(
                 filename in by_path,
@@ -196,11 +207,11 @@ class Proof:
             "dimension": 8,
             "business_fields": {name: field_ids[name] for name in ("id", "category", "payload")},
             "files": inventory,
-            "visible": [{"file_id": row["file_id"], "row_offset": row["row_offset"]} for row in rows],
+            "visible": [
+                {"file_id": row["file_id"], "row_offset": row["row_offset"]} for row in rows if "file_id" in row
+            ],
         }
-        target = self.root / f"{name}.capture.json"
-        target.write_text(json.dumps(capture, sort_keys=True, separators=(",", ":")) + "\n")
-        return target, rows
+        return capture, rows
 
     def build(self, capture: Path, name: str, expected: str | None = None) -> Path:
         reference = self.root / f"{name}.reference.json"

@@ -104,3 +104,8 @@ This does not add a production SQL index API, cross-snapshot index-coverage
 reuse, automatic catalog index publication, mixed ANN/unindexed/inlined top-k,
 cloud storage or Ray execution. The next mixed-query proof can use this explicit
 read-view lifetime to keep branch results and ranked fetch on the same source.
+
+The follow-up [mixed top-k proof](native-vortex-mixed-proof.md) implements that
+explicit B/F/T validation path while retaining this snapshot-bound proof.
+Its worker configuration also requires inlined row/byte limits; snapshot-only
+views consume zero from those counters.
