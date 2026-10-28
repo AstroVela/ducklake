@@ -9,6 +9,8 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
+#include "storage/ducklake_vortex_control.hpp"
+#include "storage/ducklake_vortex_query_ffi.hpp"
 #include "mbedtls_wrapper.hpp"
 
 #include <cstdlib>
@@ -355,6 +357,66 @@ string DuckLakeVortexIndex::ToJSON() const {
 	json.Text(value, "root", root);
 	json.Add(value, "reference", yyjson_val_mut_copy(json.doc.get(), parsed.Root()));
 	return json.Finish(value);
+}
+
+DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context, const string &catalog_name,
+                                                         const string &schema, const string &table_name,
+                                                         const string &name, const string &reference_path,
+                                                         uint32_t dimension, idx_t expected_revision,
+                                                         const std::function<void(const string &)> &observe) {
+	Name(name);
+	if (!dimension || dimension > 4096 || reference_path.empty() || reference_path.size() > 65536 ||
+	    reference_path.find('\0') != string::npos || expected_revision > idx_t(NumericLimits<int64_t>::Maximum())) {
+		throw InvalidInputException("Invalid Vortex build dimension, reference or revision");
+	}
+	auto check = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	};
+	check("before_build");
+	Connection owner(*context.db);
+	try {
+		Initialized(Begin(owner, catalog_name));
+		owner.Commit();
+	} catch (...) {
+		Rollback(owner);
+		throw;
+	}
+	DuckLakeVortexViewOptions options {catalog_name, schema, table_name, dimension, MAX_ARTIFACTS, 100000, ""};
+	auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, observe, &context);
+	vector<DuckLakeVortexQuerySource> sources;
+	for (auto &source : view.sources) {
+		sources.push_back(
+		    {source.file_id, reinterpret_cast<const uint8_t *>(source.bytes.data()), source.bytes.size()});
+	}
+	DuckLakeVortexControl control {context, observe, nullptr, view.sources};
+	DuckLakeVortexBuildInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
+	                                view.admission_json.size(),
+	                                sources.data(),
+	                                sources.size(),
+	                                reinterpret_cast<const uint8_t *>(view.managed_data_path.data()),
+	                                view.managed_data_path.size(),
+	                                reinterpret_cast<const uint8_t *>(reference_path.data()),
+	                                reference_path.size(),
+	                                DuckLakeVortexControl::Check,
+	                                &control};
+	std::unique_ptr<char, decltype(&ducklake_vortex_build_error_free)> error(ducklake_vortex_build(&input),
+	                                                                         ducklake_vortex_build_error_free);
+	if (control.error) {
+		std::rethrow_exception(control.error);
+	}
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
+	if (error) {
+		throw InvalidInputException("%s", error.get());
+	}
+	check("before_build_publish");
+	return Publish(owner, catalog_name, schema, table_name, name, reference_path, expected_revision, check);
 }
 
 DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string &catalog_name, const string &schema,

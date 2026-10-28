@@ -1,5 +1,6 @@
 #include "storage/ducklake_vortex_search.hpp"
 #include "storage/ducklake_vortex_query_ffi.hpp"
+#include "storage/ducklake_vortex_control.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "common/ducklake_vortex_json.hpp"
 
@@ -7,30 +8,6 @@
 #include <exception>
 
 namespace duckdb {
-namespace {
-struct QueryControl {
-	ClientContext &context;
-	const std::function<void(const string &)> &observe;
-	std::exception_ptr error;
-	vector<DuckLakeVortexSourceBuffer> &sources;
-};
-
-uint8_t CheckQuery(void *pointer, const uint8_t *stage, uint64_t length) {
-	auto &control = *static_cast<QueryControl *>(pointer);
-	try {
-		if (string(reinterpret_cast<const char *>(stage), length) == "source_pinned") {
-			control.sources.clear();
-		}
-		if (control.observe) {
-			control.observe(string(reinterpret_cast<const char *>(stage), length));
-		}
-	} catch (...) {
-		control.error = std::current_exception();
-		return 1;
-	}
-	return control.context.IsInterrupted() ? 1 : 0;
-}
-} // namespace
 
 DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
                                                          const DuckLakeVortexViewOptions &options,
@@ -52,7 +29,7 @@ DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
 		sources.push_back(
 		    {source.file_id, reinterpret_cast<const uint8_t *>(source.bytes.data()), source.bytes.size()});
 	}
-	QueryControl control {context, observe, nullptr, view.sources};
+	DuckLakeVortexControl control {context, observe, nullptr, view.sources};
 	DuckLakeVortexQueryInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
 	                                view.admission_json.size(),
 	                                sources.data(),
@@ -67,7 +44,7 @@ DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
 	                                reinterpret_cast<const uint8_t *>(request.category.data()),
 	                                request.category.size(),
 	                                uint8_t(request.filter_category),
-	                                CheckQuery,
+	                                DuckLakeVortexControl::Check,
 	                                &control};
 	std::unique_ptr<DuckLakeVortexQueryOutput, decltype(&ducklake_vortex_query_free)> result(
 	    ducklake_vortex_query(&input), ducklake_vortex_query_free);

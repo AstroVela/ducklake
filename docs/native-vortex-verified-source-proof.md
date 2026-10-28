@@ -130,3 +130,6 @@ corrupt-input rejection and ownership checks remain in place. Publication,
 T-to-F flush, prepared snapshots, cancellation and held reads across actual
 source/index removal retain the #35 coverage. Automatic background indexing,
 out-of-core ownership and distributed ANN remain separate work.
+
+The next [native build proof](native-vortex-build-proof.md) connects the existing
+builder to SQL and validates F-to-B promotion with concurrent queries and writes.
