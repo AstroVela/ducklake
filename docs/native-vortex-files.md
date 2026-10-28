@@ -116,13 +116,20 @@ keep their ordinary SQL meaning where the schema permits them. This draft does
 not provide fixed vector dimensions, finite-component admission, or conversion
 to the static ANN provider's FixedSizeList contract. Those belong to DL3b.
 
-Static ANN construction and reopen, filtered ANN top-k, index coverage and
-publication, production ingestion/idempotency APIs, cloud storage, PostgreSQL
-and SQLite catalogs, Ray execution, node loss, server failover, and power loss
-remain separate gates. Vane builds reject Vortex data files before transporting
-ordinary scan or row-mutation tasks. Default provider manifests and release
-configurations do not enable the experimental format.
+The [native Vortex index proof](native-vortex-index-proof.md) separately connects
+these files to the existing Vortex SPFresh provider for construction, reopen and
+filtered ANN retrieval. It qualifies a frozen DuckLake view and requires a new
+generation after source or physical-inventory changes.
+
+Mixed indexed/unindexed/inlined retrieval, catalog index publication,
+production ingestion/idempotency APIs, cloud storage, PostgreSQL and SQLite
+catalogs, Ray execution, node loss, server failover, and power loss remain
+separate gates. Vane builds reject Vortex data files before transporting ordinary
+scan or row-mutation tasks. Default provider manifests and release configurations
+do not enable the experimental format.
 
 Local builds reuse native engine and Vortex objects from the exact pins above
-and rebuild the DuckLake sources. Clean ON/OFF builds remain a hosted CI gate;
-the draft does not claim that an uncompleted hosted run passed.
+and rebuild the DuckLake sources. The DL3a clean ON/OFF builds passed for
+`71e1281dc9030418257bb5c2571c52a2e3ab57d4` in
+[Native Vortex validation](https://github.com/AstroVela/ducklake/actions/runs/40646127607).
+The index proof has an additional hosted gate.
