@@ -162,3 +162,7 @@ compiling changed DuckLake code, the Rust query library and the Vortex archive
 with the required link configuration. Clean hosted builds remain a separate CI
 gate. Background indexing, index GC, cloud/multiprocess ownership, out-of-core
 queries and general SQL optimizer integration remain later work.
+
+The next [query-cost proof](native-vortex-query-cost-proof.md) separates SQL
+visibility/T capture from the full oracle, projects category and reranking
+vectors independently, and measures the change against this implementation.
