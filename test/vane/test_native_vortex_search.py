@@ -134,7 +134,7 @@ def exercise(proof, native, scratch, checks):
     native.sql("ROLLBACK;")
     failures = [
         ("cancel-search", stage, "Interrupted")
-        for stage in ("after_open", "category_filter", "after_ann", "scan_batch", "before_fetch")
+        for stage in ("after_visibility", "after_open", "category_filter", "after_ann", "scan_batch", "before_fetch")
     ]
     failures += [("fail-search", stage, "Injected query lease failure") for stage in ("source_pinned", "after_open")]
     for op, stage, error in failures:
@@ -148,6 +148,23 @@ def exercise(proof, native, scratch, checks):
     no_leases(scratch)
     checks.append(
         "interruption after index admission, injected failure, dimension rejection and early SQL LIMIT release private staging and leave fresh SQL queries usable"
+    )
+
+    split_write = proof.root / "split-write.sql"
+    split_write.write_text(
+        "UPDATE lake.items SET payload='committed-after-visibility' WHERE id=6000;"
+        "CALL ducklake_flush_inlined_data('lake');"
+    )
+    overlapping = native.call("split-search", split_write)
+    require(overlapping["rows"] == delta["rows"], "split visibility/T capture mixed metadata transactions")
+    native.call("raw", "delta")
+    oracle = native.rows("delta")
+    delta = query(native, "EXECUTE reusable_search")
+    recalls.append(qualify(delta, oracle, vector))
+    require(delta["rows"][0]["payload"] == "committed-after-visibility", "fresh SQL view missed the concurrent flush")
+    no_leases(scratch)
+    checks.append(
+        "a writer commits and flushes after visibility capture; the held query keeps old T business rows and a fresh query sees the new F version"
     )
 
     maintenance = proof.root / "maintenance.sql"

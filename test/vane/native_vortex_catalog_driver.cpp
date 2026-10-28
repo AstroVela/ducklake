@@ -77,7 +77,8 @@ public:
 			}
 			return SearchJSON(rows, "{}");
 		}
-		if (op == "core-search" || op == "cancel-search" || op == "fail-search" || op == "held-search") {
+		if (op == "core-search" || op == "cancel-search" || op == "fail-search" || op == "held-search" ||
+		    op == "split-search") {
 			Connection query(database);
 			DuckLakeVortexSearchRequest request;
 			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
@@ -104,20 +105,25 @@ public:
 				throw InvalidInputException("Query cancellation/failure injection did not fail");
 			}
 			Pause pause;
+			auto pause_stage = op == "split-search" ? "after_visibility" : "after_open";
 			auto pending = std::async(std::launch::async, [&] {
 				return DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request, [&](const string &stage) {
-					if (stage == "after_open") {
+					if (stage == pause_stage) {
 						pause.Stop();
 					}
 				});
 			});
 			ReleasePause release {pause};
 			pause.Wait();
-			Connection publisher(database);
-			DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "knn", args.at(2),
-			                             std::stoull(args.at(3)));
-			SQL(writer, ReadText(args.at(4)));
-			FileSystem::GetFileSystem(*writer.context).RemoveDirectory(args.at(5));
+			if (op == "split-search") {
+				SQL(writer, ReadText(args.at(2)));
+			} else {
+				Connection publisher(database);
+				DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "knn", args.at(2),
+				                             std::stoull(args.at(3)));
+				SQL(writer, ReadText(args.at(4)));
+				FileSystem::GetFileSystem(*writer.context).RemoveDirectory(args.at(5));
+			}
 			pause.Release();
 			auto result = pending.get();
 			return SearchJSON(result.rows, result.diagnostics);

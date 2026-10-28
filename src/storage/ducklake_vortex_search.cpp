@@ -1,6 +1,7 @@
 #include "storage/ducklake_vortex_search.hpp"
 #include "storage/ducklake_vortex_query_ffi.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "common/ducklake_vortex_json.hpp"
 
 #include <cmath>
 #include <exception>
@@ -41,8 +42,7 @@ DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
 		}
 	}
 	Connection reader(*context.db);
-	auto view = DuckLakeVortexReadView::Acquire(reader, options, observe, &context);
-	view.rows_json = string();
+	auto view = DuckLakeVortexReadView::AcquireQuery(reader, options, observe, &context);
 	QueryControl control {context, observe, nullptr};
 	DuckLakeVortexQueryInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
 	                                view.admission_json.size(),
@@ -73,7 +73,24 @@ DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
 		throw InvalidInputException("%s", error);
 	}
 	DuckLakeVortexSearchResult output;
-	output.diagnostics = ducklake_vortex_query_diagnostics(result.get());
+	using namespace duckdb_yyjson;
+	auto diagnostics = ducklake_vortex_query_diagnostics(result.get());
+	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> parsed(yyjson_read(diagnostics, strlen(diagnostics), 0),
+	                                                               yyjson_doc_free);
+	if (!parsed) {
+		throw InternalException("Invalid native query diagnostics");
+	}
+	vortex_detail::ViewJSON json;
+	auto details = yyjson_val_mut_copy(json.doc.get(), yyjson_doc_get_root(parsed.get()));
+	auto capture = json.Object();
+	json.Number(capture, "source_bytes", view.source_bytes);
+	json.Number(capture, "visible_rows", view.visible_rows);
+	json.Number(capture, "inline_rows", view.inline_rows);
+	json.Number(capture, "business_rows", view.captured_business_rows);
+	json.Number(capture, "oracle_bytes", view.rows_json.size());
+	json.Number(capture, "admission_bytes", view.admission_json.size());
+	json.Add(details, "native_capture", capture);
+	output.diagnostics = json.Finish(details);
 	auto count = ducklake_vortex_query_count(result.get());
 	if (count > request.k) {
 		throw InternalException("Native Vortex query returned excess rows");

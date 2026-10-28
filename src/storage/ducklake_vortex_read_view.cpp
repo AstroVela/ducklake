@@ -54,9 +54,9 @@ StorageLock &DuckLakeVortexReadView::AdmissionLock() {
 	return lock;
 }
 
-DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
-                                                       const std::function<void(const string &)> &observe,
-                                                       optional_ptr<ClientContext> owner) {
+static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVortexViewOptions &options,
+                                          const std::function<void(const string &)> &observe,
+                                          optional_ptr<ClientContext> owner, bool oracle_rows) {
 	const bool invalid_dimension =
 	    options.index_name.empty() ? options.dimension == 0 || options.dimension > 4096 : options.dimension != 0;
 	if (invalid_dimension || options.max_source_bytes == 0 || options.max_source_bytes > 64 * 1024 * 1024 ||
@@ -80,7 +80,7 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 		if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 			throw InvalidInputException("Native Vortex read views require DuckDB metadata");
 		}
-		auto guard = AdmissionLock().GetSharedLock();
+		auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
 		auto &transaction = DuckLakeTransaction::Get(*reader.context, catalog);
 		auto snapshot = transaction.GetSnapshot();
 		checkpoint("after_snapshot");
@@ -196,79 +196,161 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 		            KeywordHelper::WriteOptionallyQuoted(options.schema) + "." +
 		            KeywordHelper::WriteOptionallyQuoted(options.table);
 		checkpoint("before_rows");
-		auto rows = reader.SendQuery("SELECT id, embedding, category, payload, filename, file_row_number, rowid FROM " +
-		                             name + " AT (VERSION => " + to_string(snapshot.snapshot_id) + ") LIMIT " +
-		                             to_string(row_limit + 1));
-		if (rows->HasError()) {
-			rows->ThrowError();
-		}
-		ViewJSON oracle;
-		auto expected = oracle.Array();
-		idx_t business_bytes = 0;
-		idx_t inline_bytes = 0;
-		while (auto chunk = rows->Fetch()) {
-			for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
-				checkpoint("row");
-				if (++result.visible_rows > row_limit) {
-					throw InvalidInputException("Read view visible row budget exceeded");
-				}
-				vector<Value> values;
-				for (idx_t col = 0; col < 4; col++) {
-					values.push_back(chunk->GetValue(col, row_idx));
-				}
-				idx_t row_bytes = dimension * sizeof(float) + 64;
-				for (idx_t col = 2; col < 4; col++) {
-					if (!values[col].IsNull()) {
-						row_bytes += StringValue::Get(values[col]).size();
-					}
-				}
-				if (row_bytes > 64 * 1024 * 1024 - business_bytes) {
-					throw InvalidInputException("Read view business byte budget exceeded");
-				}
-				business_bytes += row_bytes;
-				auto filename = chunk->GetValue(4, row_idx).GetValue<string>();
-				auto address = json.Object();
-				auto oracle_address = oracle.Object();
-				auto file = by_path.find(filename);
-				if (file != by_path.end()) {
-					auto offset = chunk->GetValue(5, row_idx).GetValue<idx_t>();
-					json.Number(address, "file_id", file->second);
-					json.Number(address, "row_offset", offset);
-					yyjson_mut_arr_append(visible, address);
-					oracle.Text(oracle_address, "kind", "file");
-					oracle.Number(oracle_address, "file_id", file->second);
-					oracle.Number(oracle_address, "row_offset", offset);
-				} else if (StringUtil::StartsWith(filename, "ducklake_inlined_data_")) {
-					if (row_bytes > 4 * 1024 * 1024 - inline_bytes) {
-						throw InvalidInputException("Read view inline byte budget exceeded");
-					}
-					inline_bytes += row_bytes;
-					json.Text(address, "kind", "inline");
-					json.Text(address, "source", filename);
-					json.Number(address, "row_id", chunk->GetValue(6, row_idx).GetValue<idx_t>());
-					auto value = json.Object();
-					json.Add(value, "row_ref", address);
-					json.Add(value, "row", Business(json, values, dimension));
-					yyjson_mut_arr_append(inlined, value);
-					result.inline_rows++;
-					oracle.Text(oracle_address, "kind", "inline");
-					oracle.Text(oracle_address, "source", filename);
-					oracle.Number(oracle_address, "row_id", chunk->GetValue(6, row_idx).GetValue<idx_t>());
-				} else {
-					throw InvalidInputException("Visible read view row is outside the native file inventory");
-				}
-				auto value = oracle.Object();
-				oracle.Add(value, "row_ref", oracle_address);
-				oracle.Add(value, "row", Business(oracle, values, dimension));
-				yyjson_mut_arr_append(expected, value);
+
+		if (oracle_rows) {
+			auto rows = reader.SendQuery(
+			    "SELECT id, embedding, category, payload, filename, file_row_number, rowid FROM " + name +
+			    " AT (VERSION => " + to_string(snapshot.snapshot_id) + ") LIMIT " + to_string(row_limit + 1));
+			if (rows->HasError()) {
+				rows->ThrowError();
 			}
+			ViewJSON oracle;
+			auto expected = oracle.Array();
+			idx_t business_bytes = 0;
+			idx_t inline_bytes = 0;
+			while (auto chunk = rows->Fetch()) {
+				for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
+					checkpoint("row");
+					if (++result.visible_rows > row_limit) {
+						throw InvalidInputException("Read view visible row budget exceeded");
+					}
+					result.captured_business_rows++;
+					vector<Value> values;
+					for (idx_t col = 0; col < 4; col++) {
+						values.push_back(chunk->GetValue(col, row_idx));
+					}
+					idx_t row_bytes = dimension * sizeof(float) + 64;
+					for (idx_t col = 2; col < 4; col++) {
+						if (!values[col].IsNull()) {
+							row_bytes += StringValue::Get(values[col]).size();
+						}
+					}
+					if (row_bytes > 64 * 1024 * 1024 - business_bytes) {
+						throw InvalidInputException("Read view business byte budget exceeded");
+					}
+					business_bytes += row_bytes;
+					auto filename = chunk->GetValue(4, row_idx).GetValue<string>();
+					auto address = json.Object();
+					auto oracle_address = oracle.Object();
+					auto file = by_path.find(filename);
+					if (file != by_path.end()) {
+						auto offset = chunk->GetValue(5, row_idx).GetValue<idx_t>();
+						json.Number(address, "file_id", file->second);
+						json.Number(address, "row_offset", offset);
+						yyjson_mut_arr_append(visible, address);
+						oracle.Text(oracle_address, "kind", "file");
+						oracle.Number(oracle_address, "file_id", file->second);
+						oracle.Number(oracle_address, "row_offset", offset);
+					} else if (StringUtil::StartsWith(filename, "ducklake_inlined_data_")) {
+						if (row_bytes > 4 * 1024 * 1024 - inline_bytes) {
+							throw InvalidInputException("Read view inline byte budget exceeded");
+						}
+						inline_bytes += row_bytes;
+						json.Text(address, "kind", "inline");
+						json.Text(address, "source", filename);
+						json.Number(address, "row_id", chunk->GetValue(6, row_idx).GetValue<idx_t>());
+						auto value = json.Object();
+						json.Add(value, "row_ref", address);
+						json.Add(value, "row", Business(json, values, dimension));
+						yyjson_mut_arr_append(inlined, value);
+						result.inline_rows++;
+						oracle.Text(oracle_address, "kind", "inline");
+						oracle.Text(oracle_address, "source", filename);
+						oracle.Number(oracle_address, "row_id", chunk->GetValue(6, row_idx).GetValue<idx_t>());
+					} else {
+						throw InvalidInputException("Visible read view row is outside the native file inventory");
+					}
+					auto value = oracle.Object();
+					oracle.Add(value, "row_ref", oracle_address);
+					oracle.Add(value, "row", Business(oracle, values, dimension));
+					yyjson_mut_arr_append(expected, value);
+				}
+			}
+			result.rows_json = oracle.Finish(expected);
+		} else {
+			auto rows = reader.SendQuery("SELECT filename,file_row_number,rowid FROM " + name + " AT (VERSION => " +
+			                             to_string(snapshot.snapshot_id) + ") LIMIT " + to_string(row_limit + 1));
+			if (rows->HasError()) {
+				rows->ThrowError();
+			}
+			map<string, set<idx_t>> inline_visible;
+			while (auto chunk = rows->Fetch()) {
+				for (idx_t r = 0; r < chunk->size(); r++) {
+					checkpoint("row");
+					if (++result.visible_rows > row_limit) {
+						throw InvalidInputException("Read view visible row budget exceeded");
+					}
+					auto filename = chunk->GetValue(0, r).GetValue<string>();
+					auto file = by_path.find(filename);
+					if (file != by_path.end()) {
+						auto address = json.Object();
+						json.Number(address, "file_id", file->second);
+						json.Number(address, "row_offset", chunk->GetValue(1, r).GetValue<idx_t>());
+						yyjson_mut_arr_append(visible, address);
+					} else if (StringUtil::StartsWith(filename, "ducklake_inlined_data_")) {
+						if (!inline_visible[filename].insert(chunk->GetValue(2, r).GetValue<idx_t>()).second) {
+							throw InvalidInputException("Duplicate visible inline row address");
+						}
+					} else {
+						throw InvalidInputException("Visible read view row is outside the native file inventory");
+					}
+				}
+			}
+			rows.reset();
+			checkpoint("after_visibility");
+			idx_t inline_bytes = 0;
+			for (auto &source : inline_visible) {
+				// Native metadata applies the same snapshot predicates as its inlined reader.
+				auto inlined_rows = transaction.GetMetadataManager().ReadInlinedData(
+				    snapshot, source.first, {"id", "embedding", "category", "payload", "row_id"});
+				if (inlined_rows->HasError()) {
+					inlined_rows->ThrowError();
+				}
+				while (auto chunk = inlined_rows->Fetch()) {
+					for (idx_t r = 0; r < chunk->size(); r++) {
+						checkpoint("inline_row");
+						auto row_id = chunk->GetValue(4, r).GetValue<idx_t>();
+						if (source.second.erase(row_id) != 1) {
+							throw InvalidInputException("Inline visibility and business rows disagree");
+						}
+						vector<Value> values;
+						for (idx_t col = 0; col < 4; col++) {
+							values.push_back(chunk->GetValue(col, r));
+						}
+						idx_t row_bytes = dimension * sizeof(float) + 64;
+						for (idx_t col = 2; col < 4; col++) {
+							if (!values[col].IsNull()) {
+								row_bytes += StringValue::Get(values[col]).size();
+							}
+						}
+						if (row_bytes > 4 * 1024 * 1024 - inline_bytes) {
+							throw InvalidInputException("Read view inline byte budget exceeded");
+						}
+						inline_bytes += row_bytes;
+						auto address = json.Object();
+						json.Text(address, "kind", "inline");
+						json.Text(address, "source", source.first);
+						json.Number(address, "row_id", row_id);
+						auto value = json.Object();
+						json.Add(value, "row_ref", address);
+						json.Add(value, "row", Business(json, values, dimension));
+						yyjson_mut_arr_append(inlined, value);
+						result.inline_rows++;
+						result.captured_business_rows++;
+					}
+				}
+				if (!source.second.empty()) {
+					throw InvalidInputException("Missing visible inline business row");
+				}
+			}
+			checkpoint("after_inline");
 		}
+
 		checkpoint("before_publish");
 		result.admission_json = json.Finish(admission);
 		if (result.admission_json.size() > 160 * 1024 * 1024) {
 			throw InvalidInputException("Read view admission byte budget exceeded");
 		}
-		result.rows_json = oracle.Finish(expected);
 		reader.Commit();
 		return result;
 	} catch (...) {
@@ -277,6 +359,18 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 		}
 		throw;
 	}
+}
+
+DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
+                                                       const std::function<void(const string &)> &observe,
+                                                       optional_ptr<ClientContext> owner) {
+	return AcquireView(reader, options, observe, owner, true);
+}
+DuckLakeVortexReadView DuckLakeVortexReadView::AcquireQuery(Connection &reader,
+                                                            const DuckLakeVortexViewOptions &options,
+                                                            const std::function<void(const string &)> &observe,
+                                                            optional_ptr<ClientContext> owner) {
+	return AcquireView(reader, options, observe, owner, false);
 }
 
 } // namespace duckdb
