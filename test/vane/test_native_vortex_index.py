@@ -111,11 +111,13 @@ class Proof:
             directory,
             f"SELECT * FROM __ducklake_metadata_lake.ducklake_table WHERE table_name='items' AND {valid};",
         )[0]
-        field = self.sql(
+        fields = self.sql(
             directory,
-            f"SELECT column_id FROM __ducklake_metadata_lake.ducklake_column WHERE table_id={table['table_id']} "
-            f"AND column_name='embedding' AND parent_column IS NULL AND {valid};",
-        )[0]["column_id"]
+            f"SELECT column_id, column_name FROM __ducklake_metadata_lake.ducklake_column WHERE table_id={table['table_id']} "
+            f"AND column_name IN ('id','embedding','category','payload') AND parent_column IS NULL AND {valid};",
+        )
+        field_ids = {field["column_name"]: field["column_id"] for field in fields}
+        field = field_ids["embedding"]
         schema = self.sql(
             directory,
             f"SELECT schema_version FROM lake.snapshots() WHERE snapshot_id={snapshot};",
@@ -175,6 +177,10 @@ class Proof:
             f"FROM lake.items AT (VERSION => {snapshot}) ORDER BY filename, file_row_number;",
         )
         for row in rows:
+            require(
+                not row["filename"].startswith("ducklake_inlined_data_"),
+                "inlined rows require the separate mixed-query gate",
+            )
             filename = str(Path(row["filename"]).resolve(strict=True))
             require(
                 filename in by_path,
@@ -188,6 +194,7 @@ class Proof:
             "schema_version": schema,
             "field_id": field,
             "dimension": 8,
+            "business_fields": {name: field_ids[name] for name in ("id", "category", "payload")},
             "files": inventory,
             "visible": [{"file_id": row["file_id"], "row_offset": row["row_offset"]} for row in rows],
         }
