@@ -137,7 +137,9 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		auto inventory = json.Array();
 		auto sources = json.Array();
 		json.Add(captured, "files", inventory);
-		json.Add(admission, "sources", sources);
+		if (oracle_rows) {
+			json.Add(admission, "sources", sources);
+		}
 		map<string, idx_t> by_path;
 		DuckLakeVortexReadView result;
 		result.managed_data_path = catalog.DataPath();
@@ -176,10 +178,14 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			identities.push_back({file.file_id.index, file.file.path, version, file.row_count});
 			json.Number(descriptor, "row_count", file.row_count);
 			yyjson_mut_arr_append(inventory, descriptor);
-			auto source = json.Object();
-			json.Number(source, "file_id", file.file_id.index);
-			json.Text(source, "hex", Hex(bytes));
-			yyjson_mut_arr_append(sources, source);
+			if (oracle_rows) {
+				auto source = json.Object();
+				json.Number(source, "file_id", file.file_id.index);
+				json.Text(source, "hex", Hex(bytes));
+				yyjson_mut_arr_append(sources, source);
+			} else {
+				result.sources.push_back({file.file_id.index, std::move(bytes)});
+			}
 			if (!by_path.emplace(file.file.path, file.file_id.index).second) {
 				throw InvalidInputException("Duplicate native read view file path");
 			}
@@ -348,7 +354,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 
 		checkpoint("before_publish");
 		result.admission_json = json.Finish(admission);
-		if (result.admission_json.size() > 160 * 1024 * 1024) {
+		if (result.admission_json.size() > idx_t(oracle_rows ? 160 : 32) * 1024 * 1024) {
 			throw InvalidInputException("Read view admission byte budget exceeded");
 		}
 		reader.Commit();

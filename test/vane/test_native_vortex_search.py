@@ -72,6 +72,11 @@ def exercise(proof, native, scratch, checks):
     native.call("publish", "knn", refs[0], 0)
     first_generation = CAT.generation(refs[0])
     refs[0].unlink()
+    binary = native.call("binary-rejections")
+    require(
+        binary["rejections"] == 7 and binary["reordered_open"], "native binary handoff rejection gate did not complete"
+    )
+    no_leases(scratch)
     initial = query(native, "EXECUTE reusable_search")
     recalls = [qualify(initial, native.rows("bootstrap"), vector)]
     core = native.call("core-search")
@@ -134,7 +139,15 @@ def exercise(proof, native, scratch, checks):
     native.sql("ROLLBACK;")
     failures = [
         ("cancel-search", stage, "Interrupted")
-        for stage in ("after_visibility", "after_open", "category_filter", "after_ann", "scan_batch", "before_fetch")
+        for stage in (
+            "after_visibility",
+            "source_pinned",
+            "after_open",
+            "category_filter",
+            "after_ann",
+            "scan_batch",
+            "before_fetch",
+        )
     ]
     failures += [("fail-search", stage, "Injected query lease failure") for stage in ("source_pinned", "after_open")]
     for op, stage, error in failures:
@@ -231,6 +244,7 @@ def exercise(proof, native, scratch, checks):
         "index_builds": 3,
         "reclaimed_source_files": len(old_files),
         "external_query_workers": 0,
+        "binary_rejections": 7,
     }
 
 
@@ -252,7 +266,7 @@ def main():
         "duckdb_sha256": BASE.digest(proof.duckdb),
         "probe_sha256": BASE.digest(proof.probe),
         "driver_sha256": BASE.digest(args.driver.resolve(strict=True)),
-        "vortex_revision": "145f816102d6024a12164e37737ff8864faf5033",
+        "vortex_revision": "664e8cb733c5fbaa2945239e806df5b22e6d190d",
     }
     try:
         native = CAT.Native(args.driver.resolve(strict=True), root / "native")

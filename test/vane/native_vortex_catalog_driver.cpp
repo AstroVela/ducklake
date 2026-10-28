@@ -8,6 +8,7 @@
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
 #include "storage/ducklake_vortex_search.hpp"
+#include "storage/ducklake_vortex_query_ffi.hpp"
 
 #include <iostream>
 #include <sstream>
@@ -64,6 +65,71 @@ public:
 
 	string Execute(const vector<string> &args) {
 		const auto &op = args.at(1);
+		if (op == "binary-rejections") {
+			Connection reader(database);
+			auto view = DuckLakeVortexReadView::AcquireQuery(reader, Options("knn"));
+			vector<DuckLakeVortexQuerySource> sources;
+			for (auto &source : view.sources) {
+				sources.push_back(
+				    {source.file_id, reinterpret_cast<const uint8_t *>(source.bytes.data()), source.bytes.size()});
+			}
+			Require(sources.size() >= 2, "Binary rejection fixture requires two source files");
+			vector<float> query {133, 4, 2, 0, 1, 8, 7, 16};
+			string name = "knn";
+			DuckLakeVortexQueryInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
+			                                view.admission_json.size(),
+			                                sources.data(),
+			                                sources.size(),
+			                                reinterpret_cast<const uint8_t *>(view.managed_data_path.data()),
+			                                view.managed_data_path.size(),
+			                                reinterpret_cast<const uint8_t *>(name.data()),
+			                                name.size(),
+			                                query.data(),
+			                                query.size(),
+			                                10,
+			                                nullptr,
+			                                0,
+			                                0,
+			                                [](void *, const uint8_t *, uint64_t) -> uint8_t { return 0; },
+			                                nullptr};
+			auto run = [&](const vector<DuckLakeVortexQuerySource> &candidate, const string &expected) {
+				input.sources = candidate.data();
+				input.source_count = candidate.size();
+				std::unique_ptr<DuckLakeVortexQueryOutput, decltype(&ducklake_vortex_query_free)> output(
+				    ducklake_vortex_query(&input), ducklake_vortex_query_free);
+				auto error = ducklake_vortex_query_error(output.get());
+				Require(error && string(error).find(expected) != string::npos, "Wrong binary handoff rejection");
+			};
+			run({}, "Invalid native binary source inventory");
+			auto changed = sources;
+			changed.pop_back();
+			run(changed, "inventory");
+			changed = sources;
+			changed[1] = changed[0];
+			run(changed, "duplicate");
+			changed = sources;
+			changed[0].file_id = 999999;
+			run(changed, "Missing admitted source buffer");
+			const uint8_t corrupt = 0;
+			changed = sources;
+			changed[0].data = &corrupt;
+			changed[0].size = 1;
+			run(changed, "version mismatch");
+			changed = sources;
+			changed[0].data = nullptr;
+			run(changed, "Invalid, duplicate or over-budget");
+			changed = sources;
+			changed[0].size = 64 * 1024 * 1024 + 1;
+			run(changed, "over-budget");
+			std::reverse(sources.begin(), sources.end());
+			input.sources = sources.data();
+			input.source_count = sources.size();
+			std::unique_ptr<DuckLakeVortexQueryOutput, decltype(&ducklake_vortex_query_free)> output(
+			    ducklake_vortex_query(&input), ducklake_vortex_query_free);
+			Require(!ducklake_vortex_query_error(output.get()) && ducklake_vortex_query_count(output.get()) > 0,
+			        "Reordered binary buffers did not preserve source identity");
+			return "{\"rejections\":7,\"reordered_open\":true}";
+		}
 		if (op == "search") {
 			auto result = SQL(writer, ReadText(args.at(2)));
 			Require(result->ColumnCount() == 5, "SQL search must return five typed business/distance columns");
