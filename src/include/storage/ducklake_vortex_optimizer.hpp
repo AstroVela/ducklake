@@ -31,6 +31,12 @@ public:
 	static void Cancel(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                   const string &index);
 	static vector<vector<Value>> Status(ClientContext &context, const string &catalog);
+	static void EnableMaintenance(ClientContext &context, const string &catalog, idx_t max_objects, idx_t max_bytes,
+	                              const std::function<void(const string &)> &observe = nullptr);
+	static void ResumeMaintenance(ClientContext &context, const string &catalog,
+	                              const std::function<void(const string &)> &observe = nullptr);
+	static void CancelMaintenance(ClientContext &context, const string &catalog);
+	static vector<vector<Value>> MaintenanceStatus(ClientContext &context, const string &catalog);
 	static void SetWriteBudget(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                           const string &index, const DuckLakeVortexWriteBudget &budget);
 	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context);

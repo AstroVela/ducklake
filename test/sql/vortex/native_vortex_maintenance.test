@@ -1,0 +1,94 @@
+# name: test/sql/vortex/native_vortex_maintenance.test
+# description: explicit catalog-wide maintenance control uses bounded optimizer work
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_maintenance.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_maintenance_data')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement error
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',1,67108864)
+----
+optimizer catalog is not initialized
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+query I
+SELECT count(*) FROM ducklake_vortex_maintenance_status('lake')
+----
+0
+
+statement error
+SELECT * FROM ducklake_resume_vortex_maintenance('lake')
+----
+No Vortex maintenance policy
+
+statement error
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',0,67108864)
+----
+maintenance count or byte budget
+
+statement error
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',17,67108864)
+----
+maintenance count or byte budget
+
+statement error
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',1,67108865)
+----
+maintenance count or byte budget
+
+statement error
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',NULL,67108864)
+----
+cannot be NULL
+
+query T
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',1,67108864)
+----
+enabled
+
+query TIIIII
+SELECT state,enabled,running,run_count,max_objects,max_bytes FROM ducklake_vortex_maintenance_status('lake')
+----
+idle	true	false	0	1	67108864
+
+statement error
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',1,67108864)
+----
+Duplicate key
+
+query T
+SELECT * FROM ducklake_cancel_vortex_maintenance('lake')
+----
+cancellation_requested
+
+query TII
+SELECT state,enabled,running FROM ducklake_vortex_maintenance_status('lake')
+----
+cancelled	false	false
+
+query T
+SELECT * FROM ducklake_resume_vortex_maintenance('lake')
+----
+resumed
+
+query TIII
+SELECT state,enabled,run_count,collected_bytes FROM ducklake_vortex_maintenance_status('lake')
+----
+idle	true	0	0
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_maintenance('lake')
+
+statement ok
+DETACH lake
