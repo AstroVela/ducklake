@@ -3,7 +3,9 @@
 This validation draft follows [DuckLake #42](https://github.com/AstroVela/ducklake/pull/42).
 It adds explicit collection of published generations retired by replacement or
 selective merging. It reuses the existing static SPFresh generations and private
-query leases. Source data and unpublished candidates are outside collection.
+query leases. Source data and unpublished candidates are outside this generation
+collector. Registered native build leftovers have a separate
+[ownership and collection path](native-vortex-build-ownership-proof.md).
 
 ## Ownership and atomic retirement
 
@@ -18,7 +20,7 @@ requires fresh explicit initialization and adds no migration or old decoder.
 Publication verifies and registers the candidate, replaces the named index's
 reference set, and retires removed generations that have no remaining references.
 These changes commit in the same transaction as the index revision CAS. Failed
-or uncommitted candidates never become GC-owned. A still-intact retired
+or uncommitted candidates never enter this generation registry. A still-intact retired
 generation can be explicitly republished and reactivated under the publication
 lock. Collection and publication serialize, so collecting generations cannot
 be reactivated while their files are removed.
@@ -69,8 +71,8 @@ A native indexed read registers a shared collection guard before beginning its
 metadata snapshot. It holds the guard through source capture and all index
 lease materialization, releasing it before the `after_open` observer once the
 private copies and native handles exist. Errors and cancellation release the
-guard through ownership cleanup. Selected native builds retain their guard
-through publication. The collector takes the exclusive guard before the
+guard through ownership cleanup. All native builds retain their guard through
+publication and error reconciliation. The collector takes the exclusive guard before the
 publication lock and its first metadata snapshot. Publication can proceed while
 an old reader finishes admission; collection waits for the old generation copies.
 
@@ -101,9 +103,9 @@ SIGKILL covers both sides of publication commit and five GC checkpoints,
 including partial deletion and files removed before metadata completion.
 SQL cases verify shared named-index references and explicit configuration.
 
-This adds no background sweeper, orphan-directory scan, abandoned-candidate
-cleanup, source-file rewriting or SPFresh online updates. Failed candidates
-remain outside ownership until a later explicitly designed registration path.
+This generation collector adds no background sweeper, orphan-directory scan,
+source-file rewriting or SPFresh online updates. Abandoned native candidates
+are handled by the separate registered build collector.
 
 Local qualification kept DuckDB v1.5.5 (`d8cdaa33`), Vortex `65dab44f`, the native
 wrapper `b819cc03` and the qualified static SPFresh SDK unchanged from #42.

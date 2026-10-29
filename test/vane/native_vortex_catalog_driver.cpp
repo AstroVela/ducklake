@@ -142,10 +142,11 @@ public:
 			}
 			return "{}";
 		}
-		if (op == "optimizer-status" || op == "generation-status") {
-			auto result =
-			    SQL(writer, op == "generation-status" ? "SELECT * FROM ducklake_vortex_generation_status('lake')"
-			                                          : "SELECT * FROM ducklake_vortex_optimizer_status('lake')");
+		if (op == "optimizer-status" || op == "generation-status" || op == "build-status") {
+			auto function = op == "generation-status" ? "ducklake_vortex_generation_status"
+			                : op == "build-status"    ? "ducklake_vortex_build_status"
+			                                          : "ducklake_vortex_optimizer_status";
+			auto result = SQL(writer, "SELECT * FROM " + string(function) + "('lake')");
 			ViewJSON json;
 			auto rows = json.Array();
 			for (idx_t row = 0; row < result->RowCount(); row++) {
@@ -174,6 +175,100 @@ public:
 				yyjson_mut_arr_append(rows, value);
 			}
 			return json.Finish(rows);
+		}
+		if (op == "recover-builds") {
+			auto result = SQL(writer, "SELECT * FROM ducklake_recover_vortex_builds('lake'," + args.at(2) + ")");
+			return to_string(result->GetValue(0, 0).GetValue<idx_t>());
+		}
+		if (op == "build-gc" || op == "build-gc-cancel" || op == "build-gc-fail" || op == "build-gc-crash") {
+			Connection collector(database);
+			const bool controlled = op != "build-gc";
+			auto result = DuckLakeVortexIndex::CollectBuilds(
+			    *collector.context, "lake", std::stoull(args.at(controlled ? 3 : 2)),
+			    std::stoull(args.at(controlled ? 4 : 3)), [&](const string &stage) {
+				    if (!controlled || stage != args.at(2)) {
+					    return;
+				    }
+				    if (op == "build-gc-cancel") {
+					    collector.Interrupt();
+				    } else if (op == "build-gc-fail") {
+					    throw InvalidInputException("Injected Vortex build collection failure");
+				    } else {
+					    Write(root + "/build-gc-" + stage + ".ready", "ready");
+					    string line;
+					    std::getline(std::cin, line);
+					    throw InvalidInputException("Build collection resumed without SIGKILL");
+				    }
+			    });
+			return BuildGCJSON(result);
+		}
+		if (op == "build-maintenance-race") {
+			Connection builder(database);
+			Pause pause;
+			auto pending = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::BuildAndPublish(
+				    *builder.context, "lake", "main", "items", "knn", args.at(2), 8, std::stoull(args.at(3)),
+				    [&](const string &stage) {
+					    if (stage == args.at(4)) {
+						    pause.Stop();
+					    }
+				    },
+				    "", optional_idx(), DuckLakeVortexIndexOperation::APPEND);
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			std::promise<void> waiting;
+			auto started = waiting.get_future();
+			auto maintenance = std::async(std::launch::async, [&] {
+				Connection collector(database);
+				auto observe = [&](const string &stage) {
+					if (stage == "build_gc_waiting" || stage == "build_recovery_waiting") {
+						waiting.set_value();
+					}
+				};
+				if (args.at(5) == "recover") {
+					return to_string(DuckLakeVortexIndex::RecoverBuilds(*collector.context, "lake", 16, observe));
+				}
+				return BuildGCJSON(
+				    DuckLakeVortexIndex::CollectBuilds(*collector.context, "lake", 16, 64 * 1024 * 1024, observe));
+			});
+			ReleasePause release_maintenance {pause};
+			started.wait();
+			Require(maintenance.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
+			        "Build maintenance bypassed a live registered builder");
+			pause.Release();
+			auto published = pending.get();
+			return "{\"published\":" + published.ToJSON() + ",\"maintenance\":" + maintenance.get() + "}";
+		}
+		if (op == "build-gc-publish-race") {
+			Pause pause;
+			auto gc = std::async(std::launch::async, [&] {
+				Connection collector(database);
+				return DuckLakeVortexIndex::CollectBuilds(*collector.context, "lake", 16, 64 * 1024 * 1024,
+				                                          [&](const string &stage) {
+					                                          if (stage == "build_gc_deleting") {
+						                                          pause.Stop();
+					                                          }
+				                                          });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			auto publish = std::async(std::launch::async, [&] {
+				Connection publisher(database);
+				try {
+					DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "gc-alias", args.at(2), 0);
+					return string();
+				} catch (const std::exception &error) {
+					return string(error.what());
+				}
+			});
+			ReleasePause release_publish {pause};
+			Require(publish.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
+			        "Publication bypassed candidate collection");
+			pause.Release();
+			auto result = gc.get();
+			Require(publish.get().find("canonical") != string::npos, "Publisher revived a collected candidate");
+			return BuildGCJSON(result);
 		}
 		if (op == "gc" || op == "gc-cancel" || op == "gc-fail" || op == "gc-crash") {
 			Connection collector(database);
@@ -741,6 +836,14 @@ public:
 	}
 
 private:
+	string BuildGCJSON(const DuckLakeVortexBuildGCResult &result) {
+		ViewJSON json;
+		auto value = json.Object();
+		json.Number(value, "collected_builds", result.builds);
+		json.Number(value, "collected_bytes", result.bytes);
+		json.Number(value, "remaining_builds", result.remaining);
+		return json.Finish(value);
+	}
 	string GCJSON(const DuckLakeVortexGCResult &result) {
 		ViewJSON json;
 		auto value = json.Object();

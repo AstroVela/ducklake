@@ -77,7 +77,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		}
 	};
 	unique_ptr<StorageLockKey> generation_guard;
-	if (!options.index_name.empty()) {
+	if (!options.index_name.empty() && !build_files) {
 		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock();
 	}
 	reader.BeginTransaction();

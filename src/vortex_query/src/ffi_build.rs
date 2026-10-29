@@ -26,6 +26,10 @@ pub struct BuildInput {
     data_path_len: u64,
     reference_path: *const u8,
     reference_path_len: u64,
+    generation: *const u8,
+    generation_len: u64,
+    workspace: *const u8,
+    workspace_len: u64,
     control: extern "C" fn(*mut c_void, *const u8, u64) -> u8,
     context: *mut c_void,
 }
@@ -45,6 +49,10 @@ unsafe fn execute(input: &BuildInput) -> VortexResult<()> {
         || !(1..=65536).contains(&input.data_path_len)
         || input.reference_path.is_null()
         || !(1..=65536).contains(&input.reference_path_len)
+        || input.generation.is_null()
+        || !(1..=128).contains(&input.generation_len)
+        || input.workspace.is_null()
+        || !(1..=65536).contains(&input.workspace_len)
     {
         vortex_bail!("Invalid native Vortex build input");
     }
@@ -70,6 +78,16 @@ unsafe fn execute(input: &BuildInput) -> VortexResult<()> {
     })
     .map_err(|e| vortex_err!("{e}"))?;
     let reference = Path::new(reference);
+    let generation = str::from_utf8(unsafe {
+        slice::from_raw_parts(input.generation, input.generation_len as usize)
+    })
+    .map_err(|e| vortex_err!("{e}"))?;
+    let workspace = Path::new(
+        str::from_utf8(unsafe {
+            slice::from_raw_parts(input.workspace, input.workspace_len as usize)
+        })
+        .map_err(|e| vortex_err!("{e}"))?,
+    );
     let root = reference
         .parent()
         .ok_or_else(|| vortex_err!("Build reference parent required"))?;
@@ -82,6 +100,17 @@ unsafe fn execute(input: &BuildInput) -> VortexResult<()> {
     {
         vortex_bail!("Build reference must be new, canonical and outside the managed data path");
     }
+    let suffix = generation
+        .strip_prefix("generation-")
+        .ok_or_else(|| vortex_err!("Planned build generation required"))?;
+    if suffix.is_empty()
+        || workspace.parent() != Some(root)
+        || workspace.file_name().and_then(|s| s.to_str())
+            != Some(format!(".build-{suffix}").as_str())
+        || workspace.canonicalize()? != workspace
+    {
+        vortex_bail!("Owned build workspace and generation mismatch");
+    }
     let capture = serde_json::to_vec(&admission.capture).map_err(|e| vortex_err!("{e}"))?;
     block_on(|handle| async {
         let session = VortexSession::default().with_handle(handle);
@@ -91,7 +120,15 @@ unsafe fn execute(input: &BuildInput) -> VortexResult<()> {
                 .await?,
         );
         check("source_pinned")?;
-        file_index::build_checked(source, reference, session, &check).await
+        file_index::build_owned(
+            source,
+            reference,
+            generation.to_owned(),
+            workspace,
+            session,
+            &check,
+        )
+        .await
     })
 }
 

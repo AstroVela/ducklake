@@ -50,6 +50,10 @@ struct DuckLakeVortexBuildInput {
 	uint64_t data_path_len;
 	const uint8_t *reference_path;
 	uint64_t reference_path_len;
+	const uint8_t *generation;
+	uint64_t generation_len;
+	const uint8_t *workspace;
+	uint64_t workspace_len;
 	uint8_t (*control)(void *, const uint8_t *, uint64_t);
 	void *context;
 };
