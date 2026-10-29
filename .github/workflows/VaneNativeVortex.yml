@@ -1,0 +1,172 @@
+name: Vane native Vortex providers
+
+on:
+  pull_request:
+  push:
+    branches: [v1.5-variegata_vane]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vane-native-vortex-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-vane:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      CARGO_BUILD_JOBS: '1'
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+      CCACHE_MAXSIZE: 2G
+      DISABLE_EXTENSIONS_FOR_TEST: '1'
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}/build/vane-vcpkg
+      VCPKG_TARGET_TRIPLET: x64-linux-release
+      VCPKG_HOST_TRIPLET: x64-linux-release
+      VCPKG_MAX_CONCURRENCY: '2'
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg,readwrite
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: e14bf92d4053141697a59dcbd6098677cbddb80a
+          fetch-depth: 0
+          path: vane
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/duckdb-vortex
+          ref: b819cc031be61efabeedd6ded0a814984dc56d86
+          path: vortex-extension
+          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vortex
+          ref: 65dab44f86495d35bb46f69c8ec5cfc7a3544c1b
+          path: vortex-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config
+          python -m pip install uv cmake 'scikit-build-core>=0.11.4' 'pybind11[global]>=3' 'setuptools-scm>=9.2' numpy packaging pytest pytest-timeout
+          rustup toolchain install 1.91.0 --profile minimal
+          mkdir -p .cache/vcpkg build/wheels build/logs
+          printf 'BINDGEN_EXTRA_CLANG_ARGS=-isystem%s\n' "$(cc -print-file-name=include)" >> "$GITHUB_ENV"
+      - name: Restore build caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            .cache/ccache
+            .cache/vcpkg
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/runtime/cargo/build
+          key: vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/src/vortex_query/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-${{ github.sha }}
+          restore-keys: |
+            vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/src/vortex_query/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-
+      - name: Set up pinned vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+          doNotCache: true
+      - name: Build native dependency prefixes
+        run: |
+          bash vane/scripts/bootstrap_vcpkg.sh "$PWD/vane" 2>&1 | tee build/logs/vane-dependencies.log
+          "$VCPKG_ROOT/vcpkg" install --triplet x64-linux-release --host-triplet x64-linux-release \
+            --x-manifest-root="$PWD/extension" --x-install-root="$PWD/build/ducklake-vcpkg" \
+            2>&1 | tee build/logs/ducklake-dependencies.log
+      - name: Qualify self-contained SPFresh dependencies
+        env:
+          VORTEX_SOURCE_DIR: ${{ github.workspace }}/vortex-source
+          ZSTD_STATIC_LIBRARY: ${{ github.workspace }}/build/vane-vcpkg/x64-linux-release/lib/libzstd.a
+          ZSTD_INCLUDE_DIR: ${{ github.workspace }}/build/vane-vcpkg/x64-linux-release/include
+        run: |
+          bash extension/scripts/build_vane_vortex_native_sdk.sh "$PWD/build/native-sdk" \
+            2>&1 | tee build/logs/spfresh-sdk.log
+          printf 'VORTEX_SPFRESH_NATIVE=%s\n' "$PWD/build/native-sdk/spfresh/build" >> "$GITHUB_ENV"
+      - name: Build matching Vane runtime and optional artifacts
+        env:
+          DUCKDB_DUCKLAKE_DIRECTORY: ${{ github.workspace }}/extension
+          DUCKDB_VORTEX_DIRECTORY: ${{ github.workspace }}/vortex-extension
+          SKBUILD_BUILD_DIR: ${{ github.workspace }}/build/runtime
+          SKBUILD_CMAKE_BUILD_TYPE: Release
+        run: |
+          export CMAKE_ARGS="-DCMAKE_PREFIX_PATH=$VCPKG_INSTALLED_DIR/x64-linux-release -Droaring_DIR=$PWD/build/ducklake-vcpkg/x64-linux-release/share/roaring -DDUCKDB_EXTENSION_CONFIGS=$PWD/extension/extension_config_vane_native_vortex.cmake -DVANE_LOADABLE_EXTENSIONS=vortex;ducklake -DRust_TOOLCHAIN=1.91.0 -DDUCKDB_RELEASE_LINK_JOBS=1"
+          uv build --wheel --no-build-isolation -Cbuild.targets=_native \
+            -Ccmake.define.VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON \
+            --out-dir "$PWD/build/wheels" "$PWD/vane" \
+            2>&1 | tee build/logs/runtime-wheel.log
+          cmake --build build/runtime --target vane_loadable_extensions --parallel 2 \
+            2>&1 | tee build/logs/providers-build.log
+          uv pip install --system build/wheels/vane_ai-*.whl
+      - name: Run the Vane base release checks
+        run: bash vane/scripts/run_release_tests.sh 2>&1 | tee build/logs/vane-release-tests.log
+      - name: Package and install the exact provider closure
+        run: |
+          mkdir -p build/signed
+          for name in vortex ducklake; do
+            python -I vane/scripts/sign_test_dynamic_extension.py \
+              "build/runtime/vane_extensions/$name.duckdb_extension" "build/signed/$name.duckdb_extension" \
+              --private-key vane/external/duckdb/test/mbedtls/private.pem
+          done
+          mkdir -p build/notices
+          cp vortex-extension/LICENSE build/notices/duckdb-vortex-LICENSE
+          cp vortex-source/LICENSE build/notices/vortex-LICENSE
+          cp extension/LICENSE build/notices/ducklake-LICENSE
+          cp build/native-sdk/llvm/openmp-18.1.8.src/LICENSE.TXT build/notices/llvm-openmp-LICENSE
+          cp build/native-sdk/spfresh/source/LICENSE build/notices/spfresh-LICENSE
+          cp build/vane-vcpkg/x64-linux-release/share/zstd/copyright build/notices/zstd-copyright
+          cp vane/LICENSES/DuckDB-MIT.txt build/notices/DuckDB-MIT.txt
+          cp vane/LICENSES/vcpkg-binary-dependencies.txt build/notices/Vane-native-dependencies.txt
+          python -I vane/scripts/build_extension_wheel.py \
+            --artifact build/signed/vortex.duckdb_extension \
+            --extension-name vortex --platform-tag manylinux_2_39_x86_64 --trust-identity astrovela/vane \
+            --license-expression 'Apache-2.0 AND MIT' \
+            --license-file build/notices/duckdb-vortex-LICENSE --license-file build/notices/vortex-LICENSE \
+            --license-file build/notices/Vane-native-dependencies.txt \
+            --license-file build/notices/DuckDB-MIT.txt --output-directory build/wheels --test-only
+          mapfile -t vortex_wheels < <(find build/wheels -maxdepth 1 -name 'vane_extension_vortex-*.whl')
+          test "${#vortex_wheels[@]}" = 1
+          python -I vane/scripts/build_extension_wheel.py \
+            --artifact build/signed/ducklake.duckdb_extension \
+            --extension-name ducklake --platform-tag manylinux_2_39_x86_64 --trust-identity astrovela/vane \
+            --dependency-wheel "${vortex_wheels[0]}" --dependency-trust-identity astrovela/vane \
+            --license-expression 'MIT AND Apache-2.0 WITH LLVM-exception AND BSD-3-Clause' \
+            --license-file build/notices/ducklake-LICENSE --license-file build/notices/vortex-LICENSE \
+            --license-file build/notices/llvm-openmp-LICENSE --license-file build/notices/spfresh-LICENSE \
+            --license-file build/notices/zstd-copyright \
+            --license-file build/notices/Vane-native-dependencies.txt \
+            --license-file build/notices/DuckDB-MIT.txt --output-directory build/wheels --test-only
+          uv pip install --system --no-index --find-links build/wheels build/wheels/vane_extension_ducklake-*.whl
+      - name: Qualify installed Vane native vector retrieval
+        env:
+          VANE_RUNNER: local-fast
+        run: |
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_native_vortex.py --output-dir "$PWD/build/proof" \
+            2>&1 | tee build/logs/vane-native-vortex.log
+      - name: Retain build and qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-native-vortex-proof
+          path: |
+            build/logs
+            build/proof/report.json
+            build/wheels
