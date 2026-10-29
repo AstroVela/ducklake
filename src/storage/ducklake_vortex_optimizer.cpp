@@ -51,6 +51,7 @@ struct Policy {
 	idx_t min_deleted_rows = 1, min_deleted_percent = 50;
 	string rewrite_candidate, rewrite_reason = "disabled";
 	idx_t rewrite_deleted = 0, rewrite_remaining = 0;
+	bool rewrite_prune = false;
 	Key Id() const {
 		return {uuid, config.index};
 	}
@@ -370,6 +371,7 @@ string UnindexedGrowthBlocked(const Policy &p, idx_t rows, idx_t bytes, idx_t ma
 
 void SelectCompaction(Metadata &meta, Policy &p) {
 	p.rewrite_candidate.clear();
+	p.rewrite_prune = false;
 	p.rewrite_deleted = p.rewrite_remaining = 0;
 	p.rewrite_reason = p.compaction_enabled ? "no_index" : "disabled";
 	if (!p.compaction_enabled || !p.expected) {
@@ -484,7 +486,6 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 		         : "";
 		string why = deleted < p.min_deleted_rows || 100 * deleted < p.min_deleted_percent * rows ? "below_threshold"
 		             : !remaining                                                                 ? "eligible"
-		             : !to_f && !output                                ? "empty_rewrite_output"
 		             : (to_f ? all_partitioned : partitioned)          ? "unsupported_partition"
 		             : (to_f ? all_groups.size() : groups.size()) != 1 ? "multiple_schema_groups"
 		             : !budget_reason.empty()                          ? budget_reason
@@ -495,6 +496,7 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 				eligible = segment.generation;
 				eligible_deleted = deleted;
 				eligible_remaining = remaining;
+				p.rewrite_prune = remaining >= VortexCatalog::MIN_BUILD_ROWS && !output;
 			}
 		} else if (blocked.empty() || deleted > blocked_deleted ||
 		           (deleted == blocked_deleted && segment.generation < blocked)) {
@@ -663,8 +665,10 @@ bool Published(Metadata &meta, const Policy &p) {
 		return false;
 	}
 	auto ready = VortexCatalog::ParseSegments(StringValue::Get(chunk->GetValue(1, 0)), p.uuid, p.field_id);
-	return p.kind == "retire" || p.kind == "rewrite_f" ? ready.Publication() == p.run
-	                                                   : p.generation == ready.generation;
+	if (p.kind == "retire" || p.kind == "rewrite_f") {
+		return ready.Publication() == p.run;
+	}
+	return p.generation == ready.generation && (p.kind != "prune" || ready.Publication() == p.run);
 }
 
 string Candidate(Connection &connection, const string &path) {
@@ -928,7 +932,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	}
 	void Stage(DatabaseInstance &db, const Pending &pending, Policy &p, const string &stage) {
 		if (stage == "before_build_publish" ||
-		    ((p.kind == "rewrite" || p.kind == "rewrite_f") && stage == "rewrite_before_commit") ||
+		    ((p.kind == "rewrite" || p.kind == "rewrite_f" || p.kind == "prune") && stage == "rewrite_before_commit") ||
 		    (p.kind == "retire" && stage == "retire_before_commit")) {
 			std::lock_guard<std::mutex> guard(io);
 			Metadata meta(db, p.config.catalog);
@@ -963,7 +967,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		} else if (!error.empty() || state == "cancelled") {
 			current.enabled = false;
 		}
-		if ((current.kind == "rewrite" || current.kind == "rewrite_f" || current.kind == "retire") && !error.empty()) {
+		if ((current.kind == "rewrite" || current.kind == "rewrite_f" || current.kind == "retire" ||
+		     current.kind == "prune") &&
+		    !error.empty()) {
 			current.enabled = false;
 		}
 		Save(meta, current, p.run);
@@ -1020,6 +1026,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					current.expected = metrics.expected;
 					current.kind = rewrite && !metrics.rewrite_remaining                                  ? "retire"
 					               : rewrite && metrics.rewrite_remaining < VortexCatalog::MIN_BUILD_ROWS ? "rewrite_f"
+					               : rewrite && metrics.rewrite_prune                                     ? "prune"
 					               : rewrite                                                              ? "rewrite"
 					               : flush                                                                ? "flush"
 					               : metrics.merge_candidates.empty()                                     ? "build"
@@ -1066,8 +1073,10 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					VortexCatalog::Rewrite(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.selected[0],
 					    p.reference, p.expected, [&](const string &stage) { Stage(db, pending, p, stage); },
-					    p.kind == "rewrite_f" ? DuckLakeVortexRewriteMode::FILES : DuckLakeVortexRewriteMode::INDEXED,
-					    p.kind == "rewrite_f" ? p.run : "");
+					    p.kind == "rewrite_f" ? DuckLakeVortexRewriteMode::FILES
+					    : p.kind == "prune"   ? DuckLakeVortexRewriteMode::PRUNE
+					                          : DuckLakeVortexRewriteMode::INDEXED,
+					    p.kind == "rewrite_f" || p.kind == "prune" ? p.run : "");
 				}
 				if (flush) {
 					Stage(db, pending, p, "optimizer_before_flush");
@@ -1266,10 +1275,11 @@ Policy Identify(Metadata &meta, const string &catalog, const string &schema, con
 
 void Validate(const Policy &p) {
 	if ((p.kind != "none" && p.kind != "flush" && p.kind != "build" && p.kind != "merge" && p.kind != "rewrite" &&
-	     p.kind != "retire" && p.kind != "rewrite_f") ||
+	     p.kind != "retire" && p.kind != "rewrite_f" && p.kind != "prune") ||
 	    (p.kind == "merge" ? p.selected.size() != 2 || p.selected[0] == p.selected[1]
-	     : (p.kind == "rewrite" || p.kind == "retire" || p.kind == "rewrite_f") ? p.selected.size() != 1
-	                                                                            : !p.selected.empty())) {
+	     : (p.kind == "rewrite" || p.kind == "retire" || p.kind == "rewrite_f" || p.kind == "prune")
+	         ? p.selected.size() != 1
+	         : !p.selected.empty())) {
 		throw InvalidInputException("Invalid optimizer task kind or generation selection");
 	}
 	auto &c = p.config;

@@ -130,15 +130,17 @@ static unique_ptr<FunctionData> BindRewrite(ClientContext &context, TableFunctio
 	return result;
 }
 
+template <DuckLakeVortexRewriteMode MODE>
 static void ExecuteRewrite(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<IndexCatalogState>();
 	if (state.finished) {
 		return;
 	}
 	auto &args = input.bind_data->Cast<IndexCatalogBind>().args;
-	auto result = DuckLakeVortexIndex::Rewrite(
-	    context, StringValue::Get(args[0]), StringValue::Get(args[1]), StringValue::Get(args[2]),
-	    StringValue::Get(args[3]), StringValue::Get(args[4]), StringValue::Get(args[5]), args[6].GetValue<idx_t>());
+	auto result =
+	    DuckLakeVortexIndex::Rewrite(context, StringValue::Get(args[0]), StringValue::Get(args[1]),
+	                                 StringValue::Get(args[2]), StringValue::Get(args[3]), StringValue::Get(args[4]),
+	                                 StringValue::Get(args[5]), args[6].GetValue<idx_t>(), nullptr, MODE);
 	output.SetValue(0, 0, Value::UBIGINT(result.revision));
 	output.SetValue(1, 0, Value(result.generation));
 	output.SetCardinality(1);
@@ -342,7 +344,12 @@ void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader) {
 	    TableFunction("ducklake_rewrite_vortex_index_segment",
 	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
-	                  ExecuteRewrite, BindRewrite, InitCatalog));
+	                  ExecuteRewrite<DuckLakeVortexRewriteMode::INDEXED>, BindRewrite, InitCatalog));
+	loader.RegisterFunction(
+	    TableFunction("ducklake_prune_vortex_index_segment",
+	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	                  ExecuteRewrite<DuckLakeVortexRewriteMode::PRUNE>, BindRewrite, InitCatalog));
 	loader.RegisterFunction(TableFunction(
 	    "ducklake_collect_vortex_generations", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
 	    ExecuteGeneration, BindGeneration<MaintenanceOperation::COLLECT_GENERATIONS>, InitGeneration));

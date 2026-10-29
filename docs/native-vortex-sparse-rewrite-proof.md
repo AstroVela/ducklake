@@ -7,6 +7,9 @@ no replacement SPFresh generation. The existing fixed 64-head build options
 still need at least 65 physical rows; that constraint does not force a sparse B
 to retain its entire original physical inventory.
 
+For larger B whose deletions affect only whole files, see the subsequent
+[atomic empty-file pruning proof](native-vortex-prune-files-proof.md).
+
 ## Public operation and planning
 
 ```sql
