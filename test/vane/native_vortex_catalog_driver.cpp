@@ -167,12 +167,24 @@ public:
 			return "{}";
 		}
 		if (op == "optimizer-status" || op == "generation-status" || op == "build-status" ||
-		    op == "maintenance-status") {
+		    op == "maintenance-status" || op == "rewrite-status" || op == "source-status") {
 			auto function = op == "generation-status"    ? "ducklake_vortex_generation_status"
 			                : op == "build-status"       ? "ducklake_vortex_build_status"
 			                : op == "maintenance-status" ? "ducklake_vortex_maintenance_status"
 			                                             : "ducklake_vortex_optimizer_status";
-			auto result = SQL(writer, "SELECT * FROM " + string(function) + "('lake')");
+			auto query = "SELECT * FROM " + string(function) + "('lake')";
+			if (op == "rewrite-status") {
+				query = "SELECT build_id,table_uuid,source_root,new_path,capture_snapshot::UBIGINT AS capture_snapshot,"
+				        "new_file_id::UBIGINT AS new_file_id,keep_file FROM "
+				        "__ducklake_metadata_lake.ducklake_vortex_rewrites_v1 ORDER BY build_id";
+			} else if (op == "source-status") {
+				query = "SELECT data_file_id::UBIGINT AS file_id,path,record_count::UBIGINT AS rows,"
+				        "begin_snapshot::UBIGINT AS begin_snapshot,end_snapshot::UBIGINT AS end_snapshot "
+				        "FROM __ducklake_metadata_lake.ducklake_data_file WHERE table_id=(SELECT table_id FROM "
+				        "__ducklake_metadata_lake.ducklake_table WHERE table_name='items' AND end_snapshot IS NULL) "
+				        "ORDER BY data_file_id";
+			}
+			auto result = SQL(writer, query);
 			ViewJSON json;
 			auto rows = json.Array();
 			for (idx_t row = 0; row < result->RowCount(); row++) {
@@ -201,6 +213,111 @@ public:
 				yyjson_mut_arr_append(rows, value);
 			}
 			return json.Finish(rows);
+		}
+		if (op == "rewrite") {
+			return DuckLakeVortexIndex::Rewrite(*writer.context, "lake", "main", "items", "knn", args.at(2), args.at(3),
+			                                    std::stoull(args.at(4)))
+			    .ToJSON();
+		}
+		if (op == "rewrite-fail" || op == "rewrite-cancel" || op == "rewrite-crash" || op == "rewrite-collision") {
+			Connection rewriter(database);
+			return DuckLakeVortexIndex::Rewrite(
+			           *rewriter.context, "lake", "main", "items", "knn", args.at(3), args.at(4),
+			           std::stoull(args.at(5)),
+			           [&](const string &stage) {
+				           if (stage != args.at(2)) {
+					           return;
+				           }
+				           if (op == "rewrite-fail") {
+					           throw InvalidInputException("Injected indexed rewrite failure");
+				           }
+				           if (op == "rewrite-cancel") {
+					           rewriter.Interrupt();
+					           return;
+				           }
+				           if (op == "rewrite-collision") {
+					           auto paths = SQL(writer, "SELECT new_path FROM __ducklake_metadata_lake."
+					                                    "ducklake_vortex_rewrites_v1 WHERE NOT keep_file");
+					           Require(paths->RowCount() == 1, "Expected one rewrite intent");
+					           Write(StringValue::Get(paths->GetValue(0, 0)), "foreign-rewrite-output");
+					           return;
+				           }
+				           Write(root + "/rewrite-" + stage + ".ready", "ready");
+				           string line;
+				           std::getline(std::cin, line);
+				           throw InvalidInputException("Rewrite fixture resumed without SIGKILL");
+			           })
+			    .ToJSON();
+		}
+		if (op == "rewrite-write-race" || op == "rewrite-orphan-race") {
+			Connection rewriter(database);
+			Pause pause;
+			auto rewrite = std::async(std::launch::async, [&] {
+				try {
+					auto result =
+					    DuckLakeVortexIndex::Rewrite(*rewriter.context, "lake", "main", "items", "knn", args.at(3),
+					                                 args.at(4), std::stoull(args.at(5)), [&](const string &stage) {
+						                                 if (stage == args.at(2)) {
+							                                 pause.Stop();
+						                                 }
+					                                 });
+					return "{\"published\":" + result.ToJSON() + "}";
+				} catch (const std::exception &error) {
+					ViewJSON json;
+					auto value = json.Object();
+					json.Text(value, "error", error.what());
+					return json.Finish(value);
+				}
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			if (op == "rewrite-orphan-race") {
+				SQL(writer,
+				    "PREPARE stale_cleanup AS SELECT * FROM ducklake_delete_orphaned_files('lake',cleanup_all=>true)");
+				SQL(writer, "EXECUTE stale_cleanup");
+				pause.Release();
+				auto result = rewrite.get();
+				SQL(writer, "DEALLOCATE stale_cleanup");
+				return result;
+			}
+			SQL(writer, ReadText(args.at(6)));
+			pause.Release();
+			return rewrite.get();
+		}
+		if (op == "rewrite-reader-race") {
+			Connection reader(database), rewriter(database);
+			Pause pause;
+			DuckLakeVortexSearchRequest request;
+			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
+			request.k = 10;
+			auto pending = std::async(std::launch::async, [&] {
+				return DuckLakeVortexSearch::Execute(*reader.context, Options("knn"), request,
+				                                     [&](const string &stage) {
+					                                     if (stage == args.at(2)) {
+						                                     pause.Stop();
+					                                     }
+				                                     });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			auto result = DuckLakeVortexIndex::Rewrite(*rewriter.context, "lake", "main", "items", "knn", args.at(3),
+			                                           args.at(4), std::stoull(args.at(5)));
+			auto gc = std::async(std::launch::async, [&] {
+				Connection collector(database);
+				return DuckLakeVortexIndex::Collect(*collector.context, "lake", 16, 64 * 1024 * 1024);
+			});
+			ReleasePause release_gc {pause};
+			if (args.at(2) == "after_open") {
+				Require(gc.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+				        "Private view blocked rewrite GC");
+			} else {
+				Require(gc.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
+				        "GC bypassed old-view admission");
+			}
+			pause.Release();
+			auto held = pending.get();
+			return "{\"published\":" + result.ToJSON() + ",\"held\":" + SearchJSON(held.rows, held.diagnostics) +
+			       ",\"gc\":" + GCJSON(gc.get()) + "}";
 		}
 		if (op == "recover-builds") {
 			auto result = SQL(writer, "SELECT * FROM ducklake_recover_vortex_builds('lake'," + args.at(2) + ")");

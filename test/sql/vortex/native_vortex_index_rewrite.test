@@ -1,0 +1,128 @@
+# name: test/sql/vortex/native_vortex_index_rewrite.test
+# description: explicit indexed-source rewrite publishes physical files and ANN coverage atomically
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_index_rewrite.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_index_rewrite_data', DATA_INLINING_ROW_LIMIT 100)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','original' FROM range(256)t(i)
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-B1.json',2,0)
+----
+1
+
+statement ok
+INSERT INTO lake.items SELECT 1000+i,[1000+i,0],'B','unselected' FROM range(128)t(i)
+
+query I
+SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-B2.json',2,1)
+----
+2
+
+statement ok
+SET VARIABLE rewrite_generations = (SELECT regexp_extract_all(admission,'"generation":"([^"]+)"',1) FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000))
+
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-no-budget.json',2)
+----
+requires an installed write budget
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,100000,4194304,100000,67108864)
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',100,4194304,1,67108864)
+
+statement ok
+DELETE FROM lake.items WHERE id<128
+
+statement ok
+UPDATE lake.items SET embedding=[0.125,0],payload='updated' WHERE id=200
+
+statement ok
+CREATE TABLE rewrite_expected AS SELECT rowid,id,embedding,category,payload FROM lake.items
+
+statement ok
+SET VARIABLE rewrite_snapshot = (SELECT max(snapshot_id) FROM lake.snapshots())
+
+query I
+SELECT sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL
+----
+384
+
+query I
+SELECT revision FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-new.json',2)
+----
+3
+
+query I
+SELECT sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL
+----
+255
+
+query I
+SELECT count(*) FROM ((SELECT rowid,id,embedding,category,payload FROM lake.items EXCEPT ALL SELECT * FROM rewrite_expected) UNION ALL (SELECT * FROM rewrite_expected EXCEPT ALL SELECT rowid,id,embedding,category,payload FROM lake.items))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT rowid,id,embedding,category,payload FROM lake.items AT(VERSION=>getvariable('rewrite_snapshot')) EXCEPT ALL SELECT * FROM rewrite_expected) UNION ALL (SELECT * FROM rewrite_expected EXCEPT ALL SELECT rowid,id,embedding,category,payload FROM lake.items AT(VERSION=>getvariable('rewrite_snapshot'))))
+----
+0
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0.125,0]::FLOAT[],1)
+----
+200
+
+query II
+SELECT array_length(regexp_extract_all(admission,'"generation":"[^"]+"')),regexp_extract_all(admission,'"generation":"([^"]+)"',1)[1]=getvariable('rewrite_generations')[2] FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+----
+2	true
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrites_v1 WHERE keep_file
+----
+1
+
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-stale.json',3)
+----
+selected generation is not ready
+
+statement ok
+SELECT * FROM ducklake_collect_vortex_builds('lake',16,67108864)
+
+statement ok
+SELECT * FROM ducklake_collect_vortex_generations('lake',16,67108864)
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[1000,0]::FLOAT[],1,category=>'B')
+----
+1000
+
+statement ok
+DETACH lake
