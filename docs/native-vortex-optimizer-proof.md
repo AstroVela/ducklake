@@ -89,9 +89,13 @@ dedicated context. Cancellation is cooperative at the existing native
 checkpoints; an SPFresh native build call completes before its next check.
 Uncommitted failure disables the policy and preserves its reason. Explicit
 resume plans work from fresh committed table state. Failed/cancelled candidates
-can remain outside managed data. The
-[generation GC follow-up](native-vortex-generation-gc-proof.md) collects explicitly
-registered, retired published generations; unpublished candidates are excluded.
+remain outside managed data. The
+[generation collector](native-vortex-generation-gc-proof.md) handles retired
+published generations; the [build collector](native-vortex-build-ownership-proof.md)
+handles registered native workspaces and abandoned candidates. Optional
+[catalog maintenance](native-vortex-maintenance-proof.md) schedules explicit
+recovery and both collectors through the same worker, independently of indexing
+cancellation or failure.
 
 Before publication, the worker persists the sealed candidate generation and
 expected revision. Failure after commit and explicit resume after process restart
