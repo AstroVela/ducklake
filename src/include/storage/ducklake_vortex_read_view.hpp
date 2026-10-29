@@ -2,6 +2,7 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/storage/storage_lock.hpp"
 
 #include <functional>
 
@@ -41,6 +42,7 @@ struct DuckLakeVortexReadView {
 	string managed_data_path;
 	idx_t captured_business_rows = 0;
 	vector<DuckLakeVortexSourceBuffer> sources;
+	unique_ptr<StorageLockKey> generation_guard;
 
 	static DuckLakeVortexReadView Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
 	                                      const std::function<void(const string &)> &observe = nullptr,
