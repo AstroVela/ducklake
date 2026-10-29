@@ -219,12 +219,16 @@ public:
 			                                    std::stoull(args.at(4)))
 			    .ToJSON();
 		}
-		if (op == "rewrite-fail" || op == "rewrite-cancel" || op == "rewrite-crash" || op == "rewrite-collision") {
+		if (op == "rewrite-fail" || op == "rewrite-cancel" || op == "rewrite-crash" || op == "rewrite-collision" ||
+		    op == "rewrite-crash-append" || op == "rewrite-corrupt-prepared") {
 			Connection rewriter(database);
 			return DuckLakeVortexIndex::Rewrite(
 			           *rewriter.context, "lake", "main", "items", "knn", args.at(3), args.at(4),
 			           std::stoull(args.at(5)),
 			           [&](const string &stage) {
+				           if (op == "rewrite-crash-append" && stage == "rewrite_candidate_ready") {
+					           SQL(writer, ReadText(args.at(6)));
+				           }
 				           if (stage != args.at(2)) {
 					           return;
 				           }
@@ -242,6 +246,21 @@ public:
 					           Write(StringValue::Get(paths->GetValue(0, 0)), "foreign-rewrite-output");
 					           return;
 				           }
+				           if (op == "rewrite-corrupt-prepared") {
+					           auto workspace =
+					               SQL(writer,
+					                   "SELECT workspace FROM __ducklake_metadata_lake.ducklake_vortex_builds_v1 b "
+					                   "JOIN __ducklake_metadata_lake.ducklake_vortex_rewrites_v1 r USING(build_id) "
+					                   "WHERE NOT r.keep_file");
+					           Require(workspace->RowCount() == 1, "Expected one private rewrite workspace");
+					           auto path = StringValue::Get(workspace->GetValue(0, 0)) +
+					                       "/prepared/artifacts/spfresh/native/vectors.bin";
+					           auto bytes = ReadText(path);
+					           Require(!bytes.empty(), "Expected a nonempty native vector artifact");
+					           bytes[0] ^= 1;
+					           Write(path, bytes);
+					           return;
+				           }
 				           Write(root + "/rewrite-" + stage + ".ready", "ready");
 				           string line;
 				           std::getline(std::cin, line);
@@ -249,19 +268,65 @@ public:
 			           })
 			    .ToJSON();
 		}
-		if (op == "rewrite-write-race" || op == "rewrite-orphan-race") {
+		if (op == "rewrite-live-append") {
+			Connection rewriter(database);
+			std::promise<bool> start;
+			auto ready = start.get_future();
+			auto writes = std::async(std::launch::async, [&] {
+				if (ready.get()) {
+					SQL(writer, ReadText(args.at(5)));
+				}
+			});
+			bool started = false;
+			idx_t builds = 0, bindings = 0, provisional_id = 0;
+			try {
+				auto result = DuckLakeVortexIndex::Rewrite(
+				    *rewriter.context, "lake", "main", "items", "knn", args.at(2), args.at(3), std::stoull(args.at(4)),
+				    [&](const string &stage) {
+					    if (stage == "build_started") {
+						    Connection inspect(database);
+						    auto planned = SQL(inspect, "SELECT new_file_id FROM __ducklake_metadata_lake."
+						                                "ducklake_vortex_rewrites_v1 WHERE NOT keep_file");
+						    Require(planned->RowCount() == 1, "Expected one live rewrite intent");
+						    provisional_id = planned->GetValue(0, 0).GetValue<idx_t>();
+						    builds++;
+						    start.set_value(true);
+						    started = true;
+					    }
+					    bindings += stage == "rewrite_bind_started";
+					    if (stage == "rewrite_candidate_ready") {
+						    writes.get();
+					    }
+				    });
+				return "{\"published\":" + result.ToJSON() + ",\"native_builds\":" + to_string(builds) +
+				       ",\"bindings\":" + to_string(bindings) +
+				       ",\"provisional_file_id\":" + to_string(provisional_id) + "}";
+			} catch (...) {
+				if (!started) {
+					start.set_value(false);
+				}
+				throw;
+			}
+		}
+		if (op == "rewrite-write-race" || op == "rewrite-orphan-race" || op == "rewrite-commit-race") {
 			Connection rewriter(database);
 			Pause pause;
+			idx_t provisional_id = 0;
 			auto rewrite = std::async(std::launch::async, [&] {
 				try {
+					idx_t builds = 0, bindings = 0;
 					auto result =
 					    DuckLakeVortexIndex::Rewrite(*rewriter.context, "lake", "main", "items", "knn", args.at(3),
 					                                 args.at(4), std::stoull(args.at(5)), [&](const string &stage) {
+						                                 builds += stage == "build_started";
+						                                 bindings += stage == "rewrite_bind_started";
 						                                 if (stage == args.at(2)) {
 							                                 pause.Stop();
 						                                 }
 					                                 });
-					return "{\"published\":" + result.ToJSON() + "}";
+					return "{\"published\":" + result.ToJSON() + ",\"native_builds\":" + to_string(builds) +
+					       ",\"bindings\":" + to_string(bindings) +
+					       ",\"provisional_file_id\":" + to_string(provisional_id) + "}";
 				} catch (const std::exception &error) {
 					ViewJSON json;
 					auto value = json.Object();
@@ -271,6 +336,10 @@ public:
 			});
 			ReleasePause release {pause};
 			pause.Wait();
+			auto planned = SQL(writer, "SELECT new_file_id FROM __ducklake_metadata_lake.ducklake_vortex_rewrites_v1 "
+			                           "WHERE NOT keep_file");
+			Require(planned->RowCount() == 1, "Expected one unpublished rewrite intent");
+			provisional_id = planned->GetValue(0, 0).GetValue<idx_t>();
 			if (op == "rewrite-orphan-race") {
 				SQL(writer,
 				    "PREPARE stale_cleanup AS SELECT * FROM ducklake_delete_orphaned_files('lake',cleanup_all=>true)");
@@ -278,6 +347,21 @@ public:
 				pause.Release();
 				auto result = rewrite.get();
 				SQL(writer, "DEALLOCATE stale_cleanup");
+				return result;
+			}
+			if (op == "rewrite-commit-race") {
+				std::promise<void> started;
+				auto ready = started.get_future();
+				auto commit = std::async(std::launch::async, [&] {
+					started.set_value();
+					SQL(writer, ReadText(args.at(6)));
+				});
+				ready.wait();
+				Require(commit.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
+				        "Source commit bypassed final rewrite publication");
+				pause.Release();
+				auto result = rewrite.get();
+				commit.get();
 				return result;
 			}
 			SQL(writer, ReadText(args.at(6)));

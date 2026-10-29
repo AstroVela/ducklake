@@ -279,10 +279,8 @@ def race(driver, root, stage, kind, checks):
                 native, root, "INSERT INTO lake.items VALUES(200000,[133.01,4,2,0,1,8,7,16],'A','concurrent-write')"
             )
             result = native.call("rewrite-write-race", stage, SEG.generation(first), path, 3, sql)
-            require(
-                "changed before commit" in result.get("error", ""), f"Snapshot conflict was hidden or retried: {result}"
-            )
-            require(native.call("head", "knn")["revision"] == 3, "Conflicting rewrite changed the ready index")
+            require("published" in result, f"Independent inline append conflicted with rewrite: {result}")
+            require(native.call("head", "knn")["revision"] == 4, "Append/rewrite did not publish one replacement")
         native.call("maintenance-enable", 16, LIMIT)
         MA.drain(native)
         unchanged(native, parts, frozen)
