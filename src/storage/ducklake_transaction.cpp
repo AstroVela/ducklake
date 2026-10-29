@@ -1614,6 +1614,21 @@ string DuckLakeTransaction::GetDefaultSchemaName() {
 	return metadb->GetCatalog().GetDefaultSchema();
 }
 
+#ifdef DUCKLAKE_ENABLE_VORTEX
+void DuckLakeTransaction::RebaseVortexRewrite(const DuckLakeSnapshot &fresh) {
+	if (!DuckLakeVortexRewriteState::Get(*context.lock())) {
+		throw InternalException("Only a prepared Vortex rewrite can rebase its commit snapshot");
+	}
+	lock_guard<mutex> guard(snapshot_lock);
+	if (!snapshot || snapshot->snapshot_id > fresh.snapshot_id) {
+		throw TransactionException("Vortex rewrite snapshot changed before commit");
+	}
+	*snapshot = fresh;
+	catalog_version = fresh.schema_version;
+	metadata_manager->ClearCache();
+}
+#endif
+
 DuckLakeSnapshot DuckLakeTransaction::GetSnapshot() {
 	auto catalog_snapshot = ducklake_catalog.CatalogSnapshot();
 	if (catalog_snapshot) {
