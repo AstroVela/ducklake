@@ -1,0 +1,115 @@
+# name: test/sql/vortex/native_vortex_build_gc.test
+# description: native builds register ownership before work and collect only abandoned candidates or published scratch
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_build_gc.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_build_gc_data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement error
+SELECT * FROM ducklake_vortex_build_status('lake')
+----
+index catalog is not initialized
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+query I
+SELECT count(*) FROM ducklake_vortex_build_status('lake')
+----
+0
+
+query I
+SELECT * FROM ducklake_recover_vortex_builds('lake',16)
+----
+0
+
+query III
+SELECT * FROM ducklake_collect_vortex_builds('lake',16,67108864)
+----
+0	0	0
+
+statement error
+SELECT * FROM ducklake_collect_vortex_builds('lake',0,67108864)
+----
+collection count or artifact byte budget
+
+statement error
+SELECT * FROM ducklake_collect_vortex_builds('lake',1,67108865)
+----
+collection count or artifact byte budget
+
+statement error
+SELECT * FROM ducklake_recover_vortex_builds('lake',17)
+----
+collection count or artifact byte budget
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','initial' FROM range(128)t(i)
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/build-gc-B1.json',2,0)
+----
+1
+
+query II
+SELECT count(*),count(*) FILTER(WHERE state='published' AND keep_generation AND expected_revision=0 AND generation='generation-'||build_id AND workspace=index_root||'/.build-'||build_id) FROM ducklake_vortex_build_status('lake')
+----
+1	1
+
+statement ok
+INSERT INTO lake.items VALUES(1000,[0.125,0],'B','too-small')
+
+statement error
+SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/build-gc-rejected.json',2,1)
+----
+Unsupported SPFresh static build options
+
+query II
+SELECT count(*),count(*) FILTER(WHERE state='abandoned' AND NOT keep_generation AND expected_revision=1) FROM ducklake_vortex_build_status('lake')
+----
+2	1
+
+query I
+SELECT * FROM ducklake_recover_vortex_builds('lake',16)
+----
+0
+
+query II
+SELECT collected_builds,remaining_builds FROM ducklake_collect_vortex_builds('lake',16,67108864)
+----
+2	0
+
+query III
+SELECT * FROM ducklake_collect_vortex_builds('lake',16,67108864)
+----
+0	0	0
+
+query II
+SELECT count(*),min(reference_count) FROM ducklake_vortex_generation_status('lake') WHERE state='active'
+----
+1	1
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
+----
+0
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0.125,0]::FLOAT[],1,category=>'B')
+----
+1000
+
+statement ok
+DETACH lake

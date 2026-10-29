@@ -272,6 +272,13 @@ jobs:
             --driver build/index-shell/ducklake_vortex_catalog_driver \
             --probe build/index-cargo/ci/ducklake-vortex-index-probe \
             --output-dir build/index-logs/generation-gc
+      - name: Validate native build ownership, crash recovery and bounded cleanup
+        run: |
+          python3 -I test/vane/test_native_vortex_build_gc.py \
+            --duckdb build/index-shell/duckdb \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --probe build/index-cargo/ci/ducklake-vortex-index-probe \
+            --output-dir build/index-logs/build-gc
       - name: Validate query projections and record isolated process cost
         run: |
           python3 -I test/vane/test_native_vortex_cost.py \

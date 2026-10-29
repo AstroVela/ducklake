@@ -18,6 +18,10 @@ struct DuckLakeVortexGCResult {
 	idx_t generations = 0, artifact_bytes = 0, remaining = 0;
 };
 
+struct DuckLakeVortexBuildGCResult {
+	idx_t builds = 0, bytes = 0, remaining = 0;
+};
+
 struct DuckLakeVortexIndexFile {
 	idx_t id;
 	string uri;
@@ -57,6 +61,12 @@ struct DuckLakeVortexIndex {
 	                                      idx_t max_artifact_bytes,
 	                                      const std::function<void(const string &)> &observe = nullptr);
 	static vector<vector<Value>> GenerationStatus(Connection &owner, const string &catalog);
+	static vector<vector<Value>> BuildStatus(Connection &owner, const string &catalog);
+	static idx_t RecoverBuilds(ClientContext &context, const string &catalog, idx_t max_builds,
+	                           const std::function<void(const string &)> &observe = nullptr);
+	static DuckLakeVortexBuildGCResult CollectBuilds(ClientContext &context, const string &catalog, idx_t max_builds,
+	                                                 idx_t max_bytes,
+	                                                 const std::function<void(const string &)> &observe = nullptr);
 	static DuckLakeVortexIndex ParseSegments(const string &reference, const string &table_uuid, idx_t field_id);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
