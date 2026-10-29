@@ -49,16 +49,40 @@ pub struct CatalogSegment {
 #[serde(deny_unknown_fields)]
 pub struct SegmentManifest {
     pub format_version: u32,
+    pub table_uuid: String,
+    pub field_id: u32,
+    pub dimension: u32,
+    pub root: PathBuf,
+    pub publication: String,
     pub segments: Vec<CatalogSegment>,
 }
 
 impl CatalogIndex {
-    fn validate(&self, name: &str) -> VortexResult<()> {
+    fn validate(&self, name: &str, capture: &MixedCapture) -> VortexResult<()> {
         if self.name != name
             || name.is_empty()
             || self.revision == 0
-            || self.reference.format_version != 2
-            || !(1..=3).contains(&self.reference.segments.len())
+            || self.reference.format_version != 3
+            || self.reference.table_uuid != capture.file_capture.table_uuid
+            || self.reference.field_id != capture.file_capture.field_id
+            || self.reference.dimension != capture.file_capture.dimension
+            || !(1..=4096).contains(&self.reference.dimension)
+            || self.reference.publication.len() != 36
+            || !self
+                .reference
+                .publication
+                .bytes()
+                .enumerate()
+                .all(|(i, value)| {
+                    if [8, 13, 18, 23].contains(&i) {
+                        value == b'-'
+                    } else {
+                        value.is_ascii_digit() || (b'a'..=b'f').contains(&value)
+                    }
+                })
+            || !self.root.is_absolute()
+            || self.reference.root != self.root
+            || self.reference.segments.len() > 3
             || self
                 .reference
                 .segments
@@ -68,7 +92,7 @@ impl CatalogIndex {
                 .reference
                 .segments
                 .last()
-                .is_none_or(|segment| segment.root != self.root)
+                .is_some_and(|segment| segment.root != self.root)
         {
             vortex_bail!(
                 "Catalogued segment manifest name, revision, version, roots or count mismatch"
@@ -104,7 +128,7 @@ pub fn prepare_binary(bytes: &[u8], name: &str) -> VortexResult<(MixedCapture, C
     if admission.format_version != 1 {
         vortex_bail!("Binary admission version mismatch");
     }
-    admission.index.validate(name)?;
+    admission.index.validate(name, &admission.capture)?;
     Ok((admission.capture, admission.index))
 }
 
@@ -138,7 +162,7 @@ pub fn prepare_catalogued(
     }
     let admission: CatalogAdmission =
         serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
-    admission.index.validate(name)?;
+    admission.index.validate(name, &admission.capture)?;
     let prepared = materialize(
         Admission {
             format_version: admission.format_version,

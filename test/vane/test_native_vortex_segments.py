@@ -22,7 +22,7 @@ VECTOR = BUILD.VECTOR
 
 def segments(record):
     manifest = record["reference"]
-    require(manifest["format_version"] == 2, "Wrong segment manifest version")
+    require(manifest["format_version"] == 3, "Wrong segment manifest version")
     return manifest["segments"]
 
 

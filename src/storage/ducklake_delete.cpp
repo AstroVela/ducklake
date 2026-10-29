@@ -16,6 +16,9 @@
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "storage/ducklake_delete.hpp"
+#ifdef DUCKLAKE_ENABLE_VORTEX
+#include "storage/ducklake_vortex_index_catalog.hpp"
+#endif
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_schema_entry.hpp"
 #include "common/ducklake_data_file.hpp"
@@ -590,6 +593,12 @@ bool DuckLakeDelete::TryDropFullyDeletedFile(DuckLakeTransaction &transaction, c
 	if (delete_count != data_file_info.row_count) {
 		return false;
 	}
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	if (delete_file.data_file_id.IsValid() &&
+	    DuckLakeVortexIndex::CoversFile(transaction, table, delete_file.data_file_id.index)) {
+		return false;
+	}
+#endif
 	// ALL rows in this file are deleted - drop the file
 	if (delete_file.data_file_id.IsValid()) {
 		transaction.DropFile(table.GetTableId(), delete_file.data_file_id, data_file_info.file.path);

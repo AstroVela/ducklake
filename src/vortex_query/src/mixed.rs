@@ -478,11 +478,10 @@ impl MixedView {
         self.leases.iter().map(|lease| lease.artifact_bytes).sum()
     }
 
-    pub fn generation(&self) -> &str {
-        &self.leases[self.leases.len() - 1]
-            .index
-            .metadata()
-            .generation
+    pub fn generation(&self) -> Option<&str> {
+        self.leases
+            .last()
+            .map(|lease| lease.index.metadata().generation.as_str())
     }
 
     pub fn generations(&self) -> Vec<&str> {

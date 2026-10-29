@@ -3,6 +3,7 @@
 #include "common/ducklake_vortex_json.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
@@ -215,8 +216,9 @@ string JSON(yyjson_val *value) {
 	return copy.Finish(yyjson_val_mut_copy(copy.doc.get(), value));
 }
 
-void Compose(DuckLakeVortexIndex &index, vector<DuckLakeVortexIndexSegment> segments) {
-	if (segments.empty() || segments.size() > DuckLakeVortexIndex::MAX_SEGMENTS) {
+void Compose(DuckLakeVortexIndex &index, vector<DuckLakeVortexIndexSegment> segments, const string &uuid,
+             const string &publication = "") {
+	if (segments.size() > DuckLakeVortexIndex::MAX_SEGMENTS) {
 		throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex segment count budget exceeded");
 	}
 	std::set<idx_t> files;
@@ -226,7 +228,16 @@ void Compose(DuckLakeVortexIndex &index, vector<DuckLakeVortexIndexSegment> segm
 	index.files.clear();
 	ViewJSON json;
 	auto value = json.Object();
-	json.Number(value, "format_version", 2);
+	if (!segments.empty()) {
+		index.root = segments.back().root;
+	}
+	index.generation = segments.empty() ? "" : segments.back().generation;
+	json.Number(value, "format_version", 3);
+	json.Text(value, "table_uuid", uuid);
+	json.Number(value, "field_id", index.field_id);
+	json.Number(value, "dimension", index.dimension);
+	json.Text(value, "root", index.root);
+	json.Text(value, "publication", publication.empty() ? UUID::ToString(UUID::GenerateRandomUUID()) : publication);
 	auto entries = json.Array();
 	json.Add(value, "segments", entries);
 	for (auto &segment : segments) {
@@ -254,8 +265,6 @@ void Compose(DuckLakeVortexIndex &index, vector<DuckLakeVortexIndexSegment> segm
 	}
 	std::sort(index.files.begin(), index.files.end(),
 	          [](const DuckLakeVortexIndexFile &a, const DuckLakeVortexIndexFile &b) { return a.id < b.id; });
-	index.root = segments.back().root;
-	index.generation = segments.back().generation;
 	index.reference = json.Finish(value);
 	if (index.reference.size() > MAX_MANIFEST) {
 		throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex segment manifest byte budget exceeded");
@@ -266,33 +275,45 @@ void Compose(DuckLakeVortexIndex &index, vector<DuckLakeVortexIndexSegment> segm
 DuckLakeVortexIndex ParseCatalogReference(const string &bytes, const string &uuid, idx_t field_id) {
 	Parsed parsed(bytes);
 	auto value = parsed.Root();
-	Object(value, 2);
-	if (Number(value, "format_version") != 2) {
-		throw InvalidInputException("Unsupported Vortex segment manifest version");
+	Object(value, 7);
+	if (Number(value, "format_version") != 3 || Text(value, "table_uuid") != uuid ||
+	    Number(value, "field_id") != field_id || !Number(value, "dimension") || Number(value, "dimension") > 4096) {
+		throw InvalidInputException("Unsupported Vortex segment manifest version or vector definition");
+	}
+	auto publication = Text(value, "publication");
+	if (UUID::ToString(UUID::FromString(publication)) != publication) {
+		throw InvalidInputException("Invalid Vortex plan publication identity");
 	}
 	auto entries = Member(value, "segments");
 	Array(entries);
-	if (!yyjson_arr_size(entries) || yyjson_arr_size(entries) > DuckLakeVortexIndex::MAX_SEGMENTS) {
+	if (yyjson_arr_size(entries) > DuckLakeVortexIndex::MAX_SEGMENTS) {
 		throw InvalidInputException("Invalid Vortex segment count");
 	}
 	DuckLakeVortexIndex result;
+	result.field_id = uint32_t(field_id);
+	result.dimension = uint32_t(Number(value, "dimension"));
+	result.root = Text(value, "root");
+	if (result.root.empty() || result.root[0] != '/' || result.root.find('\0') != string::npos) {
+		throw InvalidInputException("Invalid Vortex plan root");
+	}
 	vector<DuckLakeVortexIndexSegment> segments;
 	for (idx_t i = 0; i < yyjson_arr_size(entries); i++) {
 		auto entry = yyjson_arr_get(entries, i);
 		Object(entry, 2);
 		auto segment = ParseReference(JSON(Member(entry, "reference")), uuid, field_id);
-		if (i && (segment.dimension != result.dimension || segment.field_id != result.field_id)) {
+		if (segment.dimension != result.dimension || segment.field_id != result.field_id) {
 			throw InvalidInputException("Vortex segment vector specification mismatch");
 		}
-		result.field_id = segment.field_id;
-		result.dimension = segment.dimension;
 		auto root = Text(entry, "root");
 		if (root.empty() || root[0] != '/' || root.find('\0') != string::npos) {
 			throw InvalidInputException("Invalid Vortex segment root");
 		}
 		segments.push_back({root, segment.generation, segment.reference, segment.files});
 	}
-	Compose(result, std::move(segments));
+	if (!segments.empty() && result.root != segments.back().root) {
+		throw InvalidInputException("Vortex plan root mismatch");
+	}
+	Compose(result, std::move(segments), uuid, publication);
 	return result;
 }
 
@@ -477,6 +498,24 @@ string RewriteInputs(ClientContext &context, DuckLakeTransaction &transaction, D
 		identity += ":delete:" + to_string(mask.first) + ":" + Hash(bytes);
 	}
 	return Hash(identity);
+}
+
+void CheckEmpty(Connection &reader, const DuckLakeVortexRewriteState &plan) {
+	vector<string> paths;
+	for (auto &file : plan.selected_files) {
+		paths.push_back(Value(file.uri).ToSQLString());
+	}
+	auto name = KeywordHelper::WriteOptionallyQuoted(plan.catalog) + "." +
+	            KeywordHelper::WriteOptionallyQuoted(plan.schema) + "." +
+	            KeywordHelper::WriteOptionallyQuoted(plan.table);
+	auto rows =
+	    reader.Query("SELECT 1 FROM " + name + " WHERE filename IN (" + StringUtil::Join(paths, ",") + ") LIMIT 1");
+	if (rows->HasError()) {
+		rows->ThrowError();
+	}
+	if (rows->Fetch()) {
+		throw InvalidInputException("Vortex segment still has visible rows; retirement requires an empty B");
+	}
 }
 
 string GenerationWhere(const string &root, const string &generation) {
@@ -899,7 +938,7 @@ shared_ptr<DuckLakeVortexRewriteState> DuckLakeVortexRewriteState::Get(ClientCon
 
 void DuckLakeVortexIndex::CheckRewriteCommit(ClientContext &context, DuckLakeTransaction &transaction) {
 	auto plan = DuckLakeVortexRewriteState::Get(context);
-	if (!plan || !plan->bind) {
+	if (!plan || (!plan->retire && !plan->bind)) {
 		throw InvalidInputException("Vortex rewrite candidate is not prepared");
 	}
 	Connection probe(*context.db);
@@ -919,12 +958,17 @@ void DuckLakeVortexIndex::CheckRewriteCommit(ClientContext &context, DuckLakeTra
 		if (RewriteInputs(*probe.context, fresh, table, *plan) != plan->input_identity) {
 			throw TransactionException("Vortex rewrite input or schema changed before commit");
 		}
+		if (plan->retire) {
+			CheckEmpty(probe, *plan);
+		}
 		probe.Commit();
 		transaction.RebaseVortexRewrite(snapshot);
 		plan->new_file_id = snapshot.next_file_id;
 		plan->commit_snapshot_id = snapshot.snapshot_id + 1;
-		plan->bind(plan->new_file_id);
-		plan->check("rewrite_before_commit");
+		if (!plan->retire) {
+			plan->bind(plan->new_file_id);
+		}
+		plan->check(plan->retire ? "retire_before_commit" : "rewrite_before_commit");
 	} catch (...) {
 		Rollback(probe);
 		throw;
@@ -965,7 +1009,7 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 			found_output = file.file_id.index == plan->new_file_id && file.row_count == plan->new_rows;
 		}
 	}
-	if (!found_output) {
+	if (!plan->retire && !found_output) {
 		throw InvalidInputException("Vortex rewrite output file identity mismatch");
 	}
 	plan->candidate.ValidateCoverage(identities);
@@ -988,9 +1032,11 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 	if (!updated->Fetch()) {
 		throw TransactionException("Vortex rewrite publication ownership changed");
 	}
-	Query(transaction, "UPDATE {METADATA_CATALOG}." + string(REWRITES) + " SET keep_file=true,new_file_id=" +
-	                       to_string(plan->new_file_id) + " WHERE build_id=" + Value(plan->build_id).ToSQLString());
-	plan->check("rewrite_after_stage");
+	if (!plan->retire) {
+		Query(transaction, "UPDATE {METADATA_CATALOG}." + string(REWRITES) + " SET keep_file=true,new_file_id=" +
+		                       to_string(plan->new_file_id) + " WHERE build_id=" + Value(plan->build_id).ToSQLString());
+	}
+	plan->check(plan->retire ? "retire_after_stage" : "rewrite_after_stage");
 }
 
 DuckLakeTransaction &DuckLakeVortexIndex::Begin(Connection &owner, const string &name) {
@@ -1543,6 +1589,139 @@ vector<string> DuckLakeVortexIndex::SmallestSegments() const {
 	return {sizes[0].second, sizes[1].second};
 }
 
+bool DuckLakeVortexIndex::CoversFile(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, idx_t file_id) {
+	auto &catalog = transaction.GetCatalog();
+	if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+	                                           CATALOG_TABLE)) {
+		return false;
+	}
+	auto records = Query(transaction, "SELECT reference FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
+	                                      " WHERE table_uuid=" + Value(table.GetTableUUID()).ToSQLString());
+	while (auto chunk = records->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			auto index = ParseSegments(StringValue::Get(chunk->GetValue(0, row)), table.GetTableUUID(),
+			                           table.GetFieldId(vector<string> {"embedding"}).GetFieldIndex().index);
+			for (auto &file : index.files) {
+				if (file.id == file_id) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+void DuckLakeVortexIndex::CheckFileRetirements(ClientContext &context, DuckLakeTransaction &transaction) {
+	if (!transaction.HasDroppedFiles()) {
+		return;
+	}
+	auto &catalog = transaction.GetCatalog();
+	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
+		return;
+	}
+	Connection reader(*context.db);
+	try {
+		auto &fresh = Begin(reader, catalog.GetName());
+		for (auto id : transaction.GetTablesDeletedFrom()) {
+			auto entry = fresh.GetCatalog().GetEntryById(fresh, fresh.GetSnapshot(), id);
+			if (!entry || entry->type != CatalogType::TABLE_ENTRY) {
+				continue;
+			}
+			auto &table = entry->Cast<DuckLakeTableEntry>();
+			for (auto &file : transaction.GetDroppedFiles()) {
+				if (CoversFile(fresh, table, file.second.index)) {
+					throw TransactionException(
+					    "Indexed Vortex source cannot be retired without atomic index publication");
+				}
+			}
+		}
+		reader.Commit();
+	} catch (...) {
+		Rollback(reader);
+		throw;
+	}
+}
+
+string DuckLakeVortexIndex::Publication() const {
+	Parsed parsed(reference);
+	return Text(parsed.Root(), "publication");
+}
+
+DuckLakeVortexIndex DuckLakeVortexIndex::RetireEmpty(ClientContext &context, const string &catalog,
+                                                     const string &schema, const string &table_name, const string &name,
+                                                     const string &selected, idx_t expected_revision,
+                                                     const std::function<void(const string &)> &observe,
+                                                     const string &publication) {
+	Name(name);
+	if (selected.empty() || expected_revision >= idx_t(NumericLimits<int64_t>::Maximum())) {
+		throw InvalidInputException("Invalid Vortex retirement arguments");
+	}
+	auto guard = CollectionLock().GetSharedLock();
+	Connection source(*context.db);
+	auto plan = source.context->registered_state->GetOrCreate<DuckLakeVortexRewriteState>("ducklake_vortex_rewrite");
+	plan->retire = true;
+	plan->catalog = catalog;
+	plan->schema = schema;
+	plan->table = table_name;
+	plan->selected = selected;
+	plan->build_id = publication.empty() ? UUID::ToString(UUID::GenerateRandomUUID()) : publication;
+	if (UUID::ToString(UUID::FromString(plan->build_id)) != plan->build_id) {
+		throw InvalidInputException("Invalid Vortex retirement publication identity");
+	}
+	plan->check = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		if (context.IsInterrupted() || source.context->IsInterrupted()) {
+			throw InterruptException();
+		}
+	};
+	bool committed = false;
+	try {
+		auto &transaction = Begin(source, catalog);
+		auto entry = transaction.GetCatalog().GetEntry(*source.context, CatalogType::TABLE_ENTRY, schema, table_name,
+		                                               OnEntryNotFound::THROW_EXCEPTION);
+		auto &table = entry->Cast<DuckLakeTableEntry>();
+		plan->table_uuid = table.GetTableUUID();
+		plan->table_id = table.GetTableId().index;
+		plan->before = Lookup(transaction, table, name);
+		if (plan->before.revision != expected_revision) {
+			throw TransactionException("Vortex retirement publication revision conflict");
+		}
+		vector<DuckLakeVortexIndexSegment> remaining;
+		for (auto &segment : plan->before.segments) {
+			if (segment.generation == selected) {
+				plan->selected_files = segment.files;
+			} else {
+				remaining.push_back(segment);
+			}
+		}
+		if (plan->selected_files.empty()) {
+			throw InvalidInputException("Vortex retirement selected generation is not ready");
+		}
+		plan->input_identity = RewriteInputs(*source.context, transaction, table, *plan);
+		CheckEmpty(source, *plan);
+		plan->candidate = plan->before;
+		plan->candidate.revision = expected_revision + 1;
+		Compose(plan->candidate, std::move(remaining), plan->table_uuid, plan->build_id);
+		for (auto &file : plan->selected_files) {
+			plan->replaced.push_back(file.id);
+			transaction.DropFile(table.GetTableId(), DataFileIndex(file.id), file.uri);
+		}
+		plan->check("retire_candidate_ready");
+		source.Commit();
+		committed = true;
+		plan->check("retire_after_commit");
+		return plan->candidate;
+	} catch (...) {
+		Rollback(source);
+		if (committed) {
+			throw IOException("Vortex retirement committed but acknowledgement failed; inspect catalog before retry");
+		}
+		throw;
+	}
+}
+
 string DuckLakeVortexIndex::ToJSON() const {
 	ViewJSON json;
 	Parsed parsed(reference);
@@ -1887,7 +2066,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 				}
 			}
 			segments.push_back({root, replacement.generation, replacement.reference, replacement.files});
-			Compose(replacement, std::move(segments));
+			Compose(replacement, std::move(segments), plan->table_uuid);
 			replacement.name = name;
 			replacement.revision = expected_revision + 1;
 			plan->candidate = std::move(replacement);
@@ -2018,7 +2197,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 			}
 		}
 		segments.push_back({candidate.root, candidate.generation, candidate.reference, candidate.files});
-		Compose(candidate, std::move(segments));
+		Compose(candidate, std::move(segments), table.GetTableUUID());
 		idx_t artifact_budget = MAX_ARTIFACTS;
 		for (auto &segment : candidate.segments) {
 			auto part = ParseReference(segment.reference, table.GetTableUUID(), field.GetFieldIndex().index);
