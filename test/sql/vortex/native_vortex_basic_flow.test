@@ -1,0 +1,184 @@
+# name: test/sql/vortex/native_vortex_basic_flow.test
+# description: one named search from empty table through committed T, flushed F and indexed B
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_basic.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_basic_data', DATA_INLINING_ROW_LIMIT 1000)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',0)
+----
+Invalid Vortex index definition dimension
+
+query I
+SELECT revision FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+1
+
+query III
+SELECT (SELECT count(*) FROM ducklake_vortex_generation_status('lake')),(SELECT count(*) FROM ducklake_vortex_build_status('lake')),array_length(regexp_extract_all(reference,'"generation":"[^"]+"')) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
+----
+0	0	0
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+already exists
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','bad','relative-root',2)
+----
+root must be absolute
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','bad','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_basic_data',2)
+----
+outside managed data
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,100000,4194304,100000,67108864)
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',1000,4194304,256,67108864)
+
+query I
+SELECT count(*) FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],10)
+----
+0
+
+statement ok
+PREPARE basic_search AS SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A',CASE WHEN i=0 THEN NULL ELSE '实时' END FROM range(16)t(i)
+
+query IT
+EXECUTE basic_search
+----
+0	NULL
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+----
+0
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE lake.items SET embedding=[900,0],payload='更新' WHERE id=0
+
+statement ok
+DELETE FROM lake.items WHERE id=2
+
+statement ok
+INSERT INTO lake.items VALUES(17,[0.25,0],'A','事务提交')
+
+statement ok
+COMMIT
+
+query IT
+EXECUTE basic_search
+----
+17	事务提交
+
+statement error
+INSERT INTO lake.items VALUES(99,[1,2,3],'A','维度错误')
+----
+dimension
+
+statement ok
+INSERT INTO lake.items SELECT 1000+i,[1000+i,0],'B','待索引' FROM range(112)t(i)
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','nonempty','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+requires an empty table
+
+statement ok
+CREATE TABLE basic_expected AS SELECT rowid,id,embedding,category,payload FROM lake.items
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'items')
+
+query IT
+EXECUTE basic_search
+----
+17	事务提交
+
+query III
+SELECT (SELECT sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL),(SELECT count(*) FROM lake.items),(SELECT count(*) FROM ducklake_vortex_generation_status('lake'))
+----
+130	128	0
+
+query I
+SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/basic-first-B.json',2,1)
+----
+2
+
+query IT
+EXECUTE basic_search
+----
+17	事务提交
+
+query I
+SELECT count(*) FROM ((SELECT rowid,id,embedding,category,payload FROM lake.items EXCEPT ALL SELECT * FROM basic_expected) UNION ALL (SELECT * FROM basic_expected EXCEPT ALL SELECT rowid,id,embedding,category,payload FROM lake.items))
+----
+0
+
+statement ok
+INSERT INTO lake.items VALUES(200000,[0.125,0],'A','B旁实时')
+
+statement ok
+UPDATE lake.items SET embedding=[800,0],category='B',payload='索引后更新' WHERE id=17
+
+statement ok
+DELETE FROM lake.items WHERE id=1
+
+query IT
+EXECUTE basic_search
+----
+200000	B旁实时
+
+query IT
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'B')
+----
+17	索引后更新
+
+statement ok
+DEALLOCATE basic_search
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_basic.ducklake' AS lake
+
+query IT
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
+----
+200000	B旁实时
+
+statement ok
+DETACH lake

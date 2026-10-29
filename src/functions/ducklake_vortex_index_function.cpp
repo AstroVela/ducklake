@@ -77,6 +77,33 @@ static unique_ptr<FunctionData> BindBuild(ClientContext &context, TableFunctionB
 	return result;
 }
 
+static unique_ptr<FunctionData> BindCreate(ClientContext &context, TableFunctionBindInput &input,
+                                           vector<LogicalType> &types, vector<string> &names) {
+	auto result = BindCatalog(context, input, types, names);
+	auto dimension = input.inputs[5].GetValue<int64_t>();
+	if (dimension < 1 || dimension > 4096) {
+		throw InvalidInputException("Invalid Vortex index definition dimension");
+	}
+	names = {"revision", "publication"};
+	return result;
+}
+
+static void ExecuteCreate(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<IndexCatalogState>();
+	if (state.finished) {
+		return;
+	}
+	auto &args = input.bind_data->Cast<IndexCatalogBind>().args;
+	Connection owner(*context.db);
+	auto result = DuckLakeVortexIndex::Create(owner, StringValue::Get(args[0]), StringValue::Get(args[1]),
+	                                          StringValue::Get(args[2]), StringValue::Get(args[3]),
+	                                          StringValue::Get(args[4]), uint32_t(args[5].GetValue<int64_t>()));
+	output.SetValue(0, 0, Value::UBIGINT(result.revision));
+	output.SetValue(1, 0, Value(result.Publication()));
+	output.SetCardinality(1);
+	state.finished = true;
+}
+
 static unique_ptr<FunctionData> BindAppend(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &types, vector<string> &names) {
 	auto result =
@@ -332,6 +359,10 @@ static void ExecuteGeneration(ClientContext &context, TableFunctionInput &input,
 }
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader) {
+	loader.RegisterFunction(TableFunction("ducklake_create_vortex_index",
+	                                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                       LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	                                      ExecuteCreate, BindCreate, InitCatalog));
 	loader.RegisterFunction(TableFunction("ducklake_rewrite_vortex_index_segment_to_f",
 	                                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                                       LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
