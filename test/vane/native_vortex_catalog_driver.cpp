@@ -150,7 +150,9 @@ public:
 				auto value = json.Object();
 				for (idx_t col = 0; col < result->ColumnCount(); col++) {
 					auto item = result->GetValue(col, row);
-					if (item.type().id() == LogicalTypeId::BOOLEAN) {
+					if (item.IsNull()) {
+						json.Add(value, result->names[col].c_str(), yyjson_mut_null(json.doc.get()));
+					} else if (item.type().id() == LogicalTypeId::BOOLEAN) {
 						json.Add(value, result->names[col].c_str(),
 						         yyjson_mut_bool(json.doc.get(), item.GetValue<bool>()));
 					} else if (item.type().id() == LogicalTypeId::UBIGINT) {
@@ -363,6 +365,65 @@ public:
 		}
 		if (op == "capture") {
 			return Capture(args.at(2), args.at(3));
+		}
+		if (op == "budget-race") {
+			auto count = std::stoull(args.at(2));
+			Require(count >= 2 && count <= 16, "Budget race requires two to sixteen writers");
+			auto sql = ReadText(args.at(3));
+			std::mutex lock;
+			std::condition_variable changed;
+			idx_t ready = 0;
+			bool release = false;
+			vector<std::future<string>> writers;
+			for (idx_t i = 0; i < count; i++) {
+				writers.push_back(std::async(std::launch::async, [&, i] {
+					Connection connection(database);
+					string error;
+					try {
+						connection.BeginTransaction();
+						SQL(connection, StringUtil::Replace(sql, "{WRITER}", to_string(i)));
+					} catch (const std::exception &ex) {
+						error = ex.what();
+					}
+					{
+						std::unique_lock<std::mutex> guard(lock);
+						ready++;
+						changed.notify_all();
+						changed.wait(guard, [&] { return release; });
+					}
+					if (error.empty()) {
+						try {
+							connection.Commit();
+						} catch (const std::exception &ex) {
+							error = ex.what();
+						}
+					}
+					return error;
+				}));
+			}
+			{
+				std::unique_lock<std::mutex> guard(lock);
+				changed.wait(guard, [&] { return ready == count; });
+				release = true;
+				changed.notify_all();
+			}
+			ViewJSON json;
+			auto rows = json.Array();
+			for (auto &task : writers) {
+				auto item = json.Object();
+				json.Text(item, "error", task.get());
+				yyjson_mut_arr_append(rows, item);
+			}
+			return json.Finish(rows);
+		}
+		if (op == "budget-interrupt") {
+			Connection connection(database);
+			connection.BeginTransaction();
+			SQL(connection, ReadText(args.at(2)));
+			auto &catalog = Catalog::GetCatalog(*connection.context, "lake");
+			connection.context->Interrupt();
+			DuckLakeTransaction::Get(*connection.context, catalog).Commit();
+			throw InvalidInputException("Interrupted budget admission unexpectedly committed");
 		}
 		if (op == "sql") {
 			SQL(writer, ReadText(args.at(2)));

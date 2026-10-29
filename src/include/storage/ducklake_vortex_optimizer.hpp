@@ -8,6 +8,12 @@ namespace duckdb {
 class ClientContext;
 class Connection;
 class ExtensionLoader;
+class DuckLakeTransaction;
+class StorageLockKey;
+
+struct DuckLakeVortexWriteBudget {
+	idx_t inline_rows, inline_bytes, unindexed_rows, unindexed_bytes;
+};
 
 struct DuckLakeVortexOptimizerConfig {
 	string catalog, schema, table, index, root;
@@ -25,6 +31,9 @@ public:
 	static void Cancel(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                   const string &index);
 	static vector<vector<Value>> Status(ClientContext &context, const string &catalog);
+	static void SetWriteBudget(ClientContext &context, const string &catalog, const string &schema, const string &table,
+	                           const string &index, const DuckLakeVortexWriteBudget &budget);
+	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context);
 };
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader);
