@@ -16,7 +16,7 @@ struct DuckLakeSnapshot;
 struct DuckLakeVortexRewriteState;
 
 enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
-enum class DuckLakeVortexRewriteMode { INDEXED, FILES };
+enum class DuckLakeVortexRewriteMode { INDEXED, FILES, PRUNE };
 
 struct DuckLakeVortexGCResult {
 	idx_t generations = 0, artifact_bytes = 0, remaining = 0;
@@ -112,7 +112,7 @@ struct DuckLakeVortexRewriteState : public ClientContextState {
 	    new_path, input_identity, output_version;
 	idx_t table_id = 0, snapshot_id = 0, schema_version = 0, new_file_id = 0, commit_snapshot_id = 0;
 	idx_t copy_plans = 0, new_rows = 0, new_bytes = 0;
-	bool retire = false, to_f = false;
+	bool retire = false, to_f = false, prune = false;
 	idx_t live_rows = 0;
 	vector<idx_t> replaced;
 	vector<DuckLakeVortexIndexFile> selected_files;

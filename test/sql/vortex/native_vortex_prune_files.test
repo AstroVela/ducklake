@@ -1,0 +1,169 @@
+# name: test/sql/vortex/native_vortex_prune_files.test
+# description: atomically retire empty B members and rebuild only their retained coverage
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_prune.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_prune_data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','保留' FROM range(128)t(i)
+
+statement ok
+INSERT INTO lake.items SELECT 128+i,[128+i,0],'A','删空' FROM range(128)t(i)
+
+statement ok
+SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/prune-B1.json',2,0)
+
+statement ok
+INSERT INTO lake.items SELECT 1000+i,[1000+i,0],'B','独立' FROM range(128)t(i)
+
+statement ok
+SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/prune-B2.json',2,1)
+
+statement ok
+SET VARIABLE prune_generations=(SELECT regexp_extract_all(reference,'"generation":"([^"]+)"',1) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1)
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,100000,4194304,100000,67108864)
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',100,4194304,32,67108864)
+
+statement ok
+SELECT * FROM ducklake_collect_vortex_builds('lake',16,67108864)
+
+statement ok
+CREATE TABLE prune_healthy AS SELECT data_file_id,path,record_count,file_size_bytes,begin_snapshot FROM __ducklake_metadata_lake.ducklake_data_file WHERE data_file_id<>1
+
+statement error
+SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/no-empty.json',2)
+----
+requires empty member files
+
+statement error
+SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',NULL,'__WORKING_DIRECTORY__/__TEST_DIR__/null.json',2)
+----
+cannot be NULL
+
+statement error
+SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/negative.json',-1)
+----
+Invalid Vortex rewrite revision
+
+statement ok
+DELETE FROM lake.items WHERE id=128
+
+statement error
+SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/partial.json',2)
+----
+requires fully visible retained files
+
+query II
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_builds_v1),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrites_v1)
+----
+0	0
+
+statement ok
+SET VARIABLE prune_old_snapshot=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement ok
+DELETE FROM lake.items WHERE id>=128 AND id<256
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')
+
+statement ok
+INSERT INTO lake.items VALUES(9999,[0.0625,0],'A','实时-T')
+
+statement ok
+CREATE TABLE prune_expected AS SELECT rowid,id,embedding,category,payload FROM lake.items
+
+query I
+SELECT revision FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/pruned.json',2)
+----
+3
+
+query II
+SELECT sum(record_count),count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL
+----
+256	2
+
+query I
+SELECT count(*) FROM ((SELECT data_file_id,path,record_count,file_size_bytes,begin_snapshot FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL EXCEPT ALL SELECT * FROM prune_healthy) UNION ALL (SELECT * FROM prune_healthy EXCEPT ALL SELECT data_file_id,path,record_count,file_size_bytes,begin_snapshot FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT rowid,id,embedding,category,payload FROM lake.items EXCEPT ALL SELECT * FROM prune_expected) UNION ALL (SELECT * FROM prune_expected EXCEPT ALL SELECT rowid,id,embedding,category,payload FROM lake.items))
+----
+0
+
+query I
+SELECT count(*) FROM lake.items AT(VERSION=>getvariable('prune_old_snapshot'))
+----
+383
+
+query II
+SELECT array_length(regexp_extract_all(reference,'"generation":"[^"]+"')),regexp_extract_all(reference,'"generation":"([^"]+)"',1)[1]=getvariable('prune_generations')[2] FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
+----
+2	true
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrites_v1
+----
+0
+
+query TI
+SELECT state,keep_generation FROM ducklake_vortex_build_status('lake')
+----
+published	true
+
+query IT
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
+----
+0	保留
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[1000,0]::FLOAT[],1,category=>'B')
+----
+1000
+
+statement error
+SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/stale.json',2)
+----
+revision conflict
+
+statement ok
+SELECT * FROM ducklake_collect_vortex_builds('lake',16,67108864)
+
+statement ok
+SELECT * FROM ducklake_collect_vortex_generations('lake',16,67108864)
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_generations_v1
+----
+2
+
+statement ok
+DETACH lake
