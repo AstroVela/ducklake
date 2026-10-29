@@ -778,6 +778,8 @@ void DuckLakeTransaction::Commit() {
 			                                 : DuckLakeVortexIndex::PublicationLock().GetSharedLock();
 			if (rewrite) {
 				DuckLakeVortexIndex::CheckRewriteCommit(*context.lock(), *this);
+			} else {
+				DuckLakeVortexIndex::CheckFileRetirements(*context.lock(), *this);
 			}
 #endif
 			FlushChanges();

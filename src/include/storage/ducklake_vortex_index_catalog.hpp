@@ -50,6 +50,7 @@ struct DuckLakeVortexIndex {
 	vector<DuckLakeVortexIndexSegment> segments;
 
 	string ToJSON() const;
+	string Publication() const;
 	void ValidateCoverage(const vector<DuckLakeVortexIndexFile> &current) const;
 	vector<DuckLakeVortexIndexFile> SelectedFiles(const vector<string> &generations) const;
 	vector<string> SmallestSegments() const;
@@ -72,6 +73,13 @@ struct DuckLakeVortexIndex {
 	                                                 const std::function<void(const string &)> &observe = nullptr);
 	static DuckLakeVortexIndex ParseSegments(const string &reference, const string &table_uuid, idx_t field_id);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
+	static bool CoversFile(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, idx_t file_id);
+	static void CheckFileRetirements(ClientContext &context, DuckLakeTransaction &transaction);
+	static DuckLakeVortexIndex RetireEmpty(ClientContext &context, const string &catalog, const string &schema,
+	                                       const string &table, const string &index, const string &generation,
+	                                       idx_t expected_revision,
+	                                       const std::function<void(const string &)> &observe = nullptr,
+	                                       const string &publication = "");
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
 	                                   const string &table, const string &name, const string &reference,
 	                                   idx_t expected_revision,
@@ -100,6 +108,7 @@ struct DuckLakeVortexRewriteState : public ClientContextState {
 	    new_path, input_identity;
 	idx_t table_id = 0, snapshot_id = 0, schema_version = 0, new_file_id = 0, commit_snapshot_id = 0;
 	idx_t copy_plans = 0, new_rows = 0, new_bytes = 0;
+	bool retire = false;
 	vector<idx_t> replaced;
 	vector<DuckLakeVortexIndexFile> selected_files;
 	DuckLakeVortexIndex before, candidate;

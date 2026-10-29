@@ -380,6 +380,10 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 	for (auto &file : index.files) {
 		ids.push_back(to_string(file.id));
 	}
+	if (ids.empty()) {
+		p.rewrite_reason = "no_segments";
+		return;
+	}
 	auto list = StringUtil::Join(ids, ",");
 	struct FileState {
 		idx_t rows, deleted, schema;
@@ -458,6 +462,7 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 		}
 		auto remaining = rows - deleted;
 		auto why = deleted < p.min_deleted_rows || 100 * deleted < p.min_deleted_percent * rows ? "below_threshold"
+		           : !remaining                                                                 ? "eligible"
 		           : !output                                                                    ? "empty_rewrite_output"
 		           : remaining < 65                                                             ? "below_native_minimum"
 		           : partitioned        ? "unsupported_partition"
@@ -617,7 +622,7 @@ void Probe(DatabaseInstance &db, Policy &p) {
 
 bool Active(const string &state) {
 	return state == "flushing" || state == "building" || state == "merging" || state == "rewriting" ||
-	       state == "publishing" || state == "cancelling";
+	       state == "retiring" || state == "publishing" || state == "cancelling";
 }
 bool FlushDue(const Policy &p) {
 	return p.t_rows >= p.config.flush_rows || p.t_bytes >= p.config.flush_bytes;
@@ -627,7 +632,7 @@ bool IndexDue(const Policy &p) {
 }
 
 bool Published(Metadata &meta, const Policy &p) {
-	if (p.generation.empty()) {
+	if (p.kind != "retire" && p.generation.empty()) {
 		return false;
 	}
 	auto result = meta.Query("SELECT revision,reference FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1" + Where(p));
@@ -636,7 +641,7 @@ bool Published(Metadata &meta, const Policy &p) {
 		return false;
 	}
 	auto ready = VortexCatalog::ParseSegments(StringValue::Get(chunk->GetValue(1, 0)), p.uuid, p.field_id);
-	return p.generation == ready.generation;
+	return p.kind == "retire" ? ready.Publication() == p.run : p.generation == ready.generation;
 }
 
 string Candidate(Connection &connection, const string &path) {
@@ -899,14 +904,17 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		}
 	}
 	void Stage(DatabaseInstance &db, const Pending &pending, Policy &p, const string &stage) {
-		if (stage == "before_build_publish" || (p.kind == "rewrite" && stage == "rewrite_before_commit")) {
+		if (stage == "before_build_publish" || (p.kind == "rewrite" && stage == "rewrite_before_commit") ||
+		    (p.kind == "retire" && stage == "retire_before_commit")) {
 			std::lock_guard<std::mutex> guard(io);
 			Metadata meta(db, p.config.catalog);
 			auto current = Load(meta, p);
 			if (current.run != p.run) {
 				throw TransactionException("Optimizer task ownership changed");
 			}
-			current.generation = Candidate(meta.connection, p.reference);
+			if (p.kind != "retire") {
+				current.generation = Candidate(meta.connection, p.reference);
+			}
 			current.state = "publishing";
 			Save(meta, current, p.run);
 			p.generation = current.generation;
@@ -923,7 +931,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		if (current.run != p.run) {
 			throw TransactionException("Optimizer task ownership changed");
 		}
-		bool published = owns_task && !current.generation.empty() && Published(meta, current);
+		bool published = owns_task && Published(meta, current);
 		current.state = published ? "published" : state;
 		current.error = error;
 		if (published) {
@@ -931,7 +939,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		} else if (!error.empty() || state == "cancelled") {
 			current.enabled = false;
 		}
-		if (current.kind == "rewrite" && !error.empty()) {
+		if ((current.kind == "rewrite" || current.kind == "retire") && !error.empty()) {
 			current.enabled = false;
 		}
 		Save(meta, current, p.run);
@@ -986,14 +994,19 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					current.generation.clear();
 					current.error.clear();
 					current.expected = metrics.expected;
-					current.kind = rewrite                            ? "rewrite"
-					               : flush                            ? "flush"
-					               : metrics.merge_candidates.empty() ? "build"
-					                                                  : "merge";
+					current.kind = rewrite && !metrics.rewrite_remaining ? "retire"
+					               : rewrite                             ? "rewrite"
+					               : flush                               ? "flush"
+					               : metrics.merge_candidates.empty()    ? "build"
+					                                                     : "merge";
+					if (current.kind == "retire") {
+						current.reference.clear();
+					}
 					current.selected = rewrite                   ? vector<string> {metrics.rewrite_candidate}
 					                   : current.kind == "merge" ? metrics.merge_candidates
 					                                             : vector<string>();
-					current.state = rewrite                   ? "rewriting"
+					current.state = current.kind == "retire"  ? "retiring"
+					                : rewrite                 ? "rewriting"
 					                : flush                   ? "flushing"
 					                : current.kind == "merge" ? "merging"
 					                                          : "building";
@@ -1018,7 +1031,12 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			{
 				Connection job(db);
 				Use(job, p.Id());
-				if (rewrite) {
+				if (p.kind == "retire") {
+					Stage(db, pending, p, "optimizer_before_retire");
+					VortexCatalog::RetireEmpty(
+					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.selected[0],
+					    p.expected, [&](const string &stage) { Stage(db, pending, p, stage); }, p.run);
+				} else if (rewrite) {
 					Stage(db, pending, p, "optimizer_before_rewrite");
 					VortexCatalog::Rewrite(*job.context, p.config.catalog, p.config.schema, p.config.table,
 					                       p.config.index, p.selected[0], p.reference, p.expected,
@@ -1084,7 +1102,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			}
 			Finish(db, p, build || rewrite ? "published" : "flushed", "", true);
 			if (rewrite) {
-				Stage(db, pending, p, "optimizer_rewritten");
+				Stage(db, pending, p, p.kind == "retire" ? "optimizer_retired" : "optimizer_rewritten");
 			}
 			if (p.kind == "merge") {
 				Stage(db, pending, p, "optimizer_merged");
@@ -1220,10 +1238,11 @@ Policy Identify(Metadata &meta, const string &catalog, const string &schema, con
 }
 
 void Validate(const Policy &p) {
-	if ((p.kind != "none" && p.kind != "flush" && p.kind != "build" && p.kind != "merge" && p.kind != "rewrite") ||
-	    (p.kind == "merge"     ? p.selected.size() != 2 || p.selected[0] == p.selected[1]
-	     : p.kind == "rewrite" ? p.selected.size() != 1
-	                           : !p.selected.empty())) {
+	if ((p.kind != "none" && p.kind != "flush" && p.kind != "build" && p.kind != "merge" && p.kind != "rewrite" &&
+	     p.kind != "retire") ||
+	    (p.kind == "merge"                             ? p.selected.size() != 2 || p.selected[0] == p.selected[1]
+	     : (p.kind == "rewrite" || p.kind == "retire") ? p.selected.size() != 1
+	                                                   : !p.selected.empty())) {
 		throw InvalidInputException("Invalid optimizer task kind or generation selection");
 	}
 	auto &c = p.config;
@@ -1365,7 +1384,7 @@ bool Grows(const LocalTableDataChanges &changes) {
 
 unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction,
                                                                ClientContext &context) {
-	bool grows = false;
+	bool grows = DuckLakeVortexRewriteState::Get(context) != nullptr;
 	for (auto &entry : transaction.GetLocalChanges().Changes()) {
 		grows |= Grows(entry.GetTableChanges());
 	}

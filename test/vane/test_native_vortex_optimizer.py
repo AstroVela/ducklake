@@ -65,7 +65,8 @@ def crash(native, stage, before_state="publishing"):
         time.sleep(0.01)
     durable = status(native)
     require(
-        durable["state"] == before_state and (before_state != "publishing" or durable["candidate_generation"]),
+        durable["state"] == before_state
+        and (before_state != "publishing" or durable["candidate_generation"] or durable["task_kind"] == "retire"),
         "Task checkpoint was not durable before crash",
     )
     native.process.kill()

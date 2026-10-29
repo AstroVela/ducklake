@@ -1,0 +1,154 @@
+# name: test/sql/vortex/native_vortex_empty_retirement.test
+# description: fully masked B retires atomically to an explicit F/T plan and can build a new first B
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_empty_retirement.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_empty_retirement_data', DATA_INLINING_ROW_LIMIT 100)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','original' FROM range(256)t(i)
+
+statement ok
+SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/empty-original.json',2,0)
+
+statement ok
+SET VARIABLE empty_generation=(SELECT regexp_extract(reference,'"generation":"([^"]+)"',1) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1)
+
+statement ok
+SET VARIABLE empty_snapshot=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement error
+SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),1)
+----
+still has visible rows
+
+statement ok
+DELETE FROM lake.items
+
+query II
+SELECT (SELECT count(*) FROM lake.items),sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL
+----
+0	256
+
+query I
+SELECT count(*) FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],10)
+----
+0
+
+query I
+SELECT revision FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),1)
+----
+2
+
+query II
+SELECT count(*),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL) FROM __ducklake_metadata_lake.ducklake_vortex_generation_refs_v1
+----
+0	0
+
+query III
+SELECT revision,regexp_extract(reference,'"dimension":([0-9]+)',1)::INTEGER,array_length(regexp_extract_all(reference,'"generation":"[^"]+"')) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
+----
+2	2	0
+
+query III
+SELECT source_bytes,visible_rows,inline_rows FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+----
+0	0	0
+
+query I
+SELECT count(*) FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],10,category=>'A')
+----
+0
+
+query I
+SELECT count(*) FROM lake.items AT(VERSION=>getvariable('empty_snapshot'))
+----
+256
+
+query T
+SELECT state FROM ducklake_vortex_generation_status('lake')
+----
+retired
+
+statement error
+SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),1)
+----
+revision conflict
+
+statement error
+SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),2)
+----
+selected generation is not ready
+
+statement error
+SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),-1)
+----
+Invalid Vortex retirement revision
+
+statement error
+SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',NULL,2)
+----
+cannot be NULL
+
+statement ok
+UPDATE __ducklake_metadata_lake.ducklake_vortex_indexes_v1 SET reference=replace(reference,'"format_version":3','"format_version":2')
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],10)
+----
+Unsupported Vortex segment manifest version
+
+statement ok
+UPDATE __ducklake_metadata_lake.ducklake_vortex_indexes_v1 SET reference=replace(reference,'"format_version":2','"format_version":3')
+
+statement ok
+INSERT INTO lake.items VALUES(1000,[0.125,0],NULL,'实时向量')
+
+query IT
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],10)
+----
+1000	实时向量
+
+statement ok
+INSERT INTO lake.items SELECT 2000+i,[2000+i,0],'B','new-F' FROM range(128)t(i)
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[2000,0]::FLOAT[],1,category=>'B')
+----
+2000
+
+query I
+SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/empty-rebuilt.json',2,2)
+----
+3
+
+query I
+SELECT array_length(regexp_extract_all(reference,'"generation":"[^"]+"')) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
+----
+1
+
+statement ok
+SELECT * FROM ducklake_collect_vortex_generations('lake',16,67108864)
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
+----
+1000
+
+statement ok
+DETACH lake

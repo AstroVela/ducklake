@@ -100,7 +100,7 @@ def descriptor(path: Path) -> dict:
 def single_reference(record):
     manifest = record["reference"]
     require(
-        manifest["format_version"] == 2 and len(manifest["segments"]) == 1, "Expected a single-segment catalog manifest"
+        manifest["format_version"] == 3 and len(manifest["segments"]) == 1, "Expected a single-segment catalog manifest"
     )
     return manifest["segments"][0]["reference"]
 

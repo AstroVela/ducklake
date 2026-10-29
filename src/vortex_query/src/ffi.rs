@@ -81,7 +81,10 @@ pub(crate) unsafe fn copy_sources(
     pointer: *const Source,
     count: u64,
 ) -> VortexResult<BTreeMap<u64, ByteBuffer>> {
-    if pointer.is_null() || !(1..=100_000).contains(&count) {
+    if count == 0 {
+        return Ok(BTreeMap::new());
+    }
+    if pointer.is_null() || count > 100_000 {
         vortex_bail!("Invalid native binary source inventory");
     }
     let sources = unsafe { slice::from_raw_parts(pointer, count as usize) };

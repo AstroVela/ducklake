@@ -219,6 +219,11 @@ public:
 			}
 			return json.Finish(rows);
 		}
+		if (op == "retire") {
+			return DuckLakeVortexIndex::RetireEmpty(*writer.context, "lake", "main", "items", "knn", args.at(2),
+			                                        std::stoull(args.at(3)))
+			    .ToJSON();
+		}
 		if (op == "rewrite") {
 			return DuckLakeVortexIndex::Rewrite(*writer.context, "lake", "main", "items", "knn", args.at(2), args.at(3),
 			                                    std::stoull(args.at(4)))
@@ -769,7 +774,7 @@ public:
 				auto error = ducklake_vortex_query_error(output.get());
 				Require(error && string(error).find(expected) != string::npos, "Wrong binary handoff rejection");
 			};
-			run({}, "Invalid native binary source inventory");
+			run({}, "Admitted source inventory must match every captured file");
 			auto changed = sources;
 			changed.pop_back();
 			run(changed, "inventory");
