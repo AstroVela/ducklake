@@ -31,6 +31,9 @@ public:
 	static void Cancel(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                   const string &index);
 	static vector<vector<Value>> Status(ClientContext &context, const string &catalog);
+	static void ConfigureCompaction(ClientContext &context, const string &catalog, const string &schema,
+	                                const string &table, const string &index, bool enabled, idx_t min_deleted_rows,
+	                                idx_t min_deleted_percent);
 	static void EnableMaintenance(ClientContext &context, const string &catalog, idx_t max_objects, idx_t max_bytes,
 	                              const std::function<void(const string &)> &observe = nullptr);
 	static void ResumeMaintenance(ClientContext &context, const string &catalog,

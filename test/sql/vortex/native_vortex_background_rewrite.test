@@ -1,0 +1,114 @@
+# name: test/sql/vortex/native_vortex_background_rewrite.test
+# description: explicit source-compaction configuration shares optimizer cancellation and strict policy format
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_background_rewrite.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_background_rewrite_data', DATA_INLINING_ROW_LIMIT 100)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','original' FROM range(256)t(i)
+
+statement ok
+SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/background-original.json',2,0)
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,100000,4194304,100000,67108864)
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')
+
+query II
+SELECT enabled,compaction_enabled FROM ducklake_vortex_optimizer_status('lake')
+----
+false	false
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,128,50)
+----
+requires an installed write budget
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',100,4194304,256,67108864)
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,0,50)
+----
+Invalid Vortex compaction thresholds
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,100001,50)
+----
+Invalid Vortex compaction thresholds
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,1,0)
+----
+Invalid Vortex compaction thresholds
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,1,101)
+----
+Invalid Vortex compaction thresholds
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',NULL,1,50)
+----
+cannot be NULL
+
+query T
+SELECT state FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,128,50)
+----
+configured
+
+query IIII
+SELECT enabled,compaction_enabled,min_deleted_rows,min_deleted_percent FROM ducklake_vortex_optimizer_status('lake')
+----
+false	true	128	50
+
+statement ok
+DELETE FROM lake.items WHERE id<128
+
+query II
+SELECT run_count,(SELECT sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL) FROM ducklake_vortex_optimizer_status('lake')
+----
+0	256
+
+statement ok
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',false,128,50)
+
+query IIT
+SELECT enabled,compaction_enabled,compaction_reason FROM ducklake_vortex_optimizer_status('lake')
+----
+false	false	disabled
+
+statement ok
+UPDATE __ducklake_metadata_lake.ducklake_vortex_optimizer_v2 SET config=replace(config,'"format_version":2','"format_version":1')
+
+statement error
+SELECT * FROM ducklake_vortex_optimizer_status('lake')
+----
+Unsupported optimizer policy version
+
+statement ok
+UPDATE __ducklake_metadata_lake.ducklake_vortex_optimizer_v2 SET config=replace(config,'"format_version":1','"format_version":2')
+
+statement ok
+DETACH lake

@@ -141,3 +141,7 @@ The [write budget follow-up](native-vortex-backpressure-proof.md) adds explicit
 transactional T/F quotas and retained-version capacity checks. Quotas survive
 optimizer cancellation and database restart; exhaustion rejects growth before
 metadata commit while acknowledged data remains queryable.
+
+The [background data-compaction proof](native-vortex-background-rewrite-proof.md)
+adds explicit source-rewrite thresholds to the same worker, with opt-out by
+default and unchanged cancellation, index and GC budgets.
