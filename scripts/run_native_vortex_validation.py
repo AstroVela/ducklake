@@ -108,7 +108,7 @@ def main() -> None:
                         "'ducklake_recover_vortex_builds','ducklake_collect_vortex_builds',"
                         "'ducklake_enable_vortex_maintenance','ducklake_resume_vortex_maintenance',"
                         "'ducklake_cancel_vortex_maintenance','ducklake_vortex_maintenance_status',"
-                        "'ducklake_rewrite_vortex_index_segment','ducklake_retire_vortex_index_segment','ducklake_set_vortex_data_compaction_policy');",
+                        "'ducklake_rewrite_vortex_index_segment','ducklake_rewrite_vortex_index_segment_to_f','ducklake_retire_vortex_index_segment','ducklake_set_vortex_data_compaction_policy');",
                     ],
                 )
         else:

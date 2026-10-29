@@ -2109,11 +2109,10 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 	return files;
 }
 
-vector<DuckLakeCompactionFileEntry> DuckLakeMetadataManager::GetFilesForCompaction(DuckLakeTableEntry &table,
-                                                                                   CompactionType type,
-                                                                                   double deletion_threshold,
-                                                                                   DuckLakeSnapshot snapshot,
-                                                                                   DuckLakeFileSizeOptions options) {
+vector<DuckLakeCompactionFileEntry>
+DuckLakeMetadataManager::GetFilesForCompaction(DuckLakeTableEntry &table, CompactionType type,
+                                               double deletion_threshold, DuckLakeSnapshot snapshot,
+                                               DuckLakeFileSizeOptions options, bool include_undeleted) {
 	auto table_id = table.GetTableId();
 	// Determine the effective max file size threshold for filtering
 	idx_t effective_max_file_size =
@@ -2277,7 +2276,7 @@ ORDER BY data.begin_snapshot, data.row_id_start, data.data_file_id, del.begin_sn
 			if (file.file.row_count > 0) {
 				delete_ratio = static_cast<double>(total_delete_count) / static_cast<double>(file.file.row_count);
 			}
-			if (total_delete_count == 0 || delete_ratio < deletion_threshold) {
+			if ((!include_undeleted && total_delete_count == 0) || delete_ratio < deletion_threshold) {
 				files.erase_at(file_idx);
 				file_idx--;
 			}

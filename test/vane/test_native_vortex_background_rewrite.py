@@ -322,15 +322,18 @@ def blocked(driver, root, kind, checks):
                 "internal inlining/global schema changes do not create false compaction groups for unchanged table columns"
             )
             return {"fixture_recalls": recalls}
-        if kind == "empty":
+        if kind in ["small", "empty"]:
             row = published(native, 4)
+            expected_kind = "rewrite_f" if kind == "small" else "retire"
             require(
-                row["task_kind"] == "retire" and len(SEG.segments(native.call("head", "knn"))) == 2,
-                "Fully masked B was not retired",
+                row["task_kind"] == expected_kind and len(SEG.segments(native.call("head", "knn"))) == 2,
+                "Sparse/empty B was not published explicitly",
             )
-            observed = visible_only(native, "retired-empty")
+            observed = visible_only(native, "retired-or-sparse")
             finish(native)
-            checks.append("fully masked B uses metadata-only retirement without constructing an empty ANN generation")
+            checks.append(
+                "sparse B publishes bounded F; fully masked B retires without constructing an empty ANN generation"
+            )
             return {"informational_recall": observed}
         row = OPT.wait(native, lambda s: s["compaction_reason"] == reason, "unsupported candidate classification")
         require(

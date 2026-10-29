@@ -224,6 +224,11 @@ public:
 			                                        std::stoull(args.at(3)))
 			    .ToJSON();
 		}
+		if (op == "rewrite-f") {
+			return DuckLakeVortexIndex::Rewrite(*writer.context, "lake", "main", "items", "knn", args.at(2), "",
+			                                    std::stoull(args.at(3)), nullptr, DuckLakeVortexRewriteMode::FILES)
+			    .ToJSON();
+		}
 		if (op == "rewrite") {
 			return DuckLakeVortexIndex::Rewrite(*writer.context, "lake", "main", "items", "knn", args.at(2), args.at(3),
 			                                    std::stoull(args.at(4)))

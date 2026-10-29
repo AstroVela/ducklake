@@ -16,6 +16,7 @@ struct DuckLakeSnapshot;
 struct DuckLakeVortexRewriteState;
 
 enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
+enum class DuckLakeVortexRewriteMode { INDEXED, FILES };
 
 struct DuckLakeVortexGCResult {
 	idx_t generations = 0, artifact_bytes = 0, remaining = 0;
@@ -39,6 +40,7 @@ struct DuckLakeVortexIndexSegment {
 
 struct DuckLakeVortexIndex {
 	static constexpr idx_t MAX_SEGMENTS = 3;
+	static constexpr idx_t MIN_BUILD_ROWS = 65;
 	string name;
 	idx_t revision;
 	uint32_t field_id;
@@ -96,7 +98,9 @@ struct DuckLakeVortexIndex {
 	static DuckLakeVortexIndex Rewrite(ClientContext &context, const string &catalog, const string &schema,
 	                                   const string &table, const string &index, const string &generation,
 	                                   const string &reference, idx_t expected_revision,
-	                                   const std::function<void(const string &)> &observe = nullptr);
+	                                   const std::function<void(const string &)> &observe = nullptr,
+	                                   DuckLakeVortexRewriteMode mode = DuckLakeVortexRewriteMode::INDEXED,
+	                                   const string &publication = "");
 	static void CheckRewriteCommit(ClientContext &context, DuckLakeTransaction &transaction);
 	static void PublishRewrite(ClientContext &context, DuckLakeTransaction &transaction,
 	                           const DuckLakeSnapshot &snapshot);
@@ -105,10 +109,11 @@ struct DuckLakeVortexIndex {
 struct DuckLakeVortexRewriteState : public ClientContextState {
 	static shared_ptr<DuckLakeVortexRewriteState> Get(ClientContext &context);
 	string catalog, schema, table, table_uuid, build_id, selected, reference, workspace, private_path, source_root,
-	    new_path, input_identity;
+	    new_path, input_identity, output_version;
 	idx_t table_id = 0, snapshot_id = 0, schema_version = 0, new_file_id = 0, commit_snapshot_id = 0;
 	idx_t copy_plans = 0, new_rows = 0, new_bytes = 0;
-	bool retire = false;
+	bool retire = false, to_f = false;
+	idx_t live_rows = 0;
 	vector<idx_t> replaced;
 	vector<DuckLakeVortexIndexFile> selected_files;
 	DuckLakeVortexIndex before, candidate;

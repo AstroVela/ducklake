@@ -213,10 +213,9 @@ public:
 	virtual vector<DuckLakeFileListExtendedEntry>
 	GetExtendedFilesForTable(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
 	                         const FilterPushdownInfo *filter_info = nullptr);
-	virtual vector<DuckLakeCompactionFileEntry> GetFilesForCompaction(DuckLakeTableEntry &table, CompactionType type,
-	                                                                  double deletion_threshold,
-	                                                                  DuckLakeSnapshot snapshot,
-	                                                                  DuckLakeFileSizeOptions options);
+	virtual vector<DuckLakeCompactionFileEntry>
+	GetFilesForCompaction(DuckLakeTableEntry &table, CompactionType type, double deletion_threshold,
+	                      DuckLakeSnapshot snapshot, DuckLakeFileSizeOptions options, bool include_undeleted = false);
 	virtual idx_t GetBeginSnapshotForTable(TableIndex table_id);
 	virtual idx_t GetBeginSnapshotForSchemaVersion(TableIndex table_id, idx_t schema_version);
 	virtual idx_t GetNetDataFileRowCount(TableIndex table_id, DuckLakeSnapshot snapshot);

@@ -10,6 +10,7 @@ class Connection;
 class ExtensionLoader;
 class DuckLakeTransaction;
 class StorageLockKey;
+struct DuckLakeVortexRewriteState;
 
 struct DuckLakeVortexWriteBudget {
 	idx_t inline_rows, inline_bytes, unindexed_rows, unindexed_bytes;
@@ -42,6 +43,7 @@ public:
 	static vector<vector<Value>> MaintenanceStatus(ClientContext &context, const string &catalog);
 	static void SetWriteBudget(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                           const string &index, const DuckLakeVortexWriteBudget &budget);
+	static void CheckRewriteToF(ClientContext &context, const DuckLakeVortexRewriteState &rewrite);
 	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context);
 };
 

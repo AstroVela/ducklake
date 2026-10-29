@@ -285,9 +285,14 @@ void DuckLakeCompactor::GenerateCompactions(DuckLakeTableEntry &table,
 	filter_options.target_file_size = target_file_size;
 	// FIXME: pass in the sort_data so that list of files is approximately sorted in the same way
 	// (sorted by the min/max metadata)
-	auto files = metadata_manager.GetFilesForCompaction(table, type, delete_threshold, snapshot, filter_options);
+	bool include_undeleted = false;
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	auto rewrite = DuckLakeVortexRewriteState::Get(context);
+	include_undeleted = rewrite && rewrite->to_f;
+#endif
+	auto files = metadata_manager.GetFilesForCompaction(table, type, delete_threshold, snapshot, filter_options,
+	                                                    include_undeleted);
+#ifdef DUCKLAKE_ENABLE_VORTEX
 	if (rewrite) {
 		if (type != CompactionType::REWRITE_DELETES || table.GetTableId().index != rewrite->table_id) {
 			throw InvalidInputException("Vortex rewrite table or compaction type mismatch");
