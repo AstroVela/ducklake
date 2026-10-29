@@ -44,8 +44,13 @@ One worker per database serializes at most 16 registered policies, with at most
 one build in flight. It first flushes due committed T using DuckLake's existing
 transactional flush; if the resulting F meets a threshold, it invokes the shared
 native builder. A run may finish as `flushed` without building if F remains small.
-Each build captures all current physical files and replaces the static SPFresh
-generation; it does not implement dynamic inserts into an existing ANN index.
+Bootstrap captures all current physical files. The
+[two-segment follow-up](native-vortex-segments-proof.md) then builds only new F
+into an independent static SPFresh generation, preserving existing B. It limits
+the catalog to two B segments under the existing aggregate budgets. Exhausting
+the second slot stops the policy explicitly; an operator can consolidate with
+the existing full-build API. There is no automatic full rebuild or native
+SPFresh online insert/delete call.
 
 Build and publication retain the previous source, artifact and revision-CAS
 checks. Heavy construction holds no metadata transaction or publication lock.
@@ -64,7 +69,8 @@ The native build's existing 64 MiB source/vector/artifact and 100,000 physical-r
 limits remain. Policy row thresholds must be 1–100,000; T byte thresholds must
 be 1–4 MiB and F byte thresholds 1–64 MiB. Serial scheduling bounds task
 concurrency, not total RSS or SPFresh's internal thread count. Hard ingestion
-backpressure and production capacity tuning remain subsequent work.
+backpressure is qualified in the follow-up below; production capacity tuning
+remains separate work.
 
 ## Durable task state and ownership
 
@@ -110,8 +116,9 @@ It records task counts and generation IDs to distinguish reconciliation from
 duplicate publication, and checks recall against committed visible-row ground
 truth separately from visibility correctness. Minimal SQL tests cover explicit
 configuration, status and cancellation; ON/OFF regression/recovery runners remain
-in CI. This qualifies local scheduling and recovery, not distributed optimizer
-ownership, writer backpressure, multi-replica operation or scale performance.
+in CI. Independent recovery scenarios explicitly consolidate after using both
+segment slots. This qualifies local scheduling and recovery, not distributed
+optimizer ownership, multi-replica operation or scale performance.
 
 The original #38 qualification restricted the database weak-reference shutdown
 assertion to optimizer fixtures after detecting retained references on the exact

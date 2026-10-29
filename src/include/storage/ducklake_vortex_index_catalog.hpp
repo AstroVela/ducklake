@@ -18,6 +18,11 @@ struct DuckLakeVortexIndexFile {
 	idx_t row_count;
 };
 
+struct DuckLakeVortexIndexSegment {
+	string root, generation, reference;
+	vector<DuckLakeVortexIndexFile> files;
+};
+
 struct DuckLakeVortexIndex {
 	string name;
 	idx_t revision;
@@ -27,6 +32,7 @@ struct DuckLakeVortexIndex {
 	string generation;
 	string reference;
 	vector<DuckLakeVortexIndexFile> files;
+	vector<DuckLakeVortexIndexSegment> segments;
 
 	string ToJSON() const;
 	void ValidateCoverage(const vector<DuckLakeVortexIndexFile> &current) const;
@@ -36,17 +42,20 @@ struct DuckLakeVortexIndex {
 	static void Initialized(DuckLakeTransaction &transaction);
 	static unique_ptr<QueryResult> Query(DuckLakeTransaction &transaction, const string &sql);
 	static void Initialize(Connection &owner, const string &catalog);
+	static DuckLakeVortexIndex ParseSegments(const string &reference, const string &table_uuid, idx_t field_id);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
 	                                   const string &table, const string &name, const string &reference,
 	                                   idx_t expected_revision,
-	                                   const std::function<void(const string &)> &observe = nullptr);
+	                                   const std::function<void(const string &)> &observe = nullptr,
+	                                   bool append_segment = false);
 	static DuckLakeVortexIndex BuildAndPublish(ClientContext &context, const string &catalog, const string &schema,
 	                                           const string &table, const string &name, const string &reference,
 	                                           uint32_t dimension, idx_t expected_revision,
 	                                           const std::function<void(const string &)> &observe = nullptr,
 	                                           const string &expected_table_uuid = "",
-	                                           optional_idx expected_field_id = optional_idx());
+	                                           optional_idx expected_field_id = optional_idx(),
+	                                           bool append_segment = false);
 };
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader);

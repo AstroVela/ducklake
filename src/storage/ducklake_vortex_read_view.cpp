@@ -100,9 +100,12 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			index = make_uniq<DuckLakeVortexIndex>(DuckLakeVortexIndex::Lookup(transaction, table, options.index_name));
 			dimension = index->dimension;
 		}
+		if (build_files && index && index->segments.size() >= 2) {
+			throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex segment count budget exceeded");
+		}
 		ViewJSON json;
 		auto admission = json.Object();
-		if (index) {
+		if (index && !build_files) {
 			auto record = index->ToJSON();
 			std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> parsed(yyjson_read(record.data(), record.size(), 0),
 			                                                               yyjson_doc_free);
@@ -156,7 +159,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		result.managed_data_path = catalog.DataPath();
 		result.snapshot_id = snapshot.snapshot_id;
 		auto &fs = FileSystem::GetFileSystem(*reader.context);
-		idx_t physical_rows = 0;
+		idx_t physical_rows = 0, selected_rows = 0, inventory_bytes = 0;
 		vector<DuckLakeVortexIndexFile> identities;
 		const auto row_limit = MinValue<idx_t>(options.max_rows, 64 * 1024 * 1024 / sizeof(float) / dimension);
 		for (auto &file : files) {
@@ -170,6 +173,23 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 				throw InvalidInputException("Read view physical row budget exceeded");
 			}
 			physical_rows += file.row_count;
+			if (file.file.file_size_bytes > options.max_source_bytes - inventory_bytes) {
+				throw InvalidInputException("Read view source byte budget exceeded");
+			}
+			inventory_bytes += file.file.file_size_bytes;
+			if (options.unindexed_only) {
+				auto covered =
+				    std::find_if(index->files.begin(), index->files.end(),
+				                 [&](const DuckLakeVortexIndexFile &old) { return old.id == file.file_id.index; });
+				if (covered != index->files.end()) {
+					if (covered->uri != file.file.path || covered->row_count != file.row_count) {
+						throw InvalidInputException("Referenced Vortex index file identity changed");
+					}
+					identities.push_back(*covered);
+					continue;
+				}
+			}
+			selected_rows += file.row_count;
 			auto handle = fs.OpenFile(file.file.path, FileFlags::FILE_FLAGS_READ);
 			auto size = handle->GetFileSize();
 			if (size < 0 || idx_t(size) != file.file.file_size_bytes ||
@@ -218,7 +238,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			if (result.sources.empty()) {
 				throw InvalidInputException("Vortex index build requires materialized Vortex files");
 			}
-			result.visible_rows = physical_rows;
+			result.visible_rows = selected_rows;
 		} else if (oracle_rows) {
 			auto rows = reader.SendQuery(
 			    "SELECT id, embedding, category, payload, filename, file_row_number, rowid FROM " + name +
@@ -399,8 +419,8 @@ DuckLakeVortexReadView DuckLakeVortexReadView::AcquireBuild(Connection &reader,
                                                             const DuckLakeVortexViewOptions &options,
                                                             const std::function<void(const string &)> &observe,
                                                             optional_ptr<ClientContext> owner) {
-	if (!options.index_name.empty()) {
-		throw InvalidInputException("Build capture does not select a published index");
+	if (options.unindexed_only != !options.index_name.empty()) {
+		throw InvalidInputException("Incremental build capture requires a published index");
 	}
 	return AcquireView(reader, options, observe, owner, false, true);
 }

@@ -9,6 +9,7 @@ namespace duckdb {
 struct IndexCatalogBind : public TableFunctionData {
 	vector<Value> args;
 	bool initialize;
+	bool append_segment = false;
 };
 struct IndexCatalogState : public GlobalTableFunctionState {
 	bool finished = false;
@@ -49,9 +50,10 @@ static void ExecuteCatalog(ClientContext &context, TableFunctionInput &input, Da
 		DuckLakeVortexIndex::Initialize(owner, StringValue::Get(data.args[0]));
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 	} else {
-		auto record = DuckLakeVortexIndex::Publish(
-		    owner, StringValue::Get(data.args[0]), StringValue::Get(data.args[1]), StringValue::Get(data.args[2]),
-		    StringValue::Get(data.args[3]), StringValue::Get(data.args[4]), data.args[5].GetValue<idx_t>());
+		auto record = DuckLakeVortexIndex::Publish(owner, StringValue::Get(data.args[0]),
+		                                           StringValue::Get(data.args[1]), StringValue::Get(data.args[2]),
+		                                           StringValue::Get(data.args[3]), StringValue::Get(data.args[4]),
+		                                           data.args[5].GetValue<idx_t>(), nullptr, data.append_segment);
 		output.SetValue(0, 0, Value::UBIGINT(record.revision));
 		output.SetValue(1, 0, Value(record.generation));
 	}
@@ -73,16 +75,25 @@ static unique_ptr<FunctionData> BindBuild(ClientContext &context, TableFunctionB
 	return result;
 }
 
+static unique_ptr<FunctionData> BindAppend(ClientContext &context, TableFunctionBindInput &input,
+                                           vector<LogicalType> &types, vector<string> &names) {
+	auto result =
+	    input.inputs.size() == 7 ? BindBuild(context, input, types, names) : BindCatalog(context, input, types, names);
+	result->Cast<IndexCatalogBind>().append_segment = true;
+	return result;
+}
+
 static void ExecuteBuild(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<IndexCatalogState>();
 	if (state.finished) {
 		return;
 	}
-	auto &args = input.bind_data->Cast<IndexCatalogBind>().args;
-	auto record = DuckLakeVortexIndex::BuildAndPublish(context, StringValue::Get(args[0]), StringValue::Get(args[1]),
-	                                                   StringValue::Get(args[2]), StringValue::Get(args[3]),
-	                                                   StringValue::Get(args[4]), uint32_t(args[5].GetValue<int64_t>()),
-	                                                   args[6].GetValue<idx_t>());
+	auto &bind = input.bind_data->Cast<IndexCatalogBind>();
+	auto &args = bind.args;
+	auto record = DuckLakeVortexIndex::BuildAndPublish(
+	    context, StringValue::Get(args[0]), StringValue::Get(args[1]), StringValue::Get(args[2]),
+	    StringValue::Get(args[3]), StringValue::Get(args[4]), uint32_t(args[5].GetValue<int64_t>()),
+	    args[6].GetValue<idx_t>(), nullptr, "", optional_idx(), bind.append_segment);
 	output.SetValue(0, 0, Value::UBIGINT(record.revision));
 	output.SetValue(1, 0, Value(record.generation));
 	output.SetCardinality(1);
@@ -128,6 +139,15 @@ static void ExecuteIndexView(ClientContext &context, TableFunctionInput &input, 
 }
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader) {
+	loader.RegisterFunction(
+	    TableFunction("ducklake_append_vortex_index_segment",
+	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                   LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                  ExecuteBuild, BindAppend, InitCatalog));
+	loader.RegisterFunction(TableFunction("ducklake_publish_vortex_index_segment",
+	                                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                       LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	                                      ExecuteCatalog, BindAppend, InitCatalog));
 	loader.RegisterFunction(
 	    TableFunction("ducklake_build_vortex_index",
 	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,

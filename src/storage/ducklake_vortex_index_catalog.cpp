@@ -13,6 +13,7 @@
 #include "storage/ducklake_vortex_query_ffi.hpp"
 #include "mbedtls_wrapper.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <set>
 
@@ -196,7 +197,93 @@ DuckLakeVortexIndex ParseReference(const string &bytes, const string &uuid, idx_
 	return result;
 }
 
-void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index) {
+string JSON(yyjson_val *value) {
+	ViewJSON copy;
+	return copy.Finish(yyjson_val_mut_copy(copy.doc.get(), value));
+}
+
+void Compose(DuckLakeVortexIndex &index, vector<DuckLakeVortexIndexSegment> segments) {
+	if (segments.empty() || segments.size() > 2) {
+		throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex segment count budget exceeded");
+	}
+	std::set<idx_t> files;
+	std::set<string> generations;
+	std::set<string> paths;
+	idx_t remaining_rows = MinValue<idx_t>(100000, MAX_ARTIFACTS / sizeof(float) / index.dimension);
+	index.files.clear();
+	ViewJSON json;
+	auto value = json.Object();
+	json.Number(value, "format_version", 2);
+	auto entries = json.Array();
+	json.Add(value, "segments", entries);
+	for (auto &segment : segments) {
+		if (!generations.insert(segment.generation).second) {
+			throw InvalidInputException("Duplicate Vortex segment generation");
+		}
+		for (auto &file : segment.files) {
+			if (!files.insert(file.id).second) {
+				throw InvalidInputException("Vortex segment file coverage overlaps");
+			}
+			if (!paths.insert(file.uri).second) {
+				throw InvalidInputException("Vortex segment source paths overlap");
+			}
+			if (file.row_count > remaining_rows) {
+				throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex segment row/vector budget exceeded");
+			}
+			remaining_rows -= file.row_count;
+			index.files.push_back(file);
+		}
+		auto entry = json.Object();
+		json.Text(entry, "root", segment.root);
+		Parsed parsed(segment.reference);
+		json.Add(entry, "reference", yyjson_val_mut_copy(json.doc.get(), parsed.Root()));
+		yyjson_mut_arr_append(entries, entry);
+	}
+	std::sort(index.files.begin(), index.files.end(),
+	          [](const DuckLakeVortexIndexFile &a, const DuckLakeVortexIndexFile &b) { return a.id < b.id; });
+	index.root = segments.back().root;
+	index.generation = segments.back().generation;
+	index.reference = json.Finish(value);
+	if (index.reference.size() > MAX_MANIFEST) {
+		throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex segment manifest byte budget exceeded");
+	}
+	index.segments = std::move(segments);
+}
+
+DuckLakeVortexIndex ParseCatalogReference(const string &bytes, const string &uuid, idx_t field_id) {
+	Parsed parsed(bytes);
+	auto value = parsed.Root();
+	Object(value, 2);
+	if (Number(value, "format_version") != 2) {
+		throw InvalidInputException("Unsupported Vortex segment manifest version");
+	}
+	auto entries = Member(value, "segments");
+	Array(entries);
+	if (!yyjson_arr_size(entries) || yyjson_arr_size(entries) > 2) {
+		throw InvalidInputException("Invalid Vortex segment count");
+	}
+	DuckLakeVortexIndex result;
+	vector<DuckLakeVortexIndexSegment> segments;
+	for (idx_t i = 0; i < yyjson_arr_size(entries); i++) {
+		auto entry = yyjson_arr_get(entries, i);
+		Object(entry, 2);
+		auto segment = ParseReference(JSON(Member(entry, "reference")), uuid, field_id);
+		if (i && (segment.dimension != result.dimension || segment.field_id != result.field_id)) {
+			throw InvalidInputException("Vortex segment vector specification mismatch");
+		}
+		result.field_id = segment.field_id;
+		result.dimension = segment.dimension;
+		auto root = Text(entry, "root");
+		if (root.empty() || root[0] != '/' || root.find('\0') != string::npos) {
+			throw InvalidInputException("Invalid Vortex segment root");
+		}
+		segments.push_back({root, segment.generation, segment.reference, segment.files});
+	}
+	Compose(result, std::move(segments));
+	return result;
+}
+
+void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index, idx_t &remaining) {
 	Parsed reference(index.reference);
 	auto descriptor = Member(reference.Root(), "generation");
 	auto directory = fs.JoinPath(index.root, index.generation);
@@ -240,7 +327,6 @@ void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index) {
 		throw InvalidInputException("Sealed Vortex artifact inventory is empty");
 	}
 	std::set<string> paths;
-	idx_t remaining = MAX_ARTIFACTS;
 	for (idx_t i = 0; i < yyjson_arr_size(artifacts); i++) {
 		auto artifact = yyjson_arr_get(artifacts, i);
 		auto path = Text(artifact, "path");
@@ -311,6 +397,10 @@ void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog) {
 	}
 }
 
+DuckLakeVortexIndex DuckLakeVortexIndex::ParseSegments(const string &reference, const string &uuid, idx_t field_id) {
+	return ParseCatalogReference(reference, uuid, field_id);
+}
+
 DuckLakeVortexIndex DuckLakeVortexIndex::Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table,
                                                 const string &name) {
 	Name(name);
@@ -328,10 +418,12 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Lookup(DuckLakeTransaction &transaction
 		throw InvalidInputException("Published vector field type mismatch");
 	}
 	auto index =
-	    ParseReference(StringValue::Get(chunk->GetValue(2, 0)), table.GetTableUUID(), field.GetFieldIndex().index);
+	    ParseSegments(StringValue::Get(chunk->GetValue(2, 0)), table.GetTableUUID(), field.GetFieldIndex().index);
 	index.name = name;
 	index.revision = chunk->GetValue(0, 0).GetValue<idx_t>();
-	index.root = StringValue::Get(chunk->GetValue(1, 0));
+	if (index.root != StringValue::Get(chunk->GetValue(1, 0))) {
+		throw InvalidInputException("Vortex catalog root mismatch");
+	}
 	if (!index.revision || index.root.empty()) {
 		throw InvalidInputException("Invalid published Vortex index record");
 	}
@@ -366,7 +458,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
                                                          uint32_t dimension, idx_t expected_revision,
                                                          const std::function<void(const string &)> &observe,
                                                          const string &expected_table_uuid,
-                                                         optional_idx expected_field_id) {
+                                                         optional_idx expected_field_id, bool append_segment) {
 	Name(name);
 	if (!dimension || dimension > 4096 || reference_path.empty() || reference_path.size() > 65536 ||
 	    reference_path.find('\0') != string::npos || expected_revision > idx_t(NumericLimits<int64_t>::Maximum())) {
@@ -383,13 +475,39 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
 	check("before_build");
 	Connection owner(*context.db);
 	try {
-		Initialized(Begin(owner, catalog_name));
+		auto &transaction = Begin(owner, catalog_name);
+		Initialized(transaction);
+		if (append_segment) {
+			auto &catalog = transaction.GetCatalog();
+			auto entry = catalog.GetEntry(*owner.context, CatalogType::TABLE_ENTRY, schema, table_name,
+			                              OnEntryNotFound::THROW_EXCEPTION);
+			auto &table = entry->Cast<DuckLakeTableEntry>();
+			if ((!expected_table_uuid.empty() && table.GetTableUUID() != expected_table_uuid) ||
+			    (expected_field_id.IsValid() && table.GetFieldId(vector<string> {"embedding"}).GetFieldIndex().index !=
+			                                        expected_field_id.GetIndex())) {
+				throw InvalidInputException("Vortex optimizer table or vector field identity changed");
+			}
+			auto previous = Lookup(transaction, entry->Cast<DuckLakeTableEntry>(), name);
+			if (previous.dimension != dimension) {
+				throw InvalidInputException("Vortex segment dimension mismatch");
+			}
+			if (previous.revision != expected_revision) {
+				throw TransactionException("Vortex index publication revision conflict");
+			}
+		}
 		owner.Commit();
 	} catch (...) {
 		Rollback(owner);
 		throw;
 	}
-	DuckLakeVortexViewOptions options {catalog_name, schema, table_name, dimension, MAX_ARTIFACTS, 100000, ""};
+	DuckLakeVortexViewOptions options {catalog_name,
+	                                   schema,
+	                                   table_name,
+	                                   append_segment ? 0 : dimension,
+	                                   MAX_ARTIFACTS,
+	                                   100000,
+	                                   append_segment ? name : ""};
+	options.unindexed_only = append_segment;
 	options.expected_table_uuid = expected_table_uuid;
 	options.expected_field_id = expected_field_id;
 	auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, observe, &context);
@@ -421,13 +539,15 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
 		throw InvalidInputException("%s", error.get());
 	}
 	check("before_build_publish");
-	return Publish(owner, catalog_name, schema, table_name, name, reference_path, expected_revision, check);
+	return Publish(owner, catalog_name, schema, table_name, name, reference_path, expected_revision, check,
+	               append_segment);
 }
 
 DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string &catalog_name, const string &schema,
                                                  const string &table_name, const string &name,
                                                  const string &reference_path, idx_t expected_revision,
-                                                 const std::function<void(const string &)> &observe) {
+                                                 const std::function<void(const string &)> &observe,
+                                                 bool append_segment) {
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex index publication requires an idle dedicated connection");
 	}
@@ -461,7 +581,34 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 		if (candidate.root == data_path || StringUtil::StartsWith(candidate.root, managed_prefix)) {
 			throw InvalidInputException("Vortex index artifacts must be outside the managed data path");
 		}
-		VerifyGeneration(fs, candidate);
+		auto where = " WHERE table_uuid=" + Value(table.GetTableUUID()).ToSQLString() +
+		             " AND index_name=" + Value(name).ToSQLString();
+		auto existing =
+		    Query(transaction, "SELECT revision FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1" + where);
+		auto previous = existing->Fetch();
+		idx_t revision = previous && previous->size() ? previous->GetValue(0, 0).GetValue<idx_t>() : 0;
+		if (revision != expected_revision || revision >= idx_t(NumericLimits<int64_t>::Maximum())) {
+			throw TransactionException("Vortex index publication revision conflict");
+		}
+		vector<DuckLakeVortexIndexSegment> segments;
+		if (append_segment) {
+			if (!revision) {
+				throw InvalidInputException("Segment append requires a published index");
+			}
+			auto previous_index = Lookup(transaction, table, name);
+			if (previous_index.dimension != candidate.dimension || previous_index.field_id != candidate.field_id) {
+				throw InvalidInputException("Vortex segment vector specification mismatch");
+			}
+			segments = std::move(previous_index.segments);
+		}
+		segments.push_back({candidate.root, candidate.generation, candidate.reference, candidate.files});
+		Compose(candidate, std::move(segments));
+		idx_t artifact_budget = MAX_ARTIFACTS;
+		for (auto &segment : candidate.segments) {
+			auto part = ParseReference(segment.reference, table.GetTableUUID(), field.GetFieldIndex().index);
+			part.root = segment.root;
+			VerifyGeneration(fs, part, artifact_budget);
+		}
 		auto source_guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
 		auto current = transaction.GetMetadataManager().GetExtendedFilesForTable(table, transaction.GetSnapshot());
 		vector<DuckLakeVortexIndexFile> files;
@@ -479,15 +626,6 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 			files.push_back({indexed.id, indexed.uri, Hash(bytes), indexed.row_count});
 		}
 		candidate.ValidateCoverage(files);
-		auto where = " WHERE table_uuid=" + Value(table.GetTableUUID()).ToSQLString() +
-		             " AND index_name=" + Value(name).ToSQLString();
-		auto existing =
-		    Query(transaction, "SELECT revision FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1" + where);
-		auto previous = existing->Fetch();
-		idx_t revision = previous && previous->size() ? previous->GetValue(0, 0).GetValue<idx_t>() : 0;
-		if (revision != expected_revision || revision >= idx_t(NumericLimits<int64_t>::Maximum())) {
-			throw TransactionException("Vortex index publication revision conflict");
-		}
 		candidate.name = name;
 		candidate.revision = revision + 1;
 		if (observe) {
