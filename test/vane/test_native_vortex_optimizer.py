@@ -144,6 +144,25 @@ def exercise(native, root, checks):
         "Automatic F promotion lost T or retained old F",
     )
 
+    explicit_rebuilds = []
+
+    def make_room():
+        head = native.call("head", "knn")
+        if len(head["reference"]["segments"]) == 2:
+            native.call("optimizer-cancel")
+            wait(native, lambda state: not state["running"], "idle before explicit consolidation")
+            rebuilt = native.call(
+                "build", "knn", artifacts / f"explicit-consolidation-{head['revision']}.json", head["revision"]
+            )
+            head = native.call("head", "knn")
+            require(
+                head["revision"] == rebuilt["revision"] and len(head["reference"]["segments"]) == 1,
+                "Explicit consolidation did not restore one segment",
+            )
+            explicit_rebuilds.append(head["revision"])
+        return head["revision"]
+
+    revision = make_room()
     native.call("optimizer-resume", "build_started", "pause")
     insert(native, 7000, 128)
     native.call("optimizer-wait")
@@ -152,20 +171,22 @@ def exercise(native, root, checks):
     native.call("optimizer-release")
     cancelled = wait(native, lambda s: s["state"] == "cancelled" and not s["running"], "cooperative cancellation")
     require(
-        not cancelled["enabled"] and native.call("head", "knn")["revision"] == 2, "Cancellation changed the ready head"
+        not cancelled["enabled"] and native.call("head", "knn")["revision"] == revision,
+        "Cancellation changed the ready head",
     )
     steady(native, cancelled)
     query("cancelled-query")
     native.call("optimizer-resume")
     wait(
         native,
-        lambda s: s["published_revision"] == 3 and s["state"] == "published",
+        lambda s: s["published_revision"] == revision + 1 and s["state"] == "published",
         "explicit resume after cancellation",
     )
     checks.append(
         "one active job; cancellation retains old ready head, stops policy and explicit resume plans a new task"
     )
 
+    revision = make_room()
     native.call("optimizer-resume", "before_build_publish", "fail")
     insert(native, 8000, 128)
     failed = wait(native, lambda s: s["state"] == "failed" and not s["running"], "terminal task failure")
@@ -173,19 +194,24 @@ def exercise(native, root, checks):
         not failed["enabled"] and "Injected optimizer failure" in failed["error"],
         "Failure was not durable and inspectable",
     )
-    require(native.call("head", "knn")["revision"] == 3, "Failure exposed an unpublished candidate")
+    require(native.call("head", "knn")["revision"] == revision, "Failure exposed an unpublished candidate")
     steady(native, failed)
     native.call("optimizer-resume")
-    wait(native, lambda s: s["published_revision"] == 4 and s["state"] == "published", "explicit resume after failure")
+    wait(
+        native,
+        lambda s: s["published_revision"] == revision + 1 and s["state"] == "published",
+        "explicit resume after failure",
+    )
     checks.append(
         "build failure stops the policy without retry/fallback; status records the failed task and explicit resume succeeds"
     )
 
+    revision = make_room()
     native.call("optimizer-resume", "after_commit", "fail")
     insert(native, 9000, 128)
     acknowledged = wait(
         native,
-        lambda s: s["published_revision"] == 5 and s["state"] == "published",
+        lambda s: s["published_revision"] == revision + 1 and s["state"] == "published",
         "lost publication ACK reconciliation",
     )
     require(
@@ -195,14 +221,18 @@ def exercise(native, root, checks):
     query("lost-ack-query")
 
     crash_runs = {}
-    for stage, first_id, expected in [("before_commit", 10000, 5), ("after_commit", 11000, 7)]:
+    for stage, first_id in [("before_commit", 10000), ("after_commit", 11000)]:
+        revision = make_room()
         native.call("optimizer-resume", stage, "pause")
         insert(native, first_id, 128)
         durable = crash(native, stage)
-        require(native.call("head", "knn")["revision"] == expected, "Crash recovered an incorrect ready head")
+        require(
+            native.call("head", "knn")["revision"] == revision + (stage == "after_commit"),
+            "Crash recovered an incorrect ready head",
+        )
         steady(native, status(native))
         native.call("optimizer-resume")
-        revision = 6 if stage == "before_commit" else 7
+        revision += 1
         recovered = wait(
             native,
             lambda s: s["state"] == "published" and s["published_revision"] == revision,
@@ -236,7 +266,13 @@ def exercise(native, root, checks):
     checks.append(
         "capture rejects a mismatched vector field ID; drop/recreate rejects a scheduled task bound to the old table UUID"
     )
-    return {"fixture_recalls": recalls, "recall_threshold": 0.8, "final_revision": 7, "restart_run_counts": crash_runs}
+    return {
+        "fixture_recalls": recalls,
+        "recall_threshold": 0.8,
+        "final_revision": revision,
+        "restart_run_counts": crash_runs,
+        "explicit_consolidation_revisions": explicit_rebuilds,
+    }
 
 
 def bytes_and_close(driver, root, checks):
@@ -248,8 +284,8 @@ def bytes_and_close(driver, root, checks):
         native.call("optimizer-enable", artifacts, 100000, 1, 100000, 1)
         wait(native, lambda s: s["published_revision"] == 1, "F byte threshold")
         native.sql("PREPARE optimizer_search AS " + SEARCH.search_sql(BUILD.VECTOR) + ";EXECUTE optimizer_search;")
-        native.sql("CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items');")
-        insert(native, 20000, 2)
+        native.sql("CALL ducklake_set_option('lake','data_inlining_row_limit',1000,table_name=>'items');")
+        insert(native, 20000, 128)
         wait(native, lambda s: s["published_revision"] == 2, "T byte threshold and F byte promotion")
         native.sql("CALL ducklake_set_option('lake','auto_compact',false,table_name=>'items');")
         stopped = wait(native, lambda s: s["state"] == "failed", "invalid flush configuration rejection")
@@ -258,6 +294,7 @@ def bytes_and_close(driver, root, checks):
         )
         steady(native, stopped)
         native.sql("CALL ducklake_set_option('lake','auto_compact',true,table_name=>'items');")
+        native.call("build", "knn", artifacts / "explicit-consolidation.json", 2)
         native.call("optimizer-resume", "optimizer_before_build", "pause")
         native.sql("CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items');")
         insert(native, 21000, 128)
@@ -269,7 +306,7 @@ def bytes_and_close(driver, root, checks):
         durable = status(native)
         require(not durable["running"], "Reopened database started jobs implicitly")
         native.call("optimizer-resume")
-        wait(native, lambda s: s["published_revision"] == 3, "reopened optimizer ownership")
+        wait(native, lambda s: s["published_revision"] == 4, "reopened optimizer ownership")
         native.finish()
         require(native.process.returncode == 0, "Idle optimizer retained its database after close")
         checks.append(

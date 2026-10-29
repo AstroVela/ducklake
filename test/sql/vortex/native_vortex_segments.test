@@ -1,0 +1,102 @@
+# name: test/sql/vortex/native_vortex_segments.test
+# description: append an immutable ANN segment and merge two B segments with F and T
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_segments.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_segments_data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','B1' FROM range(128)t(i)
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-b1.json',2,0)
+----
+1
+
+statement ok
+CREATE TEMP TABLE first_segment AS SELECT regexp_extract(admission,'"generation":"([^"]+)"',1) AS generation FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+
+statement error
+SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-empty.json',2,1)
+----
+materialized Vortex files
+
+statement ok
+INSERT INTO lake.items SELECT 1000+i,[0.125+i,0],'B','B2' FROM range(128)t(i)
+
+query I
+SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-b2.json',2,1)
+----
+2
+
+query II
+SELECT array_length(regexp_extract_all(admission,'"generation":"[^"]+"')),regexp_extract(admission,'"generation":"([^"]+)"',1)=(SELECT generation FROM first_segment) FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+----
+2	true
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')
+
+statement ok
+INSERT INTO lake.items SELECT 2000+i,[0.0625+i,0],'C','F' FROM range(128)t(i)
+
+statement ok
+INSERT INTO lake.items VALUES(3000,[0.03125,0],'D','实时-T')
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'A')
+----
+0
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'B')
+----
+1000
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'C')
+----
+2000
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'D')
+----
+3000
+
+statement error
+SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-third.json',2,2)
+----
+segment count budget exceeded
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-rebuilt.json',2,2)
+----
+3
+
+query I
+SELECT array_length(regexp_extract_all(admission,'"generation":"[^"]+"')) FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+----
+1
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'D')
+----
+3000
+
+statement ok
+DETACH lake

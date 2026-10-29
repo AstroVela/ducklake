@@ -168,7 +168,7 @@ pub struct MixedResult {
 }
 
 pub struct MixedView {
-    pub lease: IndexLease,
+    pub leases: Vec<IndexLease>,
     pub source: Arc<PhysicalSource>,
     pub digest: String,
     pub inline_bytes: usize,
@@ -375,7 +375,7 @@ impl MixedView {
         });
         check("source_pinned")?;
         let catalog_revision = catalog.as_ref().map(|index| index.revision);
-        let (descriptor, root) = match input {
+        let descriptors = match input {
             ViewInput::Mixed { reference } | ViewInput::Admitted { reference } => {
                 if !reference.is_absolute() {
                     vortex_bail!("Retained view paths must be absolute");
@@ -385,63 +385,111 @@ impl MixedView {
                     .parent()
                     .ok_or_else(|| vortex_err!("Reference parent required"))?
                     .to_path_buf();
-                (descriptor, root)
+                vec![(descriptor, root)]
             }
             ViewInput::Catalogued { .. } => {
                 let index =
                     catalog.ok_or_else(|| vortex_err!("Catalogued index record required"))?;
-                file_index::validate_reference(&source, &index.reference)?;
-                (index.reference, index.root)
+                index
+                    .reference
+                    .segments
+                    .into_iter()
+                    .map(|segment| (segment.reference, segment.root))
+                    .collect()
             }
         };
+        let mut covered = BTreeSet::new();
+        let mut generations = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        for (descriptor, _) in &descriptors {
+            file_index::validate_reference(&source, descriptor)?;
+            if !generations.insert(descriptor.generation.generation.clone()) {
+                vortex_bail!("Duplicate index segment generation");
+            }
+            for file in &descriptor.snapshot.files {
+                if !covered.insert(file.id) {
+                    vortex_bail!("Index segment file coverage overlaps");
+                }
+                if !paths.insert(file.uri.clone()) {
+                    vortex_bail!("Index segment source paths overlap");
+                }
+            }
+        }
         let scan_files = source
             .snapshot()
             .files
             .iter()
-            .filter(|file| descriptor.snapshot.file(file.id).is_none())
+            .filter(|file| !covered.contains(&file.id))
             .map(|file| file.id)
             .collect();
-        let lease = IndexLease::open_root(
-            &root,
-            &descriptor.generation,
-            &descriptor.snapshot,
-            leases,
-            budget.artifact_bytes,
-        )
-        .await?;
-        check("after_open")?;
-        let metadata = lease.index.metadata();
-        let vector = lease
-            .index
-            .as_vector()
-            .ok_or_else(|| vortex_err!("Vector capability required"))?;
-        if metadata.backend != SPFRESH_ID
-            || metadata.fields != [source.field.clone()]
-            || metadata.covered_files
-                != descriptor
-                    .snapshot
-                    .files
-                    .iter()
-                    .map(|file| file.id)
-                    .collect::<Vec<_>>()
-            || vector.spec().dimension.get() != source.capture.dimension as usize
-            || vector.spec().metric != DistanceMetric::SquaredL2
-            || !vector.supports_filter()
-        {
-            vortex_bail!("File index coverage, field, metric or prefilter capability mismatch");
+        let mut indexed = source.snapshot().clone();
+        indexed.files.retain(|file| covered.contains(&file.id));
+        let mut opened = Vec::with_capacity(descriptors.len());
+        let mut remaining = budget.artifact_bytes;
+        for (descriptor, root) in descriptors {
+            let lease = IndexLease::open_root(
+                &root,
+                &descriptor.generation,
+                &descriptor.snapshot,
+                leases,
+                remaining,
+            )
+            .await?;
+            remaining -= lease.artifact_bytes;
+            let metadata = lease.index.metadata();
+            let vector = lease
+                .index
+                .as_vector()
+                .ok_or_else(|| vortex_err!("Vector capability required"))?;
+            if metadata.backend != SPFRESH_ID
+                || metadata.fields != [source.field.clone()]
+                || metadata.covered_files
+                    != descriptor
+                        .snapshot
+                        .files
+                        .iter()
+                        .map(|file| file.id)
+                        .collect::<Vec<_>>()
+                || vector.spec().dimension.get() != source.capture.dimension as usize
+                || vector.spec().metric != DistanceMetric::SquaredL2
+                || !vector.supports_filter()
+            {
+                vortex_bail!("File index coverage, field, metric or prefilter capability mismatch");
+            }
+            opened.push(lease);
+            check("segment_opened")?;
         }
+        check("after_open")?;
         let visible = source.capture.visible.iter().copied().collect();
         Ok(Self {
-            lease,
+            leases: opened,
             source,
             digest,
             inline_bytes,
             inline,
             visible,
-            indexed: descriptor.snapshot,
+            indexed,
             scan_files,
             catalog_revision,
         })
+    }
+
+    pub fn artifact_bytes(&self) -> u64 {
+        self.leases.iter().map(|lease| lease.artifact_bytes).sum()
+    }
+
+    pub fn generation(&self) -> &str {
+        &self.leases[self.leases.len() - 1]
+            .index
+            .metadata()
+            .generation
+    }
+
+    pub fn generations(&self) -> Vec<&str> {
+        self.leases
+            .iter()
+            .map(|lease| lease.index.metadata().generation.as_str())
+            .collect()
     }
 
     pub fn inline_rows(&self) -> usize {
@@ -584,81 +632,87 @@ impl MixedView {
             vortex_bail!("Prefilter requires visible addresses from this read view");
         }
         let allowed = |row: &RowRef| allow.as_ref().is_none_or(|rows| rows.contains(row));
-        let b_allow = allow.as_ref().map(|rows| {
-            rows.iter()
-                .filter_map(|row| match row {
-                    RowRef::File {
-                        file_id,
+        let mut b = TopK::new(request.k);
+        let mut ann_candidates = 0;
+        for lease in &self.leases {
+            let indexed = &lease.index.metadata().snapshot;
+            let b_allow = allow.as_ref().map(|rows| {
+                rows.iter()
+                    .filter_map(|row| match row {
+                        RowRef::File {
+                            file_id,
+                            row_offset,
+                        } if indexed.file(*file_id).is_some() => Some(RowAddress {
+                            file_id: *file_id,
+                            row_offset: *row_offset,
+                        }),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            let excluded = indexed
+                .files
+                .iter()
+                .flat_map(|file| {
+                    (0..file.row_count).map(move |row_offset| RowAddress {
+                        file_id: file.id,
                         row_offset,
-                    } if self.indexed.file(*file_id).is_some() => Some(RowAddress {
-                        file_id: *file_id,
-                        row_offset: *row_offset,
-                    }),
-                    _ => None,
+                    })
                 })
-                .collect()
-        });
-        let excluded = self
-            .indexed
-            .files
-            .iter()
-            .flat_map(|file| {
-                (0..file.row_count).map(move |row_offset| RowAddress {
-                    file_id: file.id,
-                    row_offset,
-                })
-            })
-            .filter(|row| !self.visible.contains(row))
-            .collect();
-        let filter = RowFilter::try_new(self.indexed.clone(), b_allow, excluded)?;
-        let vector = self
-            .lease
-            .index
-            .as_vector()
-            .ok_or_else(|| vortex_err!("Vector capability required"))?;
-        check("before_ann")?;
-        let hits = vector
-            .search(
-                &request.query,
-                &VectorSearchOptions {
-                    k: NonZeroUsize::new(request.k)
-                        .ok_or_else(|| vortex_err!("k must be nonzero"))?,
-                    mode: SearchMode::Approximate,
-                    backend_options: Bytes::from_static(
-                        b"{\"max_check\":4096,\"internal_results\":64,\"search_pages\":12}",
-                    ),
-                },
-                &filter,
-            )
-            .await?;
-        check("after_ann")?;
-        let b_rows: Vec<_> = hits.iter().map(|hit| hit.row).collect();
-        if hits.len() > request.k || b_rows.iter().collect::<BTreeSet<_>>().len() != b_rows.len() {
-            vortex_bail!("ANN returned duplicate or excess candidates");
-        }
-        for hit in &hits {
-            self.indexed.validate_row(hit.row)?;
-            if !self.visible.contains(&hit.row)
-                || !filter.includes(hit.row)
-                || !hit.distance.is_finite()
-                || hit.distance < 0.0
+                .filter(|row| !self.visible.contains(row))
+                .collect();
+            let filter = RowFilter::try_new(indexed.clone(), b_allow, excluded)?;
+            let vector = lease
+                .index
+                .as_vector()
+                .ok_or_else(|| vortex_err!("Vector capability required"))?;
+            check("before_ann")?;
+            let hits = vector
+                .search(
+                    &request.query,
+                    &VectorSearchOptions {
+                        k: NonZeroUsize::new(request.k)
+                            .ok_or_else(|| vortex_err!("k must be nonzero"))?,
+                        mode: SearchMode::Approximate,
+                        backend_options: Bytes::from_static(
+                            b"{\"max_check\":4096,\"internal_results\":64,\"search_pages\":12}",
+                        ),
+                    },
+                    &filter,
+                )
+                .await?;
+            check("segment_searched")?;
+            let b_rows: Vec<_> = hits.iter().map(|hit| hit.row).collect();
+            if hits.len() > request.k
+                || b_rows.iter().collect::<BTreeSet<_>>().len() != b_rows.len()
             {
-                vortex_bail!("ANN returned an invisible, disallowed or invalid candidate");
+                vortex_bail!("ANN returned duplicate or excess candidates");
+            }
+            for hit in &hits {
+                indexed.validate_row(hit.row)?;
+                if !self.visible.contains(&hit.row)
+                    || !filter.includes(hit.row)
+                    || !hit.distance.is_finite()
+                    || hit.distance < 0.0
+                {
+                    vortex_bail!("ANN returned an invisible, disallowed or invalid candidate");
+                }
+            }
+            ann_candidates += hits.len();
+            let b_vectors = self.source.take_vectors(&b_rows).await?;
+            for (row, vector) in b_rows.into_iter().zip(b_vectors.chunks_exact(dimension)) {
+                b.offer(Candidate {
+                    row_ref: row.into(),
+                    distance: squared_l2(&request.query, vector)?,
+                });
             }
         }
-        let b_vectors = self.source.take_vectors(&b_rows).await?;
-        let mut b = TopK::new(request.k);
-        for (row, vector) in b_rows.into_iter().zip(b_vectors.chunks_exact(dimension)) {
-            b.offer(Candidate {
-                row_ref: row.into(),
-                distance: squared_l2(&request.query, vector)?,
-            });
-        }
+        check("after_ann")?;
         let mut routes = Routes {
             indexed_files: self.indexed.files.iter().map(|file| file.id).collect(),
             scan_files: self.scan_files.clone(),
-            ann_calls: 1,
-            ann_candidates: hits.len(),
+            ann_calls: self.leases.len(),
+            ann_candidates,
             scanned_rows: 0,
             scan_eligible_rows: 0,
             inline_rows: self.inline.len(),

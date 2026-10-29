@@ -64,6 +64,9 @@ available. The implementation adds no automatic retry, scan downgrade or
 compatibility path. These counters bound logical/encoded data, not resident
 memory, the native metadata WAL or SPFresh's internal threads. Promotion frees
 F quota but does not expand the prototype's total physical capacity ceiling.
+The [two-segment follow-up](native-vortex-segments-proof.md) counts B coverage
+across both generations. Its separate two-slot limit stops background
+construction without disabling these write quotas or hiding remaining F/T.
 
 ## Failure cleanup
 

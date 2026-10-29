@@ -370,15 +370,8 @@ bool Published(Metadata &meta, const Policy &p) {
 	if (!chunk || !chunk->size() || chunk->GetValue(0, 0).GetValue<idx_t>() != p.expected + 1) {
 		return false;
 	}
-	auto bytes = StringValue::Get(chunk->GetValue(1, 0));
-	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(yyjson_read(bytes.data(), bytes.size(), 0),
-	                                                            yyjson_doc_free);
-	auto generation = doc ? yyjson_obj_get(yyjson_doc_get_root(doc.get()), "generation") : nullptr;
-	auto value = generation ? yyjson_obj_get(generation, "generation") : nullptr;
-	if (!value || !yyjson_is_str(value)) {
-		throw InvalidInputException("Invalid ready optimizer generation");
-	}
-	return p.generation == string(yyjson_get_str(value), yyjson_get_len(value));
+	auto ready = VortexCatalog::ParseSegments(StringValue::Get(chunk->GetValue(1, 0)), p.uuid, p.field_id);
+	return p.generation == ready.generation;
 }
 
 string Candidate(Connection &connection, const string &path) {
@@ -630,7 +623,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					VortexCatalog::BuildAndPublish(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.reference,
 					    p.config.dimension, p.expected, [&](const string &stage) { Stage(db, pending, p, stage); },
-					    p.uuid, optional_idx(p.field_id));
+					    p.uuid, optional_idx(p.field_id), p.expected != 0);
 				}
 			}
 			Finish(db, p, build ? "published" : "flushed", "", true);

@@ -203,10 +203,10 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
             .search_category(query, input.k as usize, category, session, &check)
             .await?;
         let diagnostics = serde_json::to_vec(&serde_json::json!({"routes":result.routes,
-            "index_revision":view.catalog_revision,"generation":view.lease.index.metadata().generation,
+            "index_revision":view.catalog_revision,"generation":view.generation(),"generations":view.generations(),
             "snapshot_id":view.source.capture.snapshot_id, "cost":{"phases_us":phases.borrow().clone(),
             "projection_rows":view.source.projection_counts(),"source_bytes":view.source.pinned_bytes(),
-            "artifact_bytes":view.lease.artifact_bytes,"binary_handoff_bytes":handoff_bytes,"source_buffer_count":source_count,"source_staging_bytes":0,"elapsed_us":started.elapsed().as_micros() as u64}}))
+            "artifact_bytes":view.artifact_bytes(),"binary_handoff_bytes":handoff_bytes,"source_buffer_count":source_count,"source_staging_bytes":0,"elapsed_us":started.elapsed().as_micros() as u64}}))
             .map_err(|e| vortex_err!("{e}"))?;
         Ok(Output {
             hits: result.hits,
