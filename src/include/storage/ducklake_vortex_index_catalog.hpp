@@ -11,6 +11,8 @@ class ExtensionLoader;
 class StorageLock;
 class ClientContext;
 
+enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
+
 struct DuckLakeVortexIndexFile {
 	idx_t id;
 	string uri;
@@ -24,6 +26,7 @@ struct DuckLakeVortexIndexSegment {
 };
 
 struct DuckLakeVortexIndex {
+	static constexpr idx_t MAX_SEGMENTS = 3;
 	string name;
 	idx_t revision;
 	uint32_t field_id;
@@ -36,6 +39,8 @@ struct DuckLakeVortexIndex {
 
 	string ToJSON() const;
 	void ValidateCoverage(const vector<DuckLakeVortexIndexFile> &current) const;
+	vector<DuckLakeVortexIndexFile> SelectedFiles(const vector<string> &generations) const;
+	vector<string> SmallestSegments() const;
 	static StorageLock &PublicationLock();
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog);
 	static void Rollback(Connection &owner);
@@ -48,14 +53,15 @@ struct DuckLakeVortexIndex {
 	                                   const string &table, const string &name, const string &reference,
 	                                   idx_t expected_revision,
 	                                   const std::function<void(const string &)> &observe = nullptr,
-	                                   bool append_segment = false);
-	static DuckLakeVortexIndex BuildAndPublish(ClientContext &context, const string &catalog, const string &schema,
-	                                           const string &table, const string &name, const string &reference,
-	                                           uint32_t dimension, idx_t expected_revision,
-	                                           const std::function<void(const string &)> &observe = nullptr,
-	                                           const string &expected_table_uuid = "",
-	                                           optional_idx expected_field_id = optional_idx(),
-	                                           bool append_segment = false);
+	                                   DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
+	                                   const vector<string> &merge_generations = {});
+	static DuckLakeVortexIndex
+	BuildAndPublish(ClientContext &context, const string &catalog, const string &schema, const string &table,
+	                const string &name, const string &reference, uint32_t dimension, idx_t expected_revision,
+	                const std::function<void(const string &)> &observe = nullptr,
+	                const string &expected_table_uuid = "", optional_idx expected_field_id = optional_idx(),
+	                DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
+	                const vector<string> &merge_generations = {});
 };
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader);

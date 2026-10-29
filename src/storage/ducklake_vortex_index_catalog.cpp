@@ -203,7 +203,7 @@ string JSON(yyjson_val *value) {
 }
 
 void Compose(DuckLakeVortexIndex &index, vector<DuckLakeVortexIndexSegment> segments) {
-	if (segments.empty() || segments.size() > 2) {
+	if (segments.empty() || segments.size() > DuckLakeVortexIndex::MAX_SEGMENTS) {
 		throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex segment count budget exceeded");
 	}
 	std::set<idx_t> files;
@@ -259,7 +259,7 @@ DuckLakeVortexIndex ParseCatalogReference(const string &bytes, const string &uui
 	}
 	auto entries = Member(value, "segments");
 	Array(entries);
-	if (!yyjson_arr_size(entries) || yyjson_arr_size(entries) > 2) {
+	if (!yyjson_arr_size(entries) || yyjson_arr_size(entries) > DuckLakeVortexIndex::MAX_SEGMENTS) {
 		throw InvalidInputException("Invalid Vortex segment count");
 	}
 	DuckLakeVortexIndex result;
@@ -441,6 +441,42 @@ void DuckLakeVortexIndex::ValidateCoverage(const vector<DuckLakeVortexIndexFile>
 	}
 }
 
+vector<DuckLakeVortexIndexFile> DuckLakeVortexIndex::SelectedFiles(const vector<string> &generations) const {
+	if (generations.size() != 2 || generations[0].empty() || generations[0] == generations[1]) {
+		throw InvalidInputException("Vortex merge requires two distinct ready generations");
+	}
+	vector<DuckLakeVortexIndexFile> selected;
+	idx_t found = 0;
+	for (auto &segment : segments) {
+		if (std::find(generations.begin(), generations.end(), segment.generation) != generations.end()) {
+			found++;
+			selected.insert(selected.end(), segment.files.begin(), segment.files.end());
+		}
+	}
+	if (found != generations.size()) {
+		throw TransactionException("Vortex merge selected generation is no longer ready");
+	}
+	std::sort(selected.begin(), selected.end(),
+	          [](const DuckLakeVortexIndexFile &a, const DuckLakeVortexIndexFile &b) { return a.id < b.id; });
+	return selected;
+}
+
+vector<string> DuckLakeVortexIndex::SmallestSegments() const {
+	if (segments.size() != MAX_SEGMENTS) {
+		throw InvalidInputException("Vortex automatic merge requires a full segment set");
+	}
+	vector<std::pair<idx_t, string>> sizes;
+	for (auto &segment : segments) {
+		idx_t rows = 0;
+		for (auto &file : segment.files) {
+			rows += file.row_count;
+		}
+		sizes.emplace_back(rows, segment.generation);
+	}
+	std::sort(sizes.begin(), sizes.end());
+	return {sizes[0].second, sizes[1].second};
+}
+
 string DuckLakeVortexIndex::ToJSON() const {
 	ViewJSON json;
 	Parsed parsed(reference);
@@ -452,17 +488,20 @@ string DuckLakeVortexIndex::ToJSON() const {
 	return json.Finish(value);
 }
 
-DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context, const string &catalog_name,
-                                                         const string &schema, const string &table_name,
-                                                         const string &name, const string &reference_path,
-                                                         uint32_t dimension, idx_t expected_revision,
-                                                         const std::function<void(const string &)> &observe,
-                                                         const string &expected_table_uuid,
-                                                         optional_idx expected_field_id, bool append_segment) {
+DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
+    ClientContext &context, const string &catalog_name, const string &schema, const string &table_name,
+    const string &name, const string &reference_path, uint32_t dimension, idx_t expected_revision,
+    const std::function<void(const string &)> &observe, const string &expected_table_uuid,
+    optional_idx expected_field_id, DuckLakeVortexIndexOperation operation, const vector<string> &merge_generations) {
 	Name(name);
-	if (!dimension || dimension > 4096 || reference_path.empty() || reference_path.size() > 65536 ||
+	const bool merge = operation == DuckLakeVortexIndexOperation::MERGE;
+	const bool select_index = operation != DuckLakeVortexIndexOperation::REPLACE;
+	if ((!dimension && !merge) || dimension > 4096 || reference_path.empty() || reference_path.size() > 65536 ||
 	    reference_path.find('\0') != string::npos || expected_revision > idx_t(NumericLimits<int64_t>::Maximum())) {
 		throw InvalidInputException("Invalid Vortex build dimension, reference or revision");
+	}
+	if (!merge && !merge_generations.empty()) {
+		throw InvalidInputException("Only a Vortex merge can select generations");
 	}
 	auto check = [&](const string &stage) {
 		if (observe) {
@@ -477,7 +516,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
 	try {
 		auto &transaction = Begin(owner, catalog_name);
 		Initialized(transaction);
-		if (append_segment) {
+		if (select_index) {
 			auto &catalog = transaction.GetCatalog();
 			auto entry = catalog.GetEntry(*owner.context, CatalogType::TABLE_ENTRY, schema, table_name,
 			                              OnEntryNotFound::THROW_EXCEPTION);
@@ -488,11 +527,15 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
 				throw InvalidInputException("Vortex optimizer table or vector field identity changed");
 			}
 			auto previous = Lookup(transaction, entry->Cast<DuckLakeTableEntry>(), name);
-			if (previous.dimension != dimension) {
+			if (dimension && previous.dimension != dimension) {
 				throw InvalidInputException("Vortex segment dimension mismatch");
 			}
+			dimension = previous.dimension;
 			if (previous.revision != expected_revision) {
 				throw TransactionException("Vortex index publication revision conflict");
+			}
+			if (merge) {
+				previous.SelectedFiles(merge_generations);
 			}
 		}
 		owner.Commit();
@@ -503,11 +546,12 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
 	DuckLakeVortexViewOptions options {catalog_name,
 	                                   schema,
 	                                   table_name,
-	                                   append_segment ? 0 : dimension,
+	                                   select_index ? 0 : dimension,
 	                                   MAX_ARTIFACTS,
 	                                   100000,
-	                                   append_segment ? name : ""};
-	options.unindexed_only = append_segment;
+	                                   select_index ? name : ""};
+	options.unindexed_only = operation == DuckLakeVortexIndexOperation::APPEND;
+	options.merge_generations = merge_generations;
 	options.expected_table_uuid = expected_table_uuid;
 	options.expected_field_id = expected_field_id;
 	auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, observe, &context);
@@ -539,15 +583,16 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
 		throw InvalidInputException("%s", error.get());
 	}
 	check("before_build_publish");
-	return Publish(owner, catalog_name, schema, table_name, name, reference_path, expected_revision, check,
-	               append_segment);
+	return Publish(owner, catalog_name, schema, table_name, name, reference_path, expected_revision, check, operation,
+	               merge_generations);
 }
 
 DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string &catalog_name, const string &schema,
                                                  const string &table_name, const string &name,
                                                  const string &reference_path, idx_t expected_revision,
                                                  const std::function<void(const string &)> &observe,
-                                                 bool append_segment) {
+                                                 DuckLakeVortexIndexOperation operation,
+                                                 const vector<string> &merge_generations) {
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex index publication requires an idle dedicated connection");
 	}
@@ -556,6 +601,9 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 	bool committed = false;
 	try {
 		Name(name);
+		if (operation != DuckLakeVortexIndexOperation::MERGE && !merge_generations.empty()) {
+			throw InvalidInputException("Only a Vortex merge can select generations");
+		}
 		auto &transaction = Begin(owner, catalog_name);
 		Initialized(transaction);
 		auto &catalog = transaction.GetCatalog();
@@ -591,7 +639,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 			throw TransactionException("Vortex index publication revision conflict");
 		}
 		vector<DuckLakeVortexIndexSegment> segments;
-		if (append_segment) {
+		if (operation != DuckLakeVortexIndexOperation::REPLACE) {
 			if (!revision) {
 				throw InvalidInputException("Segment append requires a published index");
 			}
@@ -599,7 +647,21 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 			if (previous_index.dimension != candidate.dimension || previous_index.field_id != candidate.field_id) {
 				throw InvalidInputException("Vortex segment vector specification mismatch");
 			}
-			segments = std::move(previous_index.segments);
+			if (operation == DuckLakeVortexIndexOperation::MERGE) {
+				auto selected = previous_index.SelectedFiles(merge_generations);
+				if (selected.size() != candidate.files.size()) {
+					throw InvalidInputException("Vortex merge must cover exactly the selected segments");
+				}
+				candidate.ValidateCoverage(selected);
+				for (auto &segment : previous_index.segments) {
+					if (std::find(merge_generations.begin(), merge_generations.end(), segment.generation) ==
+					    merge_generations.end()) {
+						segments.push_back(std::move(segment));
+					}
+				}
+			} else {
+				segments = std::move(previous_index.segments);
+			}
 		}
 		segments.push_back({candidate.root, candidate.generation, candidate.reference, candidate.files});
 		Compose(candidate, std::move(segments));
