@@ -12,6 +12,9 @@ import subprocess
 import time
 
 
+VORTEX_REVISION = "65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
+
+
 def quote(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -529,7 +532,7 @@ def main() -> None:
     proof = Proof(args.duckdb.resolve(strict=True), args.probe.resolve(strict=True), root)
     report = {
         "backend": "spfresh.static",
-        "vortex_revision": "531fed6588d1b1b0492f1a50cad42179ce68faa5",
+        "vortex_revision": VORTEX_REVISION,
         "duckdb_sha256": digest(proof.duckdb),
         "probe_sha256": digest(proof.probe),
     }

@@ -113,9 +113,9 @@ configuration, status and cancellation; ON/OFF regression/recovery runners remai
 in CI. This qualifies local scheduling and recovery, not distributed optimizer
 ownership, writer backpressure, multi-replica operation or scale performance.
 
-The database weak-reference shutdown assertion applies to fixtures that actually
-start the optimizer. Applying it to every existing search/cost fixture exposed
-retained database references even on the exact #37 base without an optimizer
-(`236979019286cc964b0d6b3148c08376450f1378`). Explicitly deallocating the named
-prepared statement did not resolve that baseline observation. General query
-fixture teardown remains unqualified; this draft does not claim to fix it.
+The original #38 qualification restricted the database weak-reference shutdown
+assertion to optimizer fixtures after detecting retained references on the exact
+#37 base (`236979019286cc964b0d6b3148c08376450f1378`) without an optimizer.
+The [query lifecycle follow-up](native-vortex-query-lifecycle-proof.md) pins the
+Vortex reader/driver lifetime fixes, restores unconditional shutdown assertions
+and adds ownership checks without another Vortex runtime poll.

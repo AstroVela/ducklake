@@ -2382,7 +2382,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vortex"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "vortex-alp",
  "vortex-array",
@@ -2418,7 +2418,7 @@ dependencies = [
 [[package]]
 name = "vortex-alp"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "alp",
  "itertools 0.14.0",
@@ -2435,7 +2435,7 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "arc-swap",
  "arcref",
@@ -2483,7 +2483,7 @@ dependencies = [
 [[package]]
 name = "vortex-array-macros"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2493,7 +2493,7 @@ dependencies = [
 [[package]]
 name = "vortex-arrow"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2516,7 +2516,7 @@ dependencies = [
 [[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "itertools 0.14.0",
  "pco",
@@ -2542,7 +2542,7 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "arrow-buffer",
  "bitvec",
@@ -2556,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "vortex-bytebool"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "num-traits",
  "vortex-array",
@@ -2568,7 +2568,7 @@ dependencies = [
 [[package]]
 name = "vortex-compressor"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -2586,7 +2586,7 @@ dependencies = [
 [[package]]
 name = "vortex-compute"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "vortex-buffer",
 ]
@@ -2594,7 +2594,7 @@ dependencies = [
 [[package]]
 name = "vortex-datetime-parts"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "num-traits",
  "prost",
@@ -2608,7 +2608,7 @@ dependencies = [
 [[package]]
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "num-traits",
  "prost",
@@ -2622,7 +2622,7 @@ dependencies = [
 [[package]]
 name = "vortex-edition"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "parking_lot",
  "vortex-session",
@@ -2631,7 +2631,7 @@ dependencies = [
 [[package]]
 name = "vortex-error"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "arrow-schema",
  "flatbuffers",
@@ -2642,7 +2642,7 @@ dependencies = [
 [[package]]
 name = "vortex-fastlanes"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "fastlanes",
  "itertools 0.14.0",
@@ -2659,7 +2659,7 @@ dependencies = [
 [[package]]
 name = "vortex-file"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2704,7 +2704,7 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "flatbuffers",
  "vortex-buffer",
@@ -2714,7 +2714,7 @@ dependencies = [
 [[package]]
 name = "vortex-fsst"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "fsst-rs",
  "num-traits",
@@ -2729,7 +2729,7 @@ dependencies = [
 [[package]]
 name = "vortex-index"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2754,7 +2754,7 @@ dependencies = [
 [[package]]
 name = "vortex-index-spfresh"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "async-trait",
  "base16ct",
@@ -2775,7 +2775,7 @@ dependencies = [
 [[package]]
 name = "vortex-io"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "async-fs",
  "async-stream",
@@ -2803,7 +2803,7 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -2820,7 +2820,7 @@ dependencies = [
 [[package]]
 name = "vortex-layout"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "arcref",
  "arrow-array",
@@ -2862,7 +2862,7 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "itertools 0.14.0",
  "serde",
@@ -2873,7 +2873,7 @@ dependencies = [
 [[package]]
 name = "vortex-metrics"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "parking_lot",
  "sketches-ddsketch",
@@ -2882,7 +2882,7 @@ dependencies = [
 [[package]]
 name = "vortex-onpair"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "num-traits",
  "onpair",
@@ -2897,7 +2897,7 @@ dependencies = [
 [[package]]
 name = "vortex-pco"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "pco",
  "prost",
@@ -2911,7 +2911,7 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "prost",
  "prost-types",
@@ -2920,7 +2920,7 @@ dependencies = [
 [[package]]
 name = "vortex-runend"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -2935,7 +2935,7 @@ dependencies = [
 [[package]]
 name = "vortex-scan"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "async-trait",
  "futures",
@@ -2951,7 +2951,7 @@ dependencies = [
 [[package]]
 name = "vortex-sequence"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "num-traits",
  "prost",
@@ -2967,7 +2967,7 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "arc-swap",
  "lasso",
@@ -2979,7 +2979,7 @@ dependencies = [
 [[package]]
 name = "vortex-sparse"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -2994,7 +2994,7 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "dashmap",
  "hashbrown 0.17.1",
@@ -3003,7 +3003,7 @@ dependencies = [
 [[package]]
 name = "vortex-zigzag"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "vortex-array",
  "vortex-buffer",
@@ -3016,7 +3016,7 @@ dependencies = [
 [[package]]
 name = "vortex-zstd"
 version = "0.1.0"
-source = "git+https://github.com/AstroVela/vortex.git?rev=531fed6588d1b1b0492f1a50cad42179ce68faa5#531fed6588d1b1b0492f1a50cad42179ce68faa5"
+source = "git+https://github.com/AstroVela/vortex.git?rev=65dab44f86495d35bb46f69c8ec5cfc7a3544c1b#65dab44f86495d35bb46f69c8ec5cfc7a3544c1b"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",

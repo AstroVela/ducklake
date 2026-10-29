@@ -369,7 +369,7 @@ def main():
         "duckdb_sha256": BASE.digest(proof.duckdb),
         "probe_sha256": BASE.digest(proof.probe),
         "driver_sha256": BASE.digest(args.driver.resolve(strict=True)),
-        "vortex_revision": "531fed6588d1b1b0492f1a50cad42179ce68faa5",
+        "vortex_revision": BASE.VORTEX_REVISION,
     }
     try:
         native = Native(args.driver.resolve(strict=True), root / "native")
