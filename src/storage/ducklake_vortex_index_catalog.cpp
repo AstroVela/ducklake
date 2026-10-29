@@ -253,7 +253,9 @@ void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index) {
 	}
 }
 
-DuckLakeTransaction &Begin(Connection &owner, const string &name) {
+} // namespace
+
+DuckLakeTransaction &DuckLakeVortexIndex::Begin(Connection &owner, const string &name) {
 	owner.BeginTransaction();
 	auto &catalog = Catalog::GetCatalog(*owner.context, name).Cast<DuckLakeCatalog>();
 	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
@@ -264,13 +266,13 @@ DuckLakeTransaction &Begin(Connection &owner, const string &name) {
 	return transaction;
 }
 
-void Rollback(Connection &owner) {
+void DuckLakeVortexIndex::Rollback(Connection &owner) {
 	if (owner.context->transaction.HasActiveTransaction()) {
 		owner.Rollback();
 	}
 }
 
-void Initialized(DuckLakeTransaction &transaction) {
+void DuckLakeVortexIndex::Initialized(DuckLakeTransaction &transaction) {
 	auto &catalog = transaction.GetCatalog();
 	if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
 	                                           CATALOG_TABLE)) {
@@ -278,14 +280,13 @@ void Initialized(DuckLakeTransaction &transaction) {
 	}
 }
 
-unique_ptr<QueryResult> Query(DuckLakeTransaction &transaction, const string &sql) {
+unique_ptr<QueryResult> DuckLakeVortexIndex::Query(DuckLakeTransaction &transaction, const string &sql) {
 	auto result = transaction.Query(sql);
 	if (result->HasError()) {
 		result->ThrowError();
 	}
 	return result;
 }
-} // namespace
 
 StorageLock &DuckLakeVortexIndex::PublicationLock() {
 	static StorageLock lock;
@@ -363,7 +364,9 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
                                                          const string &schema, const string &table_name,
                                                          const string &name, const string &reference_path,
                                                          uint32_t dimension, idx_t expected_revision,
-                                                         const std::function<void(const string &)> &observe) {
+                                                         const std::function<void(const string &)> &observe,
+                                                         const string &expected_table_uuid,
+                                                         optional_idx expected_field_id) {
 	Name(name);
 	if (!dimension || dimension > 4096 || reference_path.empty() || reference_path.size() > 65536 ||
 	    reference_path.find('\0') != string::npos || expected_revision > idx_t(NumericLimits<int64_t>::Maximum())) {
@@ -387,6 +390,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context,
 		throw;
 	}
 	DuckLakeVortexViewOptions options {catalog_name, schema, table_name, dimension, MAX_ARTIFACTS, 100000, ""};
+	options.expected_table_uuid = expected_table_uuid;
+	options.expected_field_id = expected_field_id;
 	auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, observe, &context);
 	vector<DuckLakeVortexQuerySource> sources;
 	for (auto &source : view.sources) {

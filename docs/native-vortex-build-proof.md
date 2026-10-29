@@ -13,6 +13,9 @@ DuckLake owns transactions, snapshots and inline versions; Vortex/SPFresh owns
 the immutable files and derived ANN generation. Automatic optimization and
 write backpressure remain subsequent work.
 
+The next [background optimizer validation](native-vortex-optimizer-proof.md)
+connects this primitive to explicit T/F thresholds and durable task recovery.
+
 ## SQL contract
 
 Initialize the experimental index catalog explicitly, then build:
@@ -30,7 +33,7 @@ reference must not exist. The existing publisher also requires a canonical
 absolute managed data path. The function returns one published revision and
 generation. Revision zero requires an absent name; replacement uses the exact
 ready revision. No implicit catalog initialization, retry or format probing is
-added. Default-OFF builds expose none of the six native Vortex functions.
+added. Default-OFF builds expose none of the native Vortex functions.
 
 This is a synchronous explicit operation. Queries and writes on other
 connections can proceed during construction. The function does not enqueue a

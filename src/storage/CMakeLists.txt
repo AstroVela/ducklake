@@ -56,7 +56,7 @@ if(DUCKLAKE_ENABLE_VORTEX)
   target_sources(
     ducklake_storage
     PRIVATE ducklake_vortex_read_view.cpp ducklake_vortex_index_catalog.cpp
-            ducklake_vortex_search.cpp)
+            ducklake_vortex_search.cpp ducklake_vortex_optimizer.cpp)
 endif()
 
 set(ALL_OBJECT_FILES

@@ -98,7 +98,9 @@ def main() -> None:
                         "FROM duckdb_functions() WHERE function_name IN "
                         "('ducklake_vortex_read_view','ducklake_initialize_vortex_indexes',"
                         "'ducklake_publish_vortex_index','ducklake_vortex_index_view','ducklake_vortex_search',"
-                        "'ducklake_build_vortex_index');",
+                        "'ducklake_build_vortex_index','ducklake_initialize_vortex_optimizer',"
+                        "'ducklake_enable_vortex_optimizer','ducklake_resume_vortex_optimizer',"
+                        "'ducklake_cancel_vortex_optimizer','ducklake_vortex_optimizer_status');",
                     ],
                 )
         else:

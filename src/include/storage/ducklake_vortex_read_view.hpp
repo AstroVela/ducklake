@@ -19,6 +19,8 @@ struct DuckLakeVortexViewOptions {
 	idx_t max_source_bytes;
 	idx_t max_rows;
 	string index_name;
+	string expected_table_uuid;
+	optional_idx expected_field_id;
 };
 
 struct DuckLakeVortexSourceBuffer {
