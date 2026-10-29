@@ -24,7 +24,8 @@ if(DUCKLAKE_ENABLE_VORTEX)
     ducklake_functions
     PRIVATE ducklake_vortex_view_function.cpp
             ducklake_vortex_index_function.cpp
-            ducklake_vortex_search_function.cpp)
+            ducklake_vortex_search_function.cpp
+            ducklake_vortex_optimizer_function.cpp)
 endif()
 
 set(ALL_OBJECT_FILES
