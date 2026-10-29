@@ -773,7 +773,12 @@ void DuckLakeTransaction::Commit() {
 		if (ChangesMade()) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
 			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock());
-			auto publication_guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			auto rewrite = DuckLakeVortexRewriteState::Get(*context.lock());
+			auto publication_guard = rewrite ? DuckLakeVortexIndex::PublicationLock().GetExclusiveLock()
+			                                 : DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			if (rewrite) {
+				DuckLakeVortexIndex::CheckRewriteCommit(*context.lock(), *this);
+			}
 #endif
 			FlushChanges();
 		} else if (connection) {
@@ -1359,6 +1364,11 @@ void DuckLakeTransaction::FlushChanges() {
 		return;
 	}
 	auto retry_config = DuckLakeRetryConfig::FromContext(*context.lock());
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	if (DuckLakeVortexRewriteState::Get(*context.lock())) {
+		retry_config.max_retry_count = 0;
+	}
+#endif
 	auto transaction_changes = GetTransactionChanges();
 	if (metadata_manager->CanSkipSnapshotFetch(transaction_changes)) {
 		lock_guard<mutex> guard(snapshot_lock);
@@ -1421,7 +1431,13 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		return GetSnapshot();
 	};
 	context.execute_commit_batch = [&](DuckLakeSnapshot snapshot, string &query) {
-		return metadata_manager->Execute(snapshot, query);
+		auto result = metadata_manager->Execute(snapshot, query);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (!result->HasError() && DuckLakeVortexRewriteState::Get(*this->context.lock())) {
+			DuckLakeVortexIndex::PublishRewrite(*this->context.lock(), *this, snapshot);
+		}
+#endif
+		return result;
 	};
 	context.flush_cache_if_pending = [&]() {
 		if (metadata_manager->TakePendingCacheClear()) {

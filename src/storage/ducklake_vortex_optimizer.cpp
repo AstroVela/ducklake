@@ -339,7 +339,8 @@ idx_t ReadyRevision(Metadata &meta, const Policy &p) {
 }
 
 void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> changes = nullptr,
-           optional_ptr<const vector<FlushedInlinedTableInfo>> flushed = nullptr) {
+           optional_ptr<const vector<FlushedInlinedTableInfo>> flushed = nullptr,
+           optional_ptr<const DuckLakeVortexRewriteState> rewrite = nullptr) {
 	auto &table = Table(meta, p);
 	FlushConfiguration(table);
 	auto snapshot = meta.transaction.GetSnapshot();
@@ -404,6 +405,17 @@ void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> 
 	if (index) {
 		for (auto &file : index->files) {
 			covered.insert(file.id);
+		}
+	}
+	if (rewrite) {
+		if (!index || p.uuid != rewrite->table_uuid || p.config.index != rewrite->before.name ||
+		    revision != rewrite->before.revision) {
+			throw TransactionException("Vortex rewrite budget index identity changed");
+		}
+		for (auto id : rewrite->replaced) {
+			if (!covered.erase(id)) {
+				throw InvalidInputException("Vortex rewrite includes an uncovered source");
+			}
 		}
 	}
 	auto files = manager.GetExtendedFilesForTable(table, snapshot);
@@ -1104,15 +1116,18 @@ void PendingInline(Metadata &meta, Policy &p, const vector<FlushedInlinedTableIn
 	}
 }
 
-void AddWrite(Policy &p, DuckLakeTableEntry &table, const LocalTableDataChanges &changes) {
+void AddWrite(Policy &p, DuckLakeTableEntry &table, const LocalTableDataChanges &changes,
+              optional_ptr<const DuckLakeVortexRewriteState> rewrite = nullptr) {
 	auto file = [&](const DuckLakeDataFile &data) {
 		if (data.format != DataFileFormat::VORTEX || !data.encryption_key.empty()) {
 			throw InvalidInputException("Vortex write budgets require unencrypted Vortex output");
 		}
 		p.source_rows += data.row_count;
 		p.source_bytes += data.file_size_bytes;
-		p.f_rows += data.row_count;
-		p.f_bytes += data.file_size_bytes;
+		if (!rewrite || data.file_name != rewrite->new_path) {
+			p.f_rows += data.row_count;
+			p.f_bytes += data.file_size_bytes;
+		}
 	};
 	for (auto &data : changes.new_data_files) {
 		file(data);
@@ -1202,9 +1217,10 @@ unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransacti
 				if (table.GetTableId() != entry.GetTableIndex()) {
 					throw InvalidInputException("Vortex write budget table identity changed");
 				}
-				Probe(meta, p, &changes, &transaction.GetFlushedInlinedTables());
+				auto rewrite = DuckLakeVortexRewriteState::Get(context);
+				Probe(meta, p, &changes, &transaction.GetFlushedInlinedTables(), rewrite.get());
 				PendingInline(meta, p, transaction.GetFlushedInlinedTables());
-				AddWrite(p, table, changes);
+				AddWrite(p, table, changes, rewrite.get());
 				CheckWriteBudget(p, ReadBudget(*row, 0, 2));
 			}
 		}
