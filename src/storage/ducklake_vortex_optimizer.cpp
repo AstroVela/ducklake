@@ -358,6 +358,16 @@ idx_t ReadyRevision(Metadata &meta, const Policy &p) {
 	return chunk && chunk->size() ? chunk->GetValue(0, 0).GetValue<idx_t>() : 0;
 }
 
+string UnindexedGrowthBlocked(const Policy &p, idx_t rows, idx_t bytes, idx_t max_rows, idx_t max_bytes) {
+	if (p.f_rows > max_rows || rows > max_rows - p.f_rows) {
+		return "unindexed_row_budget";
+	}
+	if (p.f_bytes > max_bytes || bytes > max_bytes - p.f_bytes) {
+		return "unindexed_byte_budget";
+	}
+	return "";
+}
+
 void SelectCompaction(Metadata &meta, Policy &p) {
 	p.rewrite_candidate.clear();
 	p.rewrite_deleted = p.rewrite_remaining = 0;
@@ -372,8 +382,10 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 	if (aliases->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
 		throw InvalidInputException("Background Vortex compaction requires one named index");
 	}
-	auto budget = meta.Query("SELECT count(*) FROM {METADATA_CATALOG}." + string(WRITE_BUDGETS) + Where(p));
-	if (budget->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
+	auto budget = meta.Query("SELECT max_unindexed_rows,max_unindexed_bytes FROM {METADATA_CATALOG}." +
+	                         string(WRITE_BUDGETS) + Where(p));
+	auto limits = budget->Fetch();
+	if (!limits || limits->size() != 1) {
 		throw InvalidInputException("Background Vortex compaction requires an installed write budget for this index");
 	}
 	vector<string> ids;
@@ -386,7 +398,7 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 	}
 	auto list = StringUtil::Join(ids, ",");
 	struct FileState {
-		idx_t rows, deleted, schema;
+		idx_t rows, deleted, schema, bytes;
 		bool partitioned;
 	};
 	map<idx_t, FileState> files;
@@ -404,7 +416,7 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 	    "s.begin_snapshot<=d.begin_snapshot),d.partition_id,coalesce((SELECT del.delete_count "
 	    "FROM {METADATA_CATALOG}.ducklake_delete_file del WHERE del.data_file_id=d.data_file_id AND "
 	    "del.begin_snapshot<={SNAPSHOT_ID} AND (del.end_snapshot IS NULL OR del.end_snapshot>{SNAPSHOT_ID}) "
-	    "ORDER BY del.begin_snapshot DESC,del.delete_file_id DESC LIMIT 1),0) "
+	    "ORDER BY del.begin_snapshot DESC,del.delete_file_id DESC LIMIT 1),0),d.file_size_bytes "
 	    "FROM {METADATA_CATALOG}.ducklake_data_file d WHERE d.data_file_id IN (" +
 	    list +
 	    ") "
@@ -417,7 +429,8 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 			files.emplace(chunk->GetValue(0, row).GetValue<idx_t>(),
 			              FileState {chunk->GetValue(1, row).GetValue<idx_t>(),
 			                         chunk->GetValue(4, row).GetValue<idx_t>(),
-			                         chunk->GetValue(2, row).GetValue<idx_t>(), !chunk->GetValue(3, row).IsNull()});
+			                         chunk->GetValue(2, row).GetValue<idx_t>(),
+			                         chunk->GetValue(5, row).GetValue<idx_t>(), !chunk->GetValue(3, row).IsNull()});
 		}
 	}
 	auto inlined = meta.transaction.GetMetadataManager().GetInlinedDeletionTableName(table.GetTableId(),
@@ -439,9 +452,9 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 	string eligible, blocked, reason;
 	idx_t eligible_deleted = 0, eligible_remaining = 0, blocked_deleted = 0, blocked_remaining = 0;
 	for (auto &segment : index.segments) {
-		idx_t rows = 0, deleted = 0, output = 0;
-		set<idx_t> groups;
-		bool partitioned = false;
+		idx_t rows = 0, deleted = 0, output = 0, source_bytes = 0;
+		set<idx_t> groups, all_groups;
+		bool partitioned = false, all_partitioned = false;
 		for (auto &file : segment.files) {
 			auto entry = files.find(file.id);
 			if (entry == files.end() || entry->second.rows != file.row_count ||
@@ -451,6 +464,9 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 			auto &metrics = entry->second;
 			rows += metrics.rows;
 			deleted += metrics.deleted;
+			source_bytes += metrics.bytes;
+			all_groups.insert(metrics.schema);
+			all_partitioned = all_partitioned || metrics.partitioned;
 			if (metrics.deleted) {
 				groups.insert(metrics.schema);
 				partitioned = partitioned || metrics.partitioned;
@@ -461,13 +477,18 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 			continue;
 		}
 		auto remaining = rows - deleted;
-		auto why = deleted < p.min_deleted_rows || 100 * deleted < p.min_deleted_percent * rows ? "below_threshold"
-		           : !remaining                                                                 ? "eligible"
-		           : !output                                                                    ? "empty_rewrite_output"
-		           : remaining < 65                                                             ? "below_native_minimum"
-		           : partitioned        ? "unsupported_partition"
-		           : groups.size() != 1 ? "multiple_schema_groups"
-		                                : "eligible";
+		const bool to_f = remaining && remaining < VortexCatalog::MIN_BUILD_ROWS;
+		auto budget_reason =
+		    to_f ? UnindexedGrowthBlocked(p, remaining, source_bytes, limits->GetValue(0, 0).GetValue<idx_t>(),
+		                                  limits->GetValue(1, 0).GetValue<idx_t>())
+		         : "";
+		string why = deleted < p.min_deleted_rows || 100 * deleted < p.min_deleted_percent * rows ? "below_threshold"
+		             : !remaining                                                                 ? "eligible"
+		             : !to_f && !output                                ? "empty_rewrite_output"
+		             : (to_f ? all_partitioned : partitioned)          ? "unsupported_partition"
+		             : (to_f ? all_groups.size() : groups.size()) != 1 ? "multiple_schema_groups"
+		             : !budget_reason.empty()                          ? budget_reason
+		                                                               : "eligible";
 		if (string(why) == "eligible") {
 			if (eligible.empty() || deleted > eligible_deleted ||
 			    (deleted == eligible_deleted && segment.generation < eligible)) {
@@ -628,11 +649,12 @@ bool FlushDue(const Policy &p) {
 	return p.t_rows >= p.config.flush_rows || p.t_bytes >= p.config.flush_bytes;
 }
 bool IndexDue(const Policy &p) {
-	return p.f_rows >= p.config.index_rows || p.f_bytes >= p.config.index_bytes;
+	return p.f_rows >= VortexCatalog::MIN_BUILD_ROWS &&
+	       (p.f_rows >= p.config.index_rows || p.f_bytes >= p.config.index_bytes);
 }
 
 bool Published(Metadata &meta, const Policy &p) {
-	if (p.kind != "retire" && p.generation.empty()) {
+	if (p.kind != "retire" && p.kind != "rewrite_f" && p.generation.empty()) {
 		return false;
 	}
 	auto result = meta.Query("SELECT revision,reference FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1" + Where(p));
@@ -641,7 +663,8 @@ bool Published(Metadata &meta, const Policy &p) {
 		return false;
 	}
 	auto ready = VortexCatalog::ParseSegments(StringValue::Get(chunk->GetValue(1, 0)), p.uuid, p.field_id);
-	return p.kind == "retire" ? ready.Publication() == p.run : p.generation == ready.generation;
+	return p.kind == "retire" || p.kind == "rewrite_f" ? ready.Publication() == p.run
+	                                                   : p.generation == ready.generation;
 }
 
 string Candidate(Connection &connection, const string &path) {
@@ -904,7 +927,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		}
 	}
 	void Stage(DatabaseInstance &db, const Pending &pending, Policy &p, const string &stage) {
-		if (stage == "before_build_publish" || (p.kind == "rewrite" && stage == "rewrite_before_commit") ||
+		if (stage == "before_build_publish" ||
+		    ((p.kind == "rewrite" || p.kind == "rewrite_f") && stage == "rewrite_before_commit") ||
 		    (p.kind == "retire" && stage == "retire_before_commit")) {
 			std::lock_guard<std::mutex> guard(io);
 			Metadata meta(db, p.config.catalog);
@@ -912,7 +936,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			if (current.run != p.run) {
 				throw TransactionException("Optimizer task ownership changed");
 			}
-			if (p.kind != "retire") {
+			if (p.kind != "retire" && p.kind != "rewrite_f") {
 				current.generation = Candidate(meta.connection, p.reference);
 			}
 			current.state = "publishing";
@@ -939,7 +963,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		} else if (!error.empty() || state == "cancelled") {
 			current.enabled = false;
 		}
-		if ((current.kind == "rewrite" || current.kind == "retire") && !error.empty()) {
+		if ((current.kind == "rewrite" || current.kind == "rewrite_f" || current.kind == "retire") && !error.empty()) {
 			current.enabled = false;
 		}
 		Save(meta, current, p.run);
@@ -994,12 +1018,13 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					current.generation.clear();
 					current.error.clear();
 					current.expected = metrics.expected;
-					current.kind = rewrite && !metrics.rewrite_remaining ? "retire"
-					               : rewrite                             ? "rewrite"
-					               : flush                               ? "flush"
-					               : metrics.merge_candidates.empty()    ? "build"
-					                                                     : "merge";
-					if (current.kind == "retire") {
+					current.kind = rewrite && !metrics.rewrite_remaining                                  ? "retire"
+					               : rewrite && metrics.rewrite_remaining < VortexCatalog::MIN_BUILD_ROWS ? "rewrite_f"
+					               : rewrite                                                              ? "rewrite"
+					               : flush                                                                ? "flush"
+					               : metrics.merge_candidates.empty()                                     ? "build"
+					                                                                                      : "merge";
+					if (current.kind == "retire" || current.kind == "rewrite_f") {
 						current.reference.clear();
 					}
 					current.selected = rewrite                   ? vector<string> {metrics.rewrite_candidate}
@@ -1038,9 +1063,11 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					    p.expected, [&](const string &stage) { Stage(db, pending, p, stage); }, p.run);
 				} else if (rewrite) {
 					Stage(db, pending, p, "optimizer_before_rewrite");
-					VortexCatalog::Rewrite(*job.context, p.config.catalog, p.config.schema, p.config.table,
-					                       p.config.index, p.selected[0], p.reference, p.expected,
-					                       [&](const string &stage) { Stage(db, pending, p, stage); });
+					VortexCatalog::Rewrite(
+					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.selected[0],
+					    p.reference, p.expected, [&](const string &stage) { Stage(db, pending, p, stage); },
+					    p.kind == "rewrite_f" ? DuckLakeVortexRewriteMode::FILES : DuckLakeVortexRewriteMode::INDEXED,
+					    p.kind == "rewrite_f" ? p.run : "");
 				}
 				if (flush) {
 					Stage(db, pending, p, "optimizer_before_flush");
@@ -1239,10 +1266,10 @@ Policy Identify(Metadata &meta, const string &catalog, const string &schema, con
 
 void Validate(const Policy &p) {
 	if ((p.kind != "none" && p.kind != "flush" && p.kind != "build" && p.kind != "merge" && p.kind != "rewrite" &&
-	     p.kind != "retire") ||
-	    (p.kind == "merge"                             ? p.selected.size() != 2 || p.selected[0] == p.selected[1]
-	     : (p.kind == "rewrite" || p.kind == "retire") ? p.selected.size() != 1
-	                                                   : !p.selected.empty())) {
+	     p.kind != "retire" && p.kind != "rewrite_f") ||
+	    (p.kind == "merge" ? p.selected.size() != 2 || p.selected[0] == p.selected[1]
+	     : (p.kind == "rewrite" || p.kind == "retire" || p.kind == "rewrite_f") ? p.selected.size() != 1
+	                                                                            : !p.selected.empty())) {
 		throw InvalidInputException("Invalid optimizer task kind or generation selection");
 	}
 	auto &c = p.config;
@@ -1328,7 +1355,7 @@ void AddWrite(Policy &p, DuckLakeTableEntry &table, const LocalTableDataChanges 
 		}
 		p.source_rows += data.row_count;
 		p.source_bytes += data.file_size_bytes;
-		if (!rewrite || data.file_name != rewrite->new_path) {
+		if (!rewrite || rewrite->to_f || data.file_name != rewrite->new_path) {
 			p.f_rows += data.row_count;
 			p.f_bytes += data.file_size_bytes;
 		}
@@ -1381,6 +1408,51 @@ bool Grows(const LocalTableDataChanges &changes) {
 }
 
 } // namespace
+
+void DuckLakeVortexOptimizer::CheckRewriteToF(ClientContext &context, const DuckLakeVortexRewriteState &rewrite) {
+	Metadata meta(*context.db, rewrite.catalog);
+	try {
+		Policy key;
+		key.uuid = rewrite.table_uuid;
+		key.config.catalog = rewrite.catalog;
+		key.config.index = rewrite.before.name;
+		auto p = Load(meta, key);
+		Probe(meta, p);
+		if (p.expected != rewrite.before.revision) {
+			throw TransactionException("Vortex F rewrite index changed before preparation");
+		}
+		set<idx_t> selected;
+		for (auto &file : rewrite.selected_files) {
+			selected.insert(file.id);
+		}
+		idx_t bytes = 0;
+		auto &table = Table(meta, p);
+		for (auto &file :
+		     meta.transaction.GetMetadataManager().GetExtendedFilesForTable(table, meta.transaction.GetSnapshot())) {
+			if (file.data_type == DuckLakeDataType::DATA_FILE && selected.erase(file.file_id.index)) {
+				bytes += file.file.file_size_bytes;
+			}
+		}
+		if (!selected.empty()) {
+			throw TransactionException("Vortex F rewrite input disappeared before preparation");
+		}
+		auto rows = meta.Query("SELECT max_unindexed_rows,max_unindexed_bytes FROM {METADATA_CATALOG}." +
+		                       string(WRITE_BUDGETS) + Where(p));
+		auto limits = rows->Fetch();
+		if (!limits || limits->size() != 1) {
+			throw InvalidInputException("Vortex F rewrite requires an installed write budget");
+		}
+		auto reason = UnindexedGrowthBlocked(p, rewrite.live_rows, bytes, limits->GetValue(0, 0).GetValue<idx_t>(),
+		                                     limits->GetValue(1, 0).GetValue<idx_t>());
+		if (!reason.empty()) {
+			throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex F rewrite deferred: " + reason);
+		}
+		meta.Commit();
+	} catch (...) {
+		VortexCatalog::Rollback(meta.connection);
+		throw;
+	}
+}
 
 unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction,
                                                                ClientContext &context) {

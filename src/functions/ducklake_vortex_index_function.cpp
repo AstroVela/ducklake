@@ -145,6 +145,32 @@ static void ExecuteRewrite(ClientContext &context, TableFunctionInput &input, Da
 	state.finished = true;
 }
 
+static unique_ptr<FunctionData> BindRewriteToF(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &types, vector<string> &names) {
+	auto result = BindCatalog(context, input, types, names);
+	if (input.inputs[5].GetValue<int64_t>() < 0) {
+		throw InvalidInputException("Invalid Vortex F rewrite revision");
+	}
+	names = {"revision", "publication"};
+	return result;
+}
+
+static void ExecuteRewriteToF(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<IndexCatalogState>();
+	if (state.finished) {
+		return;
+	}
+	auto &args = input.bind_data->Cast<IndexCatalogBind>().args;
+	auto result =
+	    DuckLakeVortexIndex::Rewrite(context, StringValue::Get(args[0]), StringValue::Get(args[1]),
+	                                 StringValue::Get(args[2]), StringValue::Get(args[3]), StringValue::Get(args[4]),
+	                                 "", args[5].GetValue<idx_t>(), nullptr, DuckLakeVortexRewriteMode::FILES);
+	output.SetValue(0, 0, Value::UBIGINT(result.revision));
+	output.SetValue(1, 0, Value(result.Publication()));
+	output.SetCardinality(1);
+	state.finished = true;
+}
+
 static unique_ptr<FunctionData> BindRetire(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &types, vector<string> &names) {
 	auto result = BindCatalog(context, input, types, names);
@@ -304,6 +330,10 @@ static void ExecuteGeneration(ClientContext &context, TableFunctionInput &input,
 }
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader) {
+	loader.RegisterFunction(TableFunction("ducklake_rewrite_vortex_index_segment_to_f",
+	                                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                       LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	                                      ExecuteRewriteToF, BindRewriteToF, InitCatalog));
 	loader.RegisterFunction(TableFunction("ducklake_retire_vortex_index_segment",
 	                                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                                       LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},

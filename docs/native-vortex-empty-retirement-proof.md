@@ -56,8 +56,9 @@ batch can append the new first B under the same named index/revision protocol.
 The existing three-B, 100,000-row, 64-MiB source/vector/artifact, inline,
 manifest and write budgets remain unchanged. No compatibility layer, implicit
 raw-vector fallback, new backend options, dependency pins or online SPFresh
-mutation is introduced. A partially live B still uses the existing nonempty
-rewrite constraints, including the native 65-row minimum.
+mutation is introduced. The [sparse-B follow-up](native-vortex-sparse-rewrite-proof.md)
+publishes 1–64 live rows as bounded F; larger indexed rewrites retain their
+existing nonempty-output and native build constraints.
 
 ## Retention and validation
 
@@ -84,7 +85,7 @@ failure/cancel/lost-ack/publication races and six SIGKILL boundaries. A native
 SQL case checks the public API, empty sources, snapshot retention and rebuilding.
 The new proof is also part of the existing exact-pin native validation workflow.
 
-## Local result (2026-10-29)
+## Historical #49 result (2026-10-29)
 
 The process proof passed 17 checks and 84 gated query comparisons with minimum
 fixture recall 1.0, including all six SIGKILL boundaries. Three separate B
