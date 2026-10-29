@@ -72,13 +72,32 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 		         "max_inline_rows",
 		         "max_inline_bytes",
 		         "max_unindexed_rows",
-		         "max_unindexed_bytes"};
-		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-		         LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::UBIGINT,
-		         LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::UBIGINT,
-		         LogicalType::BOOLEAN, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-		         LogicalType::UBIGINT};
+		         "max_unindexed_bytes",
+		         "task_kind",
+		         "selected_generations"};
+		types = {LogicalType::VARCHAR,
+		         LogicalType::VARCHAR,
+		         LogicalType::VARCHAR,
+		         LogicalType::VARCHAR,
+		         LogicalType::VARCHAR,
+		         LogicalType::BOOLEAN,
+		         LogicalType::VARCHAR,
+		         LogicalType::UBIGINT,
+		         LogicalType::VARCHAR,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::VARCHAR,
+		         LogicalType::UBIGINT,
+		         LogicalType::BOOLEAN,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::VARCHAR,
+		         LogicalType::LIST(LogicalType::VARCHAR)};
 	} else {
 		names = {"state"};
 		types = {LogicalType::VARCHAR};

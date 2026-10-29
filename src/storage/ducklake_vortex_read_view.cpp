@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <set>
 
 namespace duckdb {
 
@@ -100,8 +101,14 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			index = make_uniq<DuckLakeVortexIndex>(DuckLakeVortexIndex::Lookup(transaction, table, options.index_name));
 			dimension = index->dimension;
 		}
-		if (build_files && index && index->segments.size() >= 2) {
+		if (build_files && options.unindexed_only && index->segments.size() >= DuckLakeVortexIndex::MAX_SEGMENTS) {
 			throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex segment count budget exceeded");
+		}
+		std::set<idx_t> merge_files;
+		if (!options.merge_generations.empty()) {
+			for (auto &file : index->SelectedFiles(options.merge_generations)) {
+				merge_files.insert(file.id);
+			}
 		}
 		ViewJSON json;
 		auto admission = json.Object();
@@ -177,15 +184,18 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 				throw InvalidInputException("Read view source byte budget exceeded");
 			}
 			inventory_bytes += file.file.file_size_bytes;
-			if (options.unindexed_only) {
+			if (options.unindexed_only || !options.merge_generations.empty()) {
 				auto covered =
 				    std::find_if(index->files.begin(), index->files.end(),
 				                 [&](const DuckLakeVortexIndexFile &old) { return old.id == file.file_id.index; });
-				if (covered != index->files.end()) {
-					if (covered->uri != file.file.path || covered->row_count != file.row_count) {
-						throw InvalidInputException("Referenced Vortex index file identity changed");
+				if ((options.unindexed_only && covered != index->files.end()) ||
+				    (!options.merge_generations.empty() && !merge_files.count(file.file_id.index))) {
+					if (covered != index->files.end()) {
+						if (covered->uri != file.file.path || covered->row_count != file.row_count) {
+							throw InvalidInputException("Referenced Vortex index file identity changed");
+						}
+						identities.push_back(*covered);
 					}
-					identities.push_back(*covered);
 					continue;
 				}
 			}
@@ -419,8 +429,9 @@ DuckLakeVortexReadView DuckLakeVortexReadView::AcquireBuild(Connection &reader,
                                                             const DuckLakeVortexViewOptions &options,
                                                             const std::function<void(const string &)> &observe,
                                                             optional_ptr<ClientContext> owner) {
-	if (options.unindexed_only != !options.index_name.empty()) {
-		throw InvalidInputException("Incremental build capture requires a published index");
+	if ((options.unindexed_only || !options.merge_generations.empty()) != !options.index_name.empty() ||
+	    (options.unindexed_only && !options.merge_generations.empty())) {
+		throw InvalidInputException("Incremental/merge build capture requires a published index and one selection");
 	}
 	return AcquireView(reader, options, observe, owner, false, true);
 }

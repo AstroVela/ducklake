@@ -102,7 +102,8 @@ def main() -> None:
                         "'ducklake_enable_vortex_optimizer','ducklake_resume_vortex_optimizer',"
                         "'ducklake_cancel_vortex_optimizer','ducklake_vortex_optimizer_status',"
                         "'ducklake_set_vortex_write_budget','ducklake_append_vortex_index_segment',"
-                        "'ducklake_publish_vortex_index_segment');",
+                        "'ducklake_publish_vortex_index_segment','ducklake_merge_vortex_index_segments',"
+                        "'ducklake_publish_vortex_index_merge');",
                     ],
                 )
         else:

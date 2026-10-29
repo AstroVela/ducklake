@@ -9,7 +9,8 @@ namespace duckdb {
 struct IndexCatalogBind : public TableFunctionData {
 	vector<Value> args;
 	bool initialize;
-	bool append_segment = false;
+	DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE;
+	vector<string> merge_generations;
 };
 struct IndexCatalogState : public GlobalTableFunctionState {
 	bool finished = false;
@@ -50,10 +51,11 @@ static void ExecuteCatalog(ClientContext &context, TableFunctionInput &input, Da
 		DuckLakeVortexIndex::Initialize(owner, StringValue::Get(data.args[0]));
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 	} else {
-		auto record = DuckLakeVortexIndex::Publish(owner, StringValue::Get(data.args[0]),
-		                                           StringValue::Get(data.args[1]), StringValue::Get(data.args[2]),
-		                                           StringValue::Get(data.args[3]), StringValue::Get(data.args[4]),
-		                                           data.args[5].GetValue<idx_t>(), nullptr, data.append_segment);
+		auto record = DuckLakeVortexIndex::Publish(
+		    owner, StringValue::Get(data.args[0]), StringValue::Get(data.args[1]), StringValue::Get(data.args[2]),
+		    StringValue::Get(data.args[3]), StringValue::Get(data.args[4]),
+		    data.args[data.operation == DuckLakeVortexIndexOperation::MERGE ? 6 : 5].GetValue<idx_t>(), nullptr,
+		    data.operation, data.merge_generations);
 		output.SetValue(0, 0, Value::UBIGINT(record.revision));
 		output.SetValue(1, 0, Value(record.generation));
 	}
@@ -79,7 +81,25 @@ static unique_ptr<FunctionData> BindAppend(ClientContext &context, TableFunction
                                            vector<LogicalType> &types, vector<string> &names) {
 	auto result =
 	    input.inputs.size() == 7 ? BindBuild(context, input, types, names) : BindCatalog(context, input, types, names);
-	result->Cast<IndexCatalogBind>().append_segment = true;
+	result->Cast<IndexCatalogBind>().operation = DuckLakeVortexIndexOperation::APPEND;
+	return result;
+}
+
+static unique_ptr<FunctionData> BindMerge(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &types, vector<string> &names) {
+	auto result = BindCatalog(context, input, types, names);
+	auto &bind = result->Cast<IndexCatalogBind>();
+	bind.operation = DuckLakeVortexIndexOperation::MERGE;
+	for (auto &value : ListValue::GetChildren(input.inputs[5])) {
+		if (value.IsNull() || StringValue::Get(value).empty()) {
+			throw InvalidInputException("Vortex merge generation cannot be NULL or empty");
+		}
+		bind.merge_generations.push_back(StringValue::Get(value));
+	}
+	if (bind.merge_generations.size() != 2 || bind.merge_generations[0] == bind.merge_generations[1] ||
+	    input.inputs[6].GetValue<int64_t>() < 0) {
+		throw InvalidInputException("Vortex merge requires two distinct ready generations and a valid revision");
+	}
 	return result;
 }
 
@@ -92,8 +112,9 @@ static void ExecuteBuild(ClientContext &context, TableFunctionInput &input, Data
 	auto &args = bind.args;
 	auto record = DuckLakeVortexIndex::BuildAndPublish(
 	    context, StringValue::Get(args[0]), StringValue::Get(args[1]), StringValue::Get(args[2]),
-	    StringValue::Get(args[3]), StringValue::Get(args[4]), uint32_t(args[5].GetValue<int64_t>()),
-	    args[6].GetValue<idx_t>(), nullptr, "", optional_idx(), bind.append_segment);
+	    StringValue::Get(args[3]), StringValue::Get(args[4]),
+	    bind.operation == DuckLakeVortexIndexOperation::MERGE ? 0 : uint32_t(args[5].GetValue<int64_t>()),
+	    args[6].GetValue<idx_t>(), nullptr, "", optional_idx(), bind.operation, bind.merge_generations);
 	output.SetValue(0, 0, Value::UBIGINT(record.revision));
 	output.SetValue(1, 0, Value(record.generation));
 	output.SetCardinality(1);
@@ -139,6 +160,14 @@ static void ExecuteIndexView(ClientContext &context, TableFunctionInput &input, 
 }
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader) {
+	for (auto &name : {"ducklake_merge_vortex_index_segments", "ducklake_publish_vortex_index_merge"}) {
+		loader.RegisterFunction(
+		    TableFunction(name,
+		                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                   LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), LogicalType::BIGINT},
+		                  string(name) == "ducklake_merge_vortex_index_segments" ? ExecuteBuild : ExecuteCatalog,
+		                  BindMerge, InitCatalog));
+	}
 	loader.RegisterFunction(
 	    TableFunction("ducklake_append_vortex_index_segment",
 	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,

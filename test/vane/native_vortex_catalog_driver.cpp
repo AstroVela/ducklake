@@ -157,6 +157,14 @@ public:
 						         yyjson_mut_bool(json.doc.get(), item.GetValue<bool>()));
 					} else if (item.type().id() == LogicalTypeId::UBIGINT) {
 						json.Number(value, result->names[col].c_str(), item.GetValue<idx_t>());
+					} else if (item.type().id() == LogicalTypeId::LIST) {
+						auto entries = json.Array();
+						for (auto &entry : ListValue::GetChildren(item)) {
+							auto text = StringValue::Get(entry);
+							yyjson_mut_arr_append(entries,
+							                      yyjson_mut_strncpy(json.doc.get(), text.data(), text.size()));
+						}
+						json.Add(value, result->names[col].c_str(), entries);
 					} else {
 						json.Text(value, result->names[col].c_str(), StringValue::Get(item));
 					}
@@ -176,18 +184,28 @@ public:
 			json.Text(value, "generation", StringValue::Get(result->GetValue(1, 0)));
 			return json.Finish(value);
 		}
+		if (op == "merge" || op == "publish-merge") {
+			auto function =
+			    op == "merge" ? "ducklake_merge_vortex_index_segments" : "ducklake_publish_vortex_index_merge";
+			SQL(writer, "SELECT * FROM " + string(function) + "('lake','main','items','knn'," +
+			                Value(args.at(2)).ToSQLString() + ",[" + Value(args.at(4)).ToSQLString() + "," +
+			                Value(args.at(5)).ToSQLString() + "]," + args.at(3) + ")");
+			return Head("knn").ToJSON();
+		}
 		if (op == "cancel-build" || op == "fail-build" || op == "crash-build" || op == "cancel-append" ||
-		    op == "fail-append" || op == "crash-append") {
+		    op == "fail-append" || op == "crash-append" || op == "cancel-merge" || op == "fail-merge" ||
+		    op == "crash-merge") {
 			Connection builder(database);
+			const bool merge = op.find("merge") != string::npos;
 			return DuckLakeVortexIndex::BuildAndPublish(
 			           *builder.context, "lake", "main", "items", "knn", args.at(3), 8, std::stoull(args.at(4)),
 			           [&](const string &stage) {
 				           if (stage != args.at(2)) {
 					           return;
 				           }
-				           if (op == "cancel-build" || op == "cancel-append") {
+				           if (op.find("cancel-") == 0) {
 					           builder.Interrupt();
-				           } else if (op == "fail-build" || op == "fail-append") {
+				           } else if (op.find("fail-") == 0) {
 					           throw InvalidInputException("Injected native build failure");
 				           } else {
 					           Write(root + "/build-" + stage + ".ready", "ready");
@@ -196,10 +214,14 @@ public:
 					           throw InvalidInputException("Build crash fixture resumed without SIGKILL");
 				           }
 			           },
-			           "", optional_idx(), op.find("append") != string::npos)
+			           "", optional_idx(),
+			           merge                               ? DuckLakeVortexIndexOperation::MERGE
+			           : op.find("append") != string::npos ? DuckLakeVortexIndexOperation::APPEND
+			                                               : DuckLakeVortexIndexOperation::REPLACE,
+			           merge ? vector<string> {args.at(5), args.at(6)} : vector<string>())
 			    .ToJSON();
 		}
-		if (op == "split-build" || op == "mutate-build" || op == "split-append") {
+		if (op == "split-build" || op == "mutate-build" || op == "split-append" || op == "split-merge") {
 			Connection builder(database);
 			Pause pause;
 			auto pending = std::async(std::launch::async, [&] {
@@ -210,7 +232,11 @@ public:
 						    pause.Stop();
 					    }
 				    },
-				    "", optional_idx(), op == "split-append");
+				    "", optional_idx(),
+				    op == "split-merge"    ? DuckLakeVortexIndexOperation::MERGE
+				    : op == "split-append" ? DuckLakeVortexIndexOperation::APPEND
+				                           : DuckLakeVortexIndexOperation::REPLACE,
+				    op == "split-merge" ? vector<string> {args.at(6), args.at(7)} : vector<string>());
 			});
 			ReleasePause release {pause};
 			pause.Wait();
@@ -218,13 +244,13 @@ public:
 			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
 			request.k = 10;
 			string before;
-			if (op == "split-build" || op == "split-append") {
+			if (op != "mutate-build") {
 				auto rows = DuckLakeVortexSearch::Execute(*writer.context, Options("knn"), request);
 				before = SearchJSON(rows.rows, rows.diagnostics);
 			}
 			SQL(writer, ReadText(args.at(5)));
 			string during;
-			if (op == "split-build" || op == "split-append") {
+			if (op != "mutate-build") {
 				auto rows = DuckLakeVortexSearch::Execute(*writer.context, Options("knn"), request);
 				during = SearchJSON(rows.rows, rows.diagnostics);
 			}
@@ -314,7 +340,7 @@ public:
 			return SearchJSON(rows, "{}");
 		}
 		if (op == "core-search" || op == "cancel-search" || op == "fail-search" || op == "held-search" ||
-		    op == "split-search") {
+		    op == "held-merge" || op == "split-search") {
 			Connection query(database);
 			DuckLakeVortexSearchRequest request;
 			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
@@ -355,8 +381,10 @@ public:
 				SQL(writer, ReadText(args.at(2)));
 			} else {
 				Connection publisher(database);
-				DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "knn", args.at(2),
-				                             std::stoull(args.at(3)));
+				DuckLakeVortexIndex::Publish(
+				    publisher, "lake", "main", "items", "knn", args.at(2), std::stoull(args.at(3)), nullptr,
+				    op == "held-merge" ? DuckLakeVortexIndexOperation::MERGE : DuckLakeVortexIndexOperation::REPLACE,
+				    op == "held-merge" ? vector<string> {args.at(6), args.at(7)} : vector<string>());
 				SQL(writer, ReadText(args.at(4)));
 				FileSystem::GetFileSystem(*writer.context).RemoveDirectory(args.at(5));
 			}
@@ -470,7 +498,7 @@ public:
 			Save(args.at(5), pending.get());
 			return published.ToJSON();
 		}
-		if (op == "race" || op == "race-build" || op == "race-append") {
+		if (op == "race" || op == "race-build" || op == "race-append" || op == "race-merge") {
 			std::promise<void> release;
 			auto start = release.get_future().share();
 			auto publish = [&](const string &path) {
@@ -481,8 +509,12 @@ public:
 						DuckLakeVortexIndex::BuildAndPublish(*owner.context, "lake", "main", "items", args.at(2), path,
 						                                     8, std::stoull(args.at(5)));
 					} else {
-						DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), path,
-						                             std::stoull(args.at(5)), nullptr, op == "race-append");
+						DuckLakeVortexIndex::Publish(
+						    owner, "lake", "main", "items", args.at(2), path, std::stoull(args.at(5)), nullptr,
+						    op == "race-merge"    ? DuckLakeVortexIndexOperation::MERGE
+						    : op == "race-append" ? DuckLakeVortexIndexOperation::APPEND
+						                          : DuckLakeVortexIndexOperation::REPLACE,
+						    op == "race-merge" ? vector<string> {args.at(6), args.at(7)} : vector<string>());
 					}
 					return true;
 				} catch (const TransactionException &error) {

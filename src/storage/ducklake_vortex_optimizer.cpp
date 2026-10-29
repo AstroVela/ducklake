@@ -29,7 +29,7 @@ using Config = DuckLakeVortexOptimizerConfig;
 using namespace duckdb_yyjson;
 using namespace vortex_detail;
 using Key = std::pair<string, string>;
-const char *POLICIES = "ducklake_vortex_optimizer_v1";
+const char *POLICIES = "ducklake_vortex_optimizer_v2";
 const char *WRITE_BUDGETS = "ducklake_vortex_write_budgets_v1";
 const char *BUDGET_COLUMNS = "max_inline_rows,max_inline_bytes,max_unindexed_rows,max_unindexed_bytes";
 const idx_t SOURCE_LIMIT = 64 * 1024 * 1024;
@@ -41,6 +41,8 @@ struct Policy {
 	idx_t field_id = 0;
 	bool enabled = false;
 	string state = "idle", run, generation, reference, error;
+	string kind = "none";
+	vector<string> selected, merge_candidates;
 	idx_t expected = 0, published = 0, t_rows = 0, t_bytes = 0, f_rows = 0, f_bytes = 0, runs = 0;
 	idx_t source_rows = 0, source_bytes = 0;
 	idx_t pending_rows = 0, pending_bytes = 0;
@@ -145,7 +147,35 @@ void Decode(Policy &p, const string &bytes) {
 
 const char *COLUMNS =
     "table_uuid,index_name,config,enabled,state,run_id,expected_revision,candidate_generation,"
-    "published_revision,reference_path,error,inline_rows,inline_bytes,unindexed_rows,unindexed_bytes,run_count";
+    "published_revision,reference_path,error,inline_rows,inline_bytes,unindexed_rows,unindexed_bytes,run_count,"
+    "task_kind,selected_generations";
+
+string Selection(const vector<string> &generations) {
+	ViewJSON json;
+	auto value = json.Array();
+	for (auto &generation : generations) {
+		yyjson_mut_arr_append(value, yyjson_mut_strncpy(json.doc.get(), generation.data(), generation.size()));
+	}
+	return json.Finish(value);
+}
+
+vector<string> ReadSelection(const string &bytes) {
+	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(yyjson_read(bytes.data(), bytes.size(), 0),
+	                                                            yyjson_doc_free);
+	auto root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
+	if (!root || !yyjson_is_arr(root) || (yyjson_arr_size(root) != 0 && yyjson_arr_size(root) != 2)) {
+		throw InvalidInputException("Invalid optimizer merge selection");
+	}
+	vector<string> result;
+	for (idx_t i = 0; i < yyjson_arr_size(root); i++) {
+		auto value = yyjson_arr_get(root, i);
+		if (!yyjson_is_str(value) || !yyjson_get_len(value)) {
+			throw InvalidInputException("Invalid optimizer selected generation");
+		}
+		result.emplace_back(yyjson_get_str(value), yyjson_get_len(value));
+	}
+	return result;
+}
 
 Policy Read(DataChunk &chunk, idx_t row, const string &catalog) {
 	Policy p;
@@ -172,6 +202,8 @@ Policy Read(DataChunk &chunk, idx_t row, const string &catalog) {
 	p.f_rows = number(13);
 	p.f_bytes = number(14);
 	p.runs = number(15);
+	p.kind = text(16);
+	p.selected = ReadSelection(text(17));
 	Validate(p);
 	return p;
 }
@@ -193,8 +225,9 @@ void Save(Metadata &meta, const Policy &p, const string &previous_run) {
 	    ",candidate_generation=" + Quote(p.generation) + ",published_revision=" + to_string(p.published) +
 	    ",reference_path=" + Quote(p.reference) + ",error=" + Quote(p.error) + ",inline_rows=" + to_string(p.t_rows) +
 	    ",inline_bytes=" + to_string(p.t_bytes) + ",unindexed_rows=" + to_string(p.f_rows) +
-	    ",unindexed_bytes=" + to_string(p.f_bytes) + ",run_count=" + to_string(p.runs) + Where(p) +
-	    " AND run_id=" + Quote(previous_run) + " RETURNING state");
+	    ",unindexed_bytes=" + to_string(p.f_bytes) + ",run_count=" + to_string(p.runs) + ",task_kind=" + Quote(p.kind) +
+	    ",selected_generations=" + Quote(Selection(p.selected)) + Where(p) + " AND run_id=" + Quote(previous_run) +
+	    " RETURNING state");
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() != 1) {
 		throw TransactionException("Optimizer task ownership changed");
@@ -289,10 +322,14 @@ void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> 
 	}
 	auto revision = ReadyRevision(meta, p);
 	unique_ptr<DuckLakeVortexIndex> index;
+	p.merge_candidates.clear();
 	if (revision) {
 		index = make_uniq<DuckLakeVortexIndex>(VortexCatalog::Lookup(meta.transaction, table, p.config.index));
 		if (index->dimension != p.config.dimension || index->field_id != p.field_id) {
 			throw InvalidInputException("Optimizer ready index vector specification changed");
+		}
+		if (index->segments.size() == VortexCatalog::MAX_SEGMENTS) {
+			p.merge_candidates = index->SmallestSegments();
 		}
 	}
 	std::set<idx_t> covered, found;
@@ -352,7 +389,8 @@ void Probe(DatabaseInstance &db, Policy &p) {
 }
 
 bool Active(const string &state) {
-	return state == "flushing" || state == "building" || state == "publishing" || state == "cancelling";
+	return state == "flushing" || state == "building" || state == "merging" || state == "publishing" ||
+	       state == "cancelling";
 }
 bool FlushDue(const Policy &p) {
 	return p.t_rows >= p.config.flush_rows || p.t_bytes >= p.config.flush_bytes;
@@ -516,7 +554,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		}
 		Save(meta, current, p.run);
 	}
-	void Run(DatabaseInstance &db, const Pending &pending) {
+	void Run(DatabaseInstance &db, Pending pending) {
 		Policy p;
 		{
 			std::lock_guard<std::mutex> guard(io);
@@ -553,7 +591,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					current.generation.clear();
 					current.error.clear();
 					current.expected = metrics.expected;
-					current.state = flush ? "flushing" : "building";
+					current.kind = flush ? "flush" : metrics.merge_candidates.empty() ? "build" : "merge";
+					current.selected = current.kind == "merge" ? metrics.merge_candidates : vector<string>();
+					current.state = flush ? "flushing" : current.kind == "merge" ? "merging" : "building";
 					current.runs++;
 				}
 				if (modified || flush || build) {
@@ -563,6 +603,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				}
 				if (flush || build) {
 					std::lock_guard<std::mutex> guard(lock);
+					pending = policies.at(current.Id());
 					active = current.Id();
 					owns_task = true;
 				}
@@ -614,19 +655,28 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 						std::lock_guard<std::mutex> guard(io);
 						Metadata meta(db, p.config.catalog);
 						auto current = Load(meta, p);
-						current.state = "building";
 						current.expected = metrics.expected;
+						current.kind = metrics.merge_candidates.empty() ? "build" : "merge";
+						current.selected = metrics.merge_candidates;
+						current.state = current.kind == "merge" ? "merging" : "building";
 						Save(meta, current, p.run);
-						p.expected = current.expected;
+						p = current;
 					}
-					Stage(db, pending, p, "optimizer_before_build");
+					Stage(db, pending, p, p.kind == "merge" ? "optimizer_before_merge" : "optimizer_before_build");
 					VortexCatalog::BuildAndPublish(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.reference,
 					    p.config.dimension, p.expected, [&](const string &stage) { Stage(db, pending, p, stage); },
-					    p.uuid, optional_idx(p.field_id), p.expected != 0);
+					    p.uuid, optional_idx(p.field_id),
+					    p.kind == "merge" ? DuckLakeVortexIndexOperation::MERGE
+					    : p.expected      ? DuckLakeVortexIndexOperation::APPEND
+					                      : DuckLakeVortexIndexOperation::REPLACE,
+					    p.selected);
 				}
 			}
 			Finish(db, p, build ? "published" : "flushed", "", true);
+			if (p.kind == "merge") {
+				Stage(db, pending, p, "optimizer_merged");
+			}
 			Clear();
 		} catch (const std::exception &error) {
 			bool cancelled_job;
@@ -737,6 +787,10 @@ Policy Identify(Metadata &meta, const string &catalog, const string &schema, con
 }
 
 void Validate(const Policy &p) {
+	if ((p.kind != "none" && p.kind != "flush" && p.kind != "build" && p.kind != "merge") ||
+	    (p.kind == "merge" ? p.selected.size() != 2 || p.selected[0] == p.selected[1] : !p.selected.empty())) {
+		throw InvalidInputException("Invalid optimizer task kind or generation selection");
+	}
 	auto &c = p.config;
 	for (auto &value : {c.catalog, c.schema, c.table, c.index, c.root}) {
 		if (value.empty() || value.size() > 4096 || value.find('\0') != string::npos) {
@@ -969,14 +1023,15 @@ void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalo
 		VortexCatalog::Initialized(transaction);
 		VortexCatalog::Query(
 		    transaction,
-		    "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_optimizer_v1("
+		    "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_optimizer_v2("
 		    "table_uuid VARCHAR NOT NULL,index_name VARCHAR NOT NULL,config VARCHAR NOT NULL,enabled BOOLEAN NOT NULL,"
 		    "state VARCHAR NOT NULL,run_id VARCHAR NOT NULL,expected_revision BIGINT NOT NULL,candidate_generation "
 		    "VARCHAR NOT NULL,"
 		    "published_revision BIGINT NOT NULL,reference_path VARCHAR NOT NULL,error VARCHAR NOT NULL,"
 		    "inline_rows BIGINT NOT NULL,inline_bytes BIGINT NOT NULL,unindexed_rows BIGINT NOT NULL,unindexed_bytes "
 		    "BIGINT NOT NULL,"
-		    "run_count BIGINT NOT NULL,PRIMARY KEY(table_uuid,index_name))");
+		    "run_count BIGINT NOT NULL,task_kind VARCHAR NOT NULL,selected_generations VARCHAR NOT NULL,"
+		    "PRIMARY KEY(table_uuid,index_name))");
 		VortexCatalog::Query(transaction,
 		                     "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_write_budgets_v1("
 		                     "table_uuid VARCHAR PRIMARY KEY,table_id BIGINT NOT NULL,index_name VARCHAR NOT NULL,"
@@ -1024,7 +1079,8 @@ void DuckLakeVortexOptimizer::Enable(ClientContext &context, const Config &confi
 		owner->runtime->Capacity(p);
 		p.enabled = true;
 		meta.Query("INSERT INTO {METADATA_CATALOG}." + string(POLICIES) + " VALUES(" + Quote(p.uuid) + "," +
-		           Quote(config.index) + "," + Quote(Encode(p)) + ",true,'idle','',0,'',0,'','',0,0,0,0,0)");
+		           Quote(config.index) + "," + Quote(Encode(p)) +
+		           ",true,'idle','',0,'',0,'','',0,0,0,0,0,'none','[]')");
 		meta.Commit();
 		owner->runtime->Add(p, observe);
 	}
@@ -1106,6 +1162,12 @@ vector<vector<Value>> DuckLakeVortexOptimizer::Status(ClientContext &context, co
 				rows.back().push_back(limits && limits->size() ? limits->GetValue(col, 0)
 				                                               : Value(LogicalType::UBIGINT));
 			}
+			vector<Value> selected;
+			for (auto &generation : p.selected) {
+				selected.emplace_back(generation);
+			}
+			rows.back().push_back(Value(p.kind));
+			rows.back().push_back(Value::LIST(LogicalType::VARCHAR, std::move(selected)));
 		}
 	}
 	meta.Commit();

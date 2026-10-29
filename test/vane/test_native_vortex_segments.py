@@ -144,8 +144,6 @@ def exercise(proof, native, root, checks, workers):
     core, rows = qualify(native, "two-B", recalls, two=True)
     routes = core["diagnostics"]["routes"]
     require(routes["scan_files"] and routes["inline_rows"], "Two-B query omitted remaining F or T")
-    native.call("append", "knn", reference("third"), 2, expected="segment count budget exceeded")
-    require(native.call("head", "knn")["revision"] == 2, "Segment budget changed the ready head")
     checks.append(
         "B2 covers only the 128 new F rows; B1 descriptor, generation, artifact bytes and write times remain unchanged"
     )
@@ -228,7 +226,7 @@ def exercise(proof, native, root, checks, workers):
         "second_generation": second["generation"]["generation"],
         "first_artifact_signature": frozen,
         "indexed_delta_rows": 128,
-        "max_segments": 2,
+        "max_segments": 3,
     }
 
 
@@ -328,14 +326,13 @@ def background(driver, root, checks):
         )
         unchanged(native, first, frozen)
         add_f(native, 6000)
-        stopped = module.wait(
-            native, lambda state: state["state"] == "failed" and not state["running"], "two-segment limit"
-        )
-        require(
-            not stopped["enabled"] and "segment count budget exceeded" in stopped["error"],
-            "Background exceeded its segment budget",
-        )
-        require(native.call("head", "knn")["revision"] == 2, "Background silently rebuilt B1/B2 after exhausting slots")
+        module.wait(native, lambda state: state["published_revision"] == 3 and not state["running"], "background B3")
+        unchanged(native, first, frozen)
+        native.call("optimizer-cancel")
+        stopped = module.wait(native, lambda state: not state["running"], "cancelled segment optimizer")
+        add_f(native, 7000)
+        native.call("append", "knn", artifacts / "fourth.json", 3, expected="segment count budget exceeded")
+        require(native.call("head", "knn")["revision"] == 3, "Direct append silently rebuilt existing B")
         rejected = sql(
             native,
             root,
@@ -343,26 +340,27 @@ def background(driver, root, checks):
         )
         native.call("sql", rejected, expected="unindexed rows")
         recalls = []
-        core, _ = qualify(native, "bounded-background", recalls, two=True)
+        core, _ = qualify(native, "bounded-background", recalls)
+        require(core["diagnostics"]["routes"]["ann_calls"] == 3, "Query skipped a ready B segment")
         require(
             core["diagnostics"]["routes"]["scan_files"] and core["diagnostics"]["routes"]["inline_rows"],
             "Exhaustion hid F/T",
         )
         unchanged(native, first, frozen)
-        rebuilt = native.call("build", "knn", artifacts / "explicit-consolidation.json", 2)
+        rebuilt = native.call("build", "knn", artifacts / "explicit-consolidation.json", 3)
         require(
-            rebuilt["revision"] == 3 and len(segments(native.call("head", "knn"))) == 1,
+            rebuilt["revision"] == 4 and len(segments(native.call("head", "knn"))) == 1,
             "Explicit consolidation did not restore capacity",
         )
-        add_f(native, 7000)
+        add_f(native, 8000)
         native.finish()
         checks.append(
-            "background F-to-B appends B2 without rebuilding B1; two-slot exhaustion stops explicitly, preserves F/T and write quotas, and explicit consolidation restores capacity"
+            "background appends B2/B3 without rebuilding B1; direct fourth append fails, cancellation preserves F/T and write quotas, and explicit consolidation restores capacity"
         )
         return {
             "fixture_recalls": recalls,
             "stopped_run_count": stopped["run_count"],
-            "explicit_consolidation_revision": 3,
+            "explicit_consolidation_revision": 4,
         }
     finally:
         if native.process.poll() is None:

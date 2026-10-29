@@ -46,11 +46,12 @@ transactional flush; if the resulting F meets a threshold, it invokes the shared
 native builder. A run may finish as `flushed` without building if F remains small.
 Bootstrap captures all current physical files. The
 [two-segment follow-up](native-vortex-segments-proof.md) then builds only new F
-into an independent static SPFresh generation, preserving existing B. It limits
-the catalog to two B segments under the existing aggregate budgets. Exhausting
-the second slot stops the policy explicitly; an operator can consolidate with
-the existing full-build API. There is no automatic full rebuild or native
-SPFresh online insert/delete call.
+into an independent static SPFresh generation, preserving existing B. The
+[selective merge follow-up](native-vortex-segment-merge-proof.md) permits three
+segments under the same aggregate budgets. When full and F is due, a separate
+task merges the two smallest B segments before a fresh append task promotes F.
+It does not automatically rebuild the whole table or call native SPFresh online
+insert/delete. The existing full-build API remains explicit operator maintenance.
 
 Build and publication retain the previous source, artifact and revision-CAS
 checks. Heavy construction holds no metadata transaction or publication lock.
@@ -74,10 +75,13 @@ remains separate work.
 
 ## Durable task state and ownership
 
-Policies and the latest task are persisted in `ducklake_vortex_optimizer_v1`.
+Policies and the latest task are persisted in `ducklake_vortex_optimizer_v2`.
+The new strict schema records task kind and selected generations. It requires
+fresh explicit initialization; no schema migration or old-table decoder is added.
 Status exposes UUID, field-bound policy identity, state, enabled intent, run ID,
 expected/candidate/published revision information, T/F metrics, run count, error
-and whether the local build connection is active. Metrics describe the latest
+and whether the local build connection is active. It also exposes task kind
+and the exact selected merge generations. Metrics describe the latest
 probe and may lag a just-completed operation until the next check.
 
 Cancellation first persists disabled intent, then interrupts the worker's
