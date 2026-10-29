@@ -602,7 +602,7 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 
 	switch (action.action_type) {
 	case MergeActionType::MERGE_UPDATE: {
-#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#ifdef DUCKLAKE_VANE_ENGINE
 		LogicalUpdate update(context, op.table);
 #else
 		LogicalUpdate update(op.table);
@@ -661,7 +661,7 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
-#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#ifdef DUCKLAKE_VANE_ENGINE
 		LogicalDelete delete_op(context, op.table, 0);
 #else
 		LogicalDelete delete_op(op.table, 0);
@@ -682,7 +682,7 @@ static unique_ptr<MergeIntoOperator> DuckLakePlanMergeIntoAction(DuckLakeCatalog
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
-#ifdef DUCKLAKE_VANE_DISTRIBUTED
+#ifdef DUCKLAKE_VANE_ENGINE
 		LogicalInsert insert_op(context, op.table, 0);
 #else
 		LogicalInsert insert_op(op.table, 0);
