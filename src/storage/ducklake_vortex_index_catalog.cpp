@@ -15,6 +15,7 @@
 #include "storage/ducklake_vortex_control.hpp"
 #include "storage/ducklake_vortex_query_ffi.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
+#include "storage/ducklake_vortex.hpp"
 #include "mbedtls_wrapper.hpp"
 
 #include <algorithm>
@@ -1129,6 +1130,82 @@ StorageLock &DuckLakeVortexIndex::PublicationLock() {
 StorageLock &DuckLakeVortexIndex::CollectionLock() {
 	static StorageLock lock;
 	return lock;
+}
+
+DuckLakeVortexIndex DuckLakeVortexIndex::Create(Connection &owner, const string &catalog_name, const string &schema,
+                                                const string &table_name, const string &name, const string &root,
+                                                uint32_t dimension) {
+	Name(name);
+	if (!dimension || dimension > 4096 || root.empty() || root.size() > 65536 || root.find('\0') != string::npos) {
+		throw InvalidInputException("Invalid Vortex index definition dimension or root");
+	}
+	if (owner.context->transaction.HasActiveTransaction()) {
+		throw InvalidInputException("Vortex index creation requires an idle dedicated connection");
+	}
+	auto publication = PublicationLock().GetExclusiveLock();
+	try {
+		auto &transaction = Begin(owner, catalog_name);
+		Initialized(transaction);
+		auto &catalog = transaction.GetCatalog();
+		auto entry = catalog.GetEntry(*owner.context, CatalogType::TABLE_ENTRY, schema, table_name,
+		                              OnEntryNotFound::THROW_EXCEPTION);
+		auto &table = entry->Cast<DuckLakeTableEntry>();
+		DuckLakeVortex::ValidateTable(table);
+		DuckLakeVortexReadView::ValidateFields(table);
+		if (DuckLakeVortex::GetFormat(table) != DataFileFormat::VORTEX ||
+		    table.GetColumns().PhysicalColumnCount() != 4 || table.GetColumns().LogicalColumnCount() != 4) {
+			throw InvalidInputException("Vortex index definition requires a Vortex table with four business columns");
+		}
+		auto existing = Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
+		                                       " WHERE table_uuid=" + Value(table.GetTableUUID()).ToSQLString() +
+		                                       " AND index_name=" + Value(name).ToSQLString());
+		if (existing->Fetch()->GetValue(0, 0).GetValue<idx_t>()) {
+			throw InvalidInputException("Vortex named index already exists");
+		}
+		auto qualified = KeywordHelper::WriteOptionallyQuoted(catalog_name) + "." +
+		                 KeywordHelper::WriteOptionallyQuoted(schema) + "." +
+		                 KeywordHelper::WriteOptionallyQuoted(table_name);
+		auto rows = owner.Query("SELECT 1 FROM " + qualified + " LIMIT 1");
+		if (rows->HasError()) {
+			rows->ThrowError();
+		}
+		if (rows->Fetch()) {
+			throw InvalidInputException(
+			    "Vortex index definition requires an empty table; build existing data explicitly");
+		}
+		auto &fs = FileSystem::GetFileSystem(*owner.context);
+		if (!fs.IsPathAbsolute(root)) {
+			throw InvalidInputException("Vortex index root must be absolute");
+		}
+		auto canonical_root = Canonical(root);
+		auto managed = fs.ExpandPath(catalog.DataPath());
+		while (managed.size() > 1 && managed.back() == '/') {
+			managed.pop_back();
+		}
+		if (!fs.DirectoryExists(managed)) {
+			fs.CreateDirectory(managed);
+		}
+		managed = Canonical(managed);
+		if (canonical_root == managed ||
+		    StringUtil::StartsWith(canonical_root, managed == "/" ? managed : managed + "/")) {
+			throw InvalidInputException("Vortex index root must be outside managed data");
+		}
+		DuckLakeVortexIndex result;
+		result.name = name;
+		result.revision = 1;
+		result.field_id = table.GetFieldId(vector<string> {"embedding"}).GetFieldIndex().index;
+		result.dimension = dimension;
+		result.root = canonical_root;
+		Compose(result, {}, table.GetTableUUID());
+		Query(transaction, "INSERT INTO {METADATA_CATALOG}." + string(CATALOG_TABLE) + " VALUES(" +
+		                       Value(table.GetTableUUID()).ToSQLString() + "," + Value(name).ToSQLString() + ",1," +
+		                       Value(result.root).ToSQLString() + "," + Value(result.reference).ToSQLString() + ")");
+		owner.Commit();
+		return result;
+	} catch (...) {
+		Rollback(owner);
+		throw;
+	}
 }
 
 void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog) {

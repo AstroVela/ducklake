@@ -1,5 +1,8 @@
 # Experimental native Vortex files
 
+For the current empty-table-to-T-to-F-to-B SQL entry and end-to-end verification,
+see the [local realtime vector query flow](native-vortex-basic-flow.md).
+
 This DL3a validation draft adds Vortex data files to the DuckLake fork's native
 transaction path. The DuckLake catalog continues to own commits, snapshots,
 inlined rows, deletes, and recovery. It adds no second source WAL and does not

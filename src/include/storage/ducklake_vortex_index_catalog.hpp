@@ -63,6 +63,8 @@ struct DuckLakeVortexIndex {
 	static void Initialized(DuckLakeTransaction &transaction);
 	static unique_ptr<QueryResult> Query(DuckLakeTransaction &transaction, const string &sql);
 	static void Initialize(Connection &owner, const string &catalog);
+	static DuckLakeVortexIndex Create(Connection &owner, const string &catalog, const string &schema,
+	                                  const string &table, const string &name, const string &root, uint32_t dimension);
 	static DuckLakeVortexGCResult Collect(ClientContext &context, const string &catalog, idx_t max_generations,
 	                                      idx_t max_artifact_bytes,
 	                                      const std::function<void(const string &)> &observe = nullptr);
