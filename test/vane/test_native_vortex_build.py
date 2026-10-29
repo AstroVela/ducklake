@@ -237,7 +237,7 @@ def main():
     report = {
         "status": "running",
         "driver_sha256": BASE.digest(args.driver.resolve(strict=True)),
-        "vortex_revision": "531fed6588d1b1b0492f1a50cad42179ce68faa5",
+        "vortex_revision": BASE.VORTEX_REVISION,
     }
     started = time.monotonic()
     try:

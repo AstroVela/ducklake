@@ -1,0 +1,84 @@
+# name: test/sql/vortex/native_vortex_query_lifecycle.test
+# description: mixed Vortex queries remain usable after LIMIT, execution errors and inline flush
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_query_lifecycle.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_query_lifecycle_data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','base' FROM range(128)t(i)
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_query_lifecycle_index.json',2,0)
+----
+1
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')
+
+statement ok
+INSERT INTO lake.items SELECT 1000+i,[8.25+i,0],'B','F-row' FROM range(128)t(i)
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE lake.items SET embedding=[80000,0],payload=NULL WHERE id=8
+
+statement ok
+INSERT INTO lake.items VALUES(2000,[8.125,0],'A','实时-T')
+
+statement ok
+COMMIT
+
+statement ok
+PREPARE lifecycle_search AS SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[8,0]::FLOAT[],10) LIMIT 1
+
+query I
+EXECUTE lifecycle_search
+----
+2000
+
+query I
+SELECT id FROM lake.items ORDER BY list_distance(embedding,[8,0]::FLOAT[]) LIMIT 1
+----
+2000
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[1,2,3]::FLOAT[],10)
+----
+Query dimension
+
+query I
+EXECUTE lifecycle_search
+----
+2000
+
+statement ok
+CALL ducklake_flush_inlined_data('lake')
+
+query I
+EXECUTE lifecycle_search
+----
+2000
+
+statement ok
+DEALLOCATE lifecycle_search
+
+statement ok
+DETACH lake
