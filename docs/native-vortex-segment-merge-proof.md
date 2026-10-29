@@ -63,9 +63,11 @@ an explicit resume cannot inherit callbacks copied by an earlier scheduling pass
 Index compaction keeps the source file layout and row addresses. It releases
 an active segment slot, not physical table capacity. Explicit full build remains
 available for operator-requested replacement. Automatic source-file rewriting,
-retired/abandoned generation collection and production count/size policies
-remain separate work. The proof actively removes retired canonical index roots
-to qualify existing view leases; it does not add a generation sweeper.
+abandoned generation collection and production count/size policies remain
+separate work. The [generation GC follow-up](native-vortex-generation-gc-proof.md)
+adds registered retirement and bounded explicit collection of published
+generations. This merge proof still removes canonical roots directly to qualify
+existing view leases.
 
 ## Qualification
 

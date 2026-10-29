@@ -29,7 +29,15 @@ DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
 		sources.push_back(
 		    {source.file_id, reinterpret_cast<const uint8_t *>(source.bytes.data()), source.bytes.size()});
 	}
-	DuckLakeVortexControl control {context, observe, nullptr, view.sources};
+	std::function<void(const string &)> lease_observe = [&](const string &stage) {
+		if (stage == "after_open") {
+			view.generation_guard.reset();
+		}
+		if (observe) {
+			observe(stage);
+		}
+	};
+	DuckLakeVortexControl control {context, lease_observe, nullptr, view.sources};
 	DuckLakeVortexQueryInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
 	                                view.admission_json.size(),
 	                                sources.data(),

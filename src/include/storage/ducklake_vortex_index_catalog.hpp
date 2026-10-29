@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection.hpp"
 #include <functional>
 
@@ -12,6 +13,10 @@ class StorageLock;
 class ClientContext;
 
 enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
+
+struct DuckLakeVortexGCResult {
+	idx_t generations = 0, artifact_bytes = 0, remaining = 0;
+};
 
 struct DuckLakeVortexIndexFile {
 	idx_t id;
@@ -42,11 +47,16 @@ struct DuckLakeVortexIndex {
 	vector<DuckLakeVortexIndexFile> SelectedFiles(const vector<string> &generations) const;
 	vector<string> SmallestSegments() const;
 	static StorageLock &PublicationLock();
+	static StorageLock &CollectionLock();
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog);
 	static void Rollback(Connection &owner);
 	static void Initialized(DuckLakeTransaction &transaction);
 	static unique_ptr<QueryResult> Query(DuckLakeTransaction &transaction, const string &sql);
 	static void Initialize(Connection &owner, const string &catalog);
+	static DuckLakeVortexGCResult Collect(ClientContext &context, const string &catalog, idx_t max_generations,
+	                                      idx_t max_artifact_bytes,
+	                                      const std::function<void(const string &)> &observe = nullptr);
+	static vector<vector<Value>> GenerationStatus(Connection &owner, const string &catalog);
 	static DuckLakeVortexIndex ParseSegments(const string &reference, const string &table_uuid, idx_t field_id);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
