@@ -99,6 +99,11 @@ public:
 			SQL(writer, "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
 			return "{}";
 		}
+		if (op == "compaction-policy") {
+			SQL(writer, "SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn'," +
+			                args.at(2) + "," + args.at(3) + "," + args.at(4) + ")");
+			return "{}";
+		}
 		if (op == "maintenance-enable") {
 			if (args.size() == 4) {
 				SQL(writer,

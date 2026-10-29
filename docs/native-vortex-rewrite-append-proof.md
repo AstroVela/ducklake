@@ -121,3 +121,6 @@ namespaces, one selected B, one nonempty output, one named index and an installe
 write budget. Static replacements still need at least 65 physical rows. This
 change adds no automatic data-compaction policy or SPFresh online Add/Delete API
 and keeps all dependency pins unchanged.
+
+The [background data-compaction follow-up](native-vortex-background-rewrite-proof.md)
+adds an explicit policy using the existing single worker and this atomic handoff.

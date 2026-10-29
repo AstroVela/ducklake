@@ -47,6 +47,10 @@ struct Policy {
 	idx_t expected = 0, published = 0, t_rows = 0, t_bytes = 0, f_rows = 0, f_bytes = 0, runs = 0;
 	idx_t source_rows = 0, source_bytes = 0;
 	idx_t pending_rows = 0, pending_bytes = 0;
+	bool compaction_enabled = false;
+	idx_t min_deleted_rows = 1, min_deleted_percent = 50;
+	string rewrite_candidate, rewrite_reason = "disabled";
+	idx_t rewrite_deleted = 0, rewrite_remaining = 0;
 	Key Id() const {
 		return {uuid, config.index};
 	}
@@ -165,7 +169,7 @@ void MaintenanceBacklog(Metadata &meta, Maintenance &m) {
 string Encode(const Policy &p) {
 	ViewJSON json;
 	auto value = json.Object();
-	json.Number(value, "format_version", 1);
+	json.Number(value, "format_version", 2);
 	json.Text(value, "schema", p.config.schema);
 	json.Text(value, "table", p.config.table);
 	json.Text(value, "root", p.config.root);
@@ -175,6 +179,9 @@ string Encode(const Policy &p) {
 	json.Number(value, "flush_bytes", p.config.flush_bytes);
 	json.Number(value, "index_rows", p.config.index_rows);
 	json.Number(value, "index_bytes", p.config.index_bytes);
+	json.Add(value, "compaction_enabled", yyjson_mut_bool(json.doc.get(), p.compaction_enabled));
+	json.Number(value, "min_deleted_rows", p.min_deleted_rows);
+	json.Number(value, "min_deleted_percent", p.min_deleted_percent);
 	return json.Finish(value);
 }
 
@@ -182,7 +189,7 @@ void Decode(Policy &p, const string &bytes) {
 	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(yyjson_read(bytes.data(), bytes.size(), 0),
 	                                                            yyjson_doc_free);
 	auto root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
-	if (!root || !yyjson_is_obj(root) || yyjson_obj_size(root) != 10) {
+	if (!root || !yyjson_is_obj(root) || yyjson_obj_size(root) != 13) {
 		throw InvalidInputException("Invalid Vortex optimizer policy shape");
 	}
 	auto number = [&](const char *name) -> idx_t {
@@ -199,7 +206,7 @@ void Decode(Policy &p, const string &bytes) {
 		}
 		return string(yyjson_get_str(value), yyjson_get_len(value));
 	};
-	if (number("format_version") != 1 || number("dimension") > 4096) {
+	if (number("format_version") != 2 || number("dimension") > 4096) {
 		throw InvalidInputException("Unsupported optimizer policy version or dimension");
 	}
 	p.config.schema = text("schema");
@@ -211,12 +218,19 @@ void Decode(Policy &p, const string &bytes) {
 	p.config.flush_bytes = number("flush_bytes");
 	p.config.index_rows = number("index_rows");
 	p.config.index_bytes = number("index_bytes");
+	auto enabled = yyjson_obj_get(root, "compaction_enabled");
+	if (!enabled || !yyjson_is_bool(enabled)) {
+		throw InvalidInputException("Invalid compaction enable flag");
+	}
+	p.compaction_enabled = yyjson_get_bool(enabled);
+	p.min_deleted_rows = number("min_deleted_rows");
+	p.min_deleted_percent = number("min_deleted_percent");
 }
 
 const char *COLUMNS =
     "table_uuid,index_name,config,enabled,state,run_id,expected_revision,candidate_generation,"
     "published_revision,reference_path,error,inline_rows,inline_bytes,unindexed_rows,unindexed_bytes,run_count,"
-    "task_kind,selected_generations";
+    "task_kind,selected_generations,rewrite_candidate,rewrite_deleted,rewrite_remaining,rewrite_reason";
 
 string Selection(const vector<string> &generations) {
 	ViewJSON json;
@@ -231,8 +245,8 @@ vector<string> ReadSelection(const string &bytes) {
 	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(yyjson_read(bytes.data(), bytes.size(), 0),
 	                                                            yyjson_doc_free);
 	auto root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
-	if (!root || !yyjson_is_arr(root) || (yyjson_arr_size(root) != 0 && yyjson_arr_size(root) != 2)) {
-		throw InvalidInputException("Invalid optimizer merge selection");
+	if (!root || !yyjson_is_arr(root) || yyjson_arr_size(root) > 2) {
+		throw InvalidInputException("Invalid optimizer generation selection");
 	}
 	vector<string> result;
 	for (idx_t i = 0; i < yyjson_arr_size(root); i++) {
@@ -272,6 +286,10 @@ Policy Read(DataChunk &chunk, idx_t row, const string &catalog) {
 	p.runs = number(15);
 	p.kind = text(16);
 	p.selected = ReadSelection(text(17));
+	p.rewrite_candidate = text(18);
+	p.rewrite_deleted = number(19);
+	p.rewrite_remaining = number(20);
+	p.rewrite_reason = text(21);
 	Validate(p);
 	return p;
 }
@@ -288,14 +306,16 @@ Policy Load(Metadata &meta, const Policy &key) {
 
 void Save(Metadata &meta, const Policy &p, const string &previous_run) {
 	auto result = meta.Query(
-	    "UPDATE {METADATA_CATALOG}." + string(POLICIES) + " SET enabled=" + string(p.enabled ? "true" : "false") +
-	    ",state=" + Quote(p.state) + ",run_id=" + Quote(p.run) + ",expected_revision=" + to_string(p.expected) +
-	    ",candidate_generation=" + Quote(p.generation) + ",published_revision=" + to_string(p.published) +
-	    ",reference_path=" + Quote(p.reference) + ",error=" + Quote(p.error) + ",inline_rows=" + to_string(p.t_rows) +
-	    ",inline_bytes=" + to_string(p.t_bytes) + ",unindexed_rows=" + to_string(p.f_rows) +
-	    ",unindexed_bytes=" + to_string(p.f_bytes) + ",run_count=" + to_string(p.runs) + ",task_kind=" + Quote(p.kind) +
-	    ",selected_generations=" + Quote(Selection(p.selected)) + Where(p) + " AND run_id=" + Quote(previous_run) +
-	    " RETURNING state");
+	    "UPDATE {METADATA_CATALOG}." + string(POLICIES) + " SET config=" + Quote(Encode(p)) +
+	    ",enabled=" + string(p.enabled ? "true" : "false") + ",state=" + Quote(p.state) + ",run_id=" + Quote(p.run) +
+	    ",expected_revision=" + to_string(p.expected) + ",candidate_generation=" + Quote(p.generation) +
+	    ",published_revision=" + to_string(p.published) + ",reference_path=" + Quote(p.reference) +
+	    ",error=" + Quote(p.error) + ",inline_rows=" + to_string(p.t_rows) + ",inline_bytes=" + to_string(p.t_bytes) +
+	    ",unindexed_rows=" + to_string(p.f_rows) + ",unindexed_bytes=" + to_string(p.f_bytes) + ",run_count=" +
+	    to_string(p.runs) + ",task_kind=" + Quote(p.kind) + ",selected_generations=" + Quote(Selection(p.selected)) +
+	    ",rewrite_candidate=" + Quote(p.rewrite_candidate) + ",rewrite_deleted=" + to_string(p.rewrite_deleted) +
+	    ",rewrite_remaining=" + to_string(p.rewrite_remaining) + ",rewrite_reason=" + Quote(p.rewrite_reason) +
+	    Where(p) + " AND run_id=" + Quote(previous_run) + " RETURNING state");
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() != 1) {
 		throw TransactionException("Optimizer task ownership changed");
@@ -336,6 +356,132 @@ idx_t ReadyRevision(Metadata &meta, const Policy &p) {
 	auto result = meta.Query("SELECT revision FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1" + Where(p));
 	auto chunk = result->Fetch();
 	return chunk && chunk->size() ? chunk->GetValue(0, 0).GetValue<idx_t>() : 0;
+}
+
+void SelectCompaction(Metadata &meta, Policy &p) {
+	p.rewrite_candidate.clear();
+	p.rewrite_deleted = p.rewrite_remaining = 0;
+	p.rewrite_reason = p.compaction_enabled ? "no_index" : "disabled";
+	if (!p.compaction_enabled || !p.expected) {
+		return;
+	}
+	auto &table = Table(meta, p);
+	auto index = VortexCatalog::Lookup(meta.transaction, table, p.config.index);
+	auto aliases = meta.Query("SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1 WHERE table_uuid=" +
+	                          Quote(p.uuid));
+	if (aliases->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
+		throw InvalidInputException("Background Vortex compaction requires one named index");
+	}
+	auto budget = meta.Query("SELECT count(*) FROM {METADATA_CATALOG}." + string(WRITE_BUDGETS) + Where(p));
+	if (budget->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
+		throw InvalidInputException("Background Vortex compaction requires an installed write budget for this index");
+	}
+	vector<string> ids;
+	for (auto &file : index.files) {
+		ids.push_back(to_string(file.id));
+	}
+	auto list = StringUtil::Join(ids, ",");
+	struct FileState {
+		idx_t rows, deleted, schema;
+		bool partitioned;
+	};
+	map<idx_t, FileState> files;
+	auto snapshot_query = [&](const string &query) {
+		auto result = meta.transaction.Query(meta.transaction.GetSnapshot(), query);
+		if (result->HasError()) {
+			result->ThrowError();
+		}
+		return result;
+	};
+	auto state = snapshot_query(
+	    "SELECT d.data_file_id,d.record_count,(SELECT max(s.schema_version) FROM "
+	    "{METADATA_CATALOG}.ducklake_schema_versions s "
+	    "WHERE s.table_id=d.table_id AND "
+	    "s.begin_snapshot<=d.begin_snapshot),d.partition_id,coalesce((SELECT del.delete_count "
+	    "FROM {METADATA_CATALOG}.ducklake_delete_file del WHERE del.data_file_id=d.data_file_id AND "
+	    "del.begin_snapshot<={SNAPSHOT_ID} AND (del.end_snapshot IS NULL OR del.end_snapshot>{SNAPSHOT_ID}) "
+	    "ORDER BY del.begin_snapshot DESC,del.delete_file_id DESC LIMIT 1),0) "
+	    "FROM {METADATA_CATALOG}.ducklake_data_file d WHERE d.data_file_id IN (" +
+	    list +
+	    ") "
+	    "AND d.begin_snapshot<={SNAPSHOT_ID} AND (d.end_snapshot IS NULL OR d.end_snapshot>{SNAPSHOT_ID})");
+	while (auto chunk = state->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			if (chunk->GetValue(2, row).IsNull()) {
+				throw InvalidInputException("Compaction source schema version is missing");
+			}
+			files.emplace(chunk->GetValue(0, row).GetValue<idx_t>(),
+			              FileState {chunk->GetValue(1, row).GetValue<idx_t>(),
+			                         chunk->GetValue(4, row).GetValue<idx_t>(),
+			                         chunk->GetValue(2, row).GetValue<idx_t>(), !chunk->GetValue(3, row).IsNull()});
+		}
+	}
+	auto inlined = meta.transaction.GetMetadataManager().GetInlinedDeletionTableName(table.GetTableId(),
+	                                                                                 meta.transaction.GetSnapshot());
+	if (!inlined.empty()) {
+		auto counts =
+		    snapshot_query("SELECT file_id,count(DISTINCT row_id) FROM {METADATA_CATALOG}." + inlined +
+		                   " WHERE file_id IN (" + list + ") AND begin_snapshot<={SNAPSHOT_ID} GROUP BY file_id");
+		while (auto chunk = counts->Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				auto file = files.find(chunk->GetValue(0, row).GetValue<idx_t>());
+				if (file == files.end()) {
+					throw InvalidInputException("Compaction deletion source is no longer active");
+				}
+				file->second.deleted += chunk->GetValue(1, row).GetValue<idx_t>();
+			}
+		}
+	}
+	string eligible, blocked, reason;
+	idx_t eligible_deleted = 0, eligible_remaining = 0, blocked_deleted = 0, blocked_remaining = 0;
+	for (auto &segment : index.segments) {
+		idx_t rows = 0, deleted = 0, output = 0;
+		set<idx_t> groups;
+		bool partitioned = false;
+		for (auto &file : segment.files) {
+			auto entry = files.find(file.id);
+			if (entry == files.end() || entry->second.rows != file.row_count ||
+			    entry->second.deleted > file.row_count) {
+				throw InvalidInputException("Compaction source identity or deletion count changed");
+			}
+			auto &metrics = entry->second;
+			rows += metrics.rows;
+			deleted += metrics.deleted;
+			if (metrics.deleted) {
+				groups.insert(metrics.schema);
+				partitioned = partitioned || metrics.partitioned;
+				output += metrics.rows - metrics.deleted;
+			}
+		}
+		if (!deleted) {
+			continue;
+		}
+		auto remaining = rows - deleted;
+		auto why = deleted < p.min_deleted_rows || 100 * deleted < p.min_deleted_percent * rows ? "below_threshold"
+		           : !output                                                                    ? "empty_rewrite_output"
+		           : remaining < 65                                                             ? "below_native_minimum"
+		           : partitioned        ? "unsupported_partition"
+		           : groups.size() != 1 ? "multiple_schema_groups"
+		                                : "eligible";
+		if (string(why) == "eligible") {
+			if (eligible.empty() || deleted > eligible_deleted ||
+			    (deleted == eligible_deleted && segment.generation < eligible)) {
+				eligible = segment.generation;
+				eligible_deleted = deleted;
+				eligible_remaining = remaining;
+			}
+		} else if (blocked.empty() || deleted > blocked_deleted ||
+		           (deleted == blocked_deleted && segment.generation < blocked)) {
+			blocked = segment.generation;
+			blocked_deleted = deleted;
+			blocked_remaining = remaining;
+			reason = why;
+		}
+	}
+	p.rewrite_candidate = eligible.empty() ? blocked : eligible;
+	p.rewrite_deleted = eligible.empty() ? blocked_deleted : eligible_deleted;
+	p.rewrite_remaining = eligible.empty() ? blocked_remaining : eligible_remaining;
+	p.rewrite_reason = !eligible.empty() ? "eligible" : blocked.empty() ? "no_deletions" : reason;
 }
 
 void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> changes = nullptr,
@@ -465,12 +611,13 @@ void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> 
 void Probe(DatabaseInstance &db, Policy &p) {
 	Metadata meta(db, p.config.catalog);
 	Probe(meta, p);
+	SelectCompaction(meta, p);
 	meta.Commit();
 }
 
 bool Active(const string &state) {
-	return state == "flushing" || state == "building" || state == "merging" || state == "publishing" ||
-	       state == "cancelling";
+	return state == "flushing" || state == "building" || state == "merging" || state == "rewriting" ||
+	       state == "publishing" || state == "cancelling";
 }
 bool FlushDue(const Policy &p) {
 	return p.t_rows >= p.config.flush_rows || p.t_bytes >= p.config.flush_bytes;
@@ -752,7 +899,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		}
 	}
 	void Stage(DatabaseInstance &db, const Pending &pending, Policy &p, const string &stage) {
-		if (stage == "before_build_publish") {
+		if (stage == "before_build_publish" || (p.kind == "rewrite" && stage == "rewrite_before_commit")) {
 			std::lock_guard<std::mutex> guard(io);
 			Metadata meta(db, p.config.catalog);
 			auto current = Load(meta, p);
@@ -784,6 +931,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		} else if (!error.empty() || state == "cancelled") {
 			current.enabled = false;
 		}
+		if (current.kind == "rewrite" && !error.empty()) {
+			current.enabled = false;
+		}
 		Save(meta, current, p.run);
 	}
 	void Run(DatabaseInstance &db, Pending pending) {
@@ -802,7 +952,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		bool owns_task = false;
 		try {
 			Probe(db, metrics);
-			bool flush = FlushDue(metrics), build = IndexDue(metrics);
+			bool rewrite = metrics.rewrite_reason == "eligible";
+			bool flush = !rewrite && FlushDue(metrics), build = !rewrite && IndexDue(metrics);
 			{
 				std::lock_guard<std::mutex> guard(io);
 				Metadata meta(db, p.config.catalog);
@@ -811,29 +962,49 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					meta.Commit();
 					return;
 				}
+				if (Encode(current) != Encode(p)) {
+					meta.Commit();
+					return;
+				}
 				bool modified = current.t_rows != metrics.t_rows || current.t_bytes != metrics.t_bytes ||
-				                current.f_rows != metrics.f_rows || current.f_bytes != metrics.f_bytes;
+				                current.f_rows != metrics.f_rows || current.f_bytes != metrics.f_bytes ||
+				                current.rewrite_candidate != metrics.rewrite_candidate ||
+				                current.rewrite_deleted != metrics.rewrite_deleted ||
+				                current.rewrite_remaining != metrics.rewrite_remaining ||
+				                current.rewrite_reason != metrics.rewrite_reason;
 				current.t_rows = metrics.t_rows;
 				current.t_bytes = metrics.t_bytes;
 				current.f_rows = metrics.f_rows;
 				current.f_bytes = metrics.f_bytes;
-				if (flush || build) {
+				current.rewrite_candidate = metrics.rewrite_candidate;
+				current.rewrite_deleted = metrics.rewrite_deleted;
+				current.rewrite_remaining = metrics.rewrite_remaining;
+				current.rewrite_reason = metrics.rewrite_reason;
+				if (flush || build || rewrite) {
 					current.run = UUID::ToString(UUID::GenerateRandomUUID());
 					current.reference = current.config.root + "/optimizer-" + current.run + ".json";
 					current.generation.clear();
 					current.error.clear();
 					current.expected = metrics.expected;
-					current.kind = flush ? "flush" : metrics.merge_candidates.empty() ? "build" : "merge";
-					current.selected = current.kind == "merge" ? metrics.merge_candidates : vector<string>();
-					current.state = flush ? "flushing" : current.kind == "merge" ? "merging" : "building";
+					current.kind = rewrite                            ? "rewrite"
+					               : flush                            ? "flush"
+					               : metrics.merge_candidates.empty() ? "build"
+					                                                  : "merge";
+					current.selected = rewrite                   ? vector<string> {metrics.rewrite_candidate}
+					                   : current.kind == "merge" ? metrics.merge_candidates
+					                                             : vector<string>();
+					current.state = rewrite                   ? "rewriting"
+					                : flush                   ? "flushing"
+					                : current.kind == "merge" ? "merging"
+					                                          : "building";
 					current.runs++;
 				}
-				if (modified || flush || build) {
+				if (modified || flush || build || rewrite) {
 					Save(meta, current, p.run);
 				} else {
 					meta.Commit();
 				}
-				if (flush || build) {
+				if (flush || build || rewrite) {
 					std::lock_guard<std::mutex> guard(lock);
 					pending = policies.at(current.Id());
 					active = current.Id();
@@ -841,12 +1012,18 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				}
 				p = current;
 			}
-			if (!flush && !build) {
+			if (!flush && !build && !rewrite) {
 				return;
 			}
 			{
 				Connection job(db);
 				Use(job, p.Id());
+				if (rewrite) {
+					Stage(db, pending, p, "optimizer_before_rewrite");
+					VortexCatalog::Rewrite(*job.context, p.config.catalog, p.config.schema, p.config.table,
+					                       p.config.index, p.selected[0], p.reference, p.expected,
+					                       [&](const string &stage) { Stage(db, pending, p, stage); });
+				}
 				if (flush) {
 					Stage(db, pending, p, "optimizer_before_flush");
 					job.BeginTransaction();
@@ -905,7 +1082,10 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					    p.selected);
 				}
 			}
-			Finish(db, p, build ? "published" : "flushed", "", true);
+			Finish(db, p, build || rewrite ? "published" : "flushed", "", true);
+			if (rewrite) {
+				Stage(db, pending, p, "optimizer_rewritten");
+			}
 			if (p.kind == "merge") {
 				Stage(db, pending, p, "optimizer_merged");
 			}
@@ -1040,8 +1220,10 @@ Policy Identify(Metadata &meta, const string &catalog, const string &schema, con
 }
 
 void Validate(const Policy &p) {
-	if ((p.kind != "none" && p.kind != "flush" && p.kind != "build" && p.kind != "merge") ||
-	    (p.kind == "merge" ? p.selected.size() != 2 || p.selected[0] == p.selected[1] : !p.selected.empty())) {
+	if ((p.kind != "none" && p.kind != "flush" && p.kind != "build" && p.kind != "merge" && p.kind != "rewrite") ||
+	    (p.kind == "merge"     ? p.selected.size() != 2 || p.selected[0] == p.selected[1]
+	     : p.kind == "rewrite" ? p.selected.size() != 1
+	                           : !p.selected.empty())) {
 		throw InvalidInputException("Invalid optimizer task kind or generation selection");
 	}
 	auto &c = p.config;
@@ -1054,6 +1236,9 @@ void Validate(const Policy &p) {
 	    !c.index_rows || c.index_rows > 100000 || !c.flush_bytes || c.flush_bytes > INLINE_LIMIT || !c.index_bytes ||
 	    c.index_bytes > SOURCE_LIMIT) {
 		throw InvalidInputException("Invalid optimizer dimension or thresholds");
+	}
+	if (!p.min_deleted_rows || p.min_deleted_rows > 100000 || !p.min_deleted_percent || p.min_deleted_percent > 100) {
+		throw InvalidInputException("Invalid Vortex compaction thresholds");
 	}
 }
 
@@ -1288,6 +1473,8 @@ void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalo
 		    "inline_rows BIGINT NOT NULL,inline_bytes BIGINT NOT NULL,unindexed_rows BIGINT NOT NULL,unindexed_bytes "
 		    "BIGINT NOT NULL,"
 		    "run_count BIGINT NOT NULL,task_kind VARCHAR NOT NULL,selected_generations VARCHAR NOT NULL,"
+		    "rewrite_candidate VARCHAR NOT NULL,rewrite_deleted BIGINT NOT NULL,rewrite_remaining BIGINT NOT NULL,"
+		    "rewrite_reason VARCHAR NOT NULL,"
 		    "PRIMARY KEY(table_uuid,index_name))");
 		VortexCatalog::Query(transaction,
 		                     "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_write_budgets_v1("
@@ -1348,7 +1535,7 @@ void DuckLakeVortexOptimizer::Enable(ClientContext &context, const Config &confi
 		p.enabled = true;
 		meta.Query("INSERT INTO {METADATA_CATALOG}." + string(POLICIES) + " VALUES(" + Quote(p.uuid) + "," +
 		           Quote(config.index) + "," + Quote(Encode(p)) +
-		           ",true,'idle','',0,'',0,'','',0,0,0,0,0,'none','[]')");
+		           ",true,'idle','',0,'',0,'','',0,0,0,0,0,'none','[]','',0,0,'disabled')");
 		meta.Commit();
 		owner->runtime->Add(p, observe);
 	}
@@ -1403,6 +1590,37 @@ void DuckLakeVortexOptimizer::Cancel(ClientContext &context, const string &catal
 		Save(meta, p, p.run);
 	}
 	owner->runtime->Cancel(p.Id());
+}
+
+void DuckLakeVortexOptimizer::ConfigureCompaction(ClientContext &context, const string &catalog, const string &schema,
+                                                  const string &table, const string &index, bool enabled,
+                                                  idx_t min_deleted_rows, idx_t min_deleted_percent) {
+	auto owner = GetOwner(*context.db);
+	std::lock_guard<std::mutex> guard(owner->runtime->io);
+	Metadata meta(*context.db, catalog);
+	auto p = Load(meta, Identify(meta, catalog, schema, table, index));
+	if (owner->runtime->IsActive(p.Id())) {
+		throw InvalidInputException("Cancel the running optimizer task before changing compaction policy");
+	}
+	p.compaction_enabled = enabled;
+	p.min_deleted_rows = min_deleted_rows;
+	p.min_deleted_percent = min_deleted_percent;
+	Validate(p);
+	if (enabled) {
+		if (!HasWriteBudgetTable(meta)) {
+			throw InvalidInputException("Background Vortex compaction requires an installed write budget");
+		}
+		auto budget = meta.Query("SELECT count(*) FROM {METADATA_CATALOG}." + string(WRITE_BUDGETS) + Where(p));
+		if (budget->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
+			throw InvalidInputException(
+			    "Background Vortex compaction requires an installed write budget for this index");
+		}
+	}
+	p.rewrite_candidate.clear();
+	p.rewrite_deleted = p.rewrite_remaining = 0;
+	p.rewrite_reason = enabled ? "awaiting_probe" : "disabled";
+	Save(meta, p, p.run);
+	owner->runtime->changed.notify_all();
 }
 
 void DuckLakeVortexOptimizer::EnableMaintenance(ClientContext &context, const string &catalog, idx_t max_objects,
@@ -1511,6 +1729,13 @@ vector<vector<Value>> DuckLakeVortexOptimizer::Status(ClientContext &context, co
 			}
 			rows.back().push_back(Value(p.kind));
 			rows.back().push_back(Value::LIST(LogicalType::VARCHAR, std::move(selected)));
+			rows.back().push_back(Value::BOOLEAN(p.compaction_enabled));
+			rows.back().push_back(Value::UBIGINT(p.min_deleted_rows));
+			rows.back().push_back(Value::UBIGINT(p.min_deleted_percent));
+			rows.back().push_back(Value(p.rewrite_candidate));
+			rows.back().push_back(Value::UBIGINT(p.rewrite_deleted));
+			rows.back().push_back(Value::UBIGINT(p.rewrite_remaining));
+			rows.back().push_back(Value(p.rewrite_reason));
 		}
 	}
 	meta.Commit();
