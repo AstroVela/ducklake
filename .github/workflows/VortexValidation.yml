@@ -246,6 +246,11 @@ jobs:
           python3 -I test/vane/test_native_vortex_optimizer.py \
             --driver build/index-shell/ducklake_vortex_catalog_driver \
             --output-dir build/index-logs/optimizer
+      - name: Validate write backpressure and concurrent commit admission
+        run: |
+          python3 -I test/vane/test_native_vortex_backpressure.py \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --output-dir build/index-logs/backpressure
       - name: Validate query projections and record isolated process cost
         run: |
           python3 -I test/vane/test_native_vortex_cost.py \

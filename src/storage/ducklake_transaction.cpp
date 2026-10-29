@@ -32,6 +32,7 @@
 
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_index_catalog.hpp"
+#include "storage/ducklake_vortex_optimizer.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #endif
 
@@ -771,6 +772,7 @@ void DuckLakeTransaction::Commit() {
 	try {
 		if (ChangesMade()) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
+			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock());
 			auto publication_guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
 #endif
 			FlushChanges();

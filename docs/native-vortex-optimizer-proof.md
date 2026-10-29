@@ -119,3 +119,8 @@ assertion to optimizer fixtures after detecting retained references on the exact
 The [query lifecycle follow-up](native-vortex-query-lifecycle-proof.md) pins the
 Vortex reader/driver lifetime fixes, restores unconditional shutdown assertions
 and adds ownership checks without another Vortex runtime poll.
+
+The [write budget follow-up](native-vortex-backpressure-proof.md) adds explicit
+transactional T/F quotas and retained-version capacity checks. Quotas survive
+optimizer cancellation and database restart; exhaustion rejects growth before
+metadata commit while acknowledged data remains queryable.
