@@ -1,0 +1,56 @@
+# name: test/sql/vortex/native_vortex_posting_coverage.test
+# description: size head selection for wide vectors without increasing the posting page budget
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_posting.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_posting_data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+INSERT INTO lake.items SELECT i,list_concat([128+i/16,(i*4)%12,(i*5)%13,0,1,8,7,16],list_transform(range(8,128),j->((i*(j+1))%17)/16))::FLOAT[],CASE WHEN i%4=0 THEN 'B' ELSE 'A' END,'coverage-'||i::VARCHAR FROM range(4096)t(i)
+
+statement ok
+SET VARIABLE point = (SELECT embedding FROM lake.items WHERE id=133)
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_posting_first.json',128,0)
+----
+1
+
+query ITTII
+SELECT id,category,payload,(embedding=getvariable('point'))::INTEGER,(distance=0)::INTEGER FROM ducklake_vortex_search('lake','main','items','knn',getvariable('point'),1)
+----
+133	A	coverage-133	1	1
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_posting.ducklake' AS lake
+
+query ITTII
+SELECT id,category,payload,(embedding=getvariable('point'))::INTEGER,(distance=0)::INTEGER FROM ducklake_vortex_search('lake','main','items','knn',getvariable('point'),1,category=>'A')
+----
+133	A	coverage-133	1	1
+
+query II
+SELECT count(*),count(DISTINCT id) FROM lake.items
+----
+4096	4096
+
+statement ok
+DETACH lake

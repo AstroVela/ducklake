@@ -174,7 +174,7 @@ jobs:
             --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --output-dir "$PWD/build/automatic-proof" \
             2>&1 | tee build/logs/vane-vortex-automatic-flow.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
-            --fixtures automatic --rows 4096 --dimensions 8 --seconds 12 --output-dir "$PWD/build/load-proof" \
+            --fixtures automatic --rows 4096 --dimensions 8 128 --seconds 12 --output-dir "$PWD/build/load-proof" \
             2>&1 | tee build/logs/vane-vortex-sustained-load.log
       - name: Retain build and qualification evidence
         if: always()
