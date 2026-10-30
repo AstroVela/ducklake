@@ -226,6 +226,7 @@ public:
 	static string GetTableColumnSchemaSql(TableIndex table_id);
 	static string GetInlinedTableNamesSql(TableIndex table_id);
 	virtual vector<DuckLakeFileForCleanup> GetOldFilesForCleanup(const string &filter);
+	bool HasFileReference(const string &path, const string &separator);
 	virtual vector<DuckLakeFileForCleanup> GetOrphanFilesForCleanup(const string &filter, const string &separator);
 	virtual vector<DuckLakeFileForCleanup> GetFilesForCleanup(const string &filter, CleanupType type,
 	                                                          const string &separator);
@@ -416,7 +417,7 @@ public:
 protected:
 	string GetInlinedTableQuery(const DuckLakeTableInfo &table, const string &table_name);
 	string GetColumnType(const DuckLakeColumnInfo &col);
-	string GetKnownFilesForCleanupQuery(const string &separator) const;
+	string GetKnownFilesForCleanupQuery(const string &separator, bool include_scheduled = true) const;
 
 	//! Optimized data file writing using DuckDB Appender API (only for DuckDB metadata manager)
 	string WriteNewDataFilesWithAppender(DuckLakeSnapshot &commit_snapshot, const vector<DuckLakeFileInfo> &new_files,

@@ -1,8 +1,10 @@
 #include "storage/ducklake_vortex_optimizer.hpp"
+#include "storage/ducklake_vortex_source_retention.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/transaction/transaction_context.hpp"
 
 namespace duckdb {
 namespace {
@@ -17,7 +19,10 @@ enum class Operation {
 	ENABLE_MAINTENANCE,
 	RESUME_MAINTENANCE,
 	CANCEL_MAINTENANCE,
-	MAINTENANCE_STATUS
+	MAINTENANCE_STATUS,
+	SOURCE_RETENTION_POLICY,
+	SOURCE_RETENTION_STATUS,
+	COLLECT_SOURCES
 };
 
 struct OptimizerBind : public TableFunctionData {
@@ -69,6 +74,16 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	    (input.inputs[1].GetValue<int64_t>() < 1 || input.inputs[1].GetValue<int64_t>() > 16 ||
 	     input.inputs[2].GetValue<int64_t>() < 1 || input.inputs[2].GetValue<int64_t>() > 64 * 1024 * 1024)) {
 		throw InvalidInputException("Invalid Vortex maintenance count or byte budget");
+	}
+	if (OP == Operation::SOURCE_RETENTION_POLICY &&
+	    (input.inputs[2].GetValue<int64_t>() < 1 || input.inputs[2].GetValue<int64_t>() > 100000 ||
+	     input.inputs[3].GetValue<int64_t>() < 0 || input.inputs[3].GetValue<int64_t>() > 315360000)) {
+		throw InvalidInputException("Invalid Vortex source retention policy");
+	}
+	if (OP == Operation::COLLECT_SOURCES &&
+	    (input.inputs[1].GetValue<int64_t>() < 1 || input.inputs[1].GetValue<int64_t>() > 16 ||
+	     input.inputs[2].GetValue<int64_t>() < 1 || input.inputs[2].GetValue<int64_t>() > 64 * 1024 * 1024)) {
+		throw InvalidInputException("Invalid Vortex source collection budgets");
 	}
 	auto bind = make_uniq<OptimizerBind>();
 	bind->operation = OP;
@@ -153,6 +168,16 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 		         LogicalType::UBIGINT, LogicalType::VARCHAR};
+	} else if (OP == Operation::SOURCE_RETENTION_STATUS) {
+		names = {"enabled",           "keep_snapshots",         "min_age_seconds",    "expired_snapshots",
+		         "collected_files",   "collected_bytes",        "eligible_snapshots", "scheduled_files",
+		         "pending_deletions", "blocked_by_transactions"};
+		types = {LogicalType::BOOLEAN, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+		         LogicalType::UBIGINT, LogicalType::BOOLEAN};
+	} else if (OP == Operation::COLLECT_SOURCES) {
+		names = {"expired_snapshots", "collected_files", "collected_bytes", "blocked_by_transactions"};
+		types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BOOLEAN};
 	} else {
 		names = {"state"};
 		types = {LogicalType::VARCHAR};
@@ -168,6 +193,10 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		return StringValue::Get(args[i]);
 	};
 	if (!state.loaded) {
+		if ((bind.operation == Operation::SOURCE_RETENTION_POLICY || bind.operation == Operation::COLLECT_SOURCES) &&
+		    !context.transaction.IsAutoCommit()) {
+			throw InvalidInputException("Vortex source retention operations require autocommit mode");
+		}
 		string result;
 		switch (bind.operation) {
 		case Operation::INITIALIZE: {
@@ -218,6 +247,21 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		case Operation::MAINTENANCE_STATUS:
 			state.rows = DuckLakeVortexOptimizer::MaintenanceStatus(context, text(0));
 			break;
+		case Operation::SOURCE_RETENTION_POLICY:
+			DuckLakeVortexOptimizer::ConfigureSourceRetention(context, text(0), args[1].GetValue<bool>(),
+			                                                  args[2].GetValue<idx_t>(), args[3].GetValue<idx_t>());
+			result = "configured";
+			break;
+		case Operation::SOURCE_RETENTION_STATUS:
+			state.rows = DuckLakeVortexSourceRetention::Status(context, text(0));
+			break;
+		case Operation::COLLECT_SOURCES: {
+			auto collected = DuckLakeVortexSourceRetention::Collect(context, text(0), args[1].GetValue<idx_t>(),
+			                                                        args[2].GetValue<idx_t>());
+			state.rows = {{Value::UBIGINT(collected.expired), Value::UBIGINT(collected.files),
+			               Value::UBIGINT(collected.bytes), Value::BOOLEAN(collected.blocked)}};
+			break;
+		}
 		case Operation::WRITE_BUDGET: {
 			DuckLakeVortexWriteBudget budget {args[4].GetValue<idx_t>(), args[5].GetValue<idx_t>(),
 			                                  args[6].GetValue<idx_t>(), args[7].GetValue<idx_t>()};
@@ -232,7 +276,8 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			result = "configured";
 			break;
 		}
-		if (bind.operation != Operation::STATUS && bind.operation != Operation::MAINTENANCE_STATUS) {
+		if (bind.operation != Operation::STATUS && bind.operation != Operation::MAINTENANCE_STATUS &&
+		    bind.operation != Operation::SOURCE_RETENTION_STATUS && bind.operation != Operation::COLLECT_SOURCES) {
 			state.rows.push_back({Value(result)});
 		}
 		state.loaded = true;
@@ -250,6 +295,15 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 } // namespace
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader) {
+	loader.RegisterFunction(
+	    TableFunction("ducklake_set_vortex_source_retention",
+	                  {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::BIGINT}, Execute,
+	                  Bind<Operation::SOURCE_RETENTION_POLICY>, Init));
+	loader.RegisterFunction(TableFunction("ducklake_vortex_source_retention_status", {LogicalType::VARCHAR}, Execute,
+	                                      Bind<Operation::SOURCE_RETENTION_STATUS>, Init));
+	loader.RegisterFunction(TableFunction("ducklake_collect_vortex_sources",
+	                                      {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT}, Execute,
+	                                      Bind<Operation::COLLECT_SOURCES>, Init));
 	loader.RegisterFunction(
 	    TableFunction("ducklake_set_vortex_data_compaction_policy",
 	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
