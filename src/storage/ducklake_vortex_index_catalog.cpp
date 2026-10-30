@@ -1089,7 +1089,11 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 
 DuckLakeTransaction &DuckLakeVortexIndex::Begin(Connection &owner, const string &name) {
 	owner.BeginTransaction();
-	auto &catalog = Catalog::GetCatalog(*owner.context, name).Cast<DuckLakeCatalog>();
+	auto &entry = Catalog::GetCatalog(*owner.context, name);
+	if (entry.GetCatalogType() != "ducklake") {
+		throw InvalidInputException("Vortex operations require an attached DuckLake catalog");
+	}
+	auto &catalog = entry.Cast<DuckLakeCatalog>();
 	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 		throw InvalidInputException("Vortex index catalog requires native DuckDB metadata");
 	}

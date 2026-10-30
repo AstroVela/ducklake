@@ -1,0 +1,129 @@
+# name: test/sql/vortex/native_vortex_write_batch.test
+# description: table-scoped native request identity commits atomically with a typed Vortex batch
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement error
+SELECT * FROM ducklake_initialize_vortex_writes('memory')
+----
+attached DuckLake catalog
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_write_batch.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_write_batch_data', DATA_INLINING_ROW_LIMIT 1000)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+
+statement error
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'}])
+----
+WriteBatch catalog is not initialized
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_writes('lake')
+
+query TI
+SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}])
+----
+r1	2
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1 r JOIN __ducklake_metadata_lake.ducklake_snapshot s USING(snapshot_id) WHERE r.request_id='r1' AND r.row_count=2 AND starts_with(r.payload_hash,'sha256:')
+----
+1
+
+query TI
+SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}])
+----
+r1	2
+
+query I
+SELECT count(*) FROM lake.items
+----
+2
+
+query IT rowsort
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],10)
+----
+1	一
+2	NULL
+
+statement error
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[5,0],'category':'A','payload':'一'}])
+----
+request_id payload mismatch
+
+statement error
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','bad',[{'id':3,'embedding':[1,0],'category':'A','payload':'valid'},{'id':4,'embedding':[1,2,3],'category':'A','payload':'invalid'}])
+----
+dimension
+
+query II
+SELECT (SELECT count(*) FROM lake.items),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1)
+----
+2	1
+
+statement error
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','empty',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[])
+----
+1 to 1000
+
+statement error
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'}])
+----
+request ID
+
+statement ok
+BEGIN
+
+statement error
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','outer',[{'id':3,'embedding':[1,0],'category':'A','payload':'一'}])
+----
+autocommit
+
+statement ok
+ROLLBACK
+
+statement error
+INSERT INTO __ducklake_metadata_lake.ducklake_vortex_write_requests_v1 SELECT * FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1
+----
+Duplicate key
+
+statement ok
+UPDATE lake.items SET payload='newer' WHERE id=1
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'items')
+
+query TI
+SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}])
+----
+r1	2
+
+query IT rowsort
+SELECT id,payload FROM lake.items
+----
+1	newer
+2	NULL
+
+query I
+SELECT current_setting('ducklake_max_retry_count')
+----
+10
+
+statement ok
+DETACH lake

@@ -113,7 +113,7 @@ jobs:
             -Ccmake.define.VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON \
             --out-dir "$PWD/build/wheels" "$PWD/vane" \
             2>&1 | tee build/logs/runtime-wheel.log
-          cmake --build build/runtime --target vane_loadable_extensions --parallel 2 \
+          cmake --build build/runtime --target vane_loadable_extensions ducklake_vortex_write_driver --parallel 2 \
             2>&1 | tee build/logs/providers-build.log
           uv pip install --system build/wheels/vane_ai-*.whl
       - name: Run the Vane base release checks
@@ -161,6 +161,9 @@ jobs:
         run: |
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_native_vortex.py --output-dir "$PWD/build/proof" \
             2>&1 | tee build/logs/vane-native-vortex.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_write_batch.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --output-dir "$PWD/build/write-proof" \
+            2>&1 | tee build/logs/vane-vortex-write-batch.log
       - name: Retain build and qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -169,4 +172,6 @@ jobs:
           path: |
             build/logs
             build/proof/report.json
+            build/write-proof/report.json
+            build/write-proof/**/driver.log
             build/wheels
