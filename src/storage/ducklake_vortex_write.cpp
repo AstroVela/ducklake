@@ -153,6 +153,10 @@ void Initialized(DuckLakeTransaction &transaction) {
 }
 } // namespace
 
+unique_ptr<StorageLockKey> DuckLakeVortexWriteBatch::AcquireWriter() {
+	return WriteLock().GetExclusiveLock();
+}
+
 LogicalType DuckLakeVortexWriteBatch::RowsType() {
 	return LogicalType::LIST(LogicalType::STRUCT({{"id", LogicalType::BIGINT},
 	                                              {"embedding", LogicalType::LIST(LogicalType::FLOAT)},
@@ -164,7 +168,7 @@ void DuckLakeVortexWriteBatch::Initialize(Connection &owner, const string &catal
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex WriteBatch initialization requires an idle dedicated connection");
 	}
-	auto guard = WriteLock().GetExclusiveLock();
+	auto guard = AcquireWriter();
 	try {
 		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog);
 		DuckLakeVortexIndex::Query(transaction, "CREATE TABLE {METADATA_CATALOG}." + string(REQUESTS) +
@@ -186,7 +190,7 @@ void DuckLakeVortexWriteBatch::Manage(Connection &owner, const string &catalog_n
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex managed writes require an idle dedicated connection");
 	}
-	auto guard = WriteLock().GetExclusiveLock();
+	auto guard = AcquireWriter();
 	auto admission = DuckLakeVortexOptimizer::ReserveWrite(*owner.context);
 	try {
 		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog_name);
@@ -284,7 +288,7 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Write(Connection &owner, con
 		}
 	};
 	check("waiting");
-	auto guard = WriteLock().GetExclusiveLock();
+	auto guard = AcquireWriter();
 	MutationScope mutation(*owner.context);
 	check("acquired");
 	// Metadata-side request staging must not be discarded by a native commit retry.

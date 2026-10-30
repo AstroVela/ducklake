@@ -1,0 +1,80 @@
+# name: test/sql/vortex/native_vortex_sustained_load.test
+# description: capacity rejection preserves the exact request for admission after an explicit budget change
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_sustained.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_sustained_data', DATA_INLINING_ROW_LIMIT 1000)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_writes('lake')
+
+statement ok
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+
+statement ok
+SELECT * FROM ducklake_manage_vortex_writes('lake','main','items','knn')
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,128,4194304,128,67108864)
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',4,4194304,1024,67108864)
+
+statement ok
+SET VARIABLE batch = [{'id':1::BIGINT,'embedding':[1,0]::FLOAT[],'category':'A'::VARCHAR,'payload':'容量'::VARCHAR},{'id':2,'embedding':[2,0],'category':'B','payload':NULL},{'id':3,'embedding':[3,0],'category':'A','payload':'3'},{'id':4,'embedding':[4,0],'category':'B','payload':'4'},{'id':5,'embedding':[5,0],'category':'A','payload':'5'}]
+
+statement error
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[])
+----
+RESOURCE_EXHAUSTED
+
+query II
+SELECT count(*),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items
+----
+0	0
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',8,4194304,1024,67108864)
+
+query TI
+SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[])
+----
+capacity	5
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[])
+
+query IT
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],2)
+----
+1	容量
+2	NULL
+
+query III
+SELECT count(*),count(DISTINCT id),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items
+----
+5	5	1
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')
+
+statement ok
+DETACH lake

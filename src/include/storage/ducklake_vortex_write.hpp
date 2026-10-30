@@ -7,6 +7,7 @@
 namespace duckdb {
 class ExtensionLoader;
 class DuckLakeTransaction;
+class StorageLockKey;
 
 struct DuckLakeVortexWriteResult {
 	string table_uuid, request_id, payload_hash;
@@ -15,6 +16,7 @@ struct DuckLakeVortexWriteResult {
 
 struct DuckLakeVortexWriteBatch {
 	static LogicalType RowsType();
+	static unique_ptr<StorageLockKey> AcquireWriter();
 	static void Initialize(Connection &owner, const string &catalog);
 	static void Manage(Connection &owner, const string &catalog, const string &schema, const string &table,
 	                   const string &index);

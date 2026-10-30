@@ -173,6 +173,9 @@ jobs:
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_automatic_flow.py \
             --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --output-dir "$PWD/build/automatic-proof" \
             2>&1 | tee build/logs/vane-vortex-automatic-flow.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
+            --fixtures automatic --rows 4096 --dimensions 8 --seconds 12 --output-dir "$PWD/build/load-proof" \
+            2>&1 | tee build/logs/vane-vortex-sustained-load.log
       - name: Retain build and qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -192,4 +195,8 @@ jobs:
             build/automatic-proof/report.json
             build/automatic-proof/**/driver.log
             build/automatic-proof/**/recovery.log
+            build/load-proof/report.json
+            build/load-proof/**/report.json
+            build/load-proof/**/worker.log
+            build/load-proof/**/events.jsonl
             build/wheels

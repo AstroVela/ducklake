@@ -1089,11 +1089,13 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				Use(job, p.Id());
 				if (p.kind == "retire") {
 					Stage(db, pending, p, "optimizer_before_retire");
+					auto writer = DuckLakeVortexWriteBatch::AcquireWriter();
 					VortexCatalog::RetireEmpty(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.selected[0],
 					    p.expected, [&](const string &stage) { Stage(db, pending, p, stage); }, p.run);
 				} else if (rewrite) {
 					Stage(db, pending, p, "optimizer_before_rewrite");
+					auto writer = DuckLakeVortexWriteBatch::AcquireWriter();
 					VortexCatalog::Rewrite(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.selected[0],
 					    p.reference, p.expected, [&](const string &stage) { Stage(db, pending, p, stage); },
@@ -1104,34 +1106,38 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				}
 				if (flush) {
 					Stage(db, pending, p, "optimizer_before_flush");
-					job.BeginTransaction();
-					auto &catalog = Catalog::GetCatalog(*job.context, p.config.catalog).Cast<DuckLakeCatalog>();
-					auto entry = catalog.GetEntry(*job.context, CatalogType::TABLE_ENTRY, p.config.schema,
-					                              p.config.table, OnEntryNotFound::THROW_EXCEPTION);
-					if (entry->Cast<DuckLakeTableEntry>().GetTableUUID() != p.uuid ||
-					    entry->Cast<DuckLakeTableEntry>()
-					            .GetFieldId(vector<string> {"embedding"})
-					            .GetFieldIndex()
-					            .index != p.field_id) {
-						throw InvalidInputException("Optimizer flush table or field identity changed");
-					}
-					FlushConfiguration(entry->Cast<DuckLakeTableEntry>());
-					auto result =
-					    job.Query("CALL ducklake_flush_inlined_data(" + Quote(p.config.catalog) + ",schema_name=>" +
-					              Quote(p.config.schema) + ",table_name=>" + Quote(p.config.table) + ")");
-					if (result->HasError()) {
-						result->ThrowError();
-					}
-					idx_t flushed = 0;
-					while (auto chunk = result->Fetch()) {
-						for (idx_t r = 0; r < chunk->size(); r++) {
-							flushed += chunk->GetValue(2, r).GetValue<idx_t>();
+					{
+						auto writer = DuckLakeVortexWriteBatch::AcquireWriter();
+						job.BeginTransaction();
+						auto &catalog = Catalog::GetCatalog(*job.context, p.config.catalog).Cast<DuckLakeCatalog>();
+						auto entry = catalog.GetEntry(*job.context, CatalogType::TABLE_ENTRY, p.config.schema,
+						                              p.config.table, OnEntryNotFound::THROW_EXCEPTION);
+						if (entry->Cast<DuckLakeTableEntry>().GetTableUUID() != p.uuid ||
+						    entry->Cast<DuckLakeTableEntry>()
+						            .GetFieldId(vector<string> {"embedding"})
+						            .GetFieldIndex()
+						            .index != p.field_id) {
+							throw InvalidInputException("Optimizer flush table or field identity changed");
 						}
+						FlushConfiguration(entry->Cast<DuckLakeTableEntry>());
+						Stage(db, pending, p, "optimizer_flush_started");
+						auto result =
+						    job.Query("CALL ducklake_flush_inlined_data(" + Quote(p.config.catalog) + ",schema_name=>" +
+						              Quote(p.config.schema) + ",table_name=>" + Quote(p.config.table) + ")");
+						if (result->HasError()) {
+							result->ThrowError();
+						}
+						idx_t flushed = 0;
+						while (auto chunk = result->Fetch()) {
+							for (idx_t r = 0; r < chunk->size(); r++) {
+								flushed += chunk->GetValue(2, r).GetValue<idx_t>();
+							}
+						}
+						if (!flushed) {
+							throw InvalidInputException("Optimizer flush produced no rows");
+						}
+						job.Commit();
 					}
-					if (!flushed) {
-						throw InvalidInputException("Optimizer flush produced no rows");
-					}
-					job.Commit();
 					Stage(db, pending, p, "optimizer_flushed");
 					metrics = p;
 					Probe(db, metrics);

@@ -110,6 +110,9 @@ non-Ray and 32 Ray tests, with 15 optional-dependency skips. Formatting and the
 Vane source/native copyleft checks passed. These test-only changes use the
 existing signed provider bytes and the rebuilt native test driver.
 
+For isolated-process load measurements and the subsequent flush coordination
+regression, see [sustained mixed load](native-vortex-sustained-load.md).
+
 ## Physical footprint and limits
 
 After each drain, the probe checks actual source bytes against the complete
