@@ -1574,7 +1574,8 @@ bool DuckLakeVortexIndex::ReferencesSource(DuckLakeTransaction &transaction, con
 			auto index =
 			    ParseSegments(reference, StringValue::Get(chunk->GetValue(0, row)), Number(parsed.Root(), "field_id"));
 			for (auto &file : index.files) {
-				if (file.uri == path) {
+				auto &fs = FileSystem::GetFileSystem(*transaction.GetConnection().context);
+				if (fs.FileSystem::CanonicalizePath(file.uri) == path) {
 					return true;
 				}
 			}

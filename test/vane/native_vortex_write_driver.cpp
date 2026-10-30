@@ -1,4 +1,5 @@
 #include "native_vortex_fixture.hpp"
+#include "native_vortex_keyed_fixture.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -32,6 +33,10 @@ int main(int argc, char **argv) {
 			           "SELECT * FROM ducklake_initialize_vortex_writes('lake');"
 			           "SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn'," +
 			               Value(root + "/indexes").ToSQLString() + ",2)");
+		}
+		if (StringUtil::StartsWith(mode, "keyed-")) {
+			RunKeyedFixture(database, setup, root, mode);
+			return 0;
 		}
 		auto input = SQL(setup, "SELECT [{'id':1::BIGINT,'embedding':[1,0]::FLOAT[],'category':'A'::VARCHAR,"
 		                        "'payload':'一'::VARCHAR},{'id':2::BIGINT,'embedding':[2,0]::FLOAT[],"
