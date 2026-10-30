@@ -375,6 +375,7 @@ struct AutomaticFixture {
 
 inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
 	auto pause = std::make_shared<Pause>();
+	auto build_pause = std::make_shared<Pause>();
 	AutomaticFixture f(database, setup, root);
 	ReleasePause release {*pause};
 	auto wait_for_kill = [root](const string &stage) {
@@ -386,7 +387,7 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		throw IOException("Automatic checkpoint was not killed");
 	};
 	auto events = f.events;
-	auto observe = [events, pause, root, mode, wait_for_kill](const string &stage) {
+	auto observe = [events, pause, build_pause, root, mode, wait_for_kill](const string &stage) {
 		{
 			std::lock_guard<std::mutex> guard(events->lock);
 			events->stages[stage]++;
@@ -394,11 +395,91 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		if (mode == "automatic-backpressure" && stage == "optimizer_before_flush") {
 			pause->Stop();
 		}
+		if (mode == "automatic-flush-serialization" && stage == "optimizer_flush_started") {
+			pause->Stop();
+		}
+		if (mode == "automatic-flush-serialization" && stage == "optimizer_before_build") {
+			build_pause->Stop();
+		}
+		if (mode == "automatic-rewrite-serialization" && stage == "rewrite_candidate_ready") {
+			pause->Stop();
+		}
 		if (mode == "automatic-pause-" + stage) {
 			wait_for_kill(stage);
 		}
 	};
 	f.Configure(observe, mode == "automatic-backpressure" ? 128 : 256);
+	if (mode == "automatic-flush-serialization" || mode == "automatic-rewrite-serialization") {
+		bool flush_case = mode == "automatic-flush-serialization";
+		idx_t expected_revision = 3;
+		if (flush_case) {
+			f.Grow(0);
+		} else {
+			for (idx_t wave = 0; wave < 4; wave++) {
+				auto before = f.Index().revision;
+				f.Grow(wave);
+				f.Wait(before + 1);
+			}
+			expected_revision = f.Index().revision + 1;
+			f.Wave(0);
+		}
+		pause->Wait();
+		std::promise<void> waiting, acquired;
+		auto waiting_event = waiting.get_future(), acquired_event = acquired.get_future();
+		vector<AutomaticRow> rows;
+		if (flush_case) {
+			for (idx_t id = 128; id < 256; id++) {
+				rows.push_back(f.Row(id, 0));
+			}
+		} else {
+			auto selected = DuckLakeVortexOptimizer::Status(*setup.context, "lake")[0][26].ToString();
+			set<string> paths;
+			for (auto &segment : f.Index().segments) {
+				if (segment.generation == selected) {
+					for (auto &file : segment.files) {
+						paths.insert(file.uri);
+					}
+				}
+			}
+			auto live = SQL(setup, "SELECT id,filename FROM lake.items ORDER BY id");
+			for (auto &entry : *live) {
+				if (paths.count(entry.GetValue<string>(1)) && rows.size() < 128) {
+					rows.push_back(f.Row(entry.GetValue<int64_t>(0), 99));
+				}
+			}
+			Require(rows.size() == 128, "Serialization fixture lost its live rewrite input");
+		}
+		auto writer = std::async(std::launch::async, [&] {
+			return f.Submit("serialized", rows, {}, [&](const string &stage) {
+				if (stage == "waiting") {
+					waiting.set_value();
+				} else if (stage == "acquired") {
+					acquired.set_value();
+				}
+			});
+		});
+		ReleasePause release_flush {*pause}, release_build {*build_pause};
+		Require(waiting_event.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+		        "Managed writer never reached flush admission");
+		Require(acquired_event.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
+		        "Managed writer entered a physical-maintenance snapshot");
+		Connection reader(database);
+		auto before = f.Observe(reader, false);
+		pause->Release();
+		if (flush_case) {
+			build_pause->Wait();
+		}
+		Require(writer.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+		        "Index construction retained the flush writer reservation");
+		writer.get();
+		f.Validate({before, f.Observe(reader, false), f.Observe(reader, true)});
+		build_pause->Release();
+		f.Wait(expected_revision);
+		f.Replay();
+		f.Stop();
+		std::cout << mode << ": physical changes serialize managed commits; captured queries remain valid" << std::endl;
+		return;
+	}
 	if (mode == "automatic-backpressure") {
 		f.Grow(0);
 		pause->Wait();
