@@ -101,6 +101,9 @@ after commit is resolved by exact retry. Native metadata WAL recovery restores
 the same outcome. [Source retention](native-vortex-source-retention.md) can
 expire the original snapshot without expiring its receipt or reapplying data.
 
+For managed writes and queries with the background pipeline driving every
+maintenance stage, see [automatic flow](native-vortex-automatic-flow.md).
+
 ## Qualification
 
 ```sh

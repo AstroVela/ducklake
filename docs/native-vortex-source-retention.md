@@ -83,6 +83,9 @@ continues from the same native metadata WAL after explicit resume. Request
 receipts are never expired: replay returns the original receipt without
 reapplying business rows, even when its snapshot ID is no longer queryable.
 
+For rolling managed mutations with automatic indexing, rewrite and reclamation,
+see the [automatic flow](native-vortex-automatic-flow.md).
+
 ## Verification and scope
 
 ```sh

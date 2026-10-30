@@ -1,0 +1,90 @@
+# name: test/sql/vortex/native_vortex_automatic_flow.test
+# description: managed writes and named T queries with automatic optimizer and maintenance configured
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_automatic.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_automatic_data', DATA_INLINING_ROW_LIMIT 1000)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_writes('lake')
+
+statement ok
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+
+statement ok
+SELECT * FROM ducklake_manage_vortex_writes('lake','main','items','knn')
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,128,4194304,128,67108864)
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',256,4194304,1024,67108864)
+
+statement ok
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,32,25)
+
+statement ok
+SELECT * FROM ducklake_set_vortex_source_retention('lake',true,2,0)
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',2,67108864)
+
+query IIIIII
+SELECT enabled::INTEGER,max_inline_rows,max_unindexed_rows,compaction_enabled::INTEGER,min_deleted_rows,min_deleted_percent FROM ducklake_vortex_optimizer_status('lake')
+----
+1	256	1024	1	32	25
+
+query III
+SELECT enabled::INTEGER,max_objects,max_bytes FROM ducklake_vortex_maintenance_status('lake')
+----
+1	2	67108864
+
+query III
+SELECT enabled::INTEGER,keep_snapshots,min_age_seconds FROM ducklake_vortex_source_retention_status('lake')
+----
+1	2	0
+
+query TI
+SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','initial',[{'id':1,'embedding':[0.25,0],'category':'A','payload':'自动'}],[]::BIGINT[])
+----
+initial	1
+
+query IT
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],2)
+----
+1	自动
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','initial',[{'id':1,'embedding':[0.25,0],'category':'A','payload':'自动'}],[]::BIGINT[])
+
+query II
+SELECT count(*),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items
+----
+1	1
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_maintenance('lake')
+
+statement ok
+DETACH lake
