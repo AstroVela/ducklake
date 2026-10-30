@@ -69,6 +69,8 @@ has 1–128 bytes and contains no NUL. The request catalog admits at most 100,00
 records across its tables; existing committed requests still resolve when
 that catalog is full. Records have no implicit expiration. The API does not
 raise the existing source/vector, pending-write or ANN segment budgets.
+The [source retention worker](native-vortex-source-retention.md) can expire a
+receipt's original snapshot while preserving the exact receipt and retry behavior.
 
 ## Atomicity and retry
 

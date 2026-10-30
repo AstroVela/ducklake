@@ -41,6 +41,8 @@ public:
 	                              const std::function<void(const string &)> &observe = nullptr);
 	static void CancelMaintenance(ClientContext &context, const string &catalog);
 	static vector<vector<Value>> MaintenanceStatus(ClientContext &context, const string &catalog);
+	static void ConfigureSourceRetention(ClientContext &context, const string &catalog, bool enabled,
+	                                     idx_t keep_snapshots, idx_t min_age_seconds);
 	static void SetWriteBudget(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                           const string &index, const DuckLakeVortexWriteBudget &budget);
 	static void CheckRewriteToF(ClientContext &context, const DuckLakeVortexRewriteState &rewrite);

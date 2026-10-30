@@ -4,6 +4,8 @@ This validation draft follows [DuckLake #44](https://github.com/AstroVela/duckla
 It connects registered build recovery, workspace collection and retired-generation
 collection to the existing optimizer worker. Repeated indexing and selective
 merging can finish their cleanup without a manual GC call after every task.
+The [source retention extension](native-vortex-source-retention.md) adds explicit
+catalog snapshot expiration and source file collection to the same bounded worker.
 
 ## Explicit catalog ownership
 

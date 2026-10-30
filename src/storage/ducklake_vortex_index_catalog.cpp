@@ -1,6 +1,7 @@
 #include "storage/ducklake_vortex_index_catalog.hpp"
 
 #include "common/ducklake_vortex_json.hpp"
+#include "common/ducklake_vortex_gc_io.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -102,18 +103,6 @@ void Name(const string &name) {
 	}
 }
 
-void Relative(const string &path, bool component) {
-	if (path.empty() || path[0] == '/' || path.find('\\') != string::npos || path.find(':') != string::npos ||
-	    path.find('\0') != string::npos || (component && path.find('/') != string::npos)) {
-		throw InvalidInputException("Invalid local index artifact path");
-	}
-	for (auto &part : StringUtil::Split(path, '/')) {
-		if (part.empty() || part == "." || part == "..") {
-			throw InvalidInputException("Invalid local index path component");
-		}
-	}
-}
-
 string Canonical(const string &path) {
 #ifdef _WIN32
 	throw NotImplementedException("Native Vortex index publication is qualified on POSIX paths");
@@ -204,7 +193,7 @@ DuckLakeVortexIndex ParseReference(const string &bytes, const string &uuid, idx_
 	auto generation = Member(value, "generation");
 	Object(generation, 2);
 	result.generation = Text(generation, "generation");
-	Relative(result.generation, true);
+	CheckRelative(result.generation, true);
 	auto manifest = Member(generation, "manifest");
 	Object(manifest, 3);
 	if (Text(manifest, "path") != "manifest.json") {
@@ -366,7 +355,7 @@ string VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index, idx_t 
 	for (idx_t i = 0; i < yyjson_arr_size(artifacts); i++) {
 		auto artifact = yyjson_arr_get(artifacts, i);
 		auto path = Text(artifact, "path");
-		Relative(path, false);
+		CheckRelative(path, false);
 		if (!paths.insert(path).second) {
 			throw InvalidInputException("Duplicate sealed Vortex artifact");
 		}
@@ -674,71 +663,6 @@ void UpdateGenerationRefs(DuckLakeTransaction &transaction, const string &uuid, 
 }
 
 #ifndef _WIN32
-struct Descriptor {
-	explicit Descriptor(int32_t fd_p) : fd(fd_p) {
-	}
-	~Descriptor() {
-		close(fd);
-	}
-	int32_t fd;
-};
-
-unique_ptr<Descriptor> OpenDirectory(int32_t parent, const string &name, bool missing) {
-	auto fd = openat(parent, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-	if (fd < 0) {
-		if (missing && errno == ENOENT) {
-			return nullptr;
-		}
-		throw IOException("Cannot open registered Vortex directory without following links: %s", name);
-	}
-	return make_uniq<Descriptor>(fd);
-}
-
-unique_ptr<Descriptor> OpenRoot(const string &path, bool missing) {
-	if (path.empty() || path[0] != '/' || path.find('\0') != string::npos) {
-		throw InvalidInputException("Invalid registered Vortex root");
-	}
-	auto result = OpenDirectory(AT_FDCWD, "/", false);
-	for (auto &part : StringUtil::Split(path, '/')) {
-		if (!part.empty()) {
-			Relative(part, true);
-			result = OpenDirectory(result->fd, part, missing);
-			if (!result) {
-				return nullptr;
-			}
-		}
-	}
-	return result;
-}
-
-struct Parent {
-	unique_ptr<Descriptor> directory;
-	string name;
-};
-
-Parent OpenParent(int32_t root, const string &path, bool missing) {
-	Relative(path, false);
-	auto parts = StringUtil::Split(path, '/');
-	auto fd = dup(root);
-	if (fd < 0) {
-		throw IOException("Cannot retain registered Vortex directory");
-	}
-	auto directory = make_uniq<Descriptor>(fd);
-	for (idx_t i = 0; i + 1 < parts.size(); i++) {
-		directory = OpenDirectory(directory->fd, parts[i], missing);
-		if (!directory) {
-			break;
-		}
-	}
-	return {std::move(directory), parts.back()};
-}
-
-void SyncDirectory(int32_t fd) {
-	if (fsync(fd)) {
-		throw IOException("Cannot sync Vortex generation collection");
-	}
-}
-
 struct CollectedFile {
 	string path, checksum;
 	idx_t size;
@@ -768,7 +692,7 @@ CollectionPlan Plan(const string &reference, const string &manifest, idx_t artif
 		auto artifact = yyjson_arr_get(artifacts, i);
 		Object(artifact, 3);
 		auto path = Text(artifact, "path");
-		Relative(path, false);
+		CheckRelative(path, false);
 		auto size = Number(artifact, "size");
 		if (size > remaining || !plan.paths.insert("artifacts/" + path).second) {
 			throw InvalidInputException("Invalid registered Vortex artifact inventory");
@@ -901,7 +825,7 @@ void InspectBuild(int32_t fd, const string &prefix, CollectionPlan &plan,
 			continue;
 		}
 		check("build_gc_inspecting");
-		Relative(name, true);
+		CheckRelative(name, true);
 		auto path = prefix + "/" + name;
 		if (plan.files.size() + plan.directories.size() >= 4096) {
 			throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex build cleanup entry budget exceeded");
@@ -1343,7 +1267,7 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 			auto reference = StringValue::Get(entry[2]);
 			auto manifest = StringValue::Get(entry[3]);
 			const bool resume = StringValue::Get(entry[5]) == "deleting";
-			Relative(generation, true);
+			CheckRelative(generation, true);
 			Parsed parsed(reference);
 			auto index =
 			    ParseReference(reference, Text(parsed.Root(), "table_uuid"), Number(parsed.Root(), "field_id"));
@@ -1535,7 +1459,7 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 			auto root = StringValue::Get(entry[1]);
 			auto generation = StringValue::Get(entry[2]);
 			auto workspace = StringValue::Get(entry[3]);
-			Relative(id, true);
+			CheckRelative(id, true);
 			if (generation != "generation-" + id ||
 			    workspace != FileSystem::GetFileSystem(context).JoinPath(root, ".build-" + id) || root == managed ||
 			    StringUtil::StartsWith(root, managed == "/" ? managed : managed + "/")) {
@@ -1639,6 +1563,24 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 
 DuckLakeVortexIndex DuckLakeVortexIndex::ParseSegments(const string &reference, const string &uuid, idx_t field_id) {
 	return ParseCatalogReference(reference, uuid, field_id);
+}
+
+bool DuckLakeVortexIndex::ReferencesSource(DuckLakeTransaction &transaction, const string &path) {
+	auto result = Query(transaction, "SELECT table_uuid,reference FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1");
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			auto reference = StringValue::Get(chunk->GetValue(1, row));
+			Parsed parsed(reference);
+			auto index =
+			    ParseSegments(reference, StringValue::Get(chunk->GetValue(0, row)), Number(parsed.Root(), "field_id"));
+			for (auto &file : index.files) {
+				if (file.uri == path) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
 }
 
 DuckLakeVortexIndex DuckLakeVortexIndex::Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table,
