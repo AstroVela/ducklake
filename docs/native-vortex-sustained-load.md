@@ -6,6 +6,10 @@ process runs installed Vane and the matching signed providers. Its reference
 model and retained event trace live in the parent process, outside the measured
 RSS and storage I/O.
 
+The [posting-coverage follow-up](native-vortex-posting-coverage.md) explains the
+rejected builds below and changes head planning within the same posting budget.
+The local results in this document describe the preceding fixed-head baseline.
+
 ## Workload and ownership
 
 Each case starts with a separately prepared immutable B containing 4,096 or
@@ -141,7 +145,7 @@ reported separately. Actual owned source/index bytes must converge to the
 retained native inventory and active generations. Metadata, WAL, receipts and
 caller reference JSON keep their separately reported lifetimes and limits.
 
-CI runs the bounded 4,096-row / 8D profile and retains the summary, per-case
+CI runs the bounded 4,096-row / 8D and 128D profiles and retains the summary, per-case
 reports, worker logs and parent-written `events.jsonl`. The latter contains the
 full query evidence and final logical state. The minimal SQL case checks quota
 rejection, admission of the unchanged request after an explicit budget change,
@@ -209,6 +213,7 @@ processes, with 15 optional-dependency skips. Formatting and Vane source/native
 copyleft checks passed. Replaying the retained query trace with a missing-hit
 canary or an invalid typed payload also produced the required nonzero exit.
 
-The next capacity gate is to explain the rejected SPFresh mapped IDs and the
-exploratory recall misses before increasing dimensions, load duration or
-production budgets. This work does not add SPFresh native online updates.
+The [posting-coverage follow-up](native-vortex-posting-coverage.md) resolves the
+mapped-ID failures in this matrix. Reclamation under the larger 128D load and
+broader recall remain unqualified. SPFresh native online updates are separate
+work.

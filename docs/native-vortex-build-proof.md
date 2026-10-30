@@ -66,6 +66,8 @@ physical files, checks exact requested identity/coverage, seals its manifest,
 verifies and reopens the native index, and persists the new reference. Source
 metadata travels in memory; the persisted reference is a sealed output artifact.
 The probe retains its existing explicit builder entry and uses the same core.
+For the row/width-based head plan and posting-truncation regression, see
+[posting coverage](native-vortex-posting-coverage.md).
 
 Heavy construction holds no publication lock or metadata transaction. At the
 end, the existing native publisher acquires its guards and rechecks table UUID,
