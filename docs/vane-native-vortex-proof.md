@@ -11,6 +11,8 @@ For bounded append with concurrent request identity and safe client retries,
 see the [native WriteBatch API](native-vortex-write-batch.md).
 For explicit snapshot retention and background source reclamation, see
 [source retention](native-vortex-source-retention.md).
+For table-owned, retryable whole-row upsert and deletion by business id, see
+[managed writes](native-vortex-keyed-writes.md).
 
 ## Fixed inputs and packaging
 

@@ -1,0 +1,192 @@
+# name: test/sql/vortex/native_vortex_keyed_writes.test
+# description: managed unique ids, atomic upsert/delete, exact request retries and native snapshot receipts
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_keyed.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_keyed_data', DATA_INLINING_ROW_LIMIT 1000)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_writes('lake')
+
+statement ok
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+
+statement error
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','unmanaged',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'}],[]::BIGINT[])
+----
+managed write mode
+
+query I
+SELECT managed::INTEGER FROM ducklake_manage_vortex_writes('lake','main','items','knn')
+----
+1
+
+query TI
+SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','seed',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],[]::BIGINT[])
+----
+seed	2
+
+statement error
+INSERT INTO lake.items VALUES(3,[3,0],'A','outside')
+----
+Managed Vortex tables require
+
+statement error
+UPDATE lake.items SET payload='outside' WHERE id=1
+----
+Managed Vortex tables require
+
+statement error
+DELETE FROM lake.items WHERE id=1
+----
+Managed Vortex tables require
+
+statement error
+ALTER TABLE lake.items ADD COLUMN extra BIGINT
+----
+fixed schema
+
+statement error
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','append',[{'id':3,'embedding':[3,0],'category':'A','payload':'outside'}])
+----
+managed write mode
+
+statement error
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','overlap',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'}],[1])
+----
+non-NULL unique ids
+
+statement error
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','null',[{'id':NULL,'embedding':[1,0],'category':'A','payload':'一'}],[]::BIGINT[])
+----
+non-NULL unique ids
+
+statement error
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','duplicate',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],[1,1])
+----
+non-NULL unique ids
+
+statement error
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','empty',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],[]::BIGINT[])
+----
+1 to 1000 operations
+
+query III
+SELECT count(*),count(DISTINCT id),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items
+----
+2	2	1
+
+query TI
+SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','change',[{'id':1,'embedding':[0.125,0],'category':'A','payload':'更新'}],[2,999])
+----
+change	3
+
+query T
+SELECT payload_hash FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1 WHERE request_id='change'
+----
+sha256:c2679179d1aa2ac49458c669d47ce922fc68f559559a0abc0045011687ec6546
+
+query IT
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],2)
+----
+1	更新
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','erase',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],[1])
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','change',[{'id':1,'embedding':[0.125,0],'category':'A','payload':'更新'}],[2,999])
+
+query I
+SELECT count(*) FROM lake.items
+----
+0
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','revive',[{'id':1,'embedding':[0.25,0],'category':'A','payload':'新提交'}],[]::BIGINT[])
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','erase',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],[1])
+
+query IT
+SELECT id,payload FROM lake.items
+----
+1	新提交
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','absent',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],[999])
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1 JOIN __ducklake_metadata_lake.ducklake_snapshot USING(snapshot_id) WHERE request_id='absent'
+----
+1
+
+statement error
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','absent',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],[998])
+----
+request_id payload mismatch
+
+statement ok
+BEGIN
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'items')
+
+statement ok
+INSERT INTO lake.items VALUES(99,[99,0],'A','mixed')
+
+statement error
+COMMIT
+----
+Managed Vortex tables require
+
+query II
+SELECT count(*),count(DISTINCT id) FROM lake.items
+----
+1	1
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','seed',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],[]::BIGINT[])
+
+query IT
+SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],2)
+----
+1	新提交
+
+statement ok
+SELECT * FROM ducklake_set_vortex_source_retention('lake',true,1,0)
+
+statement ok
+SELECT * FROM ducklake_collect_vortex_sources('lake',16,67108864)
+
+statement ok
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','seed',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],[]::BIGINT[])
+
+query IT
+SELECT id,payload FROM lake.items
+----
+1	新提交
+
+statement ok
+DETACH lake

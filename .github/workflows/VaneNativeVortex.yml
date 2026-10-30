@@ -167,6 +167,9 @@ jobs:
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_source_retention.py \
             --driver "$PWD/build/runtime/ducklake_vortex_source_driver" --output-dir "$PWD/build/source-proof" \
             2>&1 | tee build/logs/vane-vortex-source-retention.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_keyed_writes.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --output-dir "$PWD/build/keyed-proof" \
+            2>&1 | tee build/logs/vane-vortex-keyed-writes.log
       - name: Retain build and qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -180,4 +183,7 @@ jobs:
             build/source-proof/report.json
             build/source-proof/**/driver.log
             build/source-proof/**/recovery.log
+            build/keyed-proof/report.json
+            build/keyed-proof/**/driver.log
+            build/keyed-proof/**/recovery.log
             build/wheels

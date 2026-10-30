@@ -1,6 +1,7 @@
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_source_retention.hpp"
+#include "storage/ducklake_vortex_write.hpp"
 #include "common/ducklake_vortex_json.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
@@ -1489,21 +1490,23 @@ void DuckLakeVortexOptimizer::CheckRewriteToF(ClientContext &context, const Duck
 
 unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction,
                                                                ClientContext &context) {
+	auto logical = transaction.GetLogicalWriteTables();
 	bool grows = DuckLakeVortexRewriteState::Get(context) != nullptr;
 	for (auto &entry : transaction.GetLocalChanges().Changes()) {
 		grows |= Grows(entry.GetTableChanges());
 	}
 	auto &catalog = transaction.GetCatalog();
-	if (!grows || (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb")) {
+	if ((!grows && logical.empty()) || (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb")) {
 		return nullptr;
 	}
 	// Hold the reservation until metadata commit; every following writer probes fresh committed state.
-	auto admission = GetOwner(*context.db)->write_admission.GetExclusiveLock();
+	auto admission = ReserveWrite(context);
 	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
 	Metadata meta(*context.db, catalog.GetName(), false);
 	try {
+		DuckLakeVortexWriteBatch::CheckManagedWrites(meta.transaction, logical, context);
 		if (HasWriteBudgetTable(meta)) {
 			for (auto &entry : transaction.GetLocalChanges().Changes()) {
 				auto &changes = entry.GetTableChanges();
@@ -1542,6 +1545,10 @@ unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransacti
 		VortexCatalog::Rollback(meta.connection);
 		throw;
 	}
+}
+
+unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::ReserveWrite(ClientContext &context) {
+	return GetOwner(*context.db)->write_admission.GetExclusiveLock();
 }
 
 void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const string &catalog, const string &schema,

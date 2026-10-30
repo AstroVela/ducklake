@@ -47,6 +47,7 @@ public:
 	                           const string &index, const DuckLakeVortexWriteBudget &budget);
 	static void CheckRewriteToF(ClientContext &context, const DuckLakeVortexRewriteState &rewrite);
 	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context);
+	static unique_ptr<StorageLockKey> ReserveWrite(ClientContext &context);
 };
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader);

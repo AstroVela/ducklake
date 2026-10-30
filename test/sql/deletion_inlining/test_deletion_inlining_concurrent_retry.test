@@ -40,9 +40,8 @@ concurrentloop tableid 0 3
 
 loop rowid 0 5
 
-statement maybe
+statement ok
 DELETE FROM ducklake.t${tableid} WHERE a = ${rowid}
-----
 
 endloop
 

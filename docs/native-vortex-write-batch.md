@@ -5,6 +5,8 @@ with a bounded, append-only SQL write API. A batch and its durable request
 receipt commit in one DuckLake native metadata transaction. The original
 request result remains available after later writes, flush, ANN publication
 and restart.
+For non-NULL unique business ids with atomic upsert/delete, use the explicit
+[managed mutation mode](native-vortex-keyed-writes.md).
 
 ## API
 

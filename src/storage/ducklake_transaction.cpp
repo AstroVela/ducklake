@@ -1018,6 +1018,32 @@ TransactionChangeInformation DuckLakeTransaction::GetTransactionChanges() const 
 	return changes;
 }
 
+set<TableIndex> DuckLakeTransaction::GetLogicalWriteTables() const {
+	auto changes = GetTransactionChanges();
+	set<TableIndex> result = state->tables_deleted_from;
+	for (auto tables : {&changes.altered_tables, &changes.dropped_tables}) {
+		result.insert(tables->begin(), tables->end());
+	}
+	result.insert(state->renamed_tables.begin(), state->renamed_tables.end());
+	for (auto &entry : state->local_changes.Changes()) {
+		auto &local = entry.GetTableChanges();
+		bool logical =
+		    local.new_inlined_data || !local.new_inlined_data_deletes.empty() || local.new_inlined_file_deletes;
+		for (auto &file : local.new_data_files) {
+			logical |= !file.begin_snapshot.IsValid();
+		}
+		for (auto &deletes : local.new_delete_files) {
+			for (auto &file : deletes.second) {
+				logical |= file.source == DeleteFileSource::REGULAR;
+			}
+		}
+		if (logical) {
+			result.insert(entry.GetTableIndex());
+		}
+	}
+	return result;
+}
+
 // DuckLakeCommitState is defined in storage/ducklake_commit_state.hpp
 
 void DuckLakeTransaction::AddTableChanges(TableIndex table_id, const LocalTableDataChanges &table_changes,
