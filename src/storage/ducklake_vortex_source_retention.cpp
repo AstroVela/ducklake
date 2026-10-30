@@ -49,7 +49,7 @@ Policy Load(DuckLakeTransaction &transaction) {
 string Eligible(const Policy &p) {
 	return "snapshot_id NOT IN (SELECT snapshot_id FROM {METADATA_CATALOG}.ducklake_snapshot "
 	       "ORDER BY snapshot_id DESC LIMIT " +
-	       to_string(p.keep) + ") AND snapshot_time < now()-INTERVAL '" + to_string(p.age) + " seconds'";
+	       to_string(p.keep) + ") AND epoch_us(snapshot_time) < epoch_us(now())-" + to_string(p.age * 1000000);
 }
 
 idx_t Count(DuckLakeTransaction &transaction, const string &sql) {
