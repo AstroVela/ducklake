@@ -90,8 +90,9 @@ same global top-k. Committed updates/deletes are filtered against the current
 native snapshot before returning typed row values. The next eligible F batch
 can build a second B while retaining the first generation.
 
-SQL transactions are the write interface in this prototype. A public WriteBatch
-API and concurrent request-id uniqueness are separate work. Restart recovers
+SQL transactions remain available. The [retryable WriteBatch API](native-vortex-write-batch.md)
+adds bounded atomic append and table-scoped concurrent request-id uniqueness.
+Restart recovers
 committed rows and the named definition through native metadata WAL. The
 optimizer requires explicit `ducklake_resume_vortex_optimizer` after restart.
 This guide covers local native DuckDB metadata; cloud and Vane distributed

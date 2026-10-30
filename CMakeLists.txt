@@ -94,6 +94,16 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
+if(DUCKLAKE_ENABLE_VORTEX)
+  add_executable(ducklake_vortex_write_driver EXCLUDE_FROM_ALL test/vane/native_vortex_write_driver.cpp)
+  get_target_property(DUCKLAKE_VORTEX_SOURCE vortex_extension SOURCE_DIR)
+  target_include_directories(ducklake_vortex_write_driver PRIVATE "${DUCKLAKE_VORTEX_SOURCE}/src/include")
+  target_link_libraries(ducklake_vortex_write_driver ducklake_extension vortex_extension duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+  link_threads(ducklake_vortex_write_driver "")
+  link_extension_libraries(ducklake_vortex_write_driver "")
+  set_target_properties(ducklake_vortex_write_driver PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
+
 if(DUCKLAKE_ENABLE_VORTEX AND BUILD_UNITTESTS)
   add_executable(ducklake_vortex_view_driver EXCLUDE_FROM_ALL
                  test/vane/native_vortex_view_driver.cpp)
