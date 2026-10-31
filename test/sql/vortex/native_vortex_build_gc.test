@@ -74,7 +74,7 @@ INSERT INTO lake.items VALUES(1000,[0.125,0],'B','too-small')
 statement error
 SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/build-gc-rejected.json',2,1)
 ----
-Unsupported SPFresh static build options
+SPFresh build requires 65..=100000 physical rows
 
 query II
 SELECT count(*),count(*) FILTER(WHERE state='abandoned' AND NOT keep_generation AND expected_revision=1) FROM ducklake_vortex_build_status('lake')

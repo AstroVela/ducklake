@@ -241,6 +241,7 @@ def native_cases(driver, root, report):
         "manual",
         "cancel",
         "concurrent",
+        "source-only",
         "fail-source_expiry_committed",
         "fail-source_delete_intent_committed",
         "fail-source_after_unlink",

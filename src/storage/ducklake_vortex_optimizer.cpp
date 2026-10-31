@@ -895,17 +895,20 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				}
 			};
 			check("maintenance_before_recovery");
-			m.recovered += VortexCatalog::RecoverBuilds(*job.context, m.catalog, m.max_objects, check);
-			StoreMaintenance(db, m, "collecting_builds");
-			check("maintenance_before_build_gc");
-			auto builds = VortexCatalog::CollectBuilds(*job.context, m.catalog, m.max_objects, m.max_bytes, check);
-			m.builds += builds.builds;
-			m.bytes += builds.bytes;
-			StoreMaintenance(db, m, "collecting_generations");
+			DuckLakeVortexBuildGCResult builds;
+			if (m.remaining_builds) {
+				m.recovered += VortexCatalog::RecoverBuilds(*job.context, m.catalog, m.max_objects, check);
+				StoreMaintenance(db, m, "collecting_builds");
+				check("maintenance_before_build_gc");
+				builds = VortexCatalog::CollectBuilds(*job.context, m.catalog, m.max_objects, m.max_bytes, check);
+				m.builds += builds.builds;
+				m.bytes += builds.bytes;
+			}
 			check("maintenance_after_build_gc");
 			idx_t collected_objects = builds.builds;
 			idx_t collected_bytes = builds.bytes;
-			if (builds.builds < m.max_objects && builds.bytes < m.max_bytes) {
+			if (m.remaining_generations && builds.builds < m.max_objects && builds.bytes < m.max_bytes) {
+				StoreMaintenance(db, m, "collecting_generations");
 				check("maintenance_before_generation_gc");
 				auto generations = VortexCatalog::Collect(*job.context, m.catalog, m.max_objects - builds.builds,
 				                                          m.max_bytes - builds.bytes, check);

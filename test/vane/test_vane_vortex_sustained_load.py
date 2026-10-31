@@ -148,6 +148,14 @@ def worker(args):
             return dict(counters(), event_pipe_bytes=emitted, time_ns=time.monotonic_ns())
 
     connection = bootstrap(root, count, dimension, fixture)
+    try:
+        KEYED.mutate(connection, "budget-preflight", [row(count + i, 0, dimension, fixture) for i in range(257)])
+    except Exception as error:
+        require("RESOURCE_EXHAUSTED: Vortex write inline rows budget exceeded" in str(error), str(error))
+    else:
+        raise AssertionError("A 257-row mutation crossed the configured 256-row T budget")
+    AUTO.WRITE.check_no_request(connection, "budget-preflight")
+    require(AUTO.WRITE.count(connection) == count, "Rejected preflight mutation changed the live row count")
     emit(
         "ready",
         version=vane.__version__,
@@ -155,6 +163,7 @@ def worker(args):
         count=count,
         dimension=dimension,
         fixture=fixture,
+        admission_rejection_check="257-row request rejected atomically by the 256-row T budget",
         providers={
             dist.metadata["Name"]: dist.version
             for dist in importlib.metadata.distributions()
@@ -479,7 +488,6 @@ def summarize(events):
             process_write_bytes_per_mutation_byte=usage["write_bytes"] / logical,
             acknowledged_batches_per_second=len(acks) / usage["seconds"],
         )
-    require(result["burst"]["backpressure_rejections"] > 0, "Burst never reached the configured write budget")
     drain = next(entry for entry in events if entry["kind"] == "drained")
     samples = [entry for entry in events if entry["kind"] == "sample"]
     require(
@@ -495,6 +503,7 @@ def summarize(events):
     )
     return dict(
         phases=result,
+        burst_reached_write_budget=result["burst"]["backpressure_rejections"] > 0,
         drain=delta(drain["begin"], drain["end"]),
         footprint=drain["footprint"],
         sampled_peak_rss_kib=max(entry["usage"]["VmRSS"] for entry in samples),

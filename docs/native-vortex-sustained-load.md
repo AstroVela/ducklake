@@ -24,6 +24,12 @@ The `automatic` input preserves the automatic-flow vectors. The explicit
 order. Both remain selectable up front; there is no input switch after a
 failure. Their business payloads use the same small mutation fixture.
 
+Before measurement, a 257-row request must fail the configured 256-row T budget
+without a receipt or a row-count change. Burst budget rejections are measured
+outcomes; `burst_reached_write_budget=false` means that case did not demonstrate
+budget saturation. The [source-drain follow-up](native-vortex-source-gc-drain.md)
+explains this deterministic gate and the source-only scheduling change.
+
 Every committed batch replaces 96 existing keys, deletes 32 other keys and
 inserts 32 new keys. The live key count stays fixed. Row generation is
 deterministic and includes category changes, NULL payloads, Unicode and embedded
@@ -145,7 +151,7 @@ reported separately. Actual owned source/index bytes must converge to the
 retained native inventory and active generations. Metadata, WAL, receipts and
 caller reference JSON keep their separately reported lifetimes and limits.
 
-CI runs the bounded 4,096-row / 8D and 128D profiles and retains the summary, per-case
+CI runs the bounded 4,096-row and 32,768-row profiles at 8D and 128D and retains the summary, per-case
 reports, worker logs and parent-written `events.jsonl`. The latter contains the
 full query evidence and final logical state. The minimal SQL case checks quota
 rejection, admission of the unchanged request after an explicit budget change,
@@ -214,6 +220,6 @@ copyleft checks passed. Replaying the retained query trace with a missing-hit
 canary or an invalid typed payload also produced the required nonzero exit.
 
 The [posting-coverage follow-up](native-vortex-posting-coverage.md) resolves the
-mapped-ID failures in this matrix. Reclamation under the larger 128D load and
-broader recall remain unqualified. SPFresh native online updates are separate
-work.
+mapped-ID failures in this matrix. The [source-drain follow-up](native-vortex-source-gc-drain.md)
+qualifies the bounded 32,768-row / 128D reclamation cases. Broader recall,
+long-run liveness and SPFresh native online updates remain separate work.
