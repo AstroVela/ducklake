@@ -2,6 +2,7 @@
 #include "common/ducklake_vortex_json.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/storage/storage_lock.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_search.hpp"
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <thread>
 #include <unistd.h>
 
@@ -273,6 +275,45 @@ int main(int argc, char **argv) {
 		}
 		f.Rewrite();
 		f.Policy();
+		if (mode == "source-only") {
+			VortexIndex::CollectBuilds(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+			VortexIndex::Collect(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+			Require(f.Count("__ducklake_metadata_lake.ducklake_vortex_builds_v1") == 0,
+			        "Source-only fixture retained build work");
+			auto generations = VortexIndex::CollectionLock().GetExclusiveLock();
+			auto empty_phases = std::make_shared<std::atomic<idx_t>>(0);
+			auto completed = std::make_shared<std::atomic<bool>>(false);
+			auto database = &f.database;
+			DuckLakeVortexOptimizer::EnableMaintenance(
+			    *f.writer.context, "lake", 2, 64 * 1024 * 1024,
+			    [empty_phases, completed, database](const string &stage) {
+				    if (stage == "build_recovery_waiting" || stage == "build_gc_waiting" || stage == "gc_waiting") {
+					    ++*empty_phases;
+				    }
+				    if (stage == "maintenance_complete") {
+					    Connection probe(*database);
+					    auto source = Source::Status(*probe.context, "lake")[0];
+					    if (!source[6].GetValue<idx_t>() && !source[7].GetValue<idx_t>() &&
+					        !source[8].GetValue<idx_t>()) {
+						    *completed = true;
+					    }
+				    }
+			    });
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!*completed && std::chrono::steady_clock::now() < deadline) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			}
+			generations.reset();
+			DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+			deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+			while (DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, "lake")[0][2].GetValue<bool>()) {
+				Require(std::chrono::steady_clock::now() < deadline, "Source-only worker did not stop");
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			}
+			Require(*completed && *empty_phases == 0, "Source-only maintenance waited on empty index collection");
+			f.CheckReclaimed();
+			return 0;
+		}
 		if (mode == "defer") {
 			Require(f.Collect().blocked &&
 			            SQL(old, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 128,
