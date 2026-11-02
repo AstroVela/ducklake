@@ -242,6 +242,31 @@ int main(int argc, char **argv) {
 			Concurrent(f);
 			return 0;
 		}
+		if (mode == "capture-gate") {
+			f.Policy();
+			auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
+			std::promise<void> waiting;
+			auto collecting = std::async(std::launch::async, [&] {
+				return f.Collect(16, 64 * 1024 * 1024, [&](const string &stage) {
+					if (stage == "source_gc_waiting") {
+						waiting.set_value();
+					}
+				});
+			});
+			waiting.get_future().wait();
+			bool deferred = collecting.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+			auto entering = std::async(std::launch::async, [&] {
+				Connection reader(f.database);
+				return SQL(reader, "SELECT min(id) FROM lake.items")->GetValue(0, 0).GetValue<int64_t>();
+			});
+			bool progressed = entering.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+			admission.reset();
+			auto result = collecting.get();
+			Require(entering.get() == 0, "Transaction entry lost current data");
+			Require(deferred && progressed, "Source collector blocked transaction entry while awaiting capture");
+			Require(!result.blocked && result.expired, "Source collector did not progress after admission closed");
+			return 0;
+		}
 		if (mode == "held" || mode == "admission") {
 			Pause pause;
 			Connection reader(f.database);
@@ -256,7 +281,26 @@ int main(int argc, char **argv) {
 			pause.Wait();
 			f.Policy();
 			if (mode == "admission") {
-				Require(f.Collect().blocked, "Capture admission was not protected from source expiry");
+				std::promise<void> waiting;
+				auto collecting = std::async(std::launch::async, [&] {
+					return f.Collect(16, 64 * 1024 * 1024, [&](const string &stage) {
+						if (stage == "source_gc_waiting") {
+							waiting.set_value();
+						}
+					});
+				});
+				waiting.get_future().wait();
+				bool deferred = collecting.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+				auto gate = Source::TransactionGate().TryGetExclusiveLock();
+				bool gate_available = bool(gate);
+				gate.reset();
+				pause.Release();
+				Require(pending.get().rows[0][0].GetValue<int64_t>() == 0, "Admitted query lost its native view");
+				auto result = collecting.get();
+				Require(deferred, "Source collector abandoned an in-flight native capture");
+				Require(gate_available, "Source collector froze transactions before native capture completed");
+				Require(!result.blocked && result.expired, "Source collector did not progress after native capture");
+				return 0;
 			} else {
 				f.Rewrite();
 				VortexIndex::Collect(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
