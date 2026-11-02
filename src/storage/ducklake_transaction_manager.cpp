@@ -33,9 +33,17 @@ Transaction &DuckLakeTransactionManager::StartTransaction(ClientContext &context
 	return result;
 }
 
-bool DuckLakeTransactionManager::HasOtherTransactions(const DuckLakeTransaction *exclude) {
+bool DuckLakeTransactionManager::HasOtherTransactions(const DuckLakeTransaction *exclude,
+                                                      bool exclude_vortex_captures) {
 	lock_guard<mutex> guard(transaction_lock);
 	for (auto &entry : transactions) {
+		if (exclude_vortex_captures) {
+#ifdef DUCKLAKE_ENABLE_VORTEX
+			if (entry.second->IsVortexReadCapture()) {
+				continue;
+			}
+#endif
+		}
 		if (entry.second.get() != exclude) {
 			return true;
 		}

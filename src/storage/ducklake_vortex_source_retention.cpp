@@ -225,7 +225,7 @@ void DuckLakeVortexSourceRetention::Configure(ClientContext &context, const stri
 
 bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, idx_t max_bytes) {
 	auto policy = Load(transaction);
-	if (!policy.enabled || Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction)) {
+	if (!policy.enabled || Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction, true)) {
 		return false;
 	}
 	if (Count(transaction, "SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy))) {
@@ -258,7 +258,8 @@ vector<vector<Value>> DuckLakeVortexSourceRetention::Status(ClientContext &conte
 	                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(DELETIONS)}) {
 		row.push_back(Value::UBIGINT(Count(owner.transaction, sql)));
 	}
-	row.push_back(Value::BOOLEAN(Manager(owner.transaction.GetCatalog()).HasOtherTransactions(&owner.transaction)));
+	row.push_back(
+	    Value::BOOLEAN(Manager(owner.transaction.GetCatalog()).HasOtherTransactions(&owner.transaction, false)));
 	owner.connection.Commit();
 	return {std::move(row)};
 }
@@ -288,7 +289,7 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 	auto admissions = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock();
 	auto transactions = TransactionGate().GetExclusiveLock();
 	DuckLakeVortexSourceGCResult result;
-	if (Manager(catalog).HasOtherTransactions(nullptr)) {
+	if (Manager(catalog).HasOtherTransactions(nullptr, false)) {
 		result.blocked = true;
 		return result;
 	}
