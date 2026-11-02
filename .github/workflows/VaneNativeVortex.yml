@@ -48,13 +48,13 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: AstroVela/duckdb-vortex
-          ref: b819cc031be61efabeedd6ded0a814984dc56d86
+          ref: d266a922e58aee4f8ac7b57a38b09262f656ce36
           path: vortex-extension
           persist-credentials: false
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: AstroVela/vortex
-          ref: 65dab44f86495d35bb46f69c8ec5cfc7a3544c1b
+          ref: 9133de570e7ad634aea43beb1cbbd4ea559a5491
           path: vortex-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -77,9 +77,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             build/runtime/cargo/build
-          key: vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/src/vortex_query/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-${{ github.sha }}
+          key: vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-${{ github.sha }}
           restore-keys: |
-            vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/src/vortex_query/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-
+            vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-
       - name: Set up pinned vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
