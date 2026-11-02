@@ -211,6 +211,12 @@ public:
 	DuckLakeSnapshot GetSnapshot();
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	void RebaseVortexRewrite(const DuckLakeSnapshot &snapshot);
+	void MarkVortexReadCapture() {
+		vortex_read_capture = true;
+	}
+	bool IsVortexReadCapture() const {
+		return vortex_read_capture;
+	}
 #endif
 	DuckLakeSnapshot GetSnapshot(optional_ptr<BoundAtClause> at_clause,
 	                             SnapshotBound bound = SnapshotBound::UPPER_BOUND);
@@ -377,6 +383,9 @@ private:
 	idx_t local_catalog_id;
 	//! Set when this transaction inlines into a table that does not yet have an inlined-data table
 	atomic<bool> requires_new_inlined_table {false};
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	atomic<bool> vortex_read_capture {false};
+#endif
 	//! Per-transaction mutable change state (new/dropped/renamed entries, local file changes, flushed
 	//! inlined tables) and the Commit loop. Owns the data formerly held directly on the transaction.
 	unique_ptr<DuckLakeTransactionState> state;

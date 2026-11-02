@@ -847,7 +847,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		m.state = state;
 		SaveMaintenance(meta, m, m.run);
 	}
-	void RunMaintenance(DatabaseInstance &db, PendingMaintenance pending) {
+	bool RunMaintenance(DatabaseInstance &db, PendingMaintenance pending) {
 		Maintenance m;
 		{
 			std::lock_guard<std::mutex> guard(io);
@@ -855,7 +855,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			m = LoadMaintenance(meta, pending.catalog);
 			if (!m.enabled) {
 				meta.Commit();
-				return;
+				return false;
 			}
 			auto had_backlog = m.remaining_builds || m.remaining_generations;
 			MaintenanceBacklog(meta, m);
@@ -866,7 +866,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				} else {
 					meta.Commit();
 				}
-				return;
+				return false;
 			}
 			CheckMaintenance(m.catalog);
 			auto previous = m.run;
@@ -923,6 +923,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				auto source = DuckLakeVortexSourceRetention::Collect(
 				    *job.context, m.catalog, m.max_objects - collected_objects, m.max_bytes - collected_bytes, check);
 				m.bytes += source.bytes;
+				collected_objects += source.expired + source.files;
+				collected_bytes += source.bytes;
 			}
 			{
 				std::lock_guard<std::mutex> guard(io);
@@ -933,6 +935,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			StoreMaintenance(db, m, "idle");
 			check("maintenance_complete");
 			Clear();
+			return collected_objects || collected_bytes;
 		} catch (const std::exception &error) {
 			bool cancelled_job;
 			{
@@ -955,6 +958,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				throw;
 			}
 			Clear();
+			return false;
 		}
 	}
 	void Stage(DatabaseInstance &db, const Pending &pending, Policy &p, const string &stage) {
@@ -1204,6 +1208,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		while (true) {
 			vector<Pending> work;
 			vector<PendingMaintenance> cleanup;
+			bool progressed = false;
 			{
 				std::lock_guard<std::mutex> guard(lock);
 				if (stopping) {
@@ -1240,7 +1245,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					break;
 				}
 				try {
-					RunMaintenance(*db, pending);
+					progressed |= RunMaintenance(*db, pending);
 				} catch (const std::exception &error) {
 					Clear();
 					std::lock_guard<std::mutex> guard(lock);
@@ -1252,7 +1257,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			if (stopping || weak.expired()) {
 				break;
 			}
-			changed.wait_for(guard, std::chrono::milliseconds(100));
+			if (!progressed) {
+				changed.wait_for(guard, std::chrono::milliseconds(100));
+			}
 		}
 		{
 			std::lock_guard<std::mutex> guard(lock);

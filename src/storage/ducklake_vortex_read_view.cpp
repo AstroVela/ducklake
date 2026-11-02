@@ -100,6 +100,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		}
 		auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
 		auto &transaction = DuckLakeTransaction::Get(*reader.context, catalog);
+		transaction.MarkVortexReadCapture();
 		auto snapshot = transaction.GetSnapshot();
 		checkpoint("after_snapshot");
 		auto entry = catalog.GetEntry(*reader.context, CatalogType::TABLE_ENTRY, options.schema, options.table,

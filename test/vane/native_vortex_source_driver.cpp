@@ -242,6 +242,33 @@ int main(int argc, char **argv) {
 			Concurrent(f);
 			return 0;
 		}
+		if (mode == "capture-readiness") {
+			f.Policy();
+			Pause pause;
+			Connection reader(f.database);
+			auto pending = std::async(std::launch::async, [&] {
+				return f.Search(reader, [&](const string &stage) {
+					if (stage == "after_snapshot") {
+						pause.Stop();
+					}
+				});
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			Connection held(f.database), owner(f.database);
+			held.BeginTransaction();
+			SQL(held, "SELECT count(*) FROM lake.items");
+			auto &transaction = VortexIndex::Begin(owner, "lake");
+			bool ordinary_blocked = !Source::WorkReady(transaction, 64 * 1024 * 1024);
+			held.Commit();
+			bool ready = Source::WorkReady(transaction, 64 * 1024 * 1024);
+			owner.Commit();
+			pause.Release();
+			Require(pending.get().rows[0][0].GetValue<int64_t>() == 0, "Capture readiness changed its query winner");
+			Require(ordinary_blocked, "Source readiness ignored an ordinary transaction");
+			Require(ready, "Source readiness discarded finite native capture work");
+			return 0;
+		}
 		if (mode == "capture-gate") {
 			f.Policy();
 			auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
