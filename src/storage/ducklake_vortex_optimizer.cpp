@@ -1016,8 +1016,13 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		auto metrics = p;
 		bool owns_task = false;
 		try {
+			// Keep managed mutations outside physical plan selection and publication.
+			auto writer = DuckLakeVortexWriteBatch::AcquireWriter();
 			Probe(db, metrics);
 			bool rewrite = metrics.rewrite_reason == "eligible";
+			if (!rewrite) {
+				writer.reset();
+			}
 			bool flush = !rewrite && FlushDue(metrics), build = !rewrite && IndexDue(metrics);
 			{
 				std::lock_guard<std::mutex> guard(io);
@@ -1092,13 +1097,11 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				Use(job, p.Id());
 				if (p.kind == "retire") {
 					Stage(db, pending, p, "optimizer_before_retire");
-					auto writer = DuckLakeVortexWriteBatch::AcquireWriter();
 					VortexCatalog::RetireEmpty(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.selected[0],
 					    p.expected, [&](const string &stage) { Stage(db, pending, p, stage); }, p.run);
 				} else if (rewrite) {
 					Stage(db, pending, p, "optimizer_before_rewrite");
-					auto writer = DuckLakeVortexWriteBatch::AcquireWriter();
 					VortexCatalog::Rewrite(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.selected[0],
 					    p.reference, p.expected, [&](const string &stage) { Stage(db, pending, p, stage); },
@@ -1107,10 +1110,11 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					                          : DuckLakeVortexRewriteMode::INDEXED,
 					    p.kind == "rewrite_f" || p.kind == "prune" ? p.run : "");
 				}
+				writer.reset();
 				if (flush) {
 					Stage(db, pending, p, "optimizer_before_flush");
 					{
-						auto writer = DuckLakeVortexWriteBatch::AcquireWriter();
+						auto flush_writer = DuckLakeVortexWriteBatch::AcquireWriter();
 						job.BeginTransaction();
 						auto &catalog = Catalog::GetCatalog(*job.context, p.config.catalog).Cast<DuckLakeCatalog>();
 						auto entry = catalog.GetEntry(*job.context, CatalogType::TABLE_ENTRY, p.config.schema,

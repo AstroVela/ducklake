@@ -122,3 +122,7 @@ new atomic budget precheck, then stopped its optimizer with `Vortex rewrite
 requires one nonempty source compaction`. That run is retained as a failed
 baseline diagnostic, not counted as a passing load or resolved by this scheduler
 change.
+
+The [physical-planning follow-up](native-vortex-rewrite-planning.md) investigates
+that retained 512-row failure and serializes plan selection with managed
+mutations.
