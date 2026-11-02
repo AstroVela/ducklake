@@ -23,6 +23,14 @@ using Source = DuckLakeVortexSourceRetention;
 using VortexIndex = DuckLakeVortexIndex;
 
 namespace {
+Pause *status_pause = nullptr;
+std::atomic<bool> pause_status {false};
+bool StatusEnabled(bool enabled) {
+	if (pause_status.exchange(false)) {
+		status_pause->Stop();
+	}
+	return enabled;
+}
 string Read(const string &path) {
 	std::ifstream input(path, std::ios::binary);
 	Require(bool(input), "Cannot read source fixture file");
@@ -240,6 +248,45 @@ int main(int argc, char **argv) {
 		f.Seed();
 		if (mode == "concurrent") {
 			Concurrent(f);
+			return 0;
+		}
+		if (mode == "status-readiness") {
+			f.Policy();
+			f.writer.CreateScalarFunction<bool, bool>("source_status_gate", &StatusEnabled);
+			SQL(f.writer, "ALTER TABLE __ducklake_metadata_lake.ducklake_vortex_source_retention_v1 RENAME TO "
+			              "source_policy_backing;"
+			              "CREATE VIEW __ducklake_metadata_lake.ducklake_vortex_source_retention_v1 AS "
+			              "SELECT * REPLACE(source_status_gate(enabled) AS enabled) FROM "
+			              "__ducklake_metadata_lake.source_policy_backing");
+			Pause pause;
+			status_pause = &pause;
+			pause_status = true;
+			auto pending = std::async(std::launch::async, [&] { return Source::Status(*f.writer.context, "lake"); });
+			ReleasePause release {pause};
+			pause.Wait();
+			auto admission = DuckLakeVortexReadView::AdmissionLock().TryGetExclusiveLock();
+			bool admitted = !admission;
+			admission.reset();
+			Connection held(f.database), owner(f.database);
+			held.BeginTransaction();
+			SQL(held, "SELECT count(*) FROM lake.items");
+			auto &transaction = VortexIndex::Begin(owner, "lake");
+			bool ordinary_blocked = !Source::WorkReady(transaction, 64 * 1024 * 1024);
+			held.Commit();
+			bool ready = Source::WorkReady(transaction, 64 * 1024 * 1024);
+			owner.Commit();
+			pause.Release();
+			auto status = pending.get();
+			SQL(f.writer, "DROP VIEW __ducklake_metadata_lake.ducklake_vortex_source_retention_v1;"
+			              "ALTER TABLE __ducklake_metadata_lake.source_policy_backing RENAME TO "
+			              "ducklake_vortex_source_retention_v1");
+			Require(status.size() == 1 && status[0][0].GetValue<bool>(), "Finite status capture lost its result");
+			Require(ordinary_blocked, "Status readiness ignored an ordinary transaction");
+			Require(ready, "Source readiness discarded finite status work");
+			Require(admitted, "Source status did not hold finite read admission");
+			f.Drain();
+			Connection reader(f.database);
+			Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == 0, "Status capture changed the query winner");
 			return 0;
 		}
 		if (mode == "capture-readiness") {

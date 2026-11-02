@@ -243,7 +243,9 @@ bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, 
 }
 
 vector<vector<Value>> DuckLakeVortexSourceRetention::Status(ClientContext &context, const string &catalog) {
+	auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
 	Owner owner(context, catalog);
+	owner.transaction.MarkVortexReadCapture();
 	auto policy = Load(owner.transaction);
 	auto counts = VortexIndex::Query(
 	    owner.transaction,

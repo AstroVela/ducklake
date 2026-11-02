@@ -92,6 +92,11 @@ SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[]
 ----
 2
 
+query I reader
+SELECT blocked_by_transactions::INTEGER FROM ducklake_vortex_source_retention_status('lake')
+----
+1
+
 query I
 SELECT blocked_by_transactions::INTEGER FROM ducklake_collect_vortex_sources('lake',1,1)
 ----
