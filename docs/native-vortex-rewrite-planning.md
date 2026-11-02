@@ -108,6 +108,10 @@ exploration query. Those diagnostics did not reproduce the stop or provide
 a stalled stack, so the original failure remains open. The instrumented run
 is excluded from the load matrix and its performance observations.
 
+The [stall-diagnostics follow-up](native-vortex-stall-diagnostics.md) adds
+pre-termination capture and records further investigation without closing the
+original stop.
+
 ```sh
 VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
     --fixtures automatic --rows 512 4096 32768 --dimensions 8 128 --seconds 12 \

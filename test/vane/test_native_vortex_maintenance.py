@@ -262,7 +262,7 @@ def budgets(driver, root, checks):
         before = drain(native)
         native.call("maintenance-cancel")
         native.call("build", "knn", artifacts / "replacement.json", 1)
-        native.call("maintenance-resume", "maintenance_after_build_gc", "pause")
+        native.call("maintenance-resume", "maintenance_complete", "pause")
         native.call("optimizer-wait")
         during = status(native)
         require(
