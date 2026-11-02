@@ -281,7 +281,7 @@ def aggregate_rows(driver, root, checks):
             "CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items');"
             "INSERT INTO lake.items VALUES(9999,[0,0,0,0,0,0,0,0],'A','small-F')"
         )
-        native.call("append", "knn", artifacts / "small.json", 1, expected="requires at least 64 rows")
+        native.call("append", "knn", artifacts / "small.json", 1, expected="requires 65..=100000 physical rows")
         unchanged(native, first, frozen)
         native.sql(
             "INSERT INTO lake.items SELECT 10000+i,[i::FLOAT,0,0,0,0,0,0,0],'A','global-cap' FROM range(95904)t(i)"
