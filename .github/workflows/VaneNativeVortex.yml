@@ -63,7 +63,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config
+          sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config gdb
           python -m pip install uv cmake 'scikit-build-core>=0.11.4' 'pybind11[global]>=3' 'setuptools-scm>=9.2' numpy packaging pytest pytest-timeout
           rustup toolchain install 1.91.0 --profile minimal
           mkdir -p .cache/vcpkg build/wheels build/logs
@@ -173,8 +173,10 @@ jobs:
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_automatic_flow.py \
             --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --output-dir "$PWD/build/automatic-proof" \
             2>&1 | tee build/logs/vane-vortex-automatic-flow.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_stall_capture.py \
+            --output-dir "$PWD/build/stall-capture-proof" 2>&1 | tee build/logs/vane-vortex-stall-capture.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
-            --fixtures automatic --rows 4096 32768 --dimensions 8 128 --seconds 12 --output-dir "$PWD/build/load-proof" \
+            --fixtures automatic --rows 4096 32768 --dimensions 8 128 --seconds 12 --capture-stalls --output-dir "$PWD/build/load-proof" \
             2>&1 | tee build/logs/vane-vortex-sustained-load.log
       - name: Retain build and qualification evidence
         if: always()
@@ -195,8 +197,11 @@ jobs:
             build/automatic-proof/report.json
             build/automatic-proof/**/driver.log
             build/automatic-proof/**/recovery.log
+            build/stall-capture-proof
             build/load-proof/report.json
             build/load-proof/**/report.json
             build/load-proof/**/worker.log
             build/load-proof/**/events.jsonl
+            build/load-proof/**/stall.json
+            build/load-proof/**/native-stacks.log
             build/wheels

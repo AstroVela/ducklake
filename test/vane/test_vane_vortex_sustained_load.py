@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import platform
 import resource
+import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -28,6 +30,54 @@ BASE, KEYED = AUTO.BASE, AUTO.KEYED
 query, require, quote = AUTO.query, AUTO.require, AUTO.quote
 REQUESTS = AUTO.WRITE.REQUESTS
 PHASES = [("paced", 1.0), ("burst", 0.0), ("recovery", 1.0)]
+PR_SET_PTRACER = 0x59616D61
+
+
+def enable_stall_capture():
+    import ctypes
+    import faulthandler
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    require(libc.prctl(PR_SET_PTRACER, os.getppid(), 0, 0, 0) == 0, f"PR_SET_PTRACER failed: {ctypes.get_errno()}")
+    faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
+
+
+def capture_stall(child, case, progress, reason):
+    diagnostic = dict(
+        reason=reason,
+        pid=child.pid,
+        progress=progress,
+        build_workspaces=sorted(path.name for path in (case / "indexes").glob(".build-*")),
+    )
+    try:
+        with (case / "native-stacks.log").open("w") as log:
+            result = subprocess.run(
+                [
+                    "gdb",
+                    "-q",
+                    "-n",
+                    "-batch",
+                    "-ex",
+                    "set debuginfod enabled off",
+                    "-ex",
+                    "set pagination off",
+                    "-ex",
+                    "thread apply all bt 32",
+                    "-ex",
+                    "detach",
+                    "-p",
+                    str(child.pid),
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=20,
+            )
+        diagnostic["gdb_exit_status"] = result.returncode
+        if child.poll() is None:
+            child.send_signal(signal.SIGUSR2)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        diagnostic["error"] = str(error)
+    (case / "stall.json").write_text(json.dumps(diagnostic, indent=2) + "\n")
 
 
 def row(key, epoch, dimension, fixture):
@@ -127,6 +177,8 @@ def bootstrap(root, count, dimension, fixture):
 
 
 def worker(args):
+    if args.capture_stalls:
+        enable_stall_capture()
     import vane
 
     root, count, dimension, fixture = args.worker_case, args.rows[0], args.dimensions[0], args.fixtures[0]
@@ -547,21 +599,74 @@ def run_case(args, root, count, dimension, fixture):
         "--recovery-query-pause",
         str(args.recovery_query_pause),
     ]
+    if args.capture_stalls:
+        command.append("--capture-stalls")
     events = []
     with (case / "worker.log").open("w") as log:
         child = subprocess.Popen(command, pass_fds=(write_fd,), stdout=log, stderr=subprocess.STDOUT)
         os.close(write_fd)
-        watchdog = threading.Timer(3 * args.seconds + 300, child.kill)
+        expired, diagnostics_stopped = threading.Event(), threading.Event()
+        progress_lock = threading.Lock()
+        progress = dict(time=time.monotonic(), query_time=time.monotonic(), ready=False)
+        deadline = time.monotonic() + 3 * args.seconds + 300
+
+        def expire():
+            expired.set()
+            child.kill()
+
+        def diagnose():
+            while not diagnostics_stopped.wait(0.25):
+                if child.poll() is not None:
+                    return
+                with progress_lock:
+                    current = dict(progress)
+                now = time.monotonic()
+                stalled = current["ready"] and now - current["time"] >= 30
+                queries_stalled = current["ready"] and now - current["query_time"] >= 30
+                if stalled or queries_stalled or deadline - now <= 25:
+                    reason = (
+                        "queries_stalled_30_seconds"
+                        if queries_stalled
+                        else "no_events_30_seconds" if stalled else "watchdog_deadline"
+                    )
+                    capture_stall(child, case, current, reason)
+                    return
+
+        watchdog = threading.Timer(3 * args.seconds + 300, expire)
         watchdog.start()
+        diagnostics = threading.Thread(target=diagnose) if args.capture_stalls else None
+        if diagnostics:
+            diagnostics.start()
         try:
             with os.fdopen(read_fd, encoding="utf-8") as pipe, (case / "events.jsonl").open("w") as trace:
                 for line in pipe:
                     trace.write(line)
-                    events.append(json.loads(line))
+                    event = json.loads(line)
+                    events.append(event)
+                    with progress_lock:
+                        progress.update(time=time.monotonic(), kind=event["kind"], phase=event.get("phase"))
+                        if event["kind"] == "ready":
+                            progress.update(ready=True, query_time=time.monotonic())
+                        elif event["kind"] == "query":
+                            progress["query_time"] = time.monotonic()
+                            progress["last_query"] = {
+                                key: event[key] for key in ["vector", "category", "before", "after", "canary"]
+                            }
+                        elif event["kind"] == "sample":
+                            progress["sample"] = event
+                        elif event["kind"] == "measured":
+                            progress["ready"] = False
             child.wait(timeout=30)
-            require(child.returncode == 0, "Load worker failed: " + (case / "worker.log").read_text()[-6000:])
+            require(
+                child.returncode == 0,
+                f"Load worker failed (exit {child.returncode}, watchdog_expired={expired.is_set()}): "
+                + (case / "worker.log").read_text()[-6000:],
+            )
         finally:
             watchdog.cancel()
+            diagnostics_stopped.set()
+            if diagnostics:
+                diagnostics.join(timeout=25)
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=10)
@@ -574,6 +679,7 @@ def run_case(args, root, count, dimension, fixture):
         **validate(events, count, dimension, fixture),
         **summarize(events),
     )
+    result["stall_capture_performed"] = (case / "stall.json").exists()
     result["correctness"] = "passed"
     if not result["canary_gate_passed"]:
         result.update(status="failed", error="Qualified canary fell below its unchanged 0.8 recall gate")
@@ -594,8 +700,12 @@ def main():
     parser.add_argument("--readers", type=int, default=2)
     parser.add_argument("--query-pause", type=float, default=0.02)
     parser.add_argument("--recovery-query-pause", type=float, default=0.5)
+    parser.add_argument(
+        "--capture-stalls", action="store_true", help="Capture native/Python stacks before watchdog termination"
+    )
     args = parser.parse_args()
     require(os.environ.get("VANE_RUNNER") == "local-fast", "Set VANE_RUNNER=local-fast explicitly")
+    require(not args.capture_stalls or shutil.which("gdb"), "--capture-stalls requires gdb")
     require(
         all(512 <= n <= 32768 for n in args.rows) and all(8 <= n <= 128 for n in args.dimensions),
         "Invalid qualification size or dimension",
@@ -624,6 +734,7 @@ def main():
         seconds_per_phase=args.seconds,
         query_pause_seconds=args.query_pause,
         recovery_query_pause_seconds=args.recovery_query_pause,
+        stall_capture_enabled=args.capture_stalls,
     )
     started = time.monotonic()
     failed = False
