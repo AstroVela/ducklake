@@ -233,6 +233,7 @@ def native_cases(driver, root, report):
         "defer",
         "held",
         "admission",
+        "capture-gate",
         "budget",
         "live",
         "gate",
