@@ -26,6 +26,11 @@ using VortexIndex = DuckLakeVortexIndex;
 namespace {
 Pause *status_pause = nullptr;
 std::atomic<bool> pause_status {false};
+std::atomic<idx_t> probe_revision_reads {0};
+int64_t ProbeRevision(int64_t value) {
+	probe_revision_reads++;
+	return value;
+}
 bool StatusEnabled(bool enabled) {
 	if (pause_status.exchange(false)) {
 		status_pause->Stop();
@@ -220,7 +225,7 @@ void MaintenanceFairness(Fixture &f, idx_t objects) {
 	}
 	stop();
 	auto timings = DuckLakeVortexOptimizer::MaintenanceProfile(*control.context, "lake");
-	Require(timings.size() == 15, "Missing bounded maintenance profile stages");
+	Require(timings.size() == 17, "Missing bounded maintenance profile stages");
 	std::set<string> measured;
 	for (auto &row : timings) {
 		auto calls = row[2].GetValue<uint64_t>(), total = row[3].GetValue<uint64_t>();
@@ -344,6 +349,70 @@ int main(int argc, char **argv) {
 		string root = argv[1], mode = argv[2];
 		Fixture f(root);
 		f.Seed();
+		if (mode == "probe-index-reuse") {
+			f.writer.CreateScalarFunction<int64_t, int64_t>("probe_revision_gate", &ProbeRevision);
+			SQL(f.writer,
+			    "ALTER TABLE __ducklake_metadata_lake.ducklake_vortex_indexes_v1 RENAME TO probe_index_backing");
+			auto columns = SQL(f.writer, "DESCRIBE __ducklake_metadata_lake.probe_index_backing");
+			string definitions, inputs, outputs;
+			for (auto &column : *columns) {
+				auto name = column.GetValue<string>(0);
+				auto input = "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+				auto output = name == "revision" ? string("revision_backing") : input;
+				if (!definitions.empty()) {
+					definitions += ",";
+					inputs += ",";
+					outputs += ",";
+				}
+				definitions += output + " " + column.GetValue<string>(1);
+				inputs += input;
+				outputs += output;
+			}
+			definitions += ",revision BIGINT GENERATED ALWAYS AS(probe_revision_gate(revision_backing))";
+			SQL(f.writer, "CREATE TABLE __ducklake_metadata_lake.ducklake_vortex_indexes_v1(" + definitions +
+			                  ");INSERT INTO __ducklake_metadata_lake.ducklake_vortex_indexes_v1(" + outputs +
+			                  ") SELECT " + inputs + " FROM __ducklake_metadata_lake.probe_index_backing");
+			DuckLakeVortexOptimizer::ConfigureCompaction(*f.writer.context, "lake", "main", "items", "knn", true, 1, 1);
+			probe_revision_reads = 0;
+			Pause pause;
+			DuckLakeVortexOptimizer::Resume(*f.writer.context, "lake", "main", "items", "knn",
+			                                [&](const string &stage) {
+				                                if (stage == "optimizer_probed") {
+					                                pause.Stop();
+				                                }
+			                                });
+			ReleasePause release {pause};
+			pause.Wait();
+			auto reads = probe_revision_reads.load();
+			DuckLakeVortexOptimizer::Cancel(*f.writer.context, "lake", "main", "items", "knn");
+			pause.Release();
+			vortex_detail::ViewJSON json;
+			auto facts = json.Object();
+			json.Number(facts, "revision_reads", reads);
+			Write(root + "/probe-reuse.json", json.Finish(facts));
+			Require(reads == 2, "One compaction probe reread its ready index");
+			Connection reader(f.database);
+			Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == 0,
+			        "Reused probe changed the current ANN winner");
+			return 0;
+		}
+		if (mode == "maintenance-idle-wait") {
+			f.Policy(1, 315360000);
+			DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024);
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+			bool observed = false;
+			while (!observed) {
+				for (auto &row : DuckLakeVortexOptimizer::MaintenanceProfile(*f.writer.context, "lake")) {
+					if (StringValue::Get(row[1]) == "loop_wait_timeout") {
+						observed = row[2].GetValue<uint64_t>() && row[3].GetValue<uint64_t>() >= 50 * 1000 * 1000;
+					}
+				}
+				Require(std::chrono::steady_clock::now() < deadline, "Idle worker did not report timed loop waits");
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			}
+			DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+			return 0;
+		}
 		if (mode == "maintenance-fairness-1" || mode == "maintenance-fairness-2") {
 			MaintenanceFairness(f, mode == "maintenance-fairness-1" ? 1 : 2);
 			return 0;
@@ -706,10 +775,10 @@ int main(int argc, char **argv) {
 			pause.Wait();
 			Connection cancellation(f.database);
 			auto before_profile = DuckLakeVortexOptimizer::MaintenanceProfile(*cancellation.context, "lake");
-			Require(before_profile.size() == 15, "Maintenance profile read blocked behind source collection");
+			Require(before_profile.size() == 17, "Maintenance profile read blocked behind source collection");
 			Require(SQL(cancellation, "SELECT count(*) FROM ducklake_vortex_maintenance_profile('lake')")
 			                ->GetValue(0, 0)
-			                .GetValue<idx_t>() == 15,
+			                .GetValue<idx_t>() == 17,
 			        "SQL maintenance profile read blocked behind source collection");
 			auto cancelled = std::async(
 			    std::launch::async, [&] { DuckLakeVortexOptimizer::CancelMaintenance(*cancellation.context, "lake"); });
@@ -735,7 +804,7 @@ int main(int argc, char **argv) {
 			Require(timed_cancellation, "Failed/cancelled source scope lost its held wall time");
 			DuckLakeVortexOptimizer::ResumeMaintenance(*f.writer.context, "lake");
 			auto resumed_profile = DuckLakeVortexOptimizer::MaintenanceProfile(*cancellation.context, "lake");
-			Require(resumed_profile.size() == 15 && resumed_profile[0][0] != before_profile[0][0],
+			Require(resumed_profile.size() == 17 && resumed_profile[0][0] != before_profile[0][0],
 			        "Explicit maintenance resume did not identify the new in-memory profile");
 			while (FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source)) {
 				Require(std::chrono::steady_clock::now() < deadline, "Resumed source worker did not finish");

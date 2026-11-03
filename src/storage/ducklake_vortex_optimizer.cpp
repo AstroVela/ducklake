@@ -377,7 +377,8 @@ string UnindexedGrowthBlocked(const Policy &p, idx_t rows, idx_t bytes, idx_t ma
 	return "";
 }
 
-void SelectCompaction(Metadata &meta, Policy &p) {
+void SelectCompaction(Metadata &meta, Policy &p, DuckLakeTableEntry &table,
+                      optional_ptr<const DuckLakeVortexIndex> captured) {
 	p.rewrite_candidate.clear();
 	p.rewrite_prune = false;
 	p.rewrite_deleted = p.rewrite_remaining = 0;
@@ -385,8 +386,10 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 	if (!p.compaction_enabled || !p.expected) {
 		return;
 	}
-	auto &table = Table(meta, p);
-	auto index = VortexCatalog::Lookup(meta.transaction, table, p.config.index);
+	if (!captured || captured->revision != p.expected) {
+		throw InternalException("Compaction probe lost its captured ready index");
+	}
+	auto &index = *captured;
 	auto aliases = meta.Query("SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1 WHERE table_uuid=" +
 	                          Quote(p.uuid));
 	if (aliases->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
@@ -520,9 +523,14 @@ void SelectCompaction(Metadata &meta, Policy &p) {
 	p.rewrite_reason = !eligible.empty() ? "eligible" : blocked.empty() ? "no_deletions" : reason;
 }
 
-void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> changes = nullptr,
-           optional_ptr<const vector<FlushedInlinedTableInfo>> flushed = nullptr,
-           optional_ptr<const DuckLakeVortexRewriteState> rewrite = nullptr) {
+struct ProbeCapture {
+	DuckLakeTableEntry &table;
+	unique_ptr<DuckLakeVortexIndex> index;
+};
+
+ProbeCapture Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> changes = nullptr,
+                   optional_ptr<const vector<FlushedInlinedTableInfo>> flushed = nullptr,
+                   optional_ptr<const DuckLakeVortexRewriteState> rewrite = nullptr) {
 	auto &table = Table(meta, p);
 	FlushConfiguration(table);
 	auto snapshot = meta.transaction.GetSnapshot();
@@ -642,12 +650,13 @@ void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> 
 		throw InvalidInputException("Optimizer indexed source was replaced; explicit rebuild required");
 	}
 	p.expected = revision;
+	return {table, std::move(index)};
 }
 
 void Probe(DatabaseInstance &db, Policy &p) {
 	Metadata meta(db, p.config.catalog);
-	Probe(meta, p);
-	SelectCompaction(meta, p);
+	auto capture = Probe(meta, p);
+	SelectCompaction(meta, p, capture.table, capture.index.get());
 	meta.Commit();
 }
 
@@ -960,10 +969,10 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				std::lock_guard<std::mutex> guard(io);
 				Metadata meta(db, m.catalog);
 				MaintenanceBacklog(meta, m);
-				meta.Commit();
+				phase.Switch(Phase::MAINTENANCE_METADATA);
+				m.state = "idle";
+				SaveMaintenance(meta, m, m.run, true);
 			}
-			phase.Switch(Phase::MAINTENANCE_METADATA);
-			StoreMaintenance(db, m, "idle");
 			check("maintenance_complete");
 			{
 				std::lock_guard<std::mutex> guard(lock);
@@ -1070,6 +1079,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				writer = DuckLakeVortexWriteBatch::AcquireWriter();
 				Probe(db, metrics);
 			}
+			Stage(db, pending, p, "optimizer_probed");
 			bool rewrite = metrics.rewrite_reason == "eligible";
 			if (!rewrite) {
 				writer.reset();
@@ -1310,7 +1320,16 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				break;
 			}
 			if (!progressed) {
-				changed.wait_for(guard, std::chrono::milliseconds(100));
+				auto started_wait = std::chrono::steady_clock::now();
+				auto outcome = changed.wait_for(guard, std::chrono::milliseconds(100));
+				auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+				                                                               started_wait)
+				              .count();
+				auto phase = outcome == std::cv_status::timeout ? Phase::LOOP_WAIT_TIMEOUT : Phase::LOOP_WAIT_WAKE;
+				// This is one shared worker wait, observed by each scheduled catalog.
+				for (auto &pending : cleanup) {
+					pending.profile->Record(phase, ns);
+				}
 			}
 		}
 		{
@@ -1898,7 +1917,8 @@ vector<vector<Value>> DuckLakeVortexOptimizer::MaintenanceProfile(ClientContext 
 	const char *names[] = {
 	    "optimizer_total",      "optimizer_probe", "optimizer_metadata", "maintenance_total", "maintenance_probe",
 	    "maintenance_metadata", "build_recovery",  "build_gc",           "generation_gc",     "source_gc",
-	    "source_wait",          "source_metadata", "source_expire",      "source_artifact",   "source_unlink"};
+	    "source_wait",          "source_metadata", "source_expire",      "source_artifact",   "source_unlink",
+	    "loop_wait_timeout",    "loop_wait_wake"};
 	static_assert(sizeof(names) / sizeof(names[0]) == idx_t(Phase::COUNT), "Missing Vortex profile stage name");
 	auto samples = profile->Snapshot();
 	for (idx_t i = 0; i < samples.size(); i++) {

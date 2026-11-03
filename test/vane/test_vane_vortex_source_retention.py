@@ -249,6 +249,8 @@ def native_cases(driver, root, report):
         "source-only",
         "maintenance-fairness-1",
         "maintenance-fairness-2",
+        "probe-index-reuse",
+        "maintenance-idle-wait",
         "fail-source_expiry_committed",
         "fail-source_delete_intent_committed",
         "fail-source_after_unlink",
