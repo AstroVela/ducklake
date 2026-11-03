@@ -8,6 +8,7 @@ namespace duckdb {
 class ClientContext;
 class DuckLakeTransaction;
 class StorageLock;
+class DuckLakeVortexMaintenanceProfile;
 
 struct DuckLakeVortexSourceGCResult {
 	idx_t expired = 0, files = 0, bytes = 0;
@@ -25,6 +26,7 @@ public:
 	static vector<vector<Value>> Status(ClientContext &context, const string &catalog);
 	static DuckLakeVortexSourceGCResult Collect(ClientContext &context, const string &catalog, idx_t max_objects,
 	                                            idx_t max_bytes,
-	                                            const std::function<void(const string &)> &observe = nullptr);
+	                                            const std::function<void(const string &)> &observe = nullptr,
+	                                            DuckLakeVortexMaintenanceProfile *profile = nullptr);
 };
 } // namespace duckdb

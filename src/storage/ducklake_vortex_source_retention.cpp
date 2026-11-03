@@ -1,4 +1,5 @@
 #include "storage/ducklake_vortex_source_retention.hpp"
+#include "storage/ducklake_vortex_profile.hpp"
 
 #include "common/ducklake_vortex_gc_io.hpp"
 #include "common/ducklake_vortex_json.hpp"
@@ -266,9 +267,10 @@ vector<vector<Value>> DuckLakeVortexSourceRetention::Status(ClientContext &conte
 	return {std::move(row)};
 }
 
-DuckLakeVortexSourceGCResult
-DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &catalog_name, idx_t max_objects,
-                                       idx_t max_bytes, const std::function<void(const string &)> &observe) {
+DuckLakeVortexSourceGCResult DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &catalog_name,
+                                                                    idx_t max_objects, idx_t max_bytes,
+                                                                    const std::function<void(const string &)> &observe,
+                                                                    DuckLakeVortexMaintenanceProfile *profile) {
 	if (!max_objects || max_objects > 16 || !max_bytes || max_bytes > MAX_BYTES) {
 		throw InvalidInputException("Invalid Vortex source collection budgets");
 	}
@@ -285,6 +287,8 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 		throw InvalidInputException("Vortex source collection requires an attached DuckLake catalog");
 	}
 	auto &catalog = attached->GetCatalog().Cast<DuckLakeCatalog>();
+	using Phase = DuckLakeVortexPhase;
+	DuckLakeVortexPhaseTimer timer(profile, Phase::SOURCE_WAIT);
 	check("source_gc_waiting");
 	auto publication = VortexIndex::PublicationLock().GetExclusiveLock();
 	// Finish admitted captures before freezing their transaction starts.
@@ -295,6 +299,7 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 		result.blocked = true;
 		return result;
 	}
+	timer.Switch(Phase::SOURCE_METADATA);
 	Connection owner(*context.db);
 	owner.context->registered_state->GetOrCreate<CollectorContext>(COLLECTOR);
 	try {
@@ -308,20 +313,26 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 			return result;
 		}
 		auto root = Root(transaction);
+		timer.Switch(Phase::SOURCE_ARTIFACT);
 		auto directory = OpenRoot(root, false);
+		timer.Switch(Phase::SOURCE_METADATA);
 		auto files = Candidates(transaction, root, max_objects);
 		owner.Commit();
 		for (auto &file : files) {
 			check("source_before_plan");
+			timer.Switch(Phase::SOURCE_ARTIFACT);
 			auto parent = OpenParent(directory->fd, file.relative, file.registered);
 			Inspect(parent, file, false);
 			if (file.bytes > max_bytes - result.bytes) {
 				break;
 			}
 			{
+				timer.Switch(Phase::SOURCE_METADATA);
 				auto &mark = VortexIndex::Begin(owner, catalog_name);
 				Unreferenced(mark, file);
+				timer.Switch(Phase::SOURCE_ARTIFACT);
 				Inspect(parent, file, true);
+				timer.Switch(Phase::SOURCE_METADATA);
 				if (!file.registered) {
 					VortexIndex::Query(mark, "INSERT INTO {METADATA_CATALOG}." + string(DELETIONS) + " VALUES(" +
 					                             to_string(file.id) + "," + Value(file.raw).ToSQLString() + "," +
@@ -334,7 +345,9 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 			}
 			check("source_delete_intent_committed");
 			check("source_before_unlink");
+			timer.Switch(Phase::SOURCE_ARTIFACT);
 			if (Inspect(parent, file, true)) {
+				timer.Switch(Phase::SOURCE_UNLINK);
 				if (unlinkat(parent.directory->fd, parent.name.c_str(), 0)) {
 					throw IOException("Cannot unlink registered Vortex source");
 				}
@@ -342,6 +355,7 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 			}
 			check("source_after_unlink");
 			{
+				timer.Switch(Phase::SOURCE_METADATA);
 				auto &finish = VortexIndex::Begin(owner, catalog_name);
 				Unreferenced(finish, file);
 				VortexIndex::Query(finish, "DELETE FROM {METADATA_CATALOG}." + string(SCHEDULED) + Where(file));
@@ -357,6 +371,7 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 			check("source_delete_completed");
 		}
 		if (result.files < max_objects) {
+			timer.Switch(Phase::SOURCE_EXPIRE);
 			auto &expire = VortexIndex::Begin(owner, catalog_name);
 			auto snapshots = expire.GetMetadataManager().GetAllSnapshots(
 			    "snapshot_id IN (SELECT snapshot_id FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " +
@@ -376,6 +391,7 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 		}
 		return result;
 	} catch (...) {
+		timer.Switch(Phase::SOURCE_METADATA);
 		VortexIndex::Rollback(owner);
 		throw;
 	}

@@ -14,6 +14,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <thread>
 #include <unistd.h>
 
@@ -218,6 +219,21 @@ void MaintenanceFairness(Fixture &f, idx_t objects) {
 		throw;
 	}
 	stop();
+	auto timings = DuckLakeVortexOptimizer::MaintenanceProfile(*control.context, "lake");
+	Require(timings.size() == 15, "Missing bounded maintenance profile stages");
+	std::set<string> measured;
+	for (auto &row : timings) {
+		auto calls = row[2].GetValue<uint64_t>(), total = row[3].GetValue<uint64_t>();
+		Require(row[0] == timings[0][0] && row[4].GetValue<uint64_t>() <= total && (!calls || total),
+		        "Invalid maintenance profile identity or timing counters");
+		if (calls) {
+			measured.insert(StringValue::Get(row[1]));
+		}
+	}
+	for (auto &stage : {"maintenance_total", "maintenance_probe", "maintenance_metadata", "build_recovery", "build_gc",
+	                    "generation_gc", "source_gc", "source_wait", "source_metadata", "source_expire"}) {
+		Require(measured.count(stage), "Maintenance profile missed an executed stage");
+	}
 	vortex_detail::ViewJSON json;
 	auto result = json.Object();
 	json.Number(result, "passes", passes);
@@ -689,6 +705,12 @@ int main(int argc, char **argv) {
 			ReleasePause release {pause};
 			pause.Wait();
 			Connection cancellation(f.database);
+			auto before_profile = DuckLakeVortexOptimizer::MaintenanceProfile(*cancellation.context, "lake");
+			Require(before_profile.size() == 15, "Maintenance profile read blocked behind source collection");
+			Require(SQL(cancellation, "SELECT count(*) FROM ducklake_vortex_maintenance_profile('lake')")
+			                ->GetValue(0, 0)
+			                .GetValue<idx_t>() == 15,
+			        "SQL maintenance profile read blocked behind source collection");
 			auto cancelled = std::async(
 			    std::launch::async, [&] { DuckLakeVortexOptimizer::CancelMaintenance(*cancellation.context, "lake"); });
 			Require(cancelled.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
@@ -703,7 +725,18 @@ int main(int argc, char **argv) {
 			Require(FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source) &&
 			            f.Count("__ducklake_metadata_lake.ducklake_vortex_source_deletions_v1") == 1,
 			        "Cancellation did not preserve the registered deletion intent");
+			auto cancelled_profile = DuckLakeVortexOptimizer::MaintenanceProfile(*cancellation.context, "lake");
+			bool timed_cancellation = false;
+			for (auto &row : cancelled_profile) {
+				if (StringValue::Get(row[1]) == "source_metadata") {
+					timed_cancellation = row[4].GetValue<uint64_t>() >= 50 * 1000 * 1000;
+				}
+			}
+			Require(timed_cancellation, "Failed/cancelled source scope lost its held wall time");
 			DuckLakeVortexOptimizer::ResumeMaintenance(*f.writer.context, "lake");
+			auto resumed_profile = DuckLakeVortexOptimizer::MaintenanceProfile(*cancellation.context, "lake");
+			Require(resumed_profile.size() == 15 && resumed_profile[0][0] != before_profile[0][0],
+			        "Explicit maintenance resume did not identify the new in-memory profile");
 			while (FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source)) {
 				Require(std::chrono::steady_clock::now() < deadline, "Resumed source worker did not finish");
 				std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -712,6 +745,13 @@ int main(int argc, char **argv) {
 			while (DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, "lake")[0][2].GetValue<bool>()) {
 				Require(std::chrono::steady_clock::now() < deadline, "Resumed source worker did not stop");
 				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			}
+			auto completed_profile = DuckLakeVortexOptimizer::MaintenanceProfile(*cancellation.context, "lake");
+			for (auto &row : completed_profile) {
+				if (StringValue::Get(row[1]) == "source_artifact" || StringValue::Get(row[1]) == "source_unlink") {
+					Require(row[2].GetValue<uint64_t>() && row[3].GetValue<uint64_t>(),
+					        "Resumed file collection lost artifact or unlink timing");
+				}
 			}
 			f.Drain();
 			f.CheckReclaimed();

@@ -113,6 +113,39 @@ def qualify(connection, label, recalls):
     for category in [None, "A", "B"]:
         result = {"rows": query(connection, SEARCH.search_sql(VECTOR, category=category))}
         recalls.append(SEARCH.qualify(result, oracle, VECTOR, category))
+        before = query(
+            connection,
+            "SELECT max(snapshot_id) AS n FROM __ducklake_metadata_lake.ducklake_snapshot",
+        )[
+            0
+        ]["n"]
+        diagnostic = query(connection, SEARCH.search_sql(VECTOR, category=category, diagnostics=True))
+        after = query(
+            connection,
+            "SELECT max(snapshot_id) AS n FROM __ducklake_metadata_lake.ducklake_snapshot",
+        )[
+            0
+        ]["n"]
+        require(
+            len(diagnostic) == 1,
+            "SQL diagnostics did not return one actual query capture",
+        )
+        snapshot = json.loads(diagnostic[0]["diagnostics"])["native_capture"]["snapshot_id"]
+        require(
+            type(snapshot) is int and before <= snapshot <= after,
+            "SQL diagnostic snapshot is outside its capture window",
+        )
+        require(
+            diagnostic[0]["hits"] == result["rows"],
+            "SQL diagnostics changed typed ranked search results",
+        )
+    empty = query(connection, SEARCH.search_sql(VECTOR, category="absent", diagnostics=True))
+    require(
+        len(empty) == 1
+        and empty[0]["hits"] == []
+        and type(json.loads(empty[0]["diagnostics"])["native_capture"]["snapshot_id"]) is int,
+        "Empty search lost its actual SQL ReadView snapshot",
+    )
     prepared = query(connection, "EXECUTE nearest")
     recalls.append(SEARCH.qualify({"rows": prepared}, oracle, VECTOR))
     return {"phase": label, "rows": len(oracle), "revision": head(connection)["revision"]}

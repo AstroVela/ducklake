@@ -1,6 +1,7 @@
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
+#include "storage/ducklake_vortex_profile.hpp"
 #include "storage/ducklake_vortex_source_retention.hpp"
 #include "storage/ducklake_vortex_write.hpp"
 #include "common/ducklake_vortex_json.hpp"
@@ -32,6 +33,8 @@ using Config = DuckLakeVortexOptimizerConfig;
 using namespace duckdb_yyjson;
 using namespace vortex_detail;
 using Key = std::pair<string, string>;
+using Phase = DuckLakeVortexPhase;
+using PhaseTimer = DuckLakeVortexPhaseTimer;
 const char *POLICIES = "ducklake_vortex_optimizer_v2";
 const char *MAINTENANCE = "ducklake_vortex_maintenance_v1";
 const char *WRITE_BUDGETS = "ducklake_vortex_write_budgets_v1";
@@ -706,6 +709,7 @@ struct PendingMaintenance {
 	string catalog;
 	std::function<void(const string &)> observe;
 	idx_t next_gc;
+	shared_ptr<DuckLakeVortexMaintenanceProfile> profile;
 };
 
 struct Runtime : public std::enable_shared_from_this<Runtime> {
@@ -765,7 +769,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		if (maintenance.size() >= 16 && !maintenance.count(catalog)) {
 			throw InvalidInputException("Vortex maintenance catalog limit exceeded");
 		}
-		maintenance[catalog] = {catalog, observe, 0};
+		maintenance[catalog] = {
+		    catalog, observe, 0,
+		    make_shared_ptr<DuckLakeVortexMaintenanceProfile>(UUID::ToString(UUID::GenerateRandomUUID()))};
 		maintenance_cancelled.erase(catalog);
 		maintenance_errors.erase(catalog);
 		changed.notify_all();
@@ -775,6 +781,11 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		if (maintenance.size() >= 16 && !maintenance.count(catalog)) {
 			throw InvalidInputException("Vortex maintenance catalog limit exceeded");
 		}
+	}
+	shared_ptr<DuckLakeVortexMaintenanceProfile> Profile(const string &catalog) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto found = maintenance.find(catalog);
+		return found == maintenance.end() ? nullptr : found->second.profile;
 	}
 	bool IsMaintenanceActive(const string &catalog) {
 		std::lock_guard<std::mutex> guard(lock);
@@ -846,6 +857,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		SaveMaintenance(meta, m, m.run, true);
 	}
 	bool RunMaintenance(DatabaseInstance &db, PendingMaintenance pending) {
+		auto profile = pending.profile;
+		PhaseTimer total(profile.get(), Phase::MAINTENANCE_TOTAL);
+		PhaseTimer phase(profile.get(), Phase::MAINTENANCE_METADATA);
 		Maintenance m;
 		{
 			std::lock_guard<std::mutex> guard(io);
@@ -856,8 +870,10 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				return false;
 			}
 			auto had_backlog = m.remaining_builds || m.remaining_generations;
+			phase.Switch(Phase::MAINTENANCE_PROBE);
 			MaintenanceBacklog(meta, m);
 			m.source_work = DuckLakeVortexSourceRetention::WorkReady(meta.transaction, m.max_bytes);
+			phase.Switch(Phase::MAINTENANCE_METADATA);
 			if (!m.remaining_builds && !m.remaining_generations && !m.source_work) {
 				if (had_backlog) {
 					m.state = "idle";
@@ -896,15 +912,18 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			idx_t collected_objects = 0, collected_bytes = 0;
 			// Every class gets first use of the shared budget, including one-object policies.
 			for (idx_t turn = 0; turn < 3; turn++) {
-				auto phase = (pending.next_gc + turn) % 3;
+				auto gc_class = (pending.next_gc + turn) % 3;
 				auto objects = m.max_objects - collected_objects;
 				auto bytes = m.max_bytes - collected_bytes;
-				if (phase == 0) {
+				if (gc_class == 0) {
 					check("maintenance_before_recovery");
 					if (m.remaining_builds && objects && bytes) {
+						phase.Switch(Phase::BUILD_RECOVERY);
 						m.recovered += VortexCatalog::RecoverBuilds(*job.context, m.catalog, objects, check);
+						phase.Switch(Phase::MAINTENANCE_METADATA);
 						StoreMaintenance(db, m, "collecting_builds");
 						check("maintenance_before_build_gc");
+						phase.Switch(Phase::BUILD_GC);
 						auto builds = VortexCatalog::CollectBuilds(*job.context, m.catalog, objects, bytes, check);
 						m.builds += builds.builds;
 						m.bytes += builds.bytes;
@@ -912,10 +931,12 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 						collected_bytes += builds.bytes;
 					}
 					check("maintenance_after_build_gc");
-				} else if (phase == 1) {
+				} else if (gc_class == 1) {
 					if (m.remaining_generations && objects && bytes) {
+						phase.Switch(Phase::MAINTENANCE_METADATA);
 						StoreMaintenance(db, m, "collecting_generations");
 						check("maintenance_before_generation_gc");
+						phase.Switch(Phase::GENERATION_GC);
 						auto generations = VortexCatalog::Collect(*job.context, m.catalog, objects, bytes, check);
 						m.generations += generations.generations;
 						m.bytes += generations.artifact_bytes;
@@ -924,20 +945,24 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					}
 					check("maintenance_after_generation_gc");
 				} else if (m.source_work && objects && bytes) {
+					phase.Switch(Phase::MAINTENANCE_METADATA);
 					StoreMaintenance(db, m, "collecting_sources");
-					auto source =
-					    DuckLakeVortexSourceRetention::Collect(*job.context, m.catalog, objects, bytes, check);
+					phase.Switch(Phase::SOURCE_GC);
+					auto source = DuckLakeVortexSourceRetention::Collect(*job.context, m.catalog, objects, bytes, check,
+					                                                     profile.get());
 					m.bytes += source.bytes;
 					collected_objects += source.expired + source.files;
 					collected_bytes += source.bytes;
 				}
 			}
+			phase.Switch(Phase::MAINTENANCE_PROBE);
 			{
 				std::lock_guard<std::mutex> guard(io);
 				Metadata meta(db, m.catalog);
 				MaintenanceBacklog(meta, m);
 				meta.Commit();
 			}
+			phase.Switch(Phase::MAINTENANCE_METADATA);
 			StoreMaintenance(db, m, "idle");
 			check("maintenance_complete");
 			{
@@ -947,6 +972,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			Clear();
 			return collected_objects || collected_bytes;
 		} catch (const std::exception &error) {
+			phase.Switch(Phase::MAINTENANCE_METADATA);
 			bool cancelled_job;
 			{
 				std::lock_guard<std::mutex> guard(lock);
@@ -975,6 +1001,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		if (stage == "before_build_publish" ||
 		    ((p.kind == "rewrite" || p.kind == "rewrite_f" || p.kind == "prune") && stage == "rewrite_before_commit") ||
 		    (p.kind == "retire" && stage == "retire_before_commit")) {
+			auto profile = Profile(p.config.catalog);
+			PhaseTimer timer(profile.get(), Phase::OPTIMIZER_METADATA);
 			std::lock_guard<std::mutex> guard(io);
 			Metadata meta(db, p.config.catalog);
 			auto current = Load(meta, p);
@@ -994,6 +1022,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		Check(p.Id());
 	}
 	void Finish(DatabaseInstance &db, Policy &p, const string &state, const string &error, bool owns_task) {
+		auto profile = Profile(p.config.catalog);
+		PhaseTimer timer(profile.get(), Phase::OPTIMIZER_METADATA);
 		std::lock_guard<std::mutex> guard(io);
 		Metadata meta(db, p.config.catalog);
 		auto current = Load(meta, p);
@@ -1016,8 +1046,11 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		Save(meta, current, p.run);
 	}
 	void Run(DatabaseInstance &db, Pending pending) {
+		auto profile = Profile(pending.policy.config.catalog);
+		PhaseTimer total(profile.get(), Phase::OPTIMIZER_TOTAL);
 		Policy p;
 		{
+			PhaseTimer timer(profile.get(), Phase::OPTIMIZER_METADATA);
 			std::lock_guard<std::mutex> guard(io);
 			Metadata meta(db, pending.policy.config.catalog);
 			p = Load(meta, pending.policy);
@@ -1031,14 +1064,19 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		bool owns_task = false;
 		try {
 			// Keep managed mutations outside physical plan selection and publication.
-			auto writer = DuckLakeVortexWriteBatch::AcquireWriter();
-			Probe(db, metrics);
+			unique_ptr<StorageLockKey> writer;
+			{
+				PhaseTimer timer(profile.get(), Phase::OPTIMIZER_PROBE);
+				writer = DuckLakeVortexWriteBatch::AcquireWriter();
+				Probe(db, metrics);
+			}
 			bool rewrite = metrics.rewrite_reason == "eligible";
 			if (!rewrite) {
 				writer.reset();
 			}
 			bool flush = !rewrite && FlushDue(metrics), build = !rewrite && IndexDue(metrics);
 			{
+				PhaseTimer timer(profile.get(), Phase::OPTIMIZER_METADATA);
 				std::lock_guard<std::mutex> guard(io);
 				Metadata meta(db, p.config.catalog);
 				auto current = Load(meta, p);
@@ -1161,11 +1199,15 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					}
 					Stage(db, pending, p, "optimizer_flushed");
 					metrics = p;
-					Probe(db, metrics);
+					{
+						PhaseTimer timer(profile.get(), Phase::OPTIMIZER_PROBE);
+						Probe(db, metrics);
+					}
 					build = IndexDue(metrics);
 				}
 				if (build) {
 					{
+						PhaseTimer timer(profile.get(), Phase::OPTIMIZER_METADATA);
 						std::lock_guard<std::mutex> guard(io);
 						Metadata meta(db, p.config.catalog);
 						auto current = Load(meta, p);
@@ -1845,6 +1887,26 @@ void DuckLakeVortexOptimizer::ConfigureSourceRetention(ClientContext &context, c
 	std::lock_guard<std::mutex> guard(owner->runtime->io);
 	DuckLakeVortexSourceRetention::Configure(context, catalog, enabled, keep_snapshots, min_age_seconds);
 	owner->runtime->changed.notify_all();
+}
+
+vector<vector<Value>> DuckLakeVortexOptimizer::MaintenanceProfile(ClientContext &context, const string &catalog) {
+	auto profile = GetOwner(*context.db)->runtime->Profile(catalog);
+	vector<vector<Value>> rows;
+	if (!profile) {
+		return rows;
+	}
+	const char *names[] = {
+	    "optimizer_total",      "optimizer_probe", "optimizer_metadata", "maintenance_total", "maintenance_probe",
+	    "maintenance_metadata", "build_recovery",  "build_gc",           "generation_gc",     "source_gc",
+	    "source_wait",          "source_metadata", "source_expire",      "source_artifact",   "source_unlink"};
+	static_assert(sizeof(names) / sizeof(names[0]) == idx_t(Phase::COUNT), "Missing Vortex profile stage name");
+	auto samples = profile->Snapshot();
+	for (idx_t i = 0; i < samples.size(); i++) {
+		auto &sample = samples[i];
+		rows.push_back({Value(profile->id), Value(names[i]), Value::UBIGINT(sample.calls),
+		                Value::UBIGINT(sample.total_ns), Value::UBIGINT(sample.max_ns)});
+	}
+	return rows;
 }
 
 vector<vector<Value>> DuckLakeVortexOptimizer::MaintenanceStatus(ClientContext &context, const string &catalog) {
