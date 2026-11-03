@@ -67,16 +67,18 @@ locked dependency metadata, shell syntax and copyleft checks pass.
 
 ## Original long-load gate
 
-The separate 60-second-per-phase, four-reader automatic load passes on this
-signed provider pair. All 6,754 typed query-window checks have canary and
-exploration recall lower bounds of 1.0. T, F, old build/generation artifacts and
+The separate 60-second-per-phase, four-reader automatic load meets its liveness
+and canary gates on this signed provider pair. All 6,754 typed query-window checks
+match a committed state, with a canary recall lower bound of 1.0. Exploration
+recall reaches 0.6, below its existing 0.8 target; this quality failure is retained
+for the next consumer qualification. T, F, old build/generation artifacts and
 eligible source snapshots drain under the original budgets. Source cleanup
 finishes in 82.46 seconds, inside the unchanged 90-second drain deadline.
 
 The run uses the original 0.02-second query pause and 0.5-second recovery/drain
 pause. No other owned builds or load tests run concurrently. No stall capture
 or watchdog expiration occurs; the worker watchdog remains 480 seconds. This
-qualifies the previously stalled workload without increasing a deadline or
-search/maintenance budget. It does not establish production throughput or
+qualifies the previously stalled workload's liveness without increasing a
+deadline or search/maintenance budget. It does not establish production throughput or
 identify the earlier uncaptured silent stop's cause. The separate 4,096-row/128D
 cost canary still requires the following exact consumer pin for Vortex #35.
