@@ -31,6 +31,14 @@ query, require, quote = AUTO.query, AUTO.require, AUTO.quote
 REQUESTS = AUTO.WRITE.REQUESTS
 PHASES = [("paced", 1.0), ("burst", 0.0), ("recovery", 1.0)]
 PR_SET_PTRACER = 0x59616D61
+SPEC = importlib.util.spec_from_file_location("load_metrics", Path(__file__).with_name("vortex_load_metrics.py"))
+assert SPEC is not None and SPEC.loader is not None
+METRICS = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(METRICS)
+
+
+def phases(args):
+    return [("steady", args.write_interval)] if args.profile == "steady" else PHASES
 
 
 def enable_stall_capture():
@@ -179,6 +187,10 @@ def bootstrap(root, count, dimension, fixture):
 def worker(args):
     if args.capture_stalls:
         enable_stall_capture()
+    if args.profile == "steady":
+        private = args.worker_case / "private"
+        private.mkdir(mode=0o700)
+        os.environ["TMPDIR"] = str(private)
     import vane
 
     root, count, dimension, fixture = args.worker_case, args.rows[0], args.dimensions[0], args.fixtures[0]
@@ -227,6 +239,36 @@ def worker(args):
     errors = []
     cursors = [connection.cursor() for _ in range(args.readers + 1)]
     baseline = usage()
+    inventory = METRICS.FileInventory(root) if args.profile == "steady" else None
+
+    def cost_sample(cursor, sample_phase):
+        started = time.monotonic()
+        catalog = query(
+            cursor,
+            "SELECT (SELECT count(*) FROM "
+            + REQUESTS
+            + ") AS request_receipts, (SELECT coalesce(sum(octet_length(encode(table_uuid))"
+            "+octet_length(encode(request_id))+octet_length(encode(payload_hash))+16),0) FROM "
+            + REQUESTS
+            + ") AS receipt_logical_payload_bytes, (SELECT count(*) FROM "
+            "__ducklake_metadata_lake.ducklake_snapshot) AS native_snapshots,"
+            "(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_generations_v1 "
+            "WHERE state='active') AS active_generations",
+        )[0]
+        require(catalog["active_generations"] <= 3, "Sampled active B segments exceeded the existing budget")
+        files = inventory.sample()
+        emit(
+            "cost_sample",
+            phase=sample_phase,
+            usage=usage(),
+            catalog=catalog,
+            inventory=files,
+            sample_seconds=time.monotonic() - started,
+        )
+
+    emit("measurement_start", usage=baseline)
+    if inventory is not None:
+        cost_sample(connection, "setup")
 
     def guarded(call):
         try:
@@ -276,10 +318,14 @@ def worker(args):
 
     def monitor():
         cursor = cursors[-1]
+        next_cost = time.monotonic() + 5
         while not stopped.is_set():
             optimizer, maintenance = AUTO.healthy(cursor)
             source = query(cursor, "SELECT * FROM ducklake_vortex_source_retention_status('lake')")[0]
             emit("sample", phase=phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
+            if inventory is not None and time.monotonic() >= next_cost:
+                cost_sample(cursor, phase)
+                next_cost = time.monotonic() + 5
             stopped.wait(0.25)
 
     def producer(name, interval, deadline):
@@ -337,11 +383,12 @@ def worker(args):
         finally:
             cursor.close()
 
+    failure = None
     with ThreadPoolExecutor(max_workers=args.readers + 2) as pool:
         tasks = [pool.submit(guarded, lambda index=i: reader(index)) for i in range(args.readers)]
         tasks.append(pool.submit(guarded, monitor))
         try:
-            for name, interval in PHASES:
+            for name, interval in phases(args):
                 phase = name
                 begin = usage()
                 task = pool.submit(guarded, lambda: producer(name, interval, time.monotonic() + args.seconds))
@@ -352,14 +399,25 @@ def worker(args):
             begin = usage()
             _, source, footprint = AUTO.settle(connection, root, 2, min(100000, 3 * count + 2048))
             emit("drained", begin=begin, end=usage(), source=source, footprint=footprint)
+        except Exception as error:
+            emit("worker_error", phase=phase, error=str(error))
+            failure = error
         finally:
             stopped.set()
             for task in tasks:
-                task.result(timeout=90)
+                try:
+                    task.result(timeout=90)
+                except Exception as error:
+                    if failure is None:
+                        failure = error
             for cursor in cursors:
                 cursor.close()
-    emit("measured", begin=baseline, end=usage())
+            emit("measured", begin=baseline, end=usage())
     try:
+        if failure is not None:
+            raise failure
+        if inventory is not None:
+            cost_sample(connection, "post_measurement")
         require(not errors, str(errors))
         emit("final_rows", rows=BASE.raw(connection))
         recorded = query(
@@ -442,11 +500,13 @@ def valid_hits(sample, model):
     return recall
 
 
-def validate(events, count, dimension, fixture):
+def validate_queries(events, count, dimension, fixture):
     acks = sorted([event for event in events if event["kind"] == "ack"], key=lambda entry: entry["epoch"])
     require([entry["epoch"] for entry in acks] == list(range(1, len(acks) + 1)), "Mutation sequence has a gap")
     snapshots = [0] + [entry["receipt"]["snapshot_id"] for entry in acks]
     require(snapshots == sorted(set(snapshots)), "Commit order changed the single producer's order")
+    finished_times = [entry["finished_ns"] for entry in acks]
+    require(finished_times == sorted(finished_times), "Single-producer acknowledgement times changed order")
     keys, model, changes = list(range(count)), {key: row(key, 0, dimension, fixture) for key in range(count)}, []
     for entry in acks:
         upserts, deletes, replaced = plan(keys, entry["epoch"], dimension, fixture)
@@ -467,10 +527,7 @@ def validate(events, count, dimension, fixture):
             sample["before"] in snapshots and sample["after"] in snapshots and sample["before"] <= sample["after"],
             "Query watermark has no committed model",
         )
-        acknowledged = max(
-            (entry["receipt"]["snapshot_id"] for entry in acks if entry["finished_ns"] <= sample["before_time_ns"]),
-            default=0,
-        )
+        acknowledged = snapshots[bisect.bisect_right(finished_times, sample["before_time_ns"])]
         require(sample["before"] >= acknowledged, "Query missed a previously acknowledged commit")
         lower, upper = bisect.bisect_left(snapshots, sample["before"]), bisect.bisect_left(snapshots, sample["after"])
         while position < lower:
@@ -495,27 +552,35 @@ def validate(events, count, dimension, fixture):
     for change in changes[position:]:
         apply(model, change)
     expected = [model[key] for key in sorted(model)]
-    for kind in ["final_rows", "retry_rows"]:
-        actual = [entry for entry in events if entry["kind"] == kind]
-        require(len(actual) == 1 and actual[0]["rows"] == expected, "Drain or old retry changed current logical rows")
     require(len(expected) == count and len(samples) >= 12, "Insufficient concurrent workload coverage")
-    return dict(
-        queries=len(samples),
-        queries_overlapping_commits=overlapping,
-        minimum_recall_lower_bound=min(recalls),
-        canary_minimum_recall_lower_bound=min(canary_recalls),
-        canary_gate_passed=min(canary_recalls) >= 0.8,
-        exploration_minimum_recall_lower_bound=min(exploration_recalls),
-        exploration_recall=percentiles(exploration_recalls),
-        exploration_meets_0_8_target=min(exploration_recalls) >= 0.8,
-        committed_batches=len(acks),
+    return (
+        dict(
+            queries=len(samples),
+            queries_overlapping_commits=overlapping,
+            minimum_recall_lower_bound=min(recalls),
+            canary_minimum_recall_lower_bound=min(canary_recalls),
+            canary_gate_passed=min(canary_recalls) >= 0.8,
+            exploration_minimum_recall_lower_bound=min(exploration_recalls),
+            exploration_recall=percentiles(exploration_recalls),
+            exploration_meets_0_8_target=min(exploration_recalls) >= 0.8,
+            committed_batches=len(acks),
+        ),
+        expected,
     )
 
 
-def summarize(events):
+def validate(events, count, dimension, fixture):
+    result, expected = validate_queries(events, count, dimension, fixture)
+    for kind in ["final_rows", "retry_rows"]:
+        actual = [entry for entry in events if entry["kind"] == kind]
+        require(len(actual) == 1 and actual[0]["rows"] == expected, "Drain or old retry changed current logical rows")
+    return result
+
+
+def phase_metrics(events):
     result = {}
-    for name, _ in PHASES:
-        phase = next(entry for entry in events if entry["kind"] == "phase" and entry["phase"] == name)
+    for phase in (entry for entry in events if entry["kind"] == "phase"):
+        name = phase["phase"]
         acks = [entry for entry in events if entry["kind"] == "ack" and entry["phase"] == name]
         queries = [entry for entry in events if entry["kind"] == "query" and entry["phase"] == name]
         rejections = [entry for entry in events if entry["kind"] == "rejected" and entry["phase"] == name]
@@ -540,6 +605,54 @@ def summarize(events):
             process_write_bytes_per_mutation_byte=usage["write_bytes"] / logical,
             acknowledged_batches_per_second=len(acks) / usage["seconds"],
         )
+    return result
+
+
+def latency_windows(events):
+    windows = []
+    for phase in (entry for entry in events if entry["kind"] == "phase" and entry["phase"] == "steady"):
+        start, end = phase["begin"]["time_ns"], phase["end"]["time_ns"]
+        buckets = {}
+        for entry in events:
+            if entry.get("phase") != "steady" or entry["kind"] not in ["ack", "query", "rejected"]:
+                continue
+            stamp = entry["before_time_ns"] if entry["kind"] == "query" else entry["started_ns"]
+            bucket = max(0, (stamp - start) // 60_000_000_000)
+            buckets.setdefault(bucket, []).append(entry)
+        for minute, entries in sorted(buckets.items()):
+            seconds = (min(end, start + (minute + 1) * 60_000_000_000) - (start + minute * 60_000_000_000)) / 1e9
+            require(seconds > 0, "Measurement window is outside the completed steady phase")
+            acks = [entry for entry in entries if entry["kind"] == "ack"]
+            queries = [entry for entry in entries if entry["kind"] == "query"]
+            windows.append(
+                dict(
+                    minute=minute,
+                    seconds=seconds,
+                    committed_batches=len(acks),
+                    committed_operations=160 * len(acks),
+                    acknowledged_batches_per_second=len(acks) / seconds,
+                    ack_attempt_ms=percentiles([entry["elapsed_ms"] for entry in acks]) if acks else None,
+                    ack_with_explicit_retries_ms=(
+                        percentiles([entry["end_to_end_ms"] for entry in acks]) if acks else None
+                    ),
+                    queries=len(queries),
+                    query_ms=percentiles([entry["elapsed_ms"] for entry in queries]) if queries else None,
+                    query_classes={
+                        label: (
+                            percentiles([entry["elapsed_ms"] for entry in queries if entry["canary"] == canary])
+                            if any(entry["canary"] == canary for entry in queries)
+                            else None
+                        )
+                        for label, canary in [("canary", True), ("exploration", False)]
+                    },
+                    rejected_attempts=sum(entry["kind"] == "rejected" for entry in entries),
+                )
+            )
+    return windows
+
+
+def summarize(events):
+    result = phase_metrics(events)
     drain = next(entry for entry in events if entry["kind"] == "drained")
     samples = [entry for entry in events if entry["kind"] == "sample"]
     require(
@@ -555,7 +668,8 @@ def summarize(events):
     )
     return dict(
         phases=result,
-        burst_reached_write_budget=result["burst"]["backpressure_rejections"] > 0,
+        steady_latency_windows=latency_windows(events),
+        burst_reached_write_budget=(result["burst"]["backpressure_rejections"] > 0 if "burst" in result else None),
         drain=delta(drain["begin"], drain["end"]),
         footprint=drain["footprint"],
         sampled_peak_rss_kib=max(entry["usage"]["VmRSS"] for entry in samples),
@@ -572,9 +686,7 @@ def summarize(events):
     )
 
 
-def run_case(args, root, count, dimension, fixture):
-    case = root / f"{fixture}-rows-{count}-dim-{dimension}"
-    case.mkdir(mode=0o700)
+def run_worker(args, case, events, count, dimension, fixture):
     read_fd, write_fd = os.pipe()
     command = [
         sys.executable,
@@ -592,6 +704,10 @@ def run_case(args, root, count, dimension, fixture):
         fixture,
         "--seconds",
         str(args.seconds),
+        "--profile",
+        args.profile,
+        "--write-interval",
+        str(args.write_interval),
         "--readers",
         str(args.readers),
         "--query-pause",
@@ -601,14 +717,14 @@ def run_case(args, root, count, dimension, fixture):
     ]
     if args.capture_stalls:
         command.append("--capture-stalls")
-    events = []
     with (case / "worker.log").open("w") as log:
         child = subprocess.Popen(command, pass_fds=(write_fd,), stdout=log, stderr=subprocess.STDOUT)
         os.close(write_fd)
         expired, diagnostics_stopped = threading.Event(), threading.Event()
         progress_lock = threading.Lock()
         progress = dict(time=time.monotonic(), query_time=time.monotonic(), ready=False)
-        deadline = time.monotonic() + 3 * args.seconds + 300
+        watchdog_seconds = len(phases(args)) * args.seconds + 300
+        deadline = time.monotonic() + watchdog_seconds
 
         def expire():
             expired.set()
@@ -632,7 +748,7 @@ def run_case(args, root, count, dimension, fixture):
                     capture_stall(child, case, current, reason)
                     return
 
-        watchdog = threading.Timer(3 * args.seconds + 300, expire)
+        watchdog = threading.Timer(watchdog_seconds, expire)
         watchdog.start()
         diagnostics = threading.Thread(target=diagnose) if args.capture_stalls else None
         if diagnostics:
@@ -670,19 +786,64 @@ def run_case(args, root, count, dimension, fixture):
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=10)
+
+
+def partial_measurement(events, count, dimension, fixture):
     result = dict(
-        status="completed",
-        fixture=fixture,
-        rows=count,
-        dimension=dimension,
-        runtime=next(entry for entry in events if entry["kind"] == "ready"),
-        **validate(events, count, dimension, fixture),
-        **summarize(events),
+        evidence="partial; worker, final logical state and drain acceptance did not all complete",
+        queries_observed=sum(event["kind"] == "query" for event in events),
+        acknowledgements_observed=sum(event["kind"] == "ack" for event in events),
     )
+    samples = [event for event in events if event["kind"] == "sample"]
+    if samples:
+        result["last_sample"] = samples[-1]
+    starts = [event for event in events if event["kind"] == "measurement_start"]
+    measured = [event for event in events if event["kind"] == "measured"]
+    if starts and (measured or samples):
+        end = measured[-1]["end"] if measured else samples[-1]["usage"]
+        result["usage_through_last_observation"] = delta(starts[0]["usage"], end)
+    try:
+        result["completed_phases"] = phase_metrics(events)
+        result["steady_latency_windows"] = latency_windows(events)
+    except Exception as error:
+        result["phase_measurement_error"] = str(error)
+    try:
+        result["observed_query_validation"], _ = validate_queries(events, count, dimension, fixture)
+    except Exception as error:
+        result["query_validation_error"] = str(error)
+    result["cost_attribution"] = METRICS.summarize(events)
+    return result
+
+
+def run_case(args, root, count, dimension, fixture):
+    case = root / f"{fixture}-rows-{count}-dim-{dimension}"
+    case.mkdir(mode=0o700)
+    events = []
+    try:
+        run_worker(args, case, events, count, dimension, fixture)
+        result = dict(
+            status="completed",
+            fixture=fixture,
+            rows=count,
+            dimension=dimension,
+            runtime=next(entry for entry in events if entry["kind"] == "ready"),
+            **validate(events, count, dimension, fixture),
+            **summarize(events),
+        )
+        result["cost_attribution"] = METRICS.summarize(events)
+        result["correctness"] = "passed"
+        if not result["canary_gate_passed"] or not result["exploration_meets_0_8_target"]:
+            result.update(status="failed", error="Canary or exploration fell below its existing 0.8 recall target")
+    except Exception as error:
+        result = dict(
+            status="failed",
+            fixture=fixture,
+            rows=count,
+            dimension=dimension,
+            error=str(error),
+            partial_measurement=partial_measurement(events, count, dimension, fixture),
+        )
     result["stall_capture_performed"] = (case / "stall.json").exists()
-    result["correctness"] = "passed"
-    if not result["canary_gate_passed"]:
-        result.update(status="failed", error="Qualified canary fell below its unchanged 0.8 recall gate")
     (case / "report.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
@@ -697,6 +858,8 @@ def main():
     parser.add_argument("--rows", type=int, nargs="+", default=[4096])
     parser.add_argument("--dimensions", type=int, nargs="+", default=[8])
     parser.add_argument("--seconds", type=float, default=12)
+    parser.add_argument("--profile", choices=["phased", "steady"], default="phased")
+    parser.add_argument("--write-interval", type=float, default=1.0)
     parser.add_argument("--readers", type=int, default=2)
     parser.add_argument("--query-pause", type=float, default=0.02)
     parser.add_argument("--recovery-query-pause", type=float, default=0.5)
@@ -715,6 +878,8 @@ def main():
         "Invalid workload configuration",
     )
     require(0.25 <= args.recovery_query_pause <= 5, "Invalid planned recovery query interval")
+    require(0.1 <= args.write_interval <= 60, "Invalid steady write interval")
+    require(args.profile == "steady" or args.write_interval == 1, "--write-interval requires --profile steady")
     if args.worker_case:
         require(
             args.events_fd is not None and len(args.rows) == len(args.dimensions) == len(args.fixtures) == 1,
@@ -732,6 +897,9 @@ def main():
         cpu_count=os.cpu_count(),
         reader_threads=args.readers,
         seconds_per_phase=args.seconds,
+        profile=args.profile,
+        nominal_workload_seconds=len(phases(args)) * args.seconds,
+        write_interval_seconds=args.write_interval if args.profile == "steady" else None,
         query_pause_seconds=args.query_pause,
         recovery_query_pause_seconds=args.recovery_query_pause,
         stall_capture_enabled=args.capture_stalls,
@@ -754,10 +922,13 @@ def main():
                         )
                         print(f"Load case failed: {count} rows / {dimension}D; see worker.log", flush=True)
                     else:
-                        print(
-                            f"Sustained load measured: {count} rows / {dimension}D; {result['queries']} queries",
-                            flush=True,
-                        )
+                        if result["status"] == "failed":
+                            print(f"Load case failed: {count} rows / {dimension}D; see report.json", flush=True)
+                        else:
+                            print(
+                                f"Sustained load measured: {count} rows / {dimension}D; {result['queries']} queries",
+                                flush=True,
+                            )
                     failed = failed or result["status"] == "failed"
                     report["cases"].append(result)
         report["status"] = "completed_with_failures" if failed else "completed"
