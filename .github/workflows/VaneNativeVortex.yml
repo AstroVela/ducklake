@@ -200,6 +200,7 @@ jobs:
             build/source-proof/**/recovery.log
             build/source-proof/**/transaction-wake.json
             build/source-proof/**/wake-guards.json
+            build/source-proof/**/maintenance-probe-query.json
             build/keyed-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log
