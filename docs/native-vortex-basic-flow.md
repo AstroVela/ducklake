@@ -1,5 +1,8 @@
 # Local realtime vector query flow
 
+For the complete architecture, current qualification boundaries and remaining
+work, see the [DuckLake＋Vortex design and roadmap](ducklake-vortex-design-roadmap.md).
+
 The basic native path now starts with an empty table. One named query works
 before the first ANN generation, through inline writes (T), flushed Vortex
 files (F), background static indexing (B), and subsequent B/F/T mixtures.
