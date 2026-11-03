@@ -97,14 +97,14 @@ ReadView snapshot IDs. Query timing excludes watermark reads and oracle work.
 The watermark reads, status monitor and event serialization still contribute
 to overall process CPU and resource measurements.
 
-One connection uses the established fixed query as a canary with the unchanged
-recall@10 >= 0.8 fixture gate. Another uses rotating filtered queries to measure
-quality outside that qualified point. Typed versions, visibility, uniqueness,
-filters, distance and rank order are hard checks for both. The report retains
-the exploratory recall distribution and whether its minimum reaches 0.8;
-exploratory quality misses are not relabeled as version failures or concealed
-by lowering the canary gate. Where several logical cuts fit a public read
-window, recall is reported as the conservative minimum over those cuts.
+One connection uses the established fixed query as a canary. Other connections
+use rotating queries to measure quality outside that point. Both query classes
+now enforce their existing recall@10 >= 0.8 target. Typed versions, visibility,
+uniqueness, filters, distance and rank order are hard checks for both. The report
+retains the exploratory recall distribution; quality misses are not relabeled
+as version failures. Where several logical cuts fit a public read window,
+recall is reported as the conservative minimum over those cuts. Historical
+results below retain the older canary-only completion classification.
 
 A completed measurement is not production quality or performance acceptance.
 New query distributions need their own agreed recall and latency targets.
@@ -157,6 +157,12 @@ full query evidence and final logical state. The minimal SQL case checks quota
 rejection, admission of the unchanged request after an explicit budget change,
 named T search and exact retry. Larger matrices and longer runs are explicit;
 no production defaults or throughput claims are derived from the short CI run.
+
+For a single thirty-minute fixed-interval period with file-cost sampling, see
+[the steady-cost baseline](native-vortex-steady-cost-baseline.md). The default
+three-phase profile retains its original schedule. Failed workers and failed
+drains now retain partial phase, query and resource evidence with a failed
+result; they do not qualify the final logical state or cleanup.
 
 ## Local qualification on 2026-10-30
 

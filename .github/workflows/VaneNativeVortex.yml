@@ -178,6 +178,11 @@ jobs:
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
             --fixtures automatic --rows 4096 32768 --dimensions 8 128 --seconds 12 --capture-stalls --output-dir "$PWD/build/load-proof" \
             2>&1 | tee build/logs/vane-vortex-sustained-load.log
+          python -I extension/test/vane/test_vane_vortex_load_metrics.py \
+            2>&1 | tee build/logs/vane-vortex-load-metrics.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
+            --profile steady --rows 512 --dimensions 8 --seconds 15 --readers 4 --capture-stalls \
+            --output-dir "$PWD/build/steady-smoke-proof" 2>&1 | tee build/logs/vane-vortex-steady-smoke.log
       - name: Retain build and qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
