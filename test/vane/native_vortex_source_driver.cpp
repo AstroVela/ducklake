@@ -2,6 +2,8 @@
 #include "common/ducklake_vortex_json.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
@@ -32,6 +34,56 @@ int64_t ProbeRevision(int64_t value) {
 	probe_revision_reads++;
 	return value;
 }
+
+struct MaintenanceProbeLog {
+	std::thread::id caller = std::this_thread::get_id();
+	std::mutex lock;
+	optional_idx connection;
+	vector<string> statements;
+	void Record(ClientContext &context) {
+		if (std::this_thread::get_id() == caller) {
+			return;
+		}
+		auto &sql = context.GetCurrentQuery();
+		bool policy = StringUtil::StartsWith(sql, "SELECT enabled,state,run_id,") &&
+		              sql.find(".ducklake_vortex_maintenance_v1") != string::npos;
+		bool backlog = sql.find("SELECT count(*) FROM ") != string::npos &&
+		               sql.find(".ducklake_vortex_builds_v1") != string::npos &&
+		               sql.find(".ducklake_vortex_generations_v1") != string::npos;
+		if (!policy && !backlog) {
+			return;
+		}
+		std::lock_guard<std::mutex> guard(lock);
+		if (!connection.IsValid()) {
+			connection = context.GetConnectionId();
+		}
+		if (connection.GetIndex() == context.GetConnectionId()) {
+			statements.push_back(sql);
+		}
+	}
+	vector<string> Snapshot() {
+		std::lock_guard<std::mutex> guard(lock);
+		return statements;
+	}
+};
+
+struct MaintenanceQueryState : public ClientContextState {
+	explicit MaintenanceQueryState(shared_ptr<MaintenanceProbeLog> log_p) : log(std::move(log_p)) {
+	}
+	void QueryBegin(ClientContext &context) override {
+		log->Record(context);
+	}
+	shared_ptr<MaintenanceProbeLog> log;
+};
+
+struct MaintenanceQueryCallback : public ExtensionCallback {
+	explicit MaintenanceQueryCallback(shared_ptr<MaintenanceProbeLog> log_p) : log(std::move(log_p)) {
+	}
+	void OnConnectionOpened(ClientContext &context) override {
+		context.registered_state->Insert("maintenance_probe_queries", make_shared_ptr<MaintenanceQueryState>(log));
+	}
+	shared_ptr<MaintenanceProbeLog> log;
+};
 bool StatusEnabled(bool enabled) {
 	if (pause_status.exchange(false)) {
 		status_pause->Stop();
@@ -145,6 +197,98 @@ struct Fixture {
 		Require(Search(reader).rows[0][0].GetValue<int64_t>() == 32, "Current ANN query changed after source cleanup");
 	}
 };
+
+void MaintenanceProbeQuery(Fixture &f, bool stale) {
+	if (stale) {
+		VortexIndex::CollectBuilds(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+		Require(f.Count("__ducklake_metadata_lake.ducklake_vortex_builds_v1") == 0,
+		        "Stale probe fixture still has real build work");
+		SQL(f.writer, "INSERT INTO __ducklake_metadata_lake.ducklake_vortex_maintenance_v1 "
+		              "VALUES(true,false,'idle','',2,67108864,0,0,0,0,0,7,9,'')");
+	} else {
+		f.Rewrite();
+	}
+	auto builds = f.Count("__ducklake_metadata_lake.ducklake_vortex_builds_v1");
+	auto generations = f.Count("__ducklake_metadata_lake.ducklake_vortex_generations_v1 WHERE state IN "
+	                           "('retired','deleting')");
+	Require(stale ? !builds && !generations : builds && generations, "Unexpected initial maintenance backlog");
+	auto log = make_shared_ptr<MaintenanceProbeLog>();
+	ExtensionCallbackManager::Get(*f.database.instance).Register(make_shared_ptr<MaintenanceQueryCallback>(log));
+	Connection control(f.database);
+	auto stopped = [&] {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+		while (DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0][2].GetValue<bool>()) {
+			Require(std::chrono::steady_clock::now() < deadline, "Probe fixture maintenance did not stop");
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+	};
+	if (stale) {
+		DuckLakeVortexOptimizer::ResumeMaintenance(*control.context, "lake");
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+		while (true) {
+			auto status = DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0];
+			Require(StringValue::Get(status[0]) != "failed", "Stale probe failed");
+			if (!status[11].GetValue<idx_t>() && !status[12].GetValue<idx_t>()) {
+				Require(status[4].GetValue<idx_t>() == 0 && StringValue::Get(status[0]) == "idle",
+				        "Clearing stale backlog created an empty maintenance run");
+				break;
+			}
+			Require(std::chrono::steady_clock::now() < deadline, "Probe did not clear persisted stale counters");
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
+		stopped();
+	} else {
+		auto pause = std::make_shared<Pause>();
+		DuckLakeVortexOptimizer::EnableMaintenance(*control.context, "lake", 2, 64 * 1024 * 1024,
+		                                           [pause](const string &stage) {
+			                                           if (stage == "maintenance_before_recovery") {
+				                                           pause->Stop();
+			                                           }
+		                                           });
+		ReleasePause release {*pause};
+		pause->Wait();
+		auto status = DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0];
+		Require(status[11].GetValue<idx_t>() == builds && status[12].GetValue<idx_t>() == generations,
+		        "Probe did not save the actual build/generation backlog");
+		Require(status[5].GetValue<idx_t>() == 2 && status[6].GetValue<idx_t>() == 64 * 1024 * 1024,
+		        "Probe changed the maintenance budget");
+		DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
+		pause->Release();
+		stopped();
+		DuckLakeVortexOptimizer::ResumeMaintenance(*control.context, "lake");
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+		while (true) {
+			auto status = DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0];
+			Require(StringValue::Get(status[0]) != "failed", "Probe cleanup failed");
+			if (!status[2].GetValue<bool>() && !status[11].GetValue<idx_t>() && !status[12].GetValue<idx_t>()) {
+				break;
+			}
+			Require(std::chrono::steady_clock::now() < deadline, "Post-collection backlog did not refresh");
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
+		stopped();
+	}
+	auto statements = log->Snapshot();
+	vortex_detail::ViewJSON json;
+	auto facts = json.Object();
+	json.Number(facts, "policy_backlog_statements", statements.size());
+	json.Number(facts, "initial_builds", builds);
+	json.Number(facts, "initial_generations", generations);
+	json.Number(facts, "persisted_builds", stale ? 7 : 0);
+	json.Number(facts, "persisted_generations", stale ? 9 : 0);
+	auto queries = json.Array();
+	for (auto &statement : statements) {
+		yyjson_mut_arr_append(queries, yyjson_mut_strncpy(json.doc.get(), statement.data(), statement.size()));
+	}
+	json.Add(facts, "statements", queries);
+	Write(f.root + "/maintenance-probe-query.json", json.Finish(facts));
+	Require(statements.size() == 2, "Production maintenance probe did not retain its two statements");
+	Connection reader(f.database);
+	Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == (stale ? 0 : 32),
+	        "Maintenance probe changed the current ANN winner");
+}
 
 idx_t DiskBytes(FileSystem &fs, const string &path) {
 	idx_t bytes = 0;
@@ -532,6 +676,10 @@ int main(int argc, char **argv) {
 		string root = argv[1], mode = argv[2];
 		Fixture f(root);
 		f.Seed();
+		if (mode == "maintenance-probe-query" || mode == "maintenance-probe-stale") {
+			MaintenanceProbeQuery(f, mode == "maintenance-probe-stale");
+			return 0;
+		}
 		if (mode == "transaction-wake-guards") {
 			WakeGuards(f);
 			return 0;

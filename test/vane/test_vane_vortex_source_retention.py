@@ -251,6 +251,8 @@ def native_cases(driver, root, report):
         "maintenance-fairness-2",
         "probe-index-reuse",
         "maintenance-idle-wait",
+        "maintenance-probe-query",
+        "maintenance-probe-stale",
         "transaction-wake-guards",
         "transaction-wake-commit",
         "transaction-wake-rollback",

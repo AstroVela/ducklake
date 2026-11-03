@@ -113,7 +113,8 @@ jobs:
             -Ccmake.define.VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON \
             --out-dir "$PWD/build/wheels" "$PWD/vane" \
             2>&1 | tee build/logs/runtime-wheel.log
-          cmake --build build/runtime --target vane_loadable_extensions ducklake_vortex_write_driver ducklake_vortex_source_driver --parallel 2 \
+          cmake --build build/runtime --target vane_loadable_extensions ducklake_vortex_write_driver ducklake_vortex_source_driver \
+            ducklake_vortex_maintenance_probe_benchmark --parallel 2 \
             2>&1 | tee build/logs/providers-build.log
           uv pip install --system build/wheels/vane_ai-*.whl
       - name: Run the Vane base release checks
@@ -182,6 +183,11 @@ jobs:
             2>&1 | tee build/logs/vane-vortex-load-metrics.log
           python -I extension/test/vane/test_vane_vortex_load_oracle.py \
             2>&1 | tee build/logs/vane-vortex-load-oracle.log
+          python -I extension/test/vane/test_vane_vortex_maintenance_probe_stats.py \
+            2>&1 | tee build/logs/vane-vortex-maintenance-probe-stats.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_maintenance_probe_benchmark.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_maintenance_probe_benchmark" --histories 8 --rounds 2 --batch 2 \
+            --output-dir "$PWD/build/maintenance-probe-smoke-proof" 2>&1 | tee build/logs/vane-vortex-maintenance-probe.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
             --profile steady --rows 512 --dimensions 8 --seconds 15 --readers 4 --capture-stalls \
             --output-dir "$PWD/build/steady-smoke-proof" 2>&1 | tee build/logs/vane-vortex-steady-smoke.log
@@ -200,6 +206,12 @@ jobs:
             build/source-proof/**/recovery.log
             build/source-proof/**/transaction-wake.json
             build/source-proof/**/wake-guards.json
+            build/source-proof/**/maintenance-probe-query.json
+            build/maintenance-probe-smoke-proof/report.json
+            build/maintenance-probe-smoke-proof/decision-rule.json
+            build/maintenance-probe-smoke-proof/**/timing.json
+            build/maintenance-probe-smoke-proof/**/diagnostic.json
+            build/maintenance-probe-smoke-proof/**/*.log
             build/keyed-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log
