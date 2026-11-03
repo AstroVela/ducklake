@@ -219,3 +219,6 @@ Complete events, logs and reports are retained under
 `/tmp/ducklake-vortex-metadata-probes-steady-30m-v1-20261103/`.
 The aggregate report SHA-256 is
 `ca42a356939d8e4f79b791e25afcf91cab21a11101e068a274599489aebb353e`.
+
+The [transaction-completion wakeup follow-up](native-vortex-transaction-gc-wakeup.md)
+validates a guarded retry signal and an epoch latch for deferred source work.

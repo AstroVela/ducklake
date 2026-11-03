@@ -8,6 +8,7 @@
 #include "storage/ducklake_vortex_search.hpp"
 #include "storage/ducklake_vortex_source_retention.hpp"
 #include "storage/ducklake_vortex_write.hpp"
+#include "storage/ducklake_transaction_manager.hpp"
 #include "vortex_extension.hpp"
 
 #include <atomic>
@@ -225,7 +226,7 @@ void MaintenanceFairness(Fixture &f, idx_t objects) {
 	}
 	stop();
 	auto timings = DuckLakeVortexOptimizer::MaintenanceProfile(*control.context, "lake");
-	Require(timings.size() == 17, "Missing bounded maintenance profile stages");
+	Require(timings.size() == 18, "Missing bounded maintenance profile stages");
 	std::set<string> measured;
 	for (auto &row : timings) {
 		auto calls = row[2].GetValue<uint64_t>(), total = row[3].GetValue<uint64_t>();
@@ -254,6 +255,188 @@ void MaintenanceFairness(Fixture &f, idx_t objects) {
 	Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == 32, "Fair maintenance changed the current ANN winner");
 	Require(progress->builds && progress->generations && progress->expired,
 	        "Continuous build/generation arrivals starved a maintenance class within nine bounded passes");
+}
+
+idx_t ProfileCount(Connection &connection, const string &stage) {
+	for (auto &row : DuckLakeVortexOptimizer::MaintenanceProfile(*connection.context, "lake")) {
+		if (StringValue::Get(row[1]) == stage) {
+			return row[2].GetValue<idx_t>();
+		}
+	}
+	throw InvalidInputException("Missing source-wake profile stage");
+}
+
+void WakeGuards(Fixture &f) {
+	f.Rewrite();
+	f.Policy();
+	Connection first(f.database), second(f.database), owner(f.database), capture(f.database);
+	first.BeginTransaction();
+	second.BeginTransaction();
+	SQL(first, "SELECT count(*) FROM lake.items");
+	SQL(second, "SELECT count(*) FROM lake.items");
+	auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
+	auto &finite = VortexIndex::Begin(capture, "lake");
+	finite.MarkVortexReadCapture();
+	auto &transaction = VortexIndex::Begin(owner, "lake");
+	auto &manager = TransactionManager::Get(transaction.GetCatalog().GetAttached()).Cast<DuckLakeTransactionManager>();
+	idx_t notifications = 0;
+	bool last_saw_other = false;
+	auto wake = [&] {
+		notifications++;
+		// Reentering the manager proves delivery is outside its transaction lock.
+		last_saw_other = manager.HasOtherTransactions(nullptr, false);
+	};
+	Require(!Source::WorkReady(transaction, 64 * 1024 * 1024, wake), "Wake registration ignored held transactions");
+	capture.Commit();
+	admission.reset();
+	owner.Commit();
+	Require(notifications == 0, "Probe/capture completion woke its own deferred source work");
+	first.Commit();
+	Require(notifications == 1 && last_saw_other, "Commit did not deliver one out-of-lock blocker notification");
+	Require(f.Collect().blocked && FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source),
+	        "A notification bypassed another ordinary transaction");
+	Connection unrelated(f.database);
+	unrelated.BeginTransaction();
+	SQL(unrelated, "SELECT count(*) FROM lake.items");
+	unrelated.Commit();
+	Require(notifications == 1, "A consumed notification fired for an unrelated transaction");
+	auto &retry = VortexIndex::Begin(owner, "lake");
+	Require(!Source::WorkReady(retry, 64 * 1024 * 1024, wake), "Remaining blocker was not rechecked");
+	owner.Commit();
+	second.Rollback();
+	Require(notifications == 2 && !last_saw_other, "Rollback did not finish the second blocker notification");
+	f.Drain();
+	f.CheckReclaimed();
+	second.BeginTransaction();
+	SQL(second, "SELECT count(*) FROM lake.items");
+	auto &idle = VortexIndex::Begin(owner, "lake");
+	bool blocked = true;
+	Require(!Source::WorkReady(idle, 64 * 1024 * 1024, wake, &blocked) && !blocked,
+	        "An idle source probe subscribed without pending work");
+	owner.Commit();
+	second.Commit();
+	Require(notifications == 2, "No-work source probe subscribed to transaction completion");
+	vortex_detail::ViewJSON json;
+	auto facts = json.Object();
+	json.Number(facts, "notifications", notifications);
+	Write(f.root + "/wake-guards.json", json.Finish(facts));
+}
+
+void WakeRuntime(Fixture &f, const string &mode) {
+	f.Rewrite();
+	f.Policy();
+	VortexIndex::CollectBuilds(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+	VortexIndex::Collect(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+	const bool late = mode == "transaction-wake-late-reader";
+	const bool cancelled = mode == "transaction-wake-cancel";
+	struct State {
+		Pause pause;
+		std::atomic<idx_t> deferred {0};
+		std::atomic<bool> released {false}, progressed {false};
+		std::promise<idx_t> first_progress;
+	};
+	auto state = std::make_shared<State>();
+	auto progress = state->first_progress.get_future();
+	Connection held(f.database), newcomer(f.database), control(f.database);
+	if (!late) {
+		held.BeginTransaction();
+		SQL(held, "SELECT count(*) FROM lake.items");
+	}
+	auto fixture = &f;
+	DuckLakeVortexOptimizer::EnableMaintenance(
+	    *f.writer.context, "lake", 2, 64 * 1024 * 1024, [state, fixture, late](const string &stage) {
+		    if ((!late && stage == "maintenance_source_deferred") || (late && stage == "source_gc_waiting")) {
+			    state->deferred++;
+			    state->pause.Stop();
+			    state->released = true;
+		    }
+		    if (late && stage == "source_gc_deferred") {
+			    state->deferred++;
+		    }
+		    if (stage == "source_before_expire" && !state->progressed.exchange(true)) {
+			    Connection probe(fixture->database);
+			    state->first_progress.set_value(ProfileCount(probe, "loop_wait_timeout"));
+		    }
+	    });
+	ReleasePause release {state->pause};
+	state->pause.Wait();
+	auto before = ProfileCount(control, "loop_wait_timeout");
+	if (late) {
+		held.BeginTransaction();
+		SQL(held, "SELECT count(*) FROM lake.items");
+		state->pause.Release();
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (state->deferred < 2) {
+			Require(std::chrono::steady_clock::now() < deadline, "Late collector did not register its blocker");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
+	if (cancelled) {
+		DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
+	}
+	Require(FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source),
+	        "Source cleanup crossed its held ordinary transaction");
+	if (mode == "transaction-wake-rollback") {
+		held.Rollback();
+	} else {
+		held.Commit();
+	}
+	auto notifications = ProfileCount(control, "source_transaction_wake");
+	Require(notifications == (cancelled ? 0 : 1), "Transaction completion did not respect maintenance registration");
+	Require(late || FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source),
+	        "Notification performed GC while its deferred callback was paused");
+	if (mode == "transaction-wake-new-reader") {
+		newcomer.BeginTransaction();
+		SQL(newcomer, "SELECT count(*) FROM lake.items");
+	}
+	state->pause.Release();
+	if (cancelled) {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (!state->released) {
+			Require(std::chrono::steady_clock::now() < deadline, "Cancelled deferred callback did not return");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		Require(!DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0][1].GetValue<bool>(),
+		        "Completion notification resumed cancelled maintenance");
+		DuckLakeVortexOptimizer::ResumeMaintenance(*control.context, "lake");
+	} else if (mode == "transaction-wake-new-reader") {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (state->deferred < 2) {
+			Require(std::chrono::steady_clock::now() < deadline,
+			        "New transaction was not rechecked after notification");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		Require(f.Collect().blocked && FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source),
+		        "A latched wake bypassed a newly active transaction");
+		newcomer.Rollback();
+		notifications = ProfileCount(control, "source_transaction_wake");
+		Require(notifications == 2, "The newly checked blocker did not produce its own completion notification");
+	}
+	if (!cancelled) {
+		Require(progress.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+		        "Transaction completion never led to guarded source progress");
+		auto timeout_delta = progress.get() - before;
+		vortex_detail::ViewJSON json;
+		auto facts = json.Object();
+		json.Number(facts, "accepted_notifications", notifications);
+		json.Number(facts, "timeouts_before_first_progress", timeout_delta);
+		Write(f.root + "/transaction-wake.json", json.Finish(facts));
+		if (mode == "transaction-wake-commit" || mode == "transaction-wake-rollback") {
+			Require(timeout_delta == 0, "A transaction-end notification before wait was lost");
+		}
+	}
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+	while (FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source)) {
+		Require(std::chrono::steady_clock::now() < deadline, "Woken source worker did not reclaim its old source");
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
+	while (DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0][2].GetValue<bool>()) {
+		Require(std::chrono::steady_clock::now() < deadline, "Woken source worker did not stop");
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	Connection reader(f.database);
+	Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == 32, "Source wake changed the current ANN winner");
 }
 
 void Concurrent(Fixture &f) {
@@ -349,6 +532,14 @@ int main(int argc, char **argv) {
 		string root = argv[1], mode = argv[2];
 		Fixture f(root);
 		f.Seed();
+		if (mode == "transaction-wake-guards") {
+			WakeGuards(f);
+			return 0;
+		}
+		if (StringUtil::StartsWith(mode, "transaction-wake-")) {
+			WakeRuntime(f, mode);
+			return 0;
+		}
 		if (mode == "probe-index-reuse") {
 			f.writer.CreateScalarFunction<int64_t, int64_t>("probe_revision_gate", &ProbeRevision);
 			SQL(f.writer,
@@ -775,10 +966,10 @@ int main(int argc, char **argv) {
 			pause.Wait();
 			Connection cancellation(f.database);
 			auto before_profile = DuckLakeVortexOptimizer::MaintenanceProfile(*cancellation.context, "lake");
-			Require(before_profile.size() == 17, "Maintenance profile read blocked behind source collection");
+			Require(before_profile.size() == 18, "Maintenance profile read blocked behind source collection");
 			Require(SQL(cancellation, "SELECT count(*) FROM ducklake_vortex_maintenance_profile('lake')")
 			                ->GetValue(0, 0)
-			                .GetValue<idx_t>() == 17,
+			                .GetValue<idx_t>() == 18,
 			        "SQL maintenance profile read blocked behind source collection");
 			auto cancelled = std::async(
 			    std::launch::async, [&] { DuckLakeVortexOptimizer::CancelMaintenance(*cancellation.context, "lake"); });
@@ -804,7 +995,7 @@ int main(int argc, char **argv) {
 			Require(timed_cancellation, "Failed/cancelled source scope lost its held wall time");
 			DuckLakeVortexOptimizer::ResumeMaintenance(*f.writer.context, "lake");
 			auto resumed_profile = DuckLakeVortexOptimizer::MaintenanceProfile(*cancellation.context, "lake");
-			Require(resumed_profile.size() == 17 && resumed_profile[0][0] != before_profile[0][0],
+			Require(resumed_profile.size() == 18 && resumed_profile[0][0] != before_profile[0][0],
 			        "Explicit maintenance resume did not identify the new in-memory profile");
 			while (FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source)) {
 				Require(std::chrono::steady_clock::now() < deadline, "Resumed source worker did not finish");
