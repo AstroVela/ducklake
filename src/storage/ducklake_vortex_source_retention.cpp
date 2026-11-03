@@ -228,21 +228,38 @@ void DuckLakeVortexSourceRetention::Configure(ClientContext &context, const stri
 	owner.connection.Commit();
 }
 
-bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, idx_t max_bytes) {
+bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, idx_t max_bytes,
+                                              const std::function<void()> &on_transaction_end,
+                                              optional_ptr<bool> blocked_by_transactions) {
+	if (blocked_by_transactions) {
+		*blocked_by_transactions = false;
+	}
 	auto policy = Load(transaction);
-	if (!policy.enabled || Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction, true)) {
+	if (!policy.enabled) {
 		return false;
 	}
 	auto eligible =
 	    VortexIndex::Query(transaction, "SELECT EXISTS(SELECT 1 FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " +
 	                                        Eligible(policy) + ")");
-	if (eligible->Fetch()->GetValue(0, 0).GetValue<bool>()) {
-		return true;
+	bool snapshots = eligible->Fetch()->GetValue(0, 0).GetValue<bool>();
+	string root;
+	vector<File> files;
+	if (!snapshots) {
+		root = Root(transaction);
+		files = Candidates(transaction, root, 1);
+		if (files.empty()) {
+			return false;
+		}
 	}
-	auto root = Root(transaction);
-	auto files = Candidates(transaction, root, 1);
-	if (files.empty()) {
+	// Subscribe only when pending work exists. No file I/O precedes the transaction check.
+	if (Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction, true, on_transaction_end)) {
+		if (blocked_by_transactions) {
+			*blocked_by_transactions = true;
+		}
 		return false;
+	}
+	if (snapshots) {
+		return true;
 	}
 	auto directory = OpenRoot(root, false);
 	auto parent = OpenParent(directory->fd, files[0].relative, files[0].registered);
@@ -287,7 +304,8 @@ vector<vector<Value>> DuckLakeVortexSourceRetention::Status(ClientContext &conte
 DuckLakeVortexSourceGCResult DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &catalog_name,
                                                                     idx_t max_objects, idx_t max_bytes,
                                                                     const std::function<void(const string &)> &observe,
-                                                                    DuckLakeVortexMaintenanceProfile *profile) {
+                                                                    DuckLakeVortexMaintenanceProfile *profile,
+                                                                    const std::function<void()> &on_transaction_end) {
 	if (!max_objects || max_objects > 16 || !max_bytes || max_bytes > MAX_BYTES) {
 		throw InvalidInputException("Invalid Vortex source collection budgets");
 	}
@@ -312,8 +330,9 @@ DuckLakeVortexSourceGCResult DuckLakeVortexSourceRetention::Collect(ClientContex
 	auto admissions = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock();
 	auto transactions = TransactionGate().GetExclusiveLock();
 	DuckLakeVortexSourceGCResult result;
-	if (Manager(catalog).HasOtherTransactions(nullptr, false)) {
+	if (Manager(catalog).HasOtherTransactions(nullptr, false, on_transaction_end)) {
 		result.blocked = true;
+		check("source_gc_deferred");
 		return result;
 	}
 	timer.Switch(Phase::SOURCE_METADATA);

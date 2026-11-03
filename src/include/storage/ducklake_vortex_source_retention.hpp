@@ -22,11 +22,14 @@ public:
 	static void Initialize(DuckLakeTransaction &transaction);
 	static void Configure(ClientContext &context, const string &catalog, bool enabled, idx_t keep_snapshots,
 	                      idx_t min_age_seconds);
-	static bool WorkReady(DuckLakeTransaction &transaction, idx_t max_bytes);
+	static bool WorkReady(DuckLakeTransaction &transaction, idx_t max_bytes,
+	                      const std::function<void()> &on_transaction_end = nullptr,
+	                      optional_ptr<bool> blocked_by_transactions = nullptr);
 	static vector<vector<Value>> Status(ClientContext &context, const string &catalog);
 	static DuckLakeVortexSourceGCResult Collect(ClientContext &context, const string &catalog, idx_t max_objects,
 	                                            idx_t max_bytes,
 	                                            const std::function<void(const string &)> &observe = nullptr,
-	                                            DuckLakeVortexMaintenanceProfile *profile = nullptr);
+	                                            DuckLakeVortexMaintenanceProfile *profile = nullptr,
+	                                            const std::function<void()> &on_transaction_end = nullptr);
 };
 } // namespace duckdb

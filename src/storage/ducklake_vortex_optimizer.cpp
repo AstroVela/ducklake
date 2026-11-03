@@ -725,6 +725,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	std::mutex lock, io;
 	std::condition_variable changed, finished;
 	bool started = false, stopping = false, done = false;
+	uint64_t source_wake_epoch = 0;
 	std::thread::id worker_id;
 	std::map<Key, Pending> policies;
 	std::set<Key> cancelled;
@@ -795,6 +796,25 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		std::lock_guard<std::mutex> guard(lock);
 		auto found = maintenance.find(catalog);
 		return found == maintenance.end() ? nullptr : found->second.profile;
+	}
+	std::function<void()> SourceWake(const PendingMaintenance &pending) {
+		std::weak_ptr<Runtime> weak = shared_from_this();
+		auto catalog = pending.catalog, id = pending.profile->id;
+		return [weak, catalog, id] {
+			auto runtime = weak.lock();
+			if (!runtime) {
+				return;
+			}
+			std::lock_guard<std::mutex> guard(runtime->lock);
+			auto found = runtime->maintenance.find(catalog);
+			if (runtime->stopping || found == runtime->maintenance.end() ||
+			    runtime->maintenance_cancelled.count(catalog) || found->second.profile->id != id) {
+				return;
+			}
+			PhaseTimer timer(found->second.profile.get(), Phase::SOURCE_TRANSACTION_WAKE);
+			runtime->source_wake_epoch++;
+			runtime->changed.notify_all();
+		};
 	}
 	bool IsMaintenanceActive(const string &catalog) {
 		std::lock_guard<std::mutex> guard(lock);
@@ -870,6 +890,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		PhaseTimer total(profile.get(), Phase::MAINTENANCE_TOTAL);
 		PhaseTimer phase(profile.get(), Phase::MAINTENANCE_METADATA);
 		Maintenance m;
+		auto on_transaction_end = SourceWake(pending);
+		bool source_blocked = false, scheduled = false;
 		{
 			std::lock_guard<std::mutex> guard(io);
 			Metadata meta(db, pending.catalog);
@@ -881,7 +903,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			auto had_backlog = m.remaining_builds || m.remaining_generations;
 			phase.Switch(Phase::MAINTENANCE_PROBE);
 			MaintenanceBacklog(meta, m);
-			m.source_work = DuckLakeVortexSourceRetention::WorkReady(meta.transaction, m.max_bytes);
+			m.source_work = DuckLakeVortexSourceRetention::WorkReady(meta.transaction, m.max_bytes, on_transaction_end,
+			                                                         &source_blocked);
 			phase.Switch(Phase::MAINTENANCE_METADATA);
 			if (!m.remaining_builds && !m.remaining_generations && !m.source_work) {
 				if (had_backlog) {
@@ -890,18 +913,25 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				} else {
 					meta.Commit();
 				}
-				return false;
+			} else {
+				CheckMaintenance(m.catalog);
+				auto previous = m.run;
+				m.run = UUID::ToString(UUID::GenerateRandomUUID());
+				m.state = "recovering";
+				m.error.clear();
+				m.runs++;
+				SaveMaintenance(meta, m, previous, false);
+				std::lock_guard<std::mutex> guard_runtime(lock);
+				pending = maintenance.at(m.catalog);
+				active_maintenance = m.catalog;
+				scheduled = true;
 			}
-			CheckMaintenance(m.catalog);
-			auto previous = m.run;
-			m.run = UUID::ToString(UUID::GenerateRandomUUID());
-			m.state = "recovering";
-			m.error.clear();
-			m.runs++;
-			SaveMaintenance(meta, m, previous, false);
-			std::lock_guard<std::mutex> guard_runtime(lock);
-			pending = maintenance.at(m.catalog);
-			active_maintenance = m.catalog;
+		}
+		if (!scheduled) {
+			if (source_blocked && pending.observe) {
+				pending.observe("maintenance_source_deferred");
+			}
+			return false;
 		}
 		try {
 			Connection job(db);
@@ -958,7 +988,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					StoreMaintenance(db, m, "collecting_sources");
 					phase.Switch(Phase::SOURCE_GC);
 					auto source = DuckLakeVortexSourceRetention::Collect(*job.context, m.catalog, objects, bytes, check,
-					                                                     profile.get());
+					                                                     profile.get(), on_transaction_end);
 					m.bytes += source.bytes;
 					collected_objects += source.expired + source.files;
 					collected_bytes += source.bytes;
@@ -1271,11 +1301,13 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			vector<Pending> work;
 			vector<PendingMaintenance> cleanup;
 			bool progressed = false;
+			uint64_t observed_wake_epoch;
 			{
 				std::lock_guard<std::mutex> guard(lock);
 				if (stopping) {
 					break;
 				}
+				observed_wake_epoch = source_wake_epoch;
 				for (auto &entry : policies) {
 					if (!cancelled.count(entry.first)) {
 						work.push_back(entry.second);
@@ -1319,7 +1351,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			if (stopping || weak.expired()) {
 				break;
 			}
-			if (!progressed) {
+			if (!progressed && observed_wake_epoch == source_wake_epoch) {
 				auto started_wait = std::chrono::steady_clock::now();
 				auto outcome = changed.wait_for(guard, std::chrono::milliseconds(100));
 				auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
@@ -1914,11 +1946,12 @@ vector<vector<Value>> DuckLakeVortexOptimizer::MaintenanceProfile(ClientContext 
 	if (!profile) {
 		return rows;
 	}
-	const char *names[] = {
-	    "optimizer_total",      "optimizer_probe", "optimizer_metadata", "maintenance_total", "maintenance_probe",
-	    "maintenance_metadata", "build_recovery",  "build_gc",           "generation_gc",     "source_gc",
-	    "source_wait",          "source_metadata", "source_expire",      "source_artifact",   "source_unlink",
-	    "loop_wait_timeout",    "loop_wait_wake"};
+	const char *names[] = {"optimizer_total",   "optimizer_probe",   "optimizer_metadata",
+	                       "maintenance_total", "maintenance_probe", "maintenance_metadata",
+	                       "build_recovery",    "build_gc",          "generation_gc",
+	                       "source_gc",         "source_wait",       "source_metadata",
+	                       "source_expire",     "source_artifact",   "source_unlink",
+	                       "loop_wait_timeout", "loop_wait_wake",    "source_transaction_wake"};
 	static_assert(sizeof(names) / sizeof(names[0]) == idx_t(Phase::COUNT), "Missing Vortex profile stage name");
 	auto samples = profile->Snapshot();
 	for (idx_t i = 0; i < samples.size(); i++) {
