@@ -188,6 +188,11 @@ both 0.8 recall targets and the ninety-second drain gate when assessing a fix.
 Receipt and caller-reference retention need separate accounting; native
 SPFresh online updates are not established by this baseline.
 
+The [maintenance-fairness follow-up](native-vortex-maintenance-fairness.md)
+contains controlled starvation and finite-status-admission regressions and the
+subsequent installed thirty-minute result. Its unresolved recall-window and
+source-drain gates remain explicit.
+
 Local evidence is retained at
 `/tmp/ducklake-vortex-steady-30m-v1-20261103/`, including the complete query
 events, worker log, per-minute results and partial report. The aggregate
