@@ -153,6 +153,88 @@ idx_t DiskBytes(FileSystem &fs, const string &path) {
 	return bytes;
 }
 
+void MaintenanceFairness(Fixture &f, idx_t objects) {
+	f.Rewrite();
+	f.Policy();
+	Connection control(f.database);
+	struct Progress {
+		std::atomic<idx_t> passes {0};
+		idx_t builds = 0, generations = 0, expired = 0, files = 0, bytes = 0;
+		idx_t max_objects = 0, max_bytes = 0;
+	};
+	auto progress = std::make_shared<Progress>();
+	auto fixture = &f;
+	const idx_t passes = 9;
+	DuckLakeVortexOptimizer::EnableMaintenance(
+	    *f.writer.context, "lake", objects, 64 * 1024 * 1024,
+	    [progress, fixture, objects, passes](const string &stage) {
+		    if (stage != "maintenance_complete" || progress->passes >= passes) {
+			    return;
+		    }
+		    Connection probe(fixture->database);
+		    auto m = DuckLakeVortexOptimizer::MaintenanceStatus(*probe.context, "lake")[0];
+		    auto s = Source::Status(*probe.context, "lake")[0];
+		    idx_t builds = m[8].GetValue<idx_t>(), generations = m[9].GetValue<idx_t>();
+		    idx_t expired = s[3].GetValue<idx_t>(), files = s[4].GetValue<idx_t>();
+		    idx_t bytes = m[10].GetValue<idx_t>();
+		    auto spent = builds - progress->builds + generations - progress->generations + expired - progress->expired +
+		                 files - progress->files;
+		    auto written = bytes - progress->bytes;
+		    progress->max_objects = MaxValue(progress->max_objects, spent);
+		    progress->max_bytes = MaxValue(progress->max_bytes, written);
+		    Require(spent <= objects && written <= 64 * 1024 * 1024,
+		            "Fair maintenance exceeded its shared per-pass object or byte budget");
+		    progress->builds = builds;
+		    progress->generations = generations;
+		    progress->expired = expired;
+		    progress->files = files;
+		    progress->bytes = bytes;
+		    auto pass = progress->passes.load() + 1;
+		    if (pass < passes) {
+			    fixture->index = VortexIndex::BuildAndPublish(
+			        *fixture->writer.context, "lake", "main", "items", "knn",
+			        fixture->root + "/indexes/fairness-" + to_string(pass) + ".json", 2, fixture->index.revision);
+		    }
+		    progress->passes = pass;
+	    });
+	auto stop = [&] {
+		DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+		while (DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0][2].GetValue<bool>()) {
+			Require(std::chrono::steady_clock::now() < deadline, "Fairness worker did not stop");
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+	};
+	try {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		while (progress->passes < passes) {
+			auto state = DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0];
+			Require(StringValue::Get(state[0]) != "failed", "Fairness worker failed: " + state[13].ToString());
+			Require(std::chrono::steady_clock::now() < deadline, "Fairness worker did not complete bounded passes");
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+	} catch (...) {
+		stop();
+		throw;
+	}
+	stop();
+	vortex_detail::ViewJSON json;
+	auto result = json.Object();
+	json.Number(result, "passes", passes);
+	json.Number(result, "object_budget", objects);
+	json.Number(result, "collected_builds", progress->builds);
+	json.Number(result, "collected_generations", progress->generations);
+	json.Number(result, "expired_snapshots", progress->expired);
+	json.Number(result, "collected_source_files", progress->files);
+	json.Number(result, "max_pass_objects", progress->max_objects);
+	json.Number(result, "max_pass_bytes", progress->max_bytes);
+	Write(f.root + "/fairness.json", json.Finish(result));
+	Connection reader(f.database);
+	Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == 32, "Fair maintenance changed the current ANN winner");
+	Require(progress->builds && progress->generations && progress->expired,
+	        "Continuous build/generation arrivals starved a maintenance class within nine bounded passes");
+}
+
 void Concurrent(Fixture &f) {
 	auto seed = f.WriteBatch(0, "seed");
 	f.Policy(2);
@@ -246,30 +328,82 @@ int main(int argc, char **argv) {
 		string root = argv[1], mode = argv[2];
 		Fixture f(root);
 		f.Seed();
+		if (mode == "maintenance-fairness-1" || mode == "maintenance-fairness-2") {
+			MaintenanceFairness(f, mode == "maintenance-fairness-1" ? 1 : 2);
+			return 0;
+		}
 		if (mode == "concurrent") {
 			Concurrent(f);
 			return 0;
 		}
-		if (mode == "status-readiness") {
+		if (mode == "status-readiness" || mode == "optimizer-status-readiness" ||
+		    mode == "maintenance-status-readiness") {
+			if (mode == "maintenance-status-readiness") {
+				DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024);
+				DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+				auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+				while (DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, "lake")[0][2].GetValue<bool>()) {
+					Require(std::chrono::steady_clock::now() < deadline, "Status fixture maintenance did not stop");
+					std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				}
+			}
+			string table = mode == "status-readiness"             ? "ducklake_vortex_source_retention_v1"
+			               : mode == "optimizer-status-readiness" ? "ducklake_vortex_optimizer_v2"
+			                                                      : "ducklake_vortex_maintenance_v1";
 			f.Policy();
 			f.writer.CreateScalarFunction<bool, bool>("source_status_gate", &StatusEnabled);
-			SQL(f.writer, "ALTER TABLE __ducklake_metadata_lake.ducklake_vortex_source_retention_v1 RENAME TO "
-			              "source_policy_backing;"
-			              "CREATE VIEW __ducklake_metadata_lake.ducklake_vortex_source_retention_v1 AS "
-			              "SELECT * REPLACE(source_status_gate(enabled) AS enabled) FROM "
-			              "__ducklake_metadata_lake.source_policy_backing");
+			SQL(f.writer, "ALTER TABLE __ducklake_metadata_lake." + table + " RENAME TO status_policy_backing");
+			if (mode == "status-readiness") {
+				SQL(f.writer, "CREATE VIEW __ducklake_metadata_lake." + table +
+				                  " AS SELECT * REPLACE(source_status_gate(enabled) AS enabled) FROM "
+				                  "__ducklake_metadata_lake.status_policy_backing");
+			} else {
+				auto columns = SQL(f.writer, "DESCRIBE __ducklake_metadata_lake.status_policy_backing");
+				string definitions, inputs, outputs;
+				for (auto &column : *columns) {
+					auto name = column.GetValue<string>(0);
+					auto input = "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+					auto output = name == "enabled" ? string("enabled_backing") : input;
+					if (!definitions.empty()) {
+						definitions += ",";
+						inputs += ",";
+						outputs += ",";
+					}
+					definitions += output + " " + column.GetValue<string>(1);
+					inputs += input;
+					outputs += output;
+				}
+				definitions += ",enabled BOOLEAN GENERATED ALWAYS AS(source_status_gate(enabled_backing))";
+				SQL(f.writer, "CREATE TABLE __ducklake_metadata_lake." + table + "(" + definitions +
+				                  ");"
+				                  "INSERT INTO __ducklake_metadata_lake." +
+				                  table + "(" + outputs + ") SELECT " + inputs +
+				                  " FROM __ducklake_metadata_lake.status_policy_backing");
+			}
+			Connection held(f.database), owner(f.database);
+			held.BeginTransaction();
+			SQL(held, "SELECT count(*) FROM lake.items");
 			Pause pause;
 			status_pause = &pause;
 			pause_status = true;
-			auto pending = std::async(std::launch::async, [&] { return Source::Status(*f.writer.context, "lake"); });
+			auto pending = std::async(std::launch::async, [&] {
+				if (mode == "optimizer-status-readiness") {
+					return DuckLakeVortexOptimizer::Status(*f.writer.context, "lake");
+				}
+				if (mode == "maintenance-status-readiness") {
+					return DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, "lake");
+				}
+				return Source::Status(*f.writer.context, "lake");
+			});
 			ReleasePause release {pause};
+			if (pending.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready) {
+				pending.get();
+				throw InvalidInputException("Status query did not reach its controlled checkpoint");
+			}
 			pause.Wait();
 			auto admission = DuckLakeVortexReadView::AdmissionLock().TryGetExclusiveLock();
 			bool admitted = !admission;
 			admission.reset();
-			Connection held(f.database), owner(f.database);
-			held.BeginTransaction();
-			SQL(held, "SELECT count(*) FROM lake.items");
 			auto &transaction = VortexIndex::Begin(owner, "lake");
 			bool ordinary_blocked = !Source::WorkReady(transaction, 64 * 1024 * 1024);
 			held.Commit();
@@ -277,10 +411,19 @@ int main(int argc, char **argv) {
 			owner.Commit();
 			pause.Release();
 			auto status = pending.get();
-			SQL(f.writer, "DROP VIEW __ducklake_metadata_lake.ducklake_vortex_source_retention_v1;"
-			              "ALTER TABLE __ducklake_metadata_lake.source_policy_backing RENAME TO "
-			              "ducklake_vortex_source_retention_v1");
-			Require(status.size() == 1 && status[0][0].GetValue<bool>(), "Finite status capture lost its result");
+			SQL(f.writer, string(mode == "status-readiness" ? "DROP VIEW " : "DROP TABLE ") +
+			                  "__ducklake_metadata_lake." + table +
+			                  ";ALTER TABLE __ducklake_metadata_lake.status_policy_backing RENAME TO " + table);
+			vortex_detail::ViewJSON json;
+			auto facts = json.Object();
+			json.Add(facts, "ordinary_transaction_blocked",
+			         duckdb_yyjson::yyjson_mut_bool(json.doc.get(), ordinary_blocked));
+			json.Add(facts, "finite_status_ready", duckdb_yyjson::yyjson_mut_bool(json.doc.get(), ready));
+			json.Add(facts, "admission_held", duckdb_yyjson::yyjson_mut_bool(json.doc.get(), admitted));
+			Write(root + "/status-readiness.json", json.Finish(facts));
+			idx_t enabled_column = mode == "status-readiness" ? 0 : mode == "optimizer-status-readiness" ? 5 : 1;
+			Require(status.size() == 1 && status[0][enabled_column].GetValue<bool>() == (mode == "status-readiness"),
+			        "Finite status capture lost its result");
 			Require(ordinary_blocked, "Status readiness ignored an ordinary transaction");
 			Require(ready, "Source readiness discarded finite status work");
 			Require(admitted, "Source status did not hold finite read admission");
