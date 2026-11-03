@@ -120,10 +120,6 @@ const char *MAINTENANCE_COLUMNS =
     "enabled,state,run_id,max_objects,max_bytes,run_count,reconciled_builds,collected_builds,"
     "collected_generations,collected_bytes,remaining_builds,remaining_generations,error";
 
-const char *MAINTENANCE_BACKLOG_COLUMNS =
-    "(SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_builds_v1),"
-    "(SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_generations_v1 WHERE state IN ('retired','deleting'))";
-
 Maintenance ReadMaintenance(DataChunk &chunk, const string &catalog) {
 	Maintenance m;
 	m.catalog = catalog;
@@ -153,22 +149,6 @@ Maintenance LoadMaintenance(Metadata &meta, const string &catalog) {
 	return ReadMaintenance(*chunk, catalog);
 }
 
-Maintenance ProbeMaintenance(Metadata &meta, const string &catalog, bool &had_backlog) {
-	Initialized(meta);
-	auto result = meta.Query("SELECT " + string(MAINTENANCE_COLUMNS) + "," + MAINTENANCE_BACKLOG_COLUMNS +
-	                         " FROM {METADATA_CATALOG}." + MAINTENANCE);
-	auto chunk = result->Fetch();
-	if (!chunk || chunk->size() != 1) {
-		throw InvalidInputException("No Vortex maintenance policy in this catalog");
-	}
-	auto m = ReadMaintenance(*chunk, catalog);
-	// Keep the persisted counters for the no-work transition, then use this statement's live counts.
-	had_backlog = m.remaining_builds || m.remaining_generations;
-	m.remaining_builds = chunk->GetValue(13, 0).GetValue<idx_t>();
-	m.remaining_generations = chunk->GetValue(14, 0).GetValue<idx_t>();
-	return m;
-}
-
 void SaveMaintenance(Metadata &meta, const Maintenance &m, const string &previous_run, bool preserve_enabled) {
 	auto result =
 	    meta.Query("UPDATE {METADATA_CATALOG}." + string(MAINTENANCE) +
@@ -187,7 +167,9 @@ void SaveMaintenance(Metadata &meta, const Maintenance &m, const string &previou
 }
 
 void MaintenanceBacklog(Metadata &meta, Maintenance &m) {
-	auto result = meta.Query("SELECT " + string(MAINTENANCE_BACKLOG_COLUMNS));
+	auto result = meta.Query("SELECT (SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_builds_v1),"
+	                         "(SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_generations_v1 WHERE state IN "
+	                         "('retired','deleting'))");
 	auto chunk = result->Fetch();
 	m.remaining_builds = chunk->GetValue(0, 0).GetValue<idx_t>();
 	m.remaining_generations = chunk->GetValue(1, 0).GetValue<idx_t>();
@@ -913,14 +895,14 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		{
 			std::lock_guard<std::mutex> guard(io);
 			Metadata meta(db, pending.catalog);
-			bool had_backlog;
-			phase.Switch(Phase::MAINTENANCE_PROBE);
-			m = ProbeMaintenance(meta, pending.catalog, had_backlog);
+			m = LoadMaintenance(meta, pending.catalog);
 			if (!m.enabled) {
-				phase.Switch(Phase::MAINTENANCE_METADATA);
 				meta.Commit();
 				return false;
 			}
+			auto had_backlog = m.remaining_builds || m.remaining_generations;
+			phase.Switch(Phase::MAINTENANCE_PROBE);
+			MaintenanceBacklog(meta, m);
 			m.source_work = DuckLakeVortexSourceRetention::WorkReady(meta.transaction, m.max_bytes, on_transaction_end,
 			                                                         &source_blocked);
 			phase.Switch(Phase::MAINTENANCE_METADATA);

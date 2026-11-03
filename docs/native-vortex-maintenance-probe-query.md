@@ -1,4 +1,20 @@
-# Read maintenance policy and backlog in one statement
+# Maintenance probe query validation
+
+**Final decision: withdraw the combined production query.** The
+[controlled A/B benchmark](native-vortex-maintenance-probe-ab.md) did not meet
+the predeclared material/repeatable gain threshold. Production optimizer code
+is restored byte-for-byte to #73, including transaction-completion wakeup,
+ordinary-transaction protection, original timing boundaries and all budgets.
+The two functional native probe cases now expect the retained two statements;
+the one-statement reference exists only in the benchmark executable.
+
+## Archived candidate at 80f4110a
+
+The sections below retain the implementation and thirty-minute observations of
+`80f4110ac45c555fbcd29e5dab52d0059983a339`, before withdrawal. They document the
+measured candidate and are not a description or qualification of the final
+production query shape. The A/B decision and final regression results are
+recorded in the linked controlled-benchmark note.
 
 The [transaction-completion wakeup validation](native-vortex-transaction-gc-wakeup.md)
 passes the original ninety-second drain in 63.003 seconds. During continuous
@@ -7,7 +23,7 @@ targets one repeated metadata cost: the initial maintenance probe reads the
 policy and live build/generation backlog in two statements within the same
 transaction.
 
-## Initial probe and state transitions
+### Initial probe and state transitions
 
 The initial probe now selects the existing thirteen policy columns and two
 scalar backlog counts in one statement. The counts use the same build table
@@ -32,7 +48,7 @@ Transaction completion subscriptions, the wake epoch, ordinary-transaction
 exclusion, publication/capture/transaction-start gates, source ownership and
 reference checks, deletion intents, fairness and per-pass budgets are unchanged.
 
-## Timing interpretation
+### Timing interpretation
 
 The eighteen profile stages are retained. The combined initial policy/backlog
 statement and its initialization checks are timed under `maintenance_probe`.
@@ -44,7 +60,7 @@ segment alone would not establish a performance gain. Parent/child stages and
 the completing-thread `source_transaction_wake` retain their existing overlap
 rules.
 
-## Controlled checks
+### Controlled checks
 
 Two native cases register the engine's existing connection/query callbacks in
 the test database. They record the actual relevant SELECT statements on the
@@ -68,7 +84,7 @@ comparison with the complete parent build. The other catalog initialization,
 source-readiness, state-write and post-collection queries remain outside this
 one-versus-two count.
 
-## Sustained validation contract
+### Sustained validation contract
 
 Rebuild and non-editably install only DuckLake with the same Vane/Vortex wheel
 bytes, then run the original isolated workload:
@@ -87,7 +103,7 @@ budgets. Measure the continuous-ingestion backlog slope and query latency as
 well as drain completion. Native SPFresh online updates and receipt expiry are
 outside this change.
 
-## Local regression qualification on 2026-11-03
+### Local regression qualification on 2026-11-03
 
 The final non-editably installed candidate passed basic, write, source, keyed,
 automatic and stall-diagnostic groups, including 38 native source cases. The
@@ -97,7 +113,7 @@ launcher passed 1,222 non-Ray and 32 Ray tests with fifteen optional skips in
 separate processes. Formatting and copyleft checks passed. Only DuckLake was
 rebuilt; Vane and Vortex wheel bytes are unchanged from the parent closure.
 
-## Complete thirty-minute observation
+### Complete thirty-minute observation
 
 The final 1,800.043-second ingestion period acknowledged 1,631 batches, or
 260,960 mutation operations, without rejected attempts. It validated 74,172
@@ -152,7 +168,7 @@ ingestion or production readiness.
 | Canary | 64.974 | 122.913 | 150.674 |
 | Exploration | 67.995 | 126.478 | 154.680 |
 
-### Completed stage costs
+#### Completed stage costs
 
 The post-ingestion interval below spans 82.126 seconds from phase end to the
 measured endpoint, before worker cancellation. Times are steady-clock seconds
@@ -195,7 +211,7 @@ ingestion and 82.137 seconds afterward, compared with elapsed periods of
 so these are approximate accounting totals rather than an exact partition.
 No CPU utilization is inferred from these wall times.
 
-### Change over the run and retained evidence
+#### Change over the run and retained evidence
 
 First-to-last monitor samples in minute 0 cover 59.950 seconds; minute 29 covers
 59.548 seconds. Different task mixes contribute to these averages.

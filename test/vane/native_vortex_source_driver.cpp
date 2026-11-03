@@ -250,9 +250,9 @@ void MaintenanceProbeQuery(Fixture &f, bool stale) {
 		pause->Wait();
 		auto status = DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0];
 		Require(status[11].GetValue<idx_t>() == builds && status[12].GetValue<idx_t>() == generations,
-		        "Combined probe did not save the actual build/generation backlog");
+		        "Probe did not save the actual build/generation backlog");
 		Require(status[5].GetValue<idx_t>() == 2 && status[6].GetValue<idx_t>() == 64 * 1024 * 1024,
-		        "Combined probe changed the maintenance budget");
+		        "Probe changed the maintenance budget");
 		DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
 		pause->Release();
 		stopped();
@@ -260,7 +260,7 @@ void MaintenanceProbeQuery(Fixture &f, bool stale) {
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
 		while (true) {
 			auto status = DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0];
-			Require(StringValue::Get(status[0]) != "failed", "Combined probe cleanup failed");
+			Require(StringValue::Get(status[0]) != "failed", "Probe cleanup failed");
 			if (!status[2].GetValue<bool>() && !status[11].GetValue<idx_t>() && !status[12].GetValue<idx_t>()) {
 				break;
 			}
@@ -284,10 +284,10 @@ void MaintenanceProbeQuery(Fixture &f, bool stale) {
 	}
 	json.Add(facts, "statements", queries);
 	Write(f.root + "/maintenance-probe-query.json", json.Finish(facts));
-	Require(statements.size() == 1, "Maintenance policy and backlog did not share one statement");
+	Require(statements.size() == 2, "Production maintenance probe did not retain its two statements");
 	Connection reader(f.database);
 	Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == (stale ? 0 : 32),
-	        "Combined maintenance probe changed the current ANN winner");
+	        "Maintenance probe changed the current ANN winner");
 }
 
 idx_t DiskBytes(FileSystem &fs, const string &path) {

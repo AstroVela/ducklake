@@ -233,6 +233,6 @@ The aggregate report SHA-256 is
 The DuckLake wheel SHA-256 is
 `7ff66181a19898c71f156d7e1c6389ec7550517b35adad59c052dda5b0834a50`.
 
-The next [maintenance probe validation](native-vortex-maintenance-probe-query.md)
-combines the initial policy/backlog statements under the same transaction and
-retains the wakeup implementation and all original guards and budgets.
+The [maintenance probe validation](native-vortex-maintenance-probe-query.md)
+evaluates query fusion and retains this two-statement implementation after a
+controlled A/B benchmark, preserving the wakeup and all guards and budgets.
