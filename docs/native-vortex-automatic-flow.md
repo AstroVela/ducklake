@@ -1,5 +1,8 @@
 # Managed writes with automatic Vortex maintenance
 
+For the complete architecture, current qualification boundaries and remaining
+work, see the [DuckLake＋Vortex design and roadmap](ducklake-vortex-design-roadmap.md).
+
 This qualification joins [managed upsert/delete](native-vortex-keyed-writes.md)
 with the existing optimizer, selective merge, source rewrite and reclamation
 workers. After explicit configuration, the foreground workload submits mutation
