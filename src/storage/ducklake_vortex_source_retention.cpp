@@ -32,6 +32,15 @@ struct Policy {
 	idx_t keep, age;
 };
 
+Policy ReadPolicy(DataChunk &row) {
+	Policy p {row.GetValue(0, 0).GetValue<bool>(), row.GetValue(1, 0).GetValue<idx_t>(),
+	          row.GetValue(2, 0).GetValue<idx_t>()};
+	if (!p.keep || p.keep > 100000 || p.age > 315360000) {
+		throw InvalidInputException("Invalid Vortex source retention policy");
+	}
+	return p;
+}
+
 Policy Load(DuckLakeTransaction &transaction) {
 	auto result = VortexIndex::Query(
 	    transaction, "SELECT enabled,keep_snapshots,min_age_seconds FROM {METADATA_CATALOG}." + string(POLICY));
@@ -39,12 +48,7 @@ Policy Load(DuckLakeTransaction &transaction) {
 	if (!row || row->size() != 1) {
 		throw InvalidInputException("Vortex source retention is not initialized");
 	}
-	Policy p {row->GetValue(0, 0).GetValue<bool>(), row->GetValue(1, 0).GetValue<idx_t>(),
-	          row->GetValue(2, 0).GetValue<idx_t>()};
-	if (!p.keep || p.keep > 100000 || p.age > 315360000) {
-		throw InvalidInputException("Invalid Vortex source retention policy");
-	}
-	return p;
+	return ReadPolicy(*row);
 }
 
 string Eligible(const Policy &p) {
@@ -229,7 +233,10 @@ bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, 
 	if (!policy.enabled || Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction, true)) {
 		return false;
 	}
-	if (Count(transaction, "SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy))) {
+	auto eligible =
+	    VortexIndex::Query(transaction, "SELECT EXISTS(SELECT 1 FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " +
+	                                        Eligible(policy) + ")");
+	if (eligible->Fetch()->GetValue(0, 0).GetValue<bool>()) {
 		return true;
 	}
 	auto root = Root(transaction);
@@ -247,19 +254,29 @@ vector<vector<Value>> DuckLakeVortexSourceRetention::Status(ClientContext &conte
 	auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
 	Owner owner(context, catalog);
 	owner.transaction.MarkVortexReadCapture();
-	auto policy = Load(owner.transaction);
+	// Read policy and all counters from one metadata statement/snapshot.
 	auto counts = VortexIndex::Query(
 	    owner.transaction,
-	    "SELECT expired_snapshots,collected_files,collected_bytes FROM {METADATA_CATALOG}." + string(POLICY));
+	    "WITH policy AS (SELECT * FROM {METADATA_CATALOG}." + string(POLICY) +
+	        ") "
+	        "SELECT enabled,keep_snapshots,min_age_seconds,expired_snapshots,collected_files,collected_bytes,"
+	        "(SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot s WHERE s.snapshot_id NOT IN "
+	        "(SELECT snapshot_id FROM {METADATA_CATALOG}.ducklake_snapshot ORDER BY snapshot_id DESC "
+	        "LIMIT (SELECT keep_snapshots FROM policy)) "
+	        "AND epoch_us(s.snapshot_time)<epoch_us(now())-(SELECT min_age_seconds FROM policy)*1000000),"
+	        "(SELECT count(*) FROM {METADATA_CATALOG}." +
+	        string(SCHEDULED) +
+	        "),"
+	        "(SELECT count(*) FROM {METADATA_CATALOG}." +
+	        string(DELETIONS) + ") FROM policy");
 	auto values = counts->Fetch();
-	vector<Value> row {Value::BOOLEAN(policy.enabled), Value::UBIGINT(policy.keep), Value::UBIGINT(policy.age)};
-	for (idx_t col = 0; col < 3; col++) {
-		row.push_back(Value::UBIGINT(values->GetValue(col, 0).GetValue<idx_t>()));
+	if (!values || values->size() != 1) {
+		throw InvalidInputException("Vortex source retention is not initialized");
 	}
-	for (auto &sql : {"SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy),
-	                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(SCHEDULED),
-	                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(DELETIONS)}) {
-		row.push_back(Value::UBIGINT(Count(owner.transaction, sql)));
+	auto policy = ReadPolicy(*values);
+	vector<Value> row {Value::BOOLEAN(policy.enabled), Value::UBIGINT(policy.keep), Value::UBIGINT(policy.age)};
+	for (idx_t col = 3; col < 9; col++) {
+		row.push_back(Value::UBIGINT(values->GetValue(col, 0).GetValue<idx_t>()));
 	}
 	row.push_back(
 	    Value::BOOLEAN(Manager(owner.transaction.GetCatalog()).HasOtherTransactions(&owner.transaction, false)));

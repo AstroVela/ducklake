@@ -246,3 +246,6 @@ Local events, worker log and reports are retained under
 `/tmp/ducklake-vortex-readview-timing-steady-30m-v1-20261103/`.
 The aggregate report SHA-256 is
 `af2f6edefa1617a93c99dffb282fb7551cfd5036deeb3b510e69067b21f3287c`.
+
+The [metadata-probe follow-up](native-vortex-metadata-probes.md) reduces repeated
+reads within a transaction and explicitly measures the existing loop waits.
