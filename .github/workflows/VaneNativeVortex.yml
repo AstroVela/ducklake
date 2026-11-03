@@ -180,6 +180,8 @@ jobs:
             2>&1 | tee build/logs/vane-vortex-sustained-load.log
           python -I extension/test/vane/test_vane_vortex_load_metrics.py \
             2>&1 | tee build/logs/vane-vortex-load-metrics.log
+          python -I extension/test/vane/test_vane_vortex_load_oracle.py \
+            2>&1 | tee build/logs/vane-vortex-load-oracle.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
             --profile steady --rows 512 --dimensions 8 --seconds 15 --readers 4 --capture-stalls \
             --output-dir "$PWD/build/steady-smoke-proof" 2>&1 | tee build/logs/vane-vortex-steady-smoke.log
@@ -209,4 +211,10 @@ jobs:
             build/load-proof/**/events.jsonl
             build/load-proof/**/stall.json
             build/load-proof/**/native-stacks.log
+            build/steady-smoke-proof/report.json
+            build/steady-smoke-proof/**/report.json
+            build/steady-smoke-proof/**/worker.log
+            build/steady-smoke-proof/**/events.jsonl
+            build/steady-smoke-proof/**/stall.json
+            build/steady-smoke-proof/**/native-stacks.log
             build/wheels

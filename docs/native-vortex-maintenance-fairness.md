@@ -226,6 +226,9 @@ again. Keep every pass within the existing count/byte budget and recheck the
 same ninety-second drain. No weighted cleanup rounds, compatibility mode,
 fallback, receipt expiry or native SPFresh online-update API was introduced.
 
+The [actual-snapshot and maintenance-profile follow-up](native-vortex-readview-maintenance-profile.md)
+records query captures and the existing worker's stage times for that experiment.
+
 Local complete events, worker log and report are retained under
 `/tmp/ducklake-vortex-status-admission-steady-30m-v1-20261103/`.
 The aggregate report SHA-256 is

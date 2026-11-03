@@ -125,6 +125,10 @@ def watermark(connection):
     )[0]["n"]
 
 
+def maintenance_profile(connection):
+    return query(connection, "SELECT * FROM ducklake_vortex_maintenance_profile('lake')")
+
+
 def counters():
     values = {}
     for filename, keys in [
@@ -227,6 +231,7 @@ def worker(args):
         count=count,
         dimension=dimension,
         fixture=fixture,
+        seed_snapshot=query(connection, "SELECT max(snapshot_id) AS n FROM " + REQUESTS)[0]["n"],
         admission_rejection_check="257-row request rejected atomically by the 256-row T budget",
         providers={
             dist.metadata["Name"]: dist.version
@@ -266,7 +271,11 @@ def worker(args):
             sample_seconds=time.monotonic() - started,
         )
 
-    emit("measurement_start", usage=baseline)
+    emit(
+        "measurement_start",
+        usage=baseline,
+        maintenance_profile=maintenance_profile(connection),
+    )
     if inventory is not None:
         cost_sample(connection, "setup")
 
@@ -298,21 +307,27 @@ def worker(args):
             before_time = time.monotonic_ns()
             before = watermark(cursor)
             started = time.monotonic_ns()
-            hits = query(cursor, BASE.SEARCH.search_sql(vector, category=category))
+            result = query(
+                cursor,
+                BASE.SEARCH.search_sql(vector, category=category, diagnostics=True),
+            )
             finished = time.monotonic_ns()
             after = watermark(cursor)
+            require(len(result) == 1, "Diagnostic search did not return exactly one capture")
+            capture = json.loads(result[0]["diagnostics"])["native_capture"]
             emit(
                 "query",
                 phase=query_phase,
                 canary=canary,
                 before=before,
                 after=after,
+                snapshot_id=capture["snapshot_id"],
                 before_time_ns=before_time,
                 elapsed_ms=(finished - started) / 1e6,
                 finished_ns=finished,
                 vector=vector,
                 category=category,
-                rows=hits,
+                rows=result[0]["hits"],
             )
             stopped.wait(args.recovery_query_pause if phase in ["recovery", "drain"] else args.query_pause)
 
@@ -322,7 +337,15 @@ def worker(args):
         while not stopped.is_set():
             optimizer, maintenance = AUTO.healthy(cursor)
             source = query(cursor, "SELECT * FROM ducklake_vortex_source_retention_status('lake')")[0]
-            emit("sample", phase=phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
+            emit(
+                "sample",
+                phase=phase,
+                usage=usage(),
+                optimizer=optimizer,
+                maintenance=maintenance,
+                source=source,
+                maintenance_profile=maintenance_profile(cursor),
+            )
             if inventory is not None and time.monotonic() >= next_cost:
                 cost_sample(cursor, phase)
                 next_cost = time.monotonic() + 5
@@ -390,10 +413,19 @@ def worker(args):
         try:
             for name, interval in phases(args):
                 phase = name
+                begin_profile = maintenance_profile(connection)
                 begin = usage()
                 task = pool.submit(guarded, lambda: producer(name, interval, time.monotonic() + args.seconds))
                 task.result(timeout=args.seconds + 90)
-                emit("phase", phase=name, begin=begin, end=usage(), interval_seconds=interval)
+                emit(
+                    "phase",
+                    phase=name,
+                    begin=begin,
+                    end=usage(),
+                    interval_seconds=interval,
+                    begin_profile=begin_profile,
+                    end_profile=maintenance_profile(connection),
+                )
                 require(not errors, str(errors))
             phase = "drain"
             begin = usage()
@@ -412,7 +444,12 @@ def worker(args):
                         failure = error
             for cursor in cursors:
                 cursor.close()
-            emit("measured", begin=baseline, end=usage())
+            emit(
+                "measured",
+                begin=baseline,
+                end=usage(),
+                maintenance_profile=maintenance_profile(connection),
+            )
     try:
         if failure is not None:
             raise failure
@@ -450,6 +487,7 @@ def worker(args):
         ):
             require(time.monotonic() < deadline, "Workers did not stop at load teardown")
             time.sleep(0.01)
+        emit("profile_final", maintenance_profile=maintenance_profile(connection))
         connection.close()
         pipe.close()
 
@@ -507,6 +545,12 @@ def validate_queries(events, count, dimension, fixture):
     require(snapshots == sorted(set(snapshots)), "Commit order changed the single producer's order")
     finished_times = [entry["finished_ns"] for entry in acks]
     require(finished_times == sorted(finished_times), "Single-producer acknowledgement times changed order")
+    ready = [event for event in events if event["kind"] == "ready"]
+    require(
+        len(ready) == 1 and type(ready[0]["seed_snapshot"]) is int,
+        "Missing committed seed snapshot",
+    )
+    seed_snapshot = ready[0]["seed_snapshot"]
     keys, model, changes = list(range(count)), {key: row(key, 0, dimension, fixture) for key in range(count)}, []
     for entry in acks:
         upserts, deletes, replaced = plan(keys, entry["epoch"], dimension, fixture)
@@ -520,7 +564,12 @@ def validate_queries(events, count, dimension, fixture):
             del state[key]
         state.update((entry["id"], entry) for entry in upserts)
 
-    samples = sorted([event for event in events if event["kind"] == "query"], key=lambda entry: entry["before"])
+    samples = [event for event in events if event["kind"] == "query"]
+    require(
+        all(type(sample.get("snapshot_id")) is int and sample["snapshot_id"] >= seed_snapshot for sample in samples),
+        "Query has no actual ReadView snapshot after the committed seed",
+    )
+    samples.sort(key=lambda entry: entry["snapshot_id"])
     recalls, canary_recalls, exploration_recalls, overlapping, position = [], [], [], 0, 0
     for sample in samples:
         require(
@@ -530,24 +579,24 @@ def validate_queries(events, count, dimension, fixture):
         acknowledged = snapshots[bisect.bisect_right(finished_times, sample["before_time_ns"])]
         require(sample["before"] >= acknowledged, "Query missed a previously acknowledged commit")
         lower, upper = bisect.bisect_left(snapshots, sample["before"]), bisect.bisect_left(snapshots, sample["after"])
-        while position < lower:
+        selected = bisect.bisect_right(snapshots, sample["snapshot_id"]) - 1
+        require(
+            lower <= selected <= upper,
+            "Actual ReadView snapshot is outside its committed read window",
+        )
+        while position < selected:
             apply(model, changes[position])
             position += 1
-        candidate = dict(model)
-        compatible_recalls = []
-        for index in range(lower, upper + 1):
-            if index > lower:
-                apply(candidate, changes[index - 1])
-            recall = valid_hits(sample, candidate)
-            if recall is not None:
-                compatible_recalls.append(recall)
-        require(compatible_recalls, "Query matches no single committed state inside its read window")
-        best = min(compatible_recalls)
+        recall = valid_hits(sample, model)
+        require(
+            recall is not None,
+            "Query does not match its actual ReadView snapshot's committed model",
+        )
         if sample["canary"]:
-            canary_recalls.append(best)
+            canary_recalls.append(recall)
         else:
-            exploration_recalls.append(best)
-        recalls.append(best)
+            exploration_recalls.append(recall)
+        recalls.append(recall)
         overlapping += upper > lower
     for change in changes[position:]:
         apply(model, change)
@@ -556,16 +605,60 @@ def validate_queries(events, count, dimension, fixture):
     return (
         dict(
             queries=len(samples),
+            oracle="actual_read_view_snapshot",
+            distinct_read_view_snapshots=len({sample["snapshot_id"] for sample in samples}),
             queries_overlapping_commits=overlapping,
-            minimum_recall_lower_bound=min(recalls),
-            canary_minimum_recall_lower_bound=min(canary_recalls),
+            minimum_recall=min(recalls),
+            canary_minimum_recall=min(canary_recalls),
             canary_gate_passed=min(canary_recalls) >= 0.8,
-            exploration_minimum_recall_lower_bound=min(exploration_recalls),
+            exploration_minimum_recall=min(exploration_recalls),
             exploration_recall=percentiles(exploration_recalls),
             exploration_meets_0_8_target=min(exploration_recalls) >= 0.8,
             committed_batches=len(acks),
         ),
         expected,
+    )
+
+
+def profile_delta(begin, end):
+    require(begin and end, "Missing maintenance timing samples")
+    require(
+        len({entry["profile_id"] for entry in begin + end}) == 1,
+        "Maintenance profile reset inside the measured window",
+    )
+    first = {entry["stage"]: entry for entry in begin}
+    require(len(first) == len(begin) == len(end), "Duplicate maintenance timing stage")
+    result = {}
+    for entry in end:
+        require(
+            entry["stage"] in first and entry["stage"] not in result,
+            "Maintenance timing stage changed",
+        )
+        old = first[entry["stage"]]
+        require(
+            all(type(entry[key]) is int and entry[key] >= old[key] >= 0 for key in ["calls", "total_ns", "max_ns"])
+            and entry["max_ns"] <= entry["total_ns"],
+            "Maintenance timing counters are invalid or decreased",
+        )
+        calls, ns = entry["calls"] - old["calls"], entry["total_ns"] - old["total_ns"]
+        result[entry["stage"]] = dict(
+            calls=calls,
+            total_ms=ns / 1e6,
+            average_ms=ns / calls / 1e6 if calls else None,
+            lifetime_max_ms=entry["max_ns"] / 1e6,
+        )
+    return result
+
+
+def profile_metrics(events):
+    start = next(entry for entry in events if entry["kind"] == "measurement_start")["maintenance_profile"]
+    end = next(entry for entry in events if entry["kind"] == "measured")["maintenance_profile"]
+    stopped = next(entry for entry in events if entry["kind"] == "profile_final")["maintenance_profile"]
+    return dict(
+        profile_id=start[0]["profile_id"],
+        semantics="steady-clock wall time; completed scopes, including waits and exceptions; parent stages overlap children",
+        through_measurement=profile_delta(start, end),
+        through_worker_stop=profile_delta(start, stopped),
     )
 
 
@@ -604,6 +697,7 @@ def phase_metrics(events):
             canonical_mutation_bytes=logical,
             process_write_bytes_per_mutation_byte=usage["write_bytes"] / logical,
             acknowledged_batches_per_second=len(acks) / usage["seconds"],
+            maintenance_profile=profile_delta(phase["begin_profile"], phase["end_profile"]),
         )
     return result
 
@@ -668,6 +762,7 @@ def summarize(events):
     )
     return dict(
         phases=result,
+        maintenance_profile=profile_metrics(events),
         steady_latency_windows=latency_windows(events),
         burst_reached_write_budget=(result["burst"]["backpressure_rejections"] > 0 if "burst" in result else None),
         drain=delta(drain["begin"], drain["end"]),
@@ -766,7 +861,15 @@ def run_worker(args, case, events, count, dimension, fixture):
                         elif event["kind"] == "query":
                             progress["query_time"] = time.monotonic()
                             progress["last_query"] = {
-                                key: event[key] for key in ["vector", "category", "before", "after", "canary"]
+                                key: event[key]
+                                for key in [
+                                    "vector",
+                                    "category",
+                                    "before",
+                                    "after",
+                                    "snapshot_id",
+                                    "canary",
+                                ]
                             }
                         elif event["kind"] == "sample":
                             progress["sample"] = event
@@ -812,6 +915,10 @@ def partial_measurement(events, count, dimension, fixture):
     except Exception as error:
         result["query_validation_error"] = str(error)
     result["cost_attribution"] = METRICS.summarize(events)
+    try:
+        result["maintenance_profile"] = profile_metrics(events)
+    except Exception as error:
+        result["maintenance_profile_error"] = str(error)
     return result
 
 

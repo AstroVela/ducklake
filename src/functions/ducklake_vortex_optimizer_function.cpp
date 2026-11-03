@@ -20,6 +20,7 @@ enum class Operation {
 	RESUME_MAINTENANCE,
 	CANCEL_MAINTENANCE,
 	MAINTENANCE_STATUS,
+	MAINTENANCE_PROFILE,
 	SOURCE_RETENTION_POLICY,
 	SOURCE_RETENTION_STATUS,
 	COLLECT_SOURCES
@@ -168,6 +169,10 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 		         LogicalType::UBIGINT, LogicalType::VARCHAR};
+	} else if (OP == Operation::MAINTENANCE_PROFILE) {
+		names = {"profile_id", "stage", "calls", "total_ns", "max_ns"};
+		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT,
+		         LogicalType::UBIGINT};
 	} else if (OP == Operation::SOURCE_RETENTION_STATUS) {
 		names = {"enabled",           "keep_snapshots",         "min_age_seconds",    "expired_snapshots",
 		         "collected_files",   "collected_bytes",        "eligible_snapshots", "scheduled_files",
@@ -247,6 +252,9 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		case Operation::MAINTENANCE_STATUS:
 			state.rows = DuckLakeVortexOptimizer::MaintenanceStatus(context, text(0));
 			break;
+		case Operation::MAINTENANCE_PROFILE:
+			state.rows = DuckLakeVortexOptimizer::MaintenanceProfile(context, text(0));
+			break;
 		case Operation::SOURCE_RETENTION_POLICY:
 			DuckLakeVortexOptimizer::ConfigureSourceRetention(context, text(0), args[1].GetValue<bool>(),
 			                                                  args[2].GetValue<idx_t>(), args[3].GetValue<idx_t>());
@@ -276,8 +284,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			result = "configured";
 			break;
 		}
-		if (bind.operation != Operation::STATUS && bind.operation != Operation::MAINTENANCE_STATUS &&
-		    bind.operation != Operation::SOURCE_RETENTION_STATUS && bind.operation != Operation::COLLECT_SOURCES) {
+		if (!result.empty()) {
 			state.rows.push_back({Value(result)});
 		}
 		state.loaded = true;
@@ -318,6 +325,8 @@ void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader) {
 	                                      Bind<Operation::CANCEL_MAINTENANCE>, Init));
 	loader.RegisterFunction(TableFunction("ducklake_vortex_maintenance_status", {LogicalType::VARCHAR}, Execute,
 	                                      Bind<Operation::MAINTENANCE_STATUS>, Init));
+	loader.RegisterFunction(TableFunction("ducklake_vortex_maintenance_profile", {LogicalType::VARCHAR}, Execute,
+	                                      Bind<Operation::MAINTENANCE_PROFILE>, Init));
 	loader.RegisterFunction(TableFunction("ducklake_initialize_vortex_optimizer", {LogicalType::VARCHAR}, Execute,
 	                                      Bind<Operation::INITIALIZE>, Init));
 	loader.RegisterFunction(TableFunction(
