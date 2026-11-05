@@ -1,0 +1,40 @@
+--- a/src/storage/ducklake_metadata_manager.cpp
++++ b/src/storage/ducklake_metadata_manager.cpp
+@@ -4,0 +5 @@
++#include "common/ducklake_snapshot_lookup.hpp"
+@@ -4940,0 +4942,15 @@
++	result = transaction.Query(R"(
++SELECT snapshot_id
++FROM {METADATA_CATALOG}.ducklake_snapshot
++ORDER BY snapshot_id;)");
++	if (result->HasError()) {
++		result->GetErrorObject().Throw("Failed to list retained snapshots in DuckLake: ");
++	}
++	vector<int64_t> retained_snapshots;
++	for (auto &row : *result) {
++		retained_snapshots.push_back(row.GetValue<int64_t>(0));
++	}
++	unordered_set<idx_t> expired_tables;
++	for (auto &table_id : cleanup_tables) {
++		expired_tables.insert(table_id.index);
++	}
+@@ -4942 +4958 @@
+-SELECT data_file_id, table_id, path, path_is_relative
++SELECT data_file_id, table_id, path, path_is_relative, begin_snapshot, end_snapshot
+@@ -4944,5 +4960 @@
+-WHERE %s (end_snapshot IS NOT NULL AND NOT EXISTS(
+-    SELECT snapshot_id
+-    FROM {METADATA_CATALOG}.ducklake_snapshot
+-    WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot
+-));)",
++WHERE %s end_snapshot IS NOT NULL;)",
+@@ -4949,0 +4962,3 @@
++	if (result->HasError()) {
++		result->GetErrorObject().Throw("Failed to list ended data files in DuckLake: ");
++	}
+@@ -4951,0 +4967,5 @@
++		auto table_index = row.GetValue<idx_t>(1);
++		if (!DuckLakeFileCanExpire(retained_snapshots, row.GetBaseValue(4), row.GetBaseValue(5),
++		                           expired_tables.count(table_index) != 0)) {
++			continue;
++		}

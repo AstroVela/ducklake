@@ -122,6 +122,16 @@ if(DUCKLAKE_ENABLE_VORTEX)
   link_threads(ducklake_vortex_source_gc_benchmark "")
   link_extension_libraries(ducklake_vortex_source_gc_benchmark "")
   set_target_properties(ducklake_vortex_source_gc_benchmark PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  foreach(lookup_tool driver resource)
+    add_executable(ducklake_vortex_expiry_lookup_${lookup_tool} EXCLUDE_FROM_ALL
+                   test/vane/native_vortex_expiry_lookup_${lookup_tool}.cpp)
+    target_include_directories(ducklake_vortex_expiry_lookup_${lookup_tool} PRIVATE test/vane)
+    target_link_libraries(ducklake_vortex_expiry_lookup_${lookup_tool} duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+    link_threads(ducklake_vortex_expiry_lookup_${lookup_tool} "")
+    link_extension_libraries(ducklake_vortex_expiry_lookup_${lookup_tool} "")
+    set_target_properties(ducklake_vortex_expiry_lookup_${lookup_tool} PROPERTIES
+                          RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  endforeach()
 endif()
 
 if(DUCKLAKE_ENABLE_VORTEX AND BUILD_UNITTESTS)
