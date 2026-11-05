@@ -115,6 +115,13 @@ if(DUCKLAKE_ENABLE_VORTEX)
   link_threads(ducklake_vortex_maintenance_probe_benchmark "")
   link_extension_libraries(ducklake_vortex_maintenance_probe_benchmark "")
   set_target_properties(ducklake_vortex_maintenance_probe_benchmark PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_executable(ducklake_vortex_source_gc_benchmark EXCLUDE_FROM_ALL
+                 test/vane/native_vortex_source_gc_benchmark.cpp)
+  target_include_directories(ducklake_vortex_source_gc_benchmark PRIVATE "${DUCKLAKE_VORTEX_SOURCE}/src/include")
+  target_link_libraries(ducklake_vortex_source_gc_benchmark ducklake_extension vortex_extension duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+  link_threads(ducklake_vortex_source_gc_benchmark "")
+  link_extension_libraries(ducklake_vortex_source_gc_benchmark "")
+  set_target_properties(ducklake_vortex_source_gc_benchmark PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endif()
 
 if(DUCKLAKE_ENABLE_VORTEX AND BUILD_UNITTESTS)
