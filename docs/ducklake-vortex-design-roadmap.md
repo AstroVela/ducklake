@@ -243,7 +243,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R1 实时基本链路 | **已实现并验证**：零 B、即时 T/F 查询、受管 upsert/delete、回执、ReadView、写入背压 | 固定 schema／单进程范围内已有端到端及恢复证据 |
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
-| R4 长期维护稳态 | **当前优先项，未完成**：观测、实际快照 oracle、30 分钟 drain 已通过；已补[实际 GC 受控基准](native-vortex-source-gc-cost.md)，定位文件历史增长后的过期候选区间查询热点 | 验证该查询的等价优化并降低实际 GC 成本，验证持续写入时积压不持续增长；开放停滞需要失败栈或确定性回归来关闭 |
+| R4 长期维护稳态 | **当前优先项，未完成**：已补[实际 GC 基准](native-vortex-source-gc-cost.md)并定位区间查询热点；[两种窗口候选](native-vortex-expiry-interval.md)等价性通过，但 A/B 未满足对照门槛，已撤回 | 继续验证更简单的有序快照查找／归并方案，衡量元数据读量与内存；持续写入积压有界和开放停滞仍待关闭 |
 | R5 容量与产品契约 | **待完成**：更大／更高维／更广过滤负载、质量与延迟、生命周期 | 明确回执保留及过期请求、reference／WAL 管理、容量 admission；按目标负载决定 schema／度量／过滤扩展 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
@@ -254,9 +254,9 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 ## 11. 下一份验证性 Draft PR
 
-**推荐针对 `DeleteSnapshots` 的过期数据文件候选区间查询做等价性验证与受控 A/B。** 2026-11-06 已完成[实际 source GC 基准](native-vortex-source-gc-cost.md)：12 个场景、192 个主样本，另有 24 次预热与 36 次独立诊断。4,096 次更新下，逐次落盘历史的两快照过期中位耗时为 197.127 ms，inline 对照为 31.230 ms；诊断定位到检查旧数据文件是否仍被保留快照引用的查询。生产代码与本节原基线相同，R4 尚未关闭。
+**推荐评估更简单的有序快照查找／归并方案，继续降低 `DeleteSnapshots` 候选选择成本。** [实际 GC 基准](native-vortex-source-gc-cost.md)已定位热点；随后两种[等价窗口方案](native-vortex-expiry-interval.md)完成 1,536 个主样本的受控 A/B，均未通过既定对照门槛，已撤回。第二种方案在大规模落盘目标中收益约 81.4%，但部分对照中位回退超过 2%；生产查询、事务保护与预算继续保留。R4 尚未关闭。
 
-1. 复用已封存的 inline／逐次落盘历史输入，先验证候选查询在快照空洞、区间边界、历史引用及表／schema 版本上的等价性；再比较实际 collector 的完整耗时。沿用现有 profile，SQL 诊断只汇总不重叠的最外层查询，不把嵌套 `COMMIT` 重复计入。
+1. 复用已封存的 inline／逐次落盘历史输入，先比较更简单查找方案的元数据传输、内存与固定开销，再验证快照空洞、区间边界、历史引用及表／schema 版本上的等价性；最终比较实际 collector 完整耗时。SQL 诊断只汇总不重叠的最外层查询，不把嵌套 `COMMIT` 重复计入。
 2. 实际 GC 会修改输入，A/B 每次从相同且独立的元数据与文件镜像恢复，并保持受管路径／文件身份有效；不能照搬 #74 对同一个只读 catalog 连续交替运行的方法。
 3. 保留普通事务、旧 ReadView、取消、崩溃、所有权与意图协议的确定性检查；保持既有对象／字节、T/F 和查询预算。计时区间、顺序、保留规则先声明，性能主样本与附加诊断分开。
 4. 找到热点后只实现一个对应优化。受控比较未达到预设收益就撤回实现，保留证据；不增加兼容分支、错误重试或 fallback。
@@ -275,6 +275,7 @@ R4 关闭后再扩大 R5 的负载／容量范围；R6 需要独立远程与分�
 | [源保留](native-vortex-source-retention.md)／[事务唤醒](native-vortex-transaction-gc-wakeup.md) | 文件删除、读者保护与最新持续验证 |
 | [快照与计时](native-vortex-readview-maintenance-profile.md)／[A/B 决策](native-vortex-maintenance-probe-ab.md) | 实际查询版本、阶段观测与已撤回实验 |
 | [实际 source GC 成本](native-vortex-source-gc-cost.md) | 从相同输入恢复，区分快照与文件历史规模，定位下一项查询优化 |
+| [过期窗口候选 A/B](native-vortex-expiry-interval.md) | 两种方案的等价性、受控比较、撤回决定和可复现测试引用 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。

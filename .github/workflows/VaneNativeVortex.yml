@@ -190,6 +190,11 @@ jobs:
             --output-dir "$PWD/build/maintenance-probe-smoke-proof" 2>&1 | tee build/logs/vane-vortex-maintenance-probe.log
           python -I extension/test/vane/test_vane_vortex_source_gc_stats.py \
             2>&1 | tee build/logs/vane-vortex-source-gc-stats.log
+          python -I extension/test/vane/test_vane_vortex_source_gc_ab_stats.py \
+            2>&1 | tee build/logs/vane-vortex-source-gc-ab-stats.log
+          VANE_RUNNER=local-fast python -I extension/test/vane/test_vane_vortex_expiry_interval.py \
+            --output-dir "$PWD/build/expiry-interval-proof" \
+            2>&1 | tee build/logs/vane-vortex-expiry-interval.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_source_gc_benchmark.py \
             --driver "$PWD/build/runtime/ducklake_vortex_source_gc_benchmark" --histories 8 \
             --repetitions 2 --warmups 1 --diagnostics 1 --output-dir "$PWD/build/source-gc-smoke-proof" \
@@ -225,6 +230,7 @@ jobs:
             build/source-gc-smoke-proof/**/primary-*.json
             build/source-gc-smoke-proof/**/diagnostic-*.json
             build/source-gc-smoke-proof/**/*.log
+            build/expiry-interval-proof
             build/keyed-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log

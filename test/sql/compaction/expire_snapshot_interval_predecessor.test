@@ -1,0 +1,135 @@
+# name: test/sql/compaction/expire_snapshot_interval_predecessor.test
+# description: retain files across snapshot gaps, rename and dropped table/schema versions
+# group: [compaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/interval_predecessor_files', METADATA_CATALOG 'metadata', DATA_INLINING_ROW_LIMIT 0)
+
+# snapshots 1 through 6
+statement ok
+CREATE SCHEMA ducklake.s
+
+statement ok
+CREATE TABLE ducklake.s.t(i INTEGER)
+
+statement ok
+INSERT INTO ducklake.s.t VALUES(1)
+
+statement ok
+INSERT INTO ducklake.s.t VALUES(2)
+
+statement ok
+ALTER TABLE ducklake.s.t RENAME TO renamed
+
+statement ok
+UPDATE ducklake.s.renamed SET i=10 WHERE i=1
+
+# Gaps at 4/5 cannot remove the file protected by snapshot 3.
+statement ok
+CALL ducklake_expire_snapshots('ducklake', versions => [4,5])
+
+query I
+SELECT COUNT(*) FROM metadata.ducklake_files_scheduled_for_deletion
+----
+0
+
+query I
+SELECT i FROM ducklake.s.t AT (VERSION => 3)
+----
+1
+
+# Snapshot 6 is the old file's exclusive end, so it cannot protect that file.
+statement ok
+CALL ducklake_expire_snapshots('ducklake', versions => [3])
+
+query I
+SELECT COUNT(*) FROM metadata.ducklake_files_scheduled_for_deletion
+----
+1
+
+query I
+SELECT i FROM ducklake.s.renamed ORDER BY i
+----
+2
+10
+
+statement ok
+CALL ducklake_cleanup_old_files('ducklake', cleanup_all => true)
+
+# snapshots 7 through 9: a dropped table's active file has a NULL end_snapshot.
+statement ok
+CREATE TABLE ducklake.s.drop_me(i INTEGER)
+
+statement ok
+INSERT INTO ducklake.s.drop_me VALUES(99)
+
+statement ok
+DROP TABLE ducklake.s.drop_me
+
+statement ok
+CALL ducklake_expire_snapshots('ducklake', versions => [7])
+
+query I
+SELECT COUNT(*) FROM metadata.ducklake_files_scheduled_for_deletion
+----
+0
+
+query I
+SELECT i FROM ducklake.s.drop_me AT (VERSION => 8)
+----
+99
+
+statement ok
+CALL ducklake_expire_snapshots('ducklake', versions => [8])
+
+query I
+SELECT COUNT(*) FROM metadata.ducklake_files_scheduled_for_deletion
+----
+1
+
+statement ok
+CALL ducklake_cleanup_old_files('ducklake', cleanup_all => true)
+
+# snapshot 10: retain then expire the schema/table history as well.
+statement ok
+DROP SCHEMA ducklake.s CASCADE
+
+query I
+SELECT i FROM ducklake.s.renamed AT (VERSION => 6) ORDER BY i
+----
+2
+10
+
+statement ok
+CALL ducklake_expire_snapshots('ducklake', versions => [1,2,6,9])
+
+query I
+SELECT COUNT(*) FROM metadata.ducklake_files_scheduled_for_deletion
+----
+2
+
+query I
+SELECT COUNT(*) FROM metadata.ducklake_data_file
+----
+0
+
+query I
+SELECT COUNT(*) FROM metadata.ducklake_table
+----
+0
+
+statement ok
+CALL ducklake_cleanup_old_files('ducklake', cleanup_all => true)
+
+query I
+SELECT COUNT(*) FROM metadata.ducklake_files_scheduled_for_deletion
+----
+0
