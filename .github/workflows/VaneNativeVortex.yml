@@ -172,6 +172,11 @@ jobs:
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_keyed_writes.py \
             --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --output-dir "$PWD/build/keyed-proof" \
             2>&1 | tee build/logs/vane-vortex-keyed-writes.log
+          epoch_cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_request_epochs.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --cpus "$epoch_cpu" \
+            --output-dir "$PWD/build/request-epochs-proof" \
+            2>&1 | tee build/logs/vane-vortex-request-epochs.log
           python -I extension/test/vane/test_vane_vortex_functional_oracle.py \
             2>&1 | tee build/logs/vane-vortex-functional-oracle.log
           functional_cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
@@ -307,6 +312,10 @@ jobs:
             build/expiry-lookup-proof
             build/expiry-lookup-resource-proof
             build/keyed-proof/report.json
+            build/request-epochs-proof/report.json
+            build/request-epochs-proof/**/driver.log
+            build/request-epochs-proof/**/recovery.log
+            build/request-epochs-proof/**/checkpoint
             build/functional-matrix-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log

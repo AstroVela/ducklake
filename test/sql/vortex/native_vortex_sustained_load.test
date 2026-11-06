@@ -42,7 +42,7 @@ statement ok
 SET VARIABLE batch = [{'id':1::BIGINT,'embedding':[1,0]::FLOAT[],'category':'A'::VARCHAR,'payload':'容量'::VARCHAR},{'id':2,'embedding':[2,0],'category':'B','payload':NULL},{'id':3,'embedding':[3,0],'category':'A','payload':'3'},{'id':4,'embedding':[4,0],'category':'B','payload':'4'},{'id':5,'embedding':[5,0],'category':'A','payload':'5'}]
 
 statement error
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[],1)
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[],1::UBIGINT)
 ----
 RESOURCE_EXHAUSTED
 
@@ -55,12 +55,12 @@ statement ok
 SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',8,4194304,1024,67108864)
 
 query TI
-SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[],1)
+SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[],1::UBIGINT)
 ----
 capacity	5
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[],1)
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','capacity',getvariable('batch'),[]::BIGINT[],1::UBIGINT)
 
 query IT
 SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],2)

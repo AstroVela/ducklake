@@ -237,6 +237,12 @@ void DuckLakeVortexWriteBatch::Initialize(Connection &owner, const string &catal
 	auto guard = AcquireWriter();
 	try {
 		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog);
+		auto &metadata = transaction.GetCatalog();
+		if (transaction.GetConnection().TableInfo(metadata.MetadataDatabaseName(), metadata.MetadataSchemaName(),
+		                                          "ducklake_vortex_write_requests_v1")) {
+			throw InvalidInputException(
+			    "Vortex request epochs require a fresh write catalog; legacy receipts are unsupported");
+		}
 		DuckLakeVortexIndex::Query(transaction, "CREATE TABLE {METADATA_CATALOG}." + string(EPOCHS) +
 		                                            "(table_uuid VARCHAR PRIMARY KEY,request_epoch UBIGINT NOT NULL "
 		                                            "CHECK(request_epoch>0),last_expired_requests UBIGINT NOT NULL)");

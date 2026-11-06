@@ -1,6 +1,7 @@
 #pragma once
 
 #include "storage/ducklake_vortex_write.hpp"
+#include "duckdb/common/string_util.hpp"
 
 #include <future>
 #include <thread>
@@ -166,8 +167,7 @@ inline void RunEpochFixture(DuckDB &database, Connection &setup, const string &r
 		if (mode == "epoch-conflict" && stage == "after_prune") {
 			observed = true;
 			Connection other(database);
-			SQL(other,
-			    "UPDATE __ducklake_metadata_lake.ducklake_vortex_request_epochs_v1 SET request_epoch=request_epoch");
+			SQL(other, "UPDATE __ducklake_metadata_lake.ducklake_vortex_request_epochs_v1 SET last_expired_requests=1");
 		}
 		if (mode == "epoch-pause-" + stage) {
 			Write(root + "/checkpoint", stage);
@@ -183,6 +183,10 @@ inline void RunEpochFixture(DuckDB &database, Connection &setup, const string &r
 		advanced = f.Advance(owner, observe);
 	} catch (std::exception &error) {
 		Require(observed, error.what());
+		if (mode == "epoch-conflict") {
+			Require(StringUtil::Lower(error.what()).find("conflict") != string::npos,
+			        "Metadata conflict fixture failed for an unrelated reason");
+		}
 		failed = true;
 	}
 	Require(failed == observed, "Epoch fault did not produce the expected failure");
