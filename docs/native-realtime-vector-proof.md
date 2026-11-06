@@ -26,10 +26,20 @@ native CI. The process recovery probe runs after the native build in the DBMS
 Catalog Tests workflow. It uses temporary local files, POSIX `SIGKILL`, and the
 built CLI without downloads or external services.
 
-To test a loadable artifact against a matching native CLI, pass
-`--extension /absolute/path/to/ducklake.duckdb_extension`. The probe disables
-automatic extension installation and loading, and explicitly loads Parquet
-and the selected DuckLake artifact or statically linked extension.
+To test a loadable artifact, use a matching native CLI that has not preloaded
+DuckLake and pass `--extension /absolute/path/to/ducklake.duckdb_extension`.
+The probe rejects a preloaded DuckLake before loading that path and verifies
+that the resulting extension is loaded dynamically. This prevents a static CLI
+from silently ignoring an invalid or different artifact with the same name.
+Omitting `--extension` requires a statically linked DuckLake. Every fresh process
+checks its selected mode; neither mode substitutes the other. Automatic
+extension installation/loading stays disabled, and Parquet is loaded explicitly.
+
+The real-CLI selection regression runs alongside the recovery probe:
+
+```sh
+python3 -I test/vane/test_native_realtime_vector_loading.py --duckdb build/release/duckdb
+```
 
 ## Assertions
 
