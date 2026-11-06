@@ -45,7 +45,7 @@ statement ok
 SET VARIABLE seed_batch=(SELECT list({'id':i::BIGINT,'embedding':[i,0]::FLOAT[],'category':'A'::VARCHAR,'payload':'original'::VARCHAR}) FROM range(512)t(i))
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','seed',getvariable('seed_batch'),[]::BIGINT[])
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','seed',getvariable('seed_batch'),[]::BIGINT[],1)
 
 query I
 SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/planning-first.json',2,1)
@@ -65,7 +65,7 @@ statement ok
 SET VARIABLE first_batch=(SELECT list({'id':i::BIGINT,'embedding':[i+0.125,0]::FLOAT[],'category':'B'::VARCHAR,'payload':NULL::VARCHAR}) FROM range(256)t(i))
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','first-half',getvariable('first_batch'),[]::BIGINT[])
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','first-half',getvariable('first_batch'),[]::BIGINT[],1)
 
 statement ok
 CALL ducklake_flush_inlined_data('lake',table_name=>'items')
@@ -74,7 +74,7 @@ statement ok
 SET VARIABLE second_batch=(SELECT list({'id':i::BIGINT,'embedding':[i+0.125,0]::FLOAT[],'category':'B'::VARCHAR,'payload':NULL::VARCHAR}) FROM range(256,512)t(i))
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','second-half',getvariable('second_batch'),[]::BIGINT[])
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','second-half',getvariable('second_batch'),[]::BIGINT[],1)
 
 query III
 SELECT count(*),count(DISTINCT id),count(*) FILTER(WHERE category='B' AND payload IS NULL) FROM lake.items
@@ -105,10 +105,10 @@ SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items',
 4
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','first-half',getvariable('first_batch'),[]::BIGINT[])
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','first-half',getvariable('first_batch'),[]::BIGINT[],1)
 
 query III
-SELECT count(*),count(DISTINCT id),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items
+SELECT count(*),count(DISTINCT id),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2) FROM lake.items
 ----
 512	512	3
 

@@ -63,7 +63,7 @@ SELECT enabled::INTEGER,keep_snapshots,min_age_seconds FROM ducklake_vortex_sour
 1	2	0
 
 query TI
-SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','initial',[{'id':1,'embedding':[0.25,0],'category':'A','payload':'自动'}],[]::BIGINT[])
+SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','initial',[{'id':1,'embedding':[0.25,0],'category':'A','payload':'自动'}],[]::BIGINT[],1)
 ----
 initial	1
 
@@ -73,10 +73,10 @@ SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]:
 1	自动
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','initial',[{'id':1,'embedding':[0.25,0],'category':'A','payload':'自动'}],[]::BIGINT[])
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','initial',[{'id':1,'embedding':[0.25,0],'category':'A','payload':'自动'}],[]::BIGINT[],1)
 
 query II
-SELECT count(*),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items
+SELECT count(*),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2) FROM lake.items
 ----
 1	1
 

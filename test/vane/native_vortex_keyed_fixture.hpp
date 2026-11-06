@@ -37,7 +37,7 @@ struct KeyedFixture {
 		                ->GetValue(0, 0);
 		Connection owner(database);
 		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "seed", seed,
-		                                 Value::LIST(LogicalType::BIGINT, {}));
+		                                 Value::LIST(LogicalType::BIGINT, {}), 1);
 		SQL(setup, "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");
 		index = DuckLakeVortexIndex::BuildAndPublish(*setup.context, "lake", "main", "items", "knn",
 		                                             root + "/indexes/seed.json", 2, 1, nullptr, "", {},
@@ -55,7 +55,7 @@ struct KeyedFixture {
 		}
 	}
 	DuckLakeVortexWriteResult Mutate(Connection &owner, const std::function<void(const string &)> &observe = {}) {
-		return DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "change", rows, deletes,
+		return DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "change", rows, deletes, 1,
 		                                        observe);
 	}
 	DuckLakeVortexSearchResult Search(Connection &reader, const std::function<void(const string &)> &observe = {}) {
@@ -77,7 +77,7 @@ struct KeyedFixture {
 		        "Mutation exposed a partial version");
 		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 256,
 		        "Mutation duplicated or lost current keys");
-		Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1 "
+		Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2 "
 		                   "WHERE request_id='change'")
 		                ->GetValue(0, 0)
 		                .GetValue<idx_t>() == (changed ? 1 : 0),
