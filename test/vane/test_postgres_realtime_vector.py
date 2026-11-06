@@ -7,6 +7,7 @@ import argparse
 import csv
 import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -129,13 +130,9 @@ class SnapshotReader:
         self.process.stdin.flush()
 
     def copy_snapshot(self, name: str) -> str:
-        state = (
-            "SELECT id, embedding[1] AS x, embedding[2] AS y, embedding[3] AS z, category, payload "
-            "FROM lake.items ORDER BY id"
-        )
         return "".join(
             f"COPY ({sql}) TO {sql_string(self.probe.root / (name + suffix + '.csv'))} (HEADER true);"
-            for sql, suffix in [(RANK, ""), (state, "_rows"), (REQUESTS, "_requests")]
+            for sql, suffix in [(RANK, ""), (ROWS, "_rows"), (REQUESTS, "_requests")]
         )
 
     def start(self) -> None:
@@ -166,7 +163,7 @@ class SnapshotReader:
                 rows = [
                     {
                         "id": int(row["id"]),
-                        "embedding": [float(row[k]) for k in ("x", "y", "z")],
+                        "embedding": json.loads(row["embedding"]),
                         "category": row["category"],
                         "payload": row["payload"],
                     }
