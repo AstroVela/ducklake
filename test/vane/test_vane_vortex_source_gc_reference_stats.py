@@ -15,6 +15,7 @@ def load(name, filename):
 
 REF = load("gc_reference", "test_vane_vortex_source_gc_reference.py")
 FIXTURE = load("gc_metadata_stats", "test_vane_vortex_source_gc_metadata_stats.py")
+BUILD = load("reference_builder", "build_vortex_reference_diagnostic.py")
 
 
 def sample():
@@ -44,6 +45,19 @@ def sample():
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_static_extension_profile_rejects_extra_or_missing(self):
+        command = ["/build/lib" + name + "_extension.a" for name in sorted(BUILD.EXTENSIONS)]
+        self.assertEqual(BUILD.validate_link(command), sorted(BUILD.EXTENSIONS))
+        for bad in (command + ["/build/libtpch_extension.a"], command[:-1]):
+            with self.assertRaises(AssertionError):
+                BUILD.validate_link(bad)
+
+    def test_cached_provider_source_is_rejected(self):
+        expected = Path("/local/ducklake/src/storage/ducklake_metadata_manager.cpp")
+        BUILD.validate_source({"file": str(expected)}, expected)
+        with self.assertRaises(AssertionError):
+            BUILD.validate_source({"file": "/build/_deps/ducklake/src/storage/ducklake_metadata_manager.cpp"}, expected)
+
     def test_partition_conserves_without_sql_overlap(self):
         value = sample()
         parts = REF.partition(value)

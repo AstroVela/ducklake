@@ -109,6 +109,16 @@ def run(args):
         build_path = args.build_report.resolve()
         build = json.loads(build_path.read_text())
         assert build["mode"] == "private_reference_diagnostic" and build["production_sources_unchanged"] is True
+        assert set(build["static_extensions"]) == {
+            "core_functions",
+            "file",
+            "httpfs",
+            "icu",
+            "json",
+            "parquet",
+            "ducklake",
+            "vortex",
+        }
         assert build["production_source_sha256"] == "97a4b1cf7d1a00c7846a974fee77647649c8b18c7ae6ae254097b9d474ffe96e"
         source = json.loads(inputs.read_text())
         assert source["status"] == "completed" and source["decision"] == "baseline_only"

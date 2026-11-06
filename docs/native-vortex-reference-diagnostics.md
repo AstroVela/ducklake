@@ -9,6 +9,26 @@ transaction lifetime, COMMIT order, policy, budget or installed provider changes
 
 ## Protocol frozen before formal sampling
 
+Qualification amendment, also committed before replacement sampling: require
+the default six base extensions and only the two explicitly linked native
+providers. Set `DISABLE_EXTENSIONS_FOR_TEST=1` and explicit
+`DUCKDB_DUCKLAKE_DIRECTORY` / `DUCKDB_VORTEX_DIRECTORY` when configuring or
+reinstalling the runtime, as in
+[the CI workflow](../.github/workflows/VaneNativeVortex.yml). Reject cached
+provider source paths, extra/missing extension archives and an unexpected
+runtime static-extension set before collecting a diagnostic.
+
+An earlier 128-call collection passed native semantic/trace checks, but its
+subsequent base qualification found an unintended `tpch` extension. Its raw
+report is retained as **configuration-invalid**, excluded from qualified results:
+`/tmp/ducklake-vortex-reference-formal-20261106/report.json`, SHA-256
+`e1035583265780a5c1424d27658c7722b84011696ded32a4b0d0ef7e07f085ee`.
+The cause was the missing CI environment flag, not a timing/precision result.
+After fixing and checking that configuration, run one fixed replacement with
+the same two inputs, CPUs, threads, budgets, ordering and sixteen rounds below.
+Do not pool the two collections, change counts or use the rejected timings to
+select another criterion. No qualified timing result is claimed yet.
+
 Commit this protocol, private builder, patch, trace header and analyzer before
 the one formal run. Reuse CPUs **6,7,8,9,10,11**, DuckDB `SET threads=2`, existing
 SPFresh settings and inherited thread environment. Preserve exact-affinity,

@@ -477,6 +477,14 @@ int main(int argc, char **argv) {
 		                Value("ducklake:" + root + "/metadata.ducklake").ToSQLString() + " AS lake(DATA_PATH " +
 		                Value(root + "/data").ToSQLString() + ",DATA_INLINING_ROW_LIMIT 1000)");
 #ifdef DUCKLAKE_REFERENCE_DIAGNOSTIC
+		const string base_extensions = "'core_functions','file','httpfs','icu','json','parquet'";
+		Require(Scalar(writer, "SELECT count(*) FROM duckdb_extensions() WHERE install_mode='STATICALLY_LINKED' "
+		                       "AND extension_name IN (" +
+		                           base_extensions + ")") == 6 &&
+		            !Scalar(writer, "SELECT count(*) FROM duckdb_extensions() WHERE install_mode='STATICALLY_LINKED' "
+		                            "AND extension_name NOT IN (" +
+		                                base_extensions + ",'ducklake','vortex')"),
+		        "Reference driver requires the default base extension profile; use DISABLE_EXTENSIONS_FOR_TEST=1");
 		if (mode == "reference-oracle") {
 			ReferenceOracle(database, writer, root);
 			return 0;
