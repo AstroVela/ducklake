@@ -1,0 +1,8 @@
+--- a/src/storage/ducklake_metadata_manager.cpp
++++ b/src/storage/ducklake_metadata_manager.cpp
+@@ -0,0 +1 @@
++#include "common/ducklake_filename_prefilter.hpp"
+@@ -4650,0 +4652,3 @@
++			if (!DuckLakeFilenameMayMatch(fs, StringValue::Get(chunk->GetValue(0, row)), path)) {
++				continue;
++			}
