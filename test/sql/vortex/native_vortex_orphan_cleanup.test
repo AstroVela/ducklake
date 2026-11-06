@@ -20,6 +20,13 @@ CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', tabl
 statement ok
 INSERT INTO lake.items VALUES (1, [1, 2, 3])
 
+# The writer must not leave a second separator in the catalog's relative path:
+# known-file exclusion compares the reconstructed path with filesystem paths.
+query II
+SELECT count(*), count(*) FILTER (WHERE NOT path_is_relative OR starts_with(path, '/') OR starts_with(path, chr(92))) FROM __ducklake_metadata_lake.ducklake_data_file
+----
+1	0
+
 # These real data files have no catalog entry, like a write left by a dead process.
 statement ok
 COPY (SELECT 99::BIGINT AS id, [9, 8, 7]::FLOAT[] AS embedding) TO '__TEST_DIR__/vortex_orphans/main/items/orphan.vortex' (FORMAT vortex)

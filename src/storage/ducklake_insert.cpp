@@ -1018,7 +1018,9 @@ static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInp
 
 DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input) {
 	if (DuckLakeVortex::GetFormat(context, copy_input.catalog, copy_input.table_id) == DataFileFormat::VORTEX) {
-		return DuckLakeVortex::CopyOptions(context, copy_input);
+		auto result = DuckLakeVortex::CopyOptions(context, copy_input);
+		StripTrailingSeparator(FileSystem::GetFileSystem(context), result.file_path);
+		return result;
 	}
 	auto info = make_uniq<CopyInfo>();
 	auto &catalog = copy_input.catalog;
