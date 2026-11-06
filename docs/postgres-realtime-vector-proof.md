@@ -51,7 +51,9 @@ regression covers reordered/defaulted inputs, selected/batched inserts,
 UPDATE, MERGE UPDATE/INSERT, reopen, and both storage paths:
 
 ```sh
-build/release/test/unittest 'test/sql/vane/native_*not_null*' --require ducklake --require parquet
+build/release/test/unittest \
+  'test/sql/vane/native_nested_not_null_writes.test,test/sql/vane/native_vector_not_null_*' \
+  --require ducklake --require parquet
 ```
 
 The PostgreSQL probe also rejects NULL vector inserts, updates, and both MERGE
