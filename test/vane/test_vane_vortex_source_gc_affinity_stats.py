@@ -24,7 +24,9 @@ def focus(passes):
     return {
         "status": "completed",
         "profile": "focus",
-        "decision": "precision_demonstrated" if all(passes) else "precision_not_demonstrated",
+        "decision": (
+            "precision_demonstrated" if all(passes) else "precision_not_demonstrated"
+        ),
         "cases": [
             {
                 "history": n,
@@ -76,7 +78,9 @@ class AffinityTests(unittest.TestCase):
                     sys.executable,
                     "-I",
                     "-c",
-                    "import os,json;print(json.dumps({'cpus':sorted(os.sched_getaffinity(0)),'env':dict(os.environ)}))",
+                    "import os,json; keys="
+                    + repr(PIN.THREAD_ENV)
+                    + "; print(json.dumps({'cpus':sorted(os.sched_getaffinity(0)),'env':{k:os.environ.get(k) for k in keys}}))",
                 ],
                 text=True,
             )
