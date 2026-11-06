@@ -99,6 +99,8 @@ Deletion-history scans also dispatch by each file's recorded format, including
 the logical row-ID lookup needed after repeated deletes, flushes and rewrites.
 Orphan cleanup recognizes both Parquet and Vortex files, using the existing
 known-file exclusions and retention-time filters.
+The COPY output keeps the catalog's absolute or relative path representation,
+so filesystem enumeration and known-file exclusion refer to the same paths.
 If restoring transaction-local options fails before a retry, the existing commit
 outcome guard cleans up aborted writes and retains files for uncertain commits.
 
@@ -117,6 +119,8 @@ renames, mixed Parquet/Vortex files, NULL/NaN/infinity/signed-zero values, empty
 writes, rollback, exact filtered top-k, active readers across flush, historical
 snapshots, and compaction. Unsupported options, types and partitioning fail
 explicitly. File IDs remain stable until a rewrite replaces their files.
+The cleanup proof runs real deletion with absolute, relative and dot-relative
+data paths, then reopens the catalog and checks every vector component.
 
 The process-recovery proof also runs with `--file-format vortex`. It kills a
 process after a committed inline batch, during an uncommitted batch, and after

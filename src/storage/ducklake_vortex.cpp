@@ -490,7 +490,7 @@ DuckLakeCopyOptions DuckLakeVortex::CopyOptions(ClientContext &context, DuckLake
 	};
 	DuckLakeCopyOptions result(std::move(info), std::move(function));
 	result.bind_data = std::move(bind);
-	result.file_path = path;
+	result.file_path = input.data_path;
 	result.file_extension = "vortex";
 	result.filename_pattern.SetFilenamePattern("ducklake-{uuidv7}");
 	result.use_tmp_file = false;
