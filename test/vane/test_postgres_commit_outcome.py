@@ -26,6 +26,29 @@ sql_string = pg.sql_string
 
 INITIAL = [{"id": 1, "payload": "initial", "distance": 0}, {"id": 2, "payload": "delete", "distance": 1}]
 UPDATED = [{"id": 3, "payload": "new", "distance": 1}]
+INITIAL_ROWS = [
+    {"id": 1, "embedding": [0, 0, 0], "category": "A", "payload": "initial"},
+    {"id": 2, "embedding": [1, 0, 0], "category": "A", "payload": "delete"},
+]
+UPDATED_ROWS = [
+    {"id": 1, "embedding": [9, 0, 0], "category": "B", "payload": "moved"},
+    {"id": 3, "embedding": [0, 1, 0], "category": "A", "payload": "new"},
+]
+INITIAL_REQUESTS = {"baseline": "baseline"}
+UPDATED_REQUESTS = {**INITIAL_REQUESTS, "fault-request": "vector-mutation"}
+
+
+def snapshot_ids(probe) -> list[dict]:
+    return probe.query("SELECT snapshot_id FROM lake.snapshots() ORDER BY snapshot_id;")
+
+
+def check_history(probe, snapshot: int, description: str) -> None:
+    for table, query, expected in [
+        ("items", pg.ROWS, INITIAL_ROWS),
+        ("requests", pg.REQUESTS, pg.expected_requests(INITIAL_REQUESTS)),
+    ]:
+        historical = query.replace(f"FROM lake.{table} ", f"FROM lake.{table} AT (VERSION => {snapshot}) ")
+        require_equal(probe.query(historical), expected, description + " complete historical " + table)
 
 
 def batch() -> str:
@@ -102,9 +125,18 @@ def exercise(probe, args, mode: str) -> dict:
         "BEGIN;INSERT INTO lake.items VALUES (1,[0,0,0],'A','initial'),(2,[1,0,0],'A','delete');"
         "INSERT INTO lake.requests VALUES ('baseline',sha256('baseline'));COMMIT;"
     )
+    pg.check_state(probe, INITIAL_ROWS, INITIAL_REQUESTS, "initial committed state")
+    require_equal(probe.query(pg.RANK), INITIAL, "initial retrieval")
     original_snapshot = probe.query("SELECT max(snapshot_id) AS id FROM lake.snapshots();")[0]["id"]
     observation = fault_commit(probe, args, mode)
     # Inspect with a fresh process connected directly, outside the failed route.
+    committed = mode == "ack_lost"
+    pg.check_state(
+        probe,
+        UPDATED_ROWS if committed else INITIAL_ROWS,
+        UPDATED_REQUESTS if committed else INITIAL_REQUESTS,
+        "direct state before retry",
+    )
     expected = UPDATED if mode == "ack_lost" else INITIAL
     require_equal(probe.query(pg.RANK), expected, "vector state matches the observed server COMMIT outcome")
     require_equal(
@@ -114,9 +146,28 @@ def exercise(probe, args, mode: str) -> dict:
     )
     historical = pg.RANK.replace("FROM lake.items WHERE", f"FROM lake.items AT (VERSION => {original_snapshot}) WHERE")
     require_equal(probe.query(historical), INITIAL, "historical vectors survive failed or uncertain commit")
+    check_history(probe, original_snapshot, "before retry")
+    snapshots_before_retry = snapshot_ids(probe)
+    require_equal(
+        snapshots_before_retry[-1]["snapshot_id"],
+        original_snapshot + int(committed),
+        "server outcome without automatic transaction replay",
+    )
 
     probe.query(pg.GUARD + "BEGIN;" + batch() + "COMMIT;")
+    pg.check_state(probe, UPDATED_ROWS, UPDATED_REQUESTS, "first request retry")
+    check_history(probe, original_snapshot, "first request retry")
+    snapshots_after_first_retry = snapshot_ids(probe)
+    require_equal(
+        snapshots_after_first_retry[-1]["snapshot_id"], original_snapshot + 1, "first explicit retry snapshot"
+    )
+    if committed:
+        require_equal(snapshots_after_first_retry, snapshots_before_retry, "committed request retry is a no-op")
     probe.query(pg.GUARD + "BEGIN;" + batch() + "COMMIT;")
+    pg.check_state(probe, UPDATED_ROWS, UPDATED_REQUESTS, "second request retry")
+    check_history(probe, original_snapshot, "second request retry")
+    snapshots_after_second_retry = snapshot_ids(probe)
+    require_equal(snapshots_after_second_retry, snapshots_after_first_retry, "duplicate request adds no snapshot")
     require_equal(probe.query(pg.RANK), UPDATED, "same request retried without duplicate vectors or resurrection")
     require_equal(
         probe.query("SELECT count(*) AS rows,count(DISTINCT request_id) AS ids FROM lake.requests;"),
@@ -125,13 +176,13 @@ def exercise(probe, args, mode: str) -> dict:
     )
     require_equal(
         probe.query("SELECT id,embedding,category,payload FROM lake.items ORDER BY id;"),
-        [
-            {"id": 1, "embedding": [9, 0, 0], "category": "B", "payload": "moved"},
-            {"id": 3, "embedding": [0, 1, 0], "category": "A", "payload": "new"},
-        ],
+        UPDATED_ROWS,
         "all vector and business columns agree after retries",
     )
     require_equal(probe.query(historical), INITIAL, "historical vectors after retries")
+    observation["snapshots_before_retry"] = snapshots_before_retry
+    observation["snapshots_after_first_retry"] = snapshots_after_first_retry
+    observation["snapshots_after_second_retry"] = snapshots_after_second_retry
     return observation
 
 
@@ -148,7 +199,12 @@ def catalog_files(probe) -> list:
     result = subprocess.run(probe.command + [sql], capture_output=True, text=True, timeout=30)
     if result.returncode:
         raise AssertionError(result.stderr)
-    return json.loads(result.stdout)
+    rows = pg.native.decode_cli_rows(result.stdout)
+    required = {"path", "table_id", "begin_snapshot", "end_snapshot"}
+    for row in rows:
+        if not required.issubset(row) or not isinstance(row["path"], str):
+            raise AssertionError("Invalid catalog file diagnostic row: " + repr(row))
+    return rows
 
 
 def main() -> None:

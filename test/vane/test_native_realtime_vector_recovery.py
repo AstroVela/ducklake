@@ -22,6 +22,19 @@ def require_equal(actual: object, expected: object, description: str) -> None:
         raise AssertionError(f"{description}: expected {expected!r}, got {actual!r}")
 
 
+def decode_cli_rows(output: str) -> list[dict]:
+    # LOAD guards and CALL can emit results before the final SELECT.
+    decoder = json.JSONDecoder()
+    remaining = output.strip()
+    rows = []
+    while remaining:
+        rows, offset = decoder.raw_decode(remaining)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise AssertionError("Expected a CLI JSON array of rows")
+        remaining = remaining[offset:].lstrip()
+    return rows
+
+
 class RecoveryProbe:
     def __init__(self, duckdb: Path, extension: Path | None, root: Path) -> None:
         self.duckdb = duckdb
@@ -62,14 +75,7 @@ class RecoveryProbe:
         result = subprocess.run(self.command + [self.prefix + sql], capture_output=True, text=True, timeout=30)
         if result.returncode:
             raise AssertionError(f"DuckDB exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
-        # CALL can emit a result before the final SELECT in the same CLI invocation.
-        decoder = json.JSONDecoder()
-        remaining = result.stdout.strip()
-        rows = []
-        while remaining:
-            rows, offset = decoder.raw_decode(remaining)
-            remaining = remaining[offset:].lstrip()
-        return rows
+        return decode_cli_rows(result.stdout)
 
     def kill_after(self, name: str, sql: str, require_wal: bool = False) -> None:
         ready = self.root / f"{name}.ready"
