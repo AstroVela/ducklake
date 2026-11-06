@@ -34,7 +34,7 @@ SELECT rowid, snapshot_id, id, embedding[1], embedding[2], embedding[3] FROM duc
 
 # Rewriting leaves logical row IDs 1 and 3 at physical positions 0 and 1.
 statement ok
-CALL ducklake_rewrite_data_files('lake', 'items')
+CALL ducklake_rewrite_data_files('lake', 'items', delete_threshold => 0)
 
 query III
 SELECT id, rowid, file_row_number FROM lake.items ORDER BY id
@@ -52,7 +52,7 @@ statement ok
 DELETE FROM lake.items WHERE id = 4
 
 query IIIIII
-SELECT rowid, snapshot_id - getvariable('rewrite_snapshot'), id, embedding[1], embedding[2], embedding[3] FROM ducklake_table_deletions('lake', 'main', 'items', getvariable('rewrite_snapshot'), getvariable('rewrite_snapshot') + 2) ORDER BY rowid
+SELECT rowid, snapshot_id - getvariable('rewrite_snapshot'), id, embedding[1], embedding[2], embedding[3] FROM ducklake_table_deletions('lake', 'main', 'items', getvariable('rewrite_snapshot') + 1, getvariable('rewrite_snapshot') + 2) ORDER BY rowid
 ----
 1	1	2	2	3	4
 3	2	4	4	5	6
@@ -80,7 +80,7 @@ statement ok
 DELETE FROM lake.mixed WHERE id = 3
 
 query IIIIII
-SELECT rowid, snapshot_id - getvariable('mixed_snapshot'), id, embedding[1], embedding[2], embedding[3] FROM ducklake_table_deletions('lake', 'main', 'mixed', getvariable('mixed_snapshot'), getvariable('mixed_snapshot') + 2) ORDER BY rowid
+SELECT rowid, snapshot_id - getvariable('mixed_snapshot'), id, embedding[1], embedding[2], embedding[3] FROM ducklake_table_deletions('lake', 'main', 'mixed', getvariable('mixed_snapshot') + 1, getvariable('mixed_snapshot') + 2) ORDER BY rowid
 ----
 0	1	1	1	2	3
 2	2	3	3	4	5
@@ -114,7 +114,7 @@ statement ok
 DELETE FROM lake.flushed WHERE id = 3
 
 query IIIIII
-SELECT rowid, snapshot_id - getvariable('flush_snapshot'), id, embedding[1], embedding[2], embedding[3] FROM ducklake_table_deletions('lake', 'main', 'flushed', getvariable('flush_snapshot'), getvariable('flush_snapshot') + 2) ORDER BY rowid
+SELECT rowid, snapshot_id - getvariable('flush_snapshot'), id, embedding[1], embedding[2], embedding[3] FROM ducklake_table_deletions('lake', 'main', 'flushed', getvariable('flush_snapshot') + 1, getvariable('flush_snapshot') + 2) ORDER BY rowid
 ----
 0	1	1	1	2	3
 2	2	3	3	4	5

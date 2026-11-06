@@ -787,6 +787,7 @@ void DuckLakeTransaction::Commit() {
 	}
 	connection.reset();
 	data_file_formats.clear();
+	pending_data_file_formats.clear();
 	state->local_changes.Clear();
 	SetRequiresNewInlinedTable(false);
 }
@@ -801,6 +802,7 @@ void DuckLakeTransaction::Rollback() {
 	}
 	state->CleanupFiles();
 	data_file_formats.clear();
+	pending_data_file_formats.clear();
 	state->local_changes.Clear();
 	SetRequiresNewInlinedTable(false);
 }
@@ -1434,6 +1436,14 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		metadata_manager->ClearInlinedTableCaches();
 		connection->BeginTransaction();
 		snapshot.reset();
+		data_file_formats.clear();
+		for (auto &entry : pending_data_file_formats) {
+			DuckLakeConfigOption option;
+			option.table_id = entry.first;
+			option.option.key = "experimental_data_file_format";
+			option.option.value = DataFileFormatToString(entry.second);
+			SetConfigOption(option);
+		}
 	};
 	context.query_metadata = [&](string q) {
 		return metadata_manager->Query(q);
@@ -1558,13 +1568,27 @@ void DuckLakeTransaction::SetConfigOption(const DuckLakeConfigOption &option) {
 		}
 		auto &table = entry->Cast<DuckLakeTableEntry>();
 		auto format = DataFileFormatFromString(option.option.value);
+		auto current_format = GetDataFileFormat(option.table_id);
 		if (format == DataFileFormat::VORTEX) {
 			DuckLakeVortex::ValidateTable(table);
-		} else if (GetDataFileFormat(option.table_id) == DataFileFormat::VORTEX) {
+		} else if (current_format == DataFileFormat::VORTEX) {
 			throw NotImplementedException("Experimental Vortex tables cannot change their data file format");
+		}
+		if (current_format == format) {
+			// In particular, the default Parquet setting needs no metadata row.
+			return;
+		}
+		// Serialize the first format transition with other transitions and schema
+		// changes to this table, using the metadata catalog's normal MVCC conflict.
+		auto locked = Query(StringUtil::Format("UPDATE {METADATA_CATALOG}.ducklake_table SET table_name = table_name "
+		                                       "WHERE table_id = %d AND end_snapshot IS NULL",
+		                                       option.table_id.index));
+		if (locked->HasError()) {
+			locked->GetErrorObject().Throw("Failed to set DuckLake data file format: ");
 		}
 		metadata_manager->SetConfigOption(option);
 		data_file_formats[option.table_id] = format;
+		pending_data_file_formats[option.table_id] = format;
 		return;
 	}
 	// write the config option to the metadata

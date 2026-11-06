@@ -66,7 +66,11 @@ partitioning changes are rejected for these experimental tables.
 Format options follow the metadata transaction: a rollback also rolls back the
 format used by subsequent statements. Empty table names are rejected, and
 prepared option statements recheck the current table and transition when they
-execute. Each writer records the format selected by its physical plan. A
+execute. A first Vortex transition uses the table metadata's transaction conflict
+boundary; setting the already active format is a no-op. Format changes are
+replayed if a data commit retries its metadata transaction, with the existing
+retry policy unchanged. Each writer records the format selected by its physical
+plan. A
 Parquet writer prepared before the switch can still produce a correctly labeled
 Parquet file in the mixed table. A prepared Vortex writer whose enabling option
 was rolled back must be prepared again before it can write.

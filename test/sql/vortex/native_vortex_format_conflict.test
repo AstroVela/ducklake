@@ -1,0 +1,55 @@
+# name: test/sql/vortex/native_vortex_format_conflict.test
+# description: concurrent first Vortex transitions use the table metadata conflict boundary
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/format_conflict.ducklake' AS lake (DATA_PATH '__TEST_DIR__/format_conflict-data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT, embedding FLOAT[])
+
+statement ok writer
+BEGIN
+
+statement ok other
+BEGIN
+
+statement ok writer
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
+
+statement error other
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
+----
+Conflict
+
+statement ok other
+ROLLBACK
+
+statement ok writer
+COMMIT
+
+# The same request is idempotent after starting a new metadata transaction.
+statement ok other
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
+
+query IT
+SELECT count(*), min(value) FROM __ducklake_metadata_lake.ducklake_metadata WHERE key = 'experimental_data_file_format' AND scope = 'table'
+----
+1	vortex
+
+statement ok
+INSERT INTO lake.items VALUES (1, [1, 2, 3])
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.items
+----
+1	1	2	3
+
+statement ok
+DETACH lake
