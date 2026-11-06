@@ -1,5 +1,5 @@
 # name: test/sql/vortex/native_vortex_format_conflict.test
-# description: concurrent first Vortex transitions use the table metadata conflict boundary
+# description: concurrent first Vortex transitions conflict at snapshot commit
 # group: [vortex]
 
 require ducklake
@@ -23,16 +23,16 @@ BEGIN
 statement ok writer
 CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
 
-statement error other
-CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
-----
-Conflict
-
 statement ok other
-ROLLBACK
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
 
 statement ok writer
 COMMIT
+
+statement error other
+COMMIT
+----
+Transaction conflict
 
 # The same request is idempotent after starting a new metadata transaction.
 statement ok other

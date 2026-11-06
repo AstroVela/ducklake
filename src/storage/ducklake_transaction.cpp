@@ -844,7 +844,7 @@ case_insensitive_map_t<unique_ptr<DuckLakeCatalogSet>> &DuckLakeTransaction::Get
 
 bool DuckLakeTransaction::ChangesMade() const {
 	return state->SchemaChangesMade() || state->local_changes.HasChanges() || !state->dropped_files.empty() ||
-	       !new_name_maps.name_maps.empty();
+	       !new_name_maps.name_maps.empty() || !pending_data_file_formats.empty();
 }
 
 void GetTransactionTableChanges(reference<CatalogEntry> table_entry, TransactionChangeInformation &changes) {
@@ -1002,6 +1002,13 @@ TransactionChangeInformation DuckLakeTransaction::GetTransactionChanges() const 
 		}
 		auto &table_changes = entry.GetTableChanges();
 		AddTableChanges(table_id, table_changes, changes);
+	}
+	// The first file-format transition changes the table's write contract. Use
+	// the existing snapshot conflict protocol to order it with schema changes.
+	for (auto &entry : pending_data_file_formats) {
+		if (dropped_tables.find(entry.first) == dropped_tables.end()) {
+			changes.altered_tables.insert(entry.first);
+		}
 	}
 	return changes;
 }
@@ -1438,6 +1445,9 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		snapshot.reset();
 		data_file_formats.clear();
 		for (auto &entry : pending_data_file_formats) {
+			if (state->dropped_tables.find(entry.first) != state->dropped_tables.end()) {
+				continue;
+			}
 			DuckLakeConfigOption option;
 			option.table_id = entry.first;
 			option.option.key = "experimental_data_file_format";
@@ -1563,7 +1573,7 @@ void DuckLakeTransaction::SetConfigOption(const DuckLakeConfigOption &option) {
 			throw InvalidInputException("experimental_data_file_format requires a committed table scope");
 		}
 		auto entry = ducklake_catalog.GetEntryById(*this, GetSnapshot(), option.table_id);
-		if (!entry) {
+		if (!entry || IsDeleted(*entry)) {
 			throw CatalogException("DuckLake format option table no longer exists");
 		}
 		auto &table = entry->Cast<DuckLakeTableEntry>();
@@ -1577,14 +1587,6 @@ void DuckLakeTransaction::SetConfigOption(const DuckLakeConfigOption &option) {
 		if (current_format == format) {
 			// In particular, the default Parquet setting needs no metadata row.
 			return;
-		}
-		// Serialize the first format transition with other transitions and schema
-		// changes to this table, using the metadata catalog's normal MVCC conflict.
-		auto locked = Query(StringUtil::Format("UPDATE {METADATA_CATALOG}.ducklake_table SET table_name = table_name "
-		                                       "WHERE table_id = %d AND end_snapshot IS NULL",
-		                                       option.table_id.index));
-		if (locked->HasError()) {
-			locked->GetErrorObject().Throw("Failed to set DuckLake data file format: ");
 		}
 		metadata_manager->SetConfigOption(option);
 		data_file_formats[option.table_id] = format;

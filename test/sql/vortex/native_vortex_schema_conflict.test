@@ -1,0 +1,128 @@
+# name: test/sql/vortex/native_vortex_schema_conflict.test
+# description: first Vortex transitions and concurrent schema changes cannot both commit
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/schema_conflict.ducklake' AS lake (DATA_PATH '__TEST_DIR__/schema_conflict-data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.format_first(id BIGINT, embedding FLOAT[])
+
+# An ALTER begun with the Parquet schema cannot commit after the format switch.
+statement ok alterer
+BEGIN
+
+statement ok alterer
+ALTER TABLE lake.format_first ADD COLUMN extra INTEGER DEFAULT 7
+
+statement ok enabler
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'format_first')
+
+statement ok enabler
+INSERT INTO lake.format_first VALUES (1, [1, 2, 3]), (2, [4, 5, 6])
+
+statement error alterer
+COMMIT
+----
+Transaction conflict
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.format_first ORDER BY id
+----
+1	1	2	3
+2	4	5	6
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'lake' AND table_name = 'format_first'
+----
+2
+
+# In the reverse order, even a format-only transaction must fail if its
+# validated schema was changed before commit. The failed setting rolls back.
+statement ok
+CREATE TABLE lake.schema_first(id BIGINT, embedding FLOAT[])
+
+statement ok enabler
+BEGIN
+
+statement ok enabler
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'schema_first')
+
+statement ok alterer
+ALTER TABLE lake.schema_first ADD COLUMN payload BLOB
+
+statement error enabler
+COMMIT
+----
+do not support type BLOB
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata JOIN __ducklake_metadata_lake.ducklake_table ON scope_id = table_id WHERE key = 'experimental_data_file_format' AND scope = 'table' AND table_name = 'schema_first'
+----
+0
+
+statement ok
+INSERT INTO lake.schema_first VALUES (3, [7, 8, 9], 'abc'::BLOB)
+
+# A serial compatible ALTER before enabling is still allowed.
+statement ok
+CREATE TABLE lake.serial(id BIGINT)
+
+statement ok
+ALTER TABLE lake.serial ADD COLUMN embedding FLOAT[]
+
+statement ok
+SET VARIABLE schema_before_format = (SELECT max(schema_version) FROM lake.snapshots())
+
+statement ok
+SET VARIABLE snapshot_before_format = (SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement ok
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'serial')
+
+query II
+SELECT max(snapshot_id) - getvariable('snapshot_before_format'), max(schema_version) - getvariable('schema_before_format') FROM lake.snapshots()
+----
+1	0
+
+statement ok
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'serial')
+
+query I
+SELECT max(snapshot_id) - getvariable('snapshot_before_format') FROM lake.snapshots()
+----
+1
+
+statement ok
+INSERT INTO lake.serial VALUES (4, [10, 11, 12])
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/schema_conflict.ducklake' AS lake (DATA_PATH '__TEST_DIR__/schema_conflict-data', DATA_INLINING_ROW_LIMIT 0)
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.format_first ORDER BY id
+----
+1	1	2	3
+2	4	5	6
+
+query IIIIT
+SELECT id, embedding[1], embedding[2], embedding[3], payload FROM lake.schema_first
+----
+3	7	8	9	abc
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.serial
+----
+4	10	11	12
+
+statement ok
+DETACH lake
