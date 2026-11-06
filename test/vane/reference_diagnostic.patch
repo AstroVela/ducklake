@@ -1,0 +1,22 @@
+--- a/src/storage/ducklake_metadata_manager.cpp
++++ b/src/storage/ducklake_metadata_manager.cpp
+@@ -0,0 +1 @@
++#include "native_vortex_reference_trace.hpp"
+@@ -4643,0 +4645,2 @@
++	vortex_test::reference_trace::Scope trace(path);
++	trace.sample.connection = transaction.GetConnection().context->GetConnectionId();
+@@ -4649 +4652,8 @@
+-	while (auto chunk = result->Fetch()) {
++	auto fetch = [&]() {
++		auto begin = vortex_test::reference_trace::Now();
++		auto chunk = result->Fetch();
++		trace.Fetch(begin, bool(chunk));
++		return chunk;
++	};
++	while (auto chunk = fetch()) {
++		auto begin = vortex_test::reference_trace::Now();
+@@ -4651,0 +4662,2 @@
++				trace.PathLoop(begin, row + 1);
++				trace.sample.found = true;
+@@ -4654,0 +4667 @@
++		trace.PathLoop(begin, chunk->size());
