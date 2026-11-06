@@ -9,6 +9,7 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -610,8 +611,7 @@ unique_ptr<DuckLakeStats> DuckLakeServerSideCommit::BuildStatsMap(vector<DuckLak
 
 vector<string> DuckLakeServerSideCommit::LookupInlinedTableNames(TableIndex table_id) {
 	vector<string> names;
-	auto sql =
-	    SubstitutePlaceholders(DuckLakeMetadataManager::GetInlinedTableNamesSql(table_id), transaction_snapshot);
+	auto sql = SubstitutePlaceholders(DuckLakeMetadataManager::GetInlinedTableNamesSql(table_id), transaction_snapshot);
 	auto result = RunQuery(sql, "lookup inlined table names");
 	for (auto &row : *result) {
 		names.push_back(row.GetValue<string>(0));
@@ -683,7 +683,8 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 		return unique_ptr_cast<MaterializedQueryResult, QueryResult>(fresh_conn.Query(query));
 	};
 	ctx.commit_connection = [this]() {
-		fresh_conn.Commit();
+		auto &schema = Catalog::GetSchema(*fresh_conn.context, INVALID_CATALOG, metadata_schema_name);
+		state->CommitMetadataConnection(fresh_conn, schema.ParentCatalog());
 	};
 	ctx.try_rollback = [this]() {
 		if (fresh_conn.context->transaction.HasActiveTransaction()) {
@@ -716,8 +717,8 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 	};
 	ctx.get_table_column_schema = [this](TableIndex table_id) {
 		vector<DuckLakeColumnSchemaEntry> schema;
-		auto sql = SubstitutePlaceholders(DuckLakeMetadataManager::GetTableColumnSchemaSql(table_id),
-		                                  transaction_snapshot);
+		auto sql =
+		    SubstitutePlaceholders(DuckLakeMetadataManager::GetTableColumnSchemaSql(table_id), transaction_snapshot);
 		auto result = RunQuery(sql, "read table column schema");
 		for (auto &row : *result) {
 			// parent_column IS NULL => top-level root; otherwise a nested leaf carrying its own leaf type.
