@@ -5,6 +5,7 @@ use ducklake_vortex_query::file_index;
 use ducklake_vortex_query::mixed;
 mod capacity;
 mod read_view;
+mod scratch_probe;
 use ducklake_vortex_query::source;
 
 use ducklake_vortex_query::{LIMITS, build_generation, provider, write_reference};
@@ -232,11 +233,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "build" | "build-file-index" | "build-admitted-file-index",
             4
         ) | ("search", 6)
-            | ("serve" | "capacity-store", 4)
+            | ("serve" | "capacity-store" | "scratch-probe", 4)
     ) {
         return Err(
             "usage: probe build|build-file-index CAPTURE REFERENCE | search CAPTURE REFERENCE REQUEST OUTPUT | serve ROOT LIMITS_JSON | capacity-store ROOT OUTPUT".into(),
         );
+    }
+    if command == "scratch-probe" {
+        return scratch_probe::run(Path::new(&args[2]), Path::new(&args[3])).map_err(Into::into);
     }
     block_on(|handle| async move {
         let session = VortexSession::default().with_handle(handle);

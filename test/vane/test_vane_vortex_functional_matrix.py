@@ -25,6 +25,7 @@ def load(name, filename):
 
 KEYED = load("matrix_keyed", "test_vane_vortex_keyed_writes.py")
 PIN = load("matrix_affinity", "test_vane_vortex_source_gc_affinity.py")
+SCRATCH = load("matrix_scratch", "vortex_query_scratch_model.py")
 BASE, WRITE = KEYED.BASE, KEYED.WRITE
 query, require, quote = BASE.query, BASE.require, BASE.quote
 DIMENSIONS = (1, 8, 128, 4096)
@@ -188,7 +189,7 @@ def qualify(connection, model, dimension, phase, segments, report, scratch):
             require(routes["ann_calls"] == segments, "Wrong ANN route count")
             recall = check_hits(hits, model, target, category, k, exact=segments == 0)
             samples.append({"category": category, "k": k, "ids": [r["id"] for r in hits], "recall": recall})
-            require(not list(scratch.iterdir()), "SQL search retained private query staging")
+            SCRATCH.assert_released(scratch)
     require(
         query(connection, "SELECT max(snapshot_id) AS n FROM __ducklake_metadata_lake.ducklake_snapshot")[0]["n"]
         == snapshot,
@@ -475,7 +476,7 @@ def main():
             for dimension in DIMENSIONS:
                 run_case(str(dimension))
                 require(PIN.thread_environment() == threads, "Thread settings changed")
-            require(not list(scratch.iterdir()), "Private staging leaked")
+            SCRATCH.assert_released(scratch)
             require(
                 all(hashlib.sha256(p.read_bytes()).hexdigest() == source_hashes[str(p.resolve())] for p in tracked),
                 "Test source changed during qualification",

@@ -100,7 +100,7 @@ def exercise(native, root, cycles, reopens, checks):
         require(limited["rows"] == result["rows"][:1], "Early LIMIT changed ranked output")
         native.sql("SELECT id,payload FROM lake.items LIMIT 1;")
         observations.append(settled(native))
-        require(not list((root / "private").iterdir()), "Successful/LIMIT query retained private leases")
+        BASE.assert_query_scratch_released((root / "private"))
         rss_samples.append(rss(native))
     checks.append(
         "successful mixed queries, prepared execution and early LIMIT release owners with one/two DuckDB threads"
@@ -117,7 +117,7 @@ def exercise(native, root, cycles, reopens, checks):
     ]:
         native.call(operation, stage, expected=expected)
         observations.append(settled(native))
-        require(not list((root / "private").iterdir()), "Failed/cancelled query retained private leases")
+        BASE.assert_query_scratch_released((root / "private"))
     SEARCH.query(native, SEARCH.search_sql([1, 2]), expected="Query dimension")
     observations.append(settled(native))
     checks.append(
@@ -191,7 +191,7 @@ def main():
         native = CAT.Native(driver, root / "native")
         report.update(exercise(native, root, args.cycles, args.reopens, checks))
         native.finish()
-        require(not list(scratch.iterdir()), "Native database close retained private leases")
+        BASE.assert_query_scratch_released(scratch)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

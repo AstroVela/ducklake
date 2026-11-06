@@ -453,7 +453,7 @@ def main():
             directory = root / name
             directory.mkdir()
             report[name] = exercise_case(driver, directory, report["checks"])
-        require(not list(private.iterdir()), "Build cleanup proof leaked private query leases")
+        BASE.assert_query_scratch_released(private)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

@@ -22,6 +22,7 @@ def load(name, filename):
 
 KEYED = load("epoch_keyed", "test_vane_vortex_keyed_writes.py")
 PIN = load("epoch_affinity", "test_vane_vortex_source_gc_affinity.py")
+SCRATCH = load("epoch_scratch", "vortex_query_scratch_model.py")
 WRITE, BASE = KEYED.WRITE, KEYED.BASE
 query, require, quote = BASE.query, BASE.require, BASE.quote
 EPOCHS = "__ducklake_metadata_lake.ducklake_vortex_request_epochs_v1"
@@ -464,7 +465,7 @@ def main():
             exercise(root / "public", report["checks"])
             legacy(root / "legacy", report["checks"])
             native(args.driver.resolve(), root / "native", report)
-            require(not list(private.iterdir()), "Epoch proof retained private query staging")
+            SCRATCH.assert_released(private)
             require(PIN.thread_environment() == threads, "Thread settings changed")
             require(
                 all(hashlib.sha256(p.read_bytes()).hexdigest() == hashes[str(p)] for p in tracked),

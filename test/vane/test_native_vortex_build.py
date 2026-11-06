@@ -243,7 +243,7 @@ def main():
     try:
         native = CAT.Native(args.driver.resolve(strict=True), root / "native")
         report.update(exercise(native, root, checks))
-        require(list(scratch.iterdir()) == [], "build/search leaked private staging")
+        BASE.assert_query_scratch_released(scratch)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))
