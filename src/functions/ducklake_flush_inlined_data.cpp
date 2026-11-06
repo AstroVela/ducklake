@@ -52,10 +52,10 @@ static void AttachDeleteFilesToWrittenFiles(vector<DuckLakeDeleteFile> &delete_f
 DuckLakeFlushData::DuckLakeFlushData(PhysicalPlan &physical_plan, const vector<LogicalType> &types,
                                      DuckLakeTableEntry &table, DuckLakeInlinedTableInfo inlined_table_p,
                                      string encryption_key_p, optional_idx partition_id, string sort_order_sql_p,
-                                     PhysicalOperator &child)
+                                     PhysicalOperator &child, DataFileFormat file_format_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 0), table(table),
       inlined_table(std::move(inlined_table_p)), encryption_key(std::move(encryption_key_p)),
-      partition_id(partition_id), sort_order_sql(std::move(sort_order_sql_p)) {
+      partition_id(partition_id), sort_order_sql(std::move(sort_order_sql_p)), file_format(file_format_p) {
 	children.push_back(child);
 }
 
@@ -96,8 +96,7 @@ SourceResultType DuckLakeFlushData::GetDataInternal(ExecutionContext &context, D
 // Sink
 //===--------------------------------------------------------------------===//
 unique_ptr<GlobalSinkState> DuckLakeFlushData::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<DuckLakeInsertGlobalState>(
-	    context, table, DataFileFormatFromString(children[0].get().Cast<PhysicalCopyToFile>().file_extension));
+	return make_uniq<DuckLakeInsertGlobalState>(context, table, file_format);
 }
 
 SinkResultType DuckLakeFlushData::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
@@ -228,9 +227,10 @@ public:
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		auto file_format = DataFileFormatFromString(children[0]->Cast<LogicalCopyToFile>().file_extension);
 		auto &child = planner.CreatePlan(*children[0]);
 		return planner.Make<DuckLakeFlushData>(types, table, std::move(inlined_table), std::move(encryption_key),
-		                                       partition_id, std::move(sort_order_sql), child);
+		                                       partition_id, std::move(sort_order_sql), child, file_format);
 	}
 
 	string GetName() const override {
