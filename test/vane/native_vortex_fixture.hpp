@@ -31,6 +31,13 @@ inline void Write(const string &path, const string &text) {
 	Require(std::rename((path + ".pending").c_str(), path.c_str()) == 0, "Cannot publish native view evidence");
 }
 
+inline string TableUUID(Connection &connection) {
+	auto result = SQL(connection, "SELECT table_uuid::VARCHAR FROM __ducklake_metadata_lake.ducklake_table "
+	                              "WHERE table_name='items' AND end_snapshot IS NULL");
+	Require(result->RowCount() == 1, "Fixture requires one current items UUID");
+	return StringValue::Get(result->GetValue(0, 0));
+}
+
 struct Pause {
 	std::mutex lock;
 	std::condition_variable changed;

@@ -5,6 +5,7 @@
 #include "native_vortex_lifecycle_fixture.hpp"
 #include "native_vortex_capacity_fixture.hpp"
 #include "native_vortex_scratch_fixture.hpp"
+#include "native_vortex_uuid_fixture.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -35,6 +36,10 @@ int RunWriteFixture(const string &root, const string &mode, weak_ptr<DatabaseIns
 		           "SELECT * FROM ducklake_initialize_vortex_writes('lake');"
 		           "SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn'," +
 		               Value(root + "/indexes").ToSQLString() + ",2)");
+	}
+	if (StringUtil::StartsWith(mode, "uuid-")) {
+		RunUUIDFixture(database, setup, root, mode);
+		return 0;
 	}
 	if (StringUtil::StartsWith(mode, "scratch-")) {
 		RunScratchFixture(database, setup, root, mode);
@@ -90,8 +95,8 @@ int RunWriteFixture(const string &root, const string &mode, weak_ptr<DatabaseIns
 		}
 	};
 	try {
-		auto result =
-		    DuckLakeVortexWriteBatch::Append(owner, "lake", "main", "items", "knn", "request", rows, 1, observer);
+		auto result = DuckLakeVortexWriteBatch::Append(owner, "lake", "main", "items", "knn", "request", rows, 1,
+		                                               TableUUID(owner), observer);
 		Require(mode == "ok" || mode == "retry" || StringUtil::StartsWith(mode, "pause-"),
 		        "WriteBatch fault did not fire");
 		std::cout << result.request_id << " " << result.row_count << " " << result.snapshot_id << std::endl;
@@ -108,7 +113,8 @@ int RunWriteFixture(const string &root, const string &mode, weak_ptr<DatabaseIns
 		auto count = SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>();
 		Require(count == (committed ? 2 : conflict ? 1 : 0), "Incorrect atomic batch count");
 		Connection retry(database);
-		auto result = DuckLakeVortexWriteBatch::Append(retry, "lake", "main", "items", "knn", "request", rows, 1);
+		auto result = DuckLakeVortexWriteBatch::Append(retry, "lake", "main", "items", "knn", "request", rows, 1,
+		                                               TableUUID(retry));
 		Require(result.row_count == 2, "Retry changed WriteBatch result");
 		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == (conflict ? 3 : 2),
 		        "Retry duplicated or lost WriteBatch rows");

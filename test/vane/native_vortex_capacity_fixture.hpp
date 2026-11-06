@@ -20,7 +20,7 @@ inline Value CapacityExtra(Connection &connection, int64_t id) {
 inline DuckLakeVortexWriteResult CapacityWrite(Connection &owner, const string &id, const Value &rows,
                                                const std::function<void(const string &)> &observe = {}) {
 	return DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", id, rows,
-	                                        Value::LIST(LogicalType::BIGINT, {}), 1, observe);
+	                                        Value::LIST(LogicalType::BIGINT, {}), 1, TableUUID(owner), observe);
 }
 
 inline void RunCapacityFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {

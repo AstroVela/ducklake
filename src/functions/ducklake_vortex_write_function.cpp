@@ -31,7 +31,7 @@ unique_ptr<FunctionData> BindWrite(ClientContext &context, TableFunctionBindInpu
 		names = {input.inputs.size() == 1 ? "initialized" : "managed"};
 	} else {
 		result->args[5] = input.inputs[5].CastAs(context, DuckLakeVortexWriteBatch::RowsType());
-		if (input.inputs.size() == 8) {
+		if (input.inputs.size() == 9) {
 			result->args[6] = input.inputs[6].CastAs(context, LogicalType::LIST(LogicalType::BIGINT));
 		}
 		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
@@ -63,15 +63,16 @@ void ExecuteWrite(ClientContext &context, TableFunctionInput &input, DataChunk &
 		                                 StringValue::Get(args[2]), StringValue::Get(args[3]));
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 	} else {
-		auto result = args.size() == 8
-		                  ? DuckLakeVortexWriteBatch::Mutate(
-		                        owner, StringValue::Get(args[0]), StringValue::Get(args[1]), StringValue::Get(args[2]),
-		                        StringValue::Get(args[3]), StringValue::Get(args[4]), args[5], args[6],
-		                        args[7].GetValue<uint64_t>(), {}, context)
-		                  : DuckLakeVortexWriteBatch::Append(owner, StringValue::Get(args[0]),
-		                                                     StringValue::Get(args[1]), StringValue::Get(args[2]),
-		                                                     StringValue::Get(args[3]), StringValue::Get(args[4]),
-		                                                     args[5], args[6].GetValue<uint64_t>(), {}, context);
+		auto result =
+		    args.size() == 9
+		        ? DuckLakeVortexWriteBatch::Mutate(owner, StringValue::Get(args[0]), StringValue::Get(args[1]),
+		                                           StringValue::Get(args[2]), StringValue::Get(args[3]),
+		                                           StringValue::Get(args[4]), args[5], args[6],
+		                                           args[7].GetValue<uint64_t>(), StringValue::Get(args[8]), {}, context)
+		        : DuckLakeVortexWriteBatch::Append(owner, StringValue::Get(args[0]), StringValue::Get(args[1]),
+		                                           StringValue::Get(args[2]), StringValue::Get(args[3]),
+		                                           StringValue::Get(args[4]), args[5], args[6].GetValue<uint64_t>(),
+		                                           StringValue::Get(args[7]), {}, context);
 		output.SetValue(0, 0, Value(result.table_uuid));
 		output.SetValue(1, 0, Value(result.request_id));
 		output.SetValue(2, 0, Value(result.payload_hash));
@@ -123,7 +124,7 @@ void ExecuteRequests(ClientContext &context, TableFunctionInput &input, DataChun
 	if (bind.advance) {
 		auto result = DuckLakeVortexWriteBatch::AdvanceRequestEpoch(
 		    owner, StringValue::Get(args[0]), StringValue::Get(args[1]), StringValue::Get(args[2]),
-		    StringValue::Get(args[3]), args[4].GetValue<uint64_t>(), {}, context);
+		    StringValue::Get(args[3]), args[4].GetValue<uint64_t>(), StringValue::Get(args[5]), {}, context);
 		output.SetValue(0, 0, Value(result.table_uuid));
 		output.SetValue(1, 0, Value::UBIGINT(result.previous_epoch));
 		output.SetValue(2, 0, Value::UBIGINT(result.request_epoch));
@@ -140,32 +141,71 @@ void ExecuteRequests(ClientContext &context, TableFunctionInput &input, DataChun
 	output.SetCardinality(1);
 	state.finished = true;
 }
+
+unique_ptr<FunctionData> BindRetire(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                    vector<string> &names) {
+	for (auto &arg : input.inputs) {
+		if (arg.IsNull()) {
+			throw InvalidInputException("Vortex table retirement arguments cannot be NULL");
+		}
+	}
+	auto result = make_uniq<WriteBind>();
+	result->args = input.inputs;
+	types = {LogicalType::VARCHAR, LogicalType::BOOLEAN};
+	names = {"table_uuid", "retired"};
+	return std::move(result);
+}
+
+void ExecuteRetire(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<WriteState>();
+	if (state.finished) {
+		return;
+	}
+	if (!context.transaction.IsAutoCommit()) {
+		throw InvalidInputException("Vortex table retirement owns its transaction; use autocommit");
+	}
+	auto &args = input.bind_data->Cast<WriteBind>().args;
+	Connection owner(*context.db);
+	auto uuid =
+	    DuckLakeVortexWriteBatch::RetireTable(owner, StringValue::Get(args[0]), StringValue::Get(args[1]),
+	                                          StringValue::Get(args[2]), StringValue::Get(args[3]), {}, context);
+	output.SetValue(0, 0, Value(uuid));
+	output.SetValue(1, 0, Value::BOOLEAN(true));
+	output.SetCardinality(1);
+	state.finished = true;
+}
+
 } // namespace
 
 void RegisterDuckLakeVortexWrite(ExtensionLoader &loader) {
 	loader.RegisterFunction(
+	    TableFunction("ducklake_retire_vortex_table",
+	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                  ExecuteRetire, BindRetire, InitWrite));
+	loader.RegisterFunction(
 	    TableFunction("ducklake_manage_vortex_writes",
 	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                  ExecuteWrite, BindWrite, InitWrite));
-	loader.RegisterFunction(TableFunction(
-	    "ducklake_mutate_vortex_batch",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	     DuckLakeVortexWriteBatch::RowsType(), LogicalType::LIST(LogicalType::BIGINT), LogicalType::UBIGINT},
-	    ExecuteWrite, BindWrite, InitWrite));
+	loader.RegisterFunction(
+	    TableFunction("ducklake_mutate_vortex_batch",
+	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                   LogicalType::VARCHAR, DuckLakeVortexWriteBatch::RowsType(),
+	                   LogicalType::LIST(LogicalType::BIGINT), LogicalType::UBIGINT, LogicalType::VARCHAR},
+	                  ExecuteWrite, BindWrite, InitWrite));
 	loader.RegisterFunction(
 	    TableFunction("ducklake_initialize_vortex_writes", {LogicalType::VARCHAR}, ExecuteWrite, BindWrite, InitWrite));
-	loader.RegisterFunction(
-	    TableFunction("ducklake_write_vortex_batch",
-	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                   LogicalType::VARCHAR, DuckLakeVortexWriteBatch::RowsType(), LogicalType::UBIGINT},
-	                  ExecuteWrite, BindWrite, InitWrite));
+	loader.RegisterFunction(TableFunction(
+	    "ducklake_write_vortex_batch",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	     DuckLakeVortexWriteBatch::RowsType(), LogicalType::UBIGINT, LogicalType::VARCHAR},
+	    ExecuteWrite, BindWrite, InitWrite));
 	loader.RegisterFunction(
 	    TableFunction("ducklake_vortex_request_status",
 	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                  ExecuteRequests, BindRequestStatus, InitWrite));
-	loader.RegisterFunction(TableFunction(
-	    "ducklake_advance_vortex_request_epoch",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT},
-	    ExecuteRequests, BindRequestAdvance, InitWrite));
+	loader.RegisterFunction(TableFunction("ducklake_advance_vortex_request_epoch",
+	                                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                       LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::VARCHAR},
+	                                      ExecuteRequests, BindRequestAdvance, InitWrite));
 }
 } // namespace duckdb

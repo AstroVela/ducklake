@@ -3,6 +3,7 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/types/value.hpp"
 #include <functional>
+#include <mutex>
 
 namespace duckdb {
 class ClientContext;
@@ -49,6 +50,9 @@ public:
 	static void CheckRewriteToF(ClientContext &context, const DuckLakeVortexRewriteState &rewrite);
 	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context);
 	static unique_ptr<StorageLockKey> ReserveWrite(ClientContext &context);
+	static std::unique_lock<std::mutex> LockTableRetirement(ClientContext &context, const string &catalog,
+	                                                        const string &table_uuid);
+	static void FinishTableRetirement(ClientContext &context, const string &table_uuid);
 };
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader);

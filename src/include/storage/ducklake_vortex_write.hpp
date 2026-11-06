@@ -34,21 +34,28 @@ struct DuckLakeVortexWriteBatch {
 	static void Manage(Connection &owner, const string &catalog, const string &schema, const string &table,
 	                   const string &index);
 	static void CheckManagedWrites(DuckLakeTransaction &fresh, const set<TableIndex> &tables, ClientContext &context);
+	static string RetireTable(Connection &owner, const string &catalog, const string &schema, const string &table,
+	                          const string &expected_table_uuid,
+	                          const std::function<void(const string &)> &observe = {},
+	                          optional_ptr<ClientContext> caller = nullptr);
+	static string RetiringTable(ClientContext &context, const string &catalog);
+	static void StageTableRetirement(ClientContext &context, DuckLakeTransaction &transaction);
 	static DuckLakeVortexRequestStatus RequestStatus(Connection &owner, const string &catalog, const string &schema,
 	                                                 const string &table, const string &index);
 	static DuckLakeVortexRequestAdvance AdvanceRequestEpoch(Connection &owner, const string &catalog,
 	                                                        const string &schema, const string &table,
 	                                                        const string &index, uint64_t expected_epoch,
+	                                                        const string &expected_table_uuid,
 	                                                        const std::function<void(const string &)> &observe = {},
 	                                                        optional_ptr<ClientContext> caller = nullptr);
-	static DuckLakeVortexWriteResult Append(Connection &owner, const string &catalog, const string &schema,
-	                                        const string &table, const string &index, const string &request_id,
-	                                        const Value &rows, uint64_t request_epoch,
-	                                        const std::function<void(const string &)> &observe = {},
-	                                        optional_ptr<ClientContext> caller = nullptr);
+	static DuckLakeVortexWriteResult
+	Append(Connection &owner, const string &catalog, const string &schema, const string &table, const string &index,
+	       const string &request_id, const Value &rows, uint64_t request_epoch, const string &expected_table_uuid,
+	       const std::function<void(const string &)> &observe = {}, optional_ptr<ClientContext> caller = nullptr);
 	static DuckLakeVortexWriteResult Mutate(Connection &owner, const string &catalog, const string &schema,
 	                                        const string &table, const string &index, const string &request_id,
 	                                        const Value &upserts, const Value &deletes, uint64_t request_epoch,
+	                                        const string &expected_table_uuid,
 	                                        const std::function<void(const string &)> &observe = {},
 	                                        optional_ptr<ClientContext> caller = nullptr);
 
@@ -56,6 +63,7 @@ private:
 	static DuckLakeVortexWriteResult Write(Connection &owner, const string &catalog, const string &schema,
 	                                       const string &table, const string &index, const string &request_id,
 	                                       const Value &rows, const Value &deletes, bool mutate, uint64_t request_epoch,
+	                                       const string &expected_table_uuid,
 	                                       const std::function<void(const string &)> &observe,
 	                                       optional_ptr<ClientContext> caller);
 };

@@ -33,6 +33,7 @@
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
+#include "storage/ducklake_vortex_write.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #endif
 
@@ -774,8 +775,16 @@ void DuckLakeTransaction::Commit() {
 #ifdef DUCKLAKE_ENABLE_VORTEX
 			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock());
 			auto rewrite = DuckLakeVortexRewriteState::Get(*context.lock());
-			auto publication_guard = rewrite ? DuckLakeVortexIndex::PublicationLock().GetExclusiveLock()
-			                                 : DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			auto retiring = DuckLakeVortexWriteBatch::RetiringTable(*context.lock(), ducklake_catalog.GetName());
+			auto publication_guard = (rewrite || !retiring.empty())
+			                             ? DuckLakeVortexIndex::PublicationLock().GetExclusiveLock()
+			                             : DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			std::unique_lock<std::mutex> retirement_guard;
+			if (!retiring.empty()) {
+				retirement_guard =
+				    DuckLakeVortexOptimizer::LockTableRetirement(*context.lock(), ducklake_catalog.GetName(), retiring);
+				DuckLakeVortexWriteBatch::StageTableRetirement(*context.lock(), *this);
+			}
 			if (rewrite) {
 				DuckLakeVortexIndex::CheckRewriteCommit(*context.lock(), *this);
 			} else {
@@ -783,6 +792,11 @@ void DuckLakeTransaction::Commit() {
 			}
 #endif
 			FlushChanges();
+#ifdef DUCKLAKE_ENABLE_VORTEX
+			if (!retiring.empty()) {
+				DuckLakeVortexOptimizer::FinishTableRetirement(*context.lock(), retiring);
+			}
+#endif
 		} else if (connection) {
 			connection->Commit();
 			if (!state->flushed_inlined_tables.empty()) {

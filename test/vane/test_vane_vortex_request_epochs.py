@@ -37,8 +37,8 @@ def status(connection, table="items"):
 def advance(connection, epoch, table="items"):
     return WRITE.query_parameters(
         connection,
-        "SELECT * FROM ducklake_advance_vortex_request_epoch('lake','main',?,'knn',?::UBIGINT)",
-        [table, epoch],
+        "SELECT * FROM ducklake_advance_vortex_request_epoch('lake','main',?,'knn',?::UBIGINT,?::VARCHAR)",
+        [table, epoch, WRITE.table_uuid(connection, table)],
     )[0]
 
 

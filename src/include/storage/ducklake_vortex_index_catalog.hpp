@@ -58,6 +58,7 @@ struct DuckLakeVortexIndex {
 	vector<string> SmallestSegments() const;
 	static StorageLock &PublicationLock();
 	static StorageLock &CollectionLock();
+	static void RetireTableMetadata(DuckLakeTransaction &transaction, const string &table_uuid);
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog);
 	static void Rollback(Connection &owner);
 	static void Initialized(DuckLakeTransaction &transaction);

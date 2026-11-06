@@ -37,7 +37,7 @@ struct KeyedFixture {
 		                ->GetValue(0, 0);
 		Connection owner(database);
 		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "seed", seed,
-		                                 Value::LIST(LogicalType::BIGINT, {}), 1);
+		                                 Value::LIST(LogicalType::BIGINT, {}), 1, TableUUID(owner));
 		SQL(setup, "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");
 		index = DuckLakeVortexIndex::BuildAndPublish(*setup.context, "lake", "main", "items", "knn",
 		                                             root + "/indexes/seed.json", 2, 1, nullptr, "", {},
@@ -56,7 +56,7 @@ struct KeyedFixture {
 	}
 	DuckLakeVortexWriteResult Mutate(Connection &owner, const std::function<void(const string &)> &observe = {}) {
 		return DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "change", rows, deletes, 1,
-		                                        observe);
+		                                        TableUUID(owner), observe);
 	}
 	DuckLakeVortexSearchResult Search(Connection &reader, const std::function<void(const string &)> &observe = {}) {
 		DuckLakeVortexViewOptions options {};
