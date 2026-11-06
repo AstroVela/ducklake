@@ -10,8 +10,6 @@
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/function/scalar/variant_utils.hpp"
 
-#include <cmath>
-
 namespace duckdb {
 
 string DuckLakeUtil::ParseQuotedValue(const string &input, idx_t &pos) {
@@ -193,20 +191,11 @@ string ToSQLString(DuckLakeMetadataManager &metadata_manager, const Value &value
 		ret += is_unnamed ? ")" : "}";
 		return ret;
 	}
-	case LogicalTypeId::FLOAT: {
-		float fval = FloatValue::Get(value);
-		if (!Value::FloatIsFinite(fval) || (fval == 0.0f && std::signbit(fval))) {
-			return StringUtil::Format("CAST('%s' AS %s)", value.ToString(), value_type);
-		}
-		return value.ToString();
-	}
-	case LogicalTypeId::DOUBLE: {
-		double val = DoubleValue::Get(value);
-		if (!Value::DoubleIsFinite(val) || (val == 0.0 && std::signbit(val))) {
-			return StringUtil::Format("CAST('%s' AS %s)", value.ToString(), value_type);
-		}
-		return value.ToString();
-	}
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+		// Bare decimal literals can round through DECIMAL before reaching the floating column. Parse the
+		// round-trippable string directly as its floating type, including recursively serialized list values.
+		return StringUtil::Format("CAST('%s' AS %s)", value.ToString(), value_type);
 	case LogicalTypeId::LIST:
 	case LogicalTypeId::ARRAY: {
 		if (!metadata_manager.TypeIsNativelySupported(value.type())) {
