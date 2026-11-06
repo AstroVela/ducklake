@@ -10,6 +10,8 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
+import sys
 import sysconfig
 import time
 
@@ -28,6 +30,7 @@ query, require, quote = BASE.query, BASE.require, BASE.quote
 DIMENSIONS = (1, 8, 128, 4096)
 FILTERS = (None, "A", "a", "", "稀有-'类别", "absent")
 BUSINESS = ("id", "embedding", "category", "payload")
+INLINE_SQL = Path(__file__).resolve().parents[1] / "sql/data_inlining/float_exact_roundtrip.test"
 
 
 def vector(ordinal, dimension):
@@ -72,6 +75,88 @@ def check_hits(hits, model, target, category, k, exact):
     require(recall >= (1.0 if exact else 0.8), f"Recall contract failed: {recall}")
     require(bool(expected) or not hits, "Empty eligible set returned hits")
     return recall
+
+
+def inline_roundtrip(root):
+    import vane
+
+    root.mkdir(mode=0o700)
+    (root / "fixtures").mkdir(mode=0o700)
+    previous = Path.cwd()
+    connection = vane.connect(
+        ":memory:",
+        config={
+            "threads": "2",
+            "autoinstall_known_extensions": "false",
+            "autoload_known_extensions": "false",
+            "extension_directory": str(root / "extensions"),
+        },
+    )
+    checked = 0
+    try:
+        os.chdir(root)
+        connection.execute("LOAD parquet")
+        vane.load_installed_extension("ducklake", connection=connection)
+        sql = INLINE_SQL.read_text().replace("__WORKING_DIRECTORY__", str(root)).replace("__TEST_DIR__", "fixtures")
+        for block in sql.split("\n\n"):
+            lines = [line for line in block.splitlines() if line and not line.startswith("#")]
+            if not lines or lines[0].startswith("require "):
+                continue
+            header = lines[0]
+            require(header in ("statement ok", "query I"), "Unexpected inline regression directive")
+            parts = "\n".join(lines[1:]).split("\n----\n", 1)
+            result = connection.execute(parts[0])
+            if header == "query I":
+                require(
+                    len(parts) == 2 and [str(r[0]) for r in result.fetchall()] == parts[1].strip().splitlines(),
+                    "Inline floating round-trip regression",
+                )
+            checked += 1
+        require(checked == 11, "Incomplete inline regression fixture")
+        return {
+            "status": "passed",
+            "assertion_blocks": checked,
+            "source_sha256": hashlib.sha256(INLINE_SQL.read_bytes()).hexdigest(),
+        }
+    finally:
+        connection.close()
+        os.chdir(previous)
+
+
+def dense_l2(root):
+    root.mkdir(mode=0o700)
+    connection = bootstrap(root, 4096)
+    try:
+        first = [4096.0] + [1.0] * 4095
+        values = [
+            {"id": i, "embedding": v, "category": "A", "payload": "dense"}
+            for i, v in enumerate((first, list(reversed(first))))
+        ]
+        KEYED.mutate(connection, "dense-l2", values)
+        model = {r["id"]: r for r in values}
+        target = [0.0] * 4096
+        result = search(connection, target, 2)
+        # Exact real sum is 2**24 + 4095, whose FLOAT rounding is 2**24 + 4096.
+        expected = float((1 << 24) + 4096)
+        require(
+            len(result) == 2 and all(r["distance"] == expected for r in result),
+            "Dense L2 lost small terms or depended on component order",
+        )
+        check_hits(result, model, target, None, 2, exact=True)
+        diagnostic = search(connection, target, 2, diagnostics=True)
+        require(len(diagnostic) == 1 and diagnostic[0]["hits"] == result, "Dense L2 diagnostics changed hits")
+        WRITE.rejected(lambda: search(connection, [3.4028234663852886e38] * 4096, 2), "Squared L2 distance overflow")
+        require(search(connection, target, 2) == result, "Overflow rejection damaged the next query")
+        return {
+            "status": "passed",
+            "dimension": 4096,
+            "rows": 2,
+            "expected_distance": expected,
+            "component_order_invariant": True,
+            "overflow_rejected": True,
+        }
+    finally:
+        connection.close()
 
 
 def search(connection, target, k, category=None, diagnostics=False):
@@ -202,6 +287,7 @@ def exercise(root, dimension, report, scratch):
 
     def qualify_phase(name, segments):
         qualify(connection, model, dimension, name, segments, report, scratch)
+        (root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
     def flush():
         connection.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
@@ -272,8 +358,33 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--cpus", required=True, type=PIN.parse_cpus)
+    parser.add_argument("--case", choices=("inline", "l2", *map(str, DIMENSIONS)), help=argparse.SUPPRESS)
     args = parser.parse_args()
     root = args.output_dir.resolve()
+    if args.case:
+        result = {
+            "status": "running",
+            "phases": [],
+            "affinity": args.cpus,
+            "thread_environment": PIN.thread_environment(),
+        }
+        if args.case not in ("inline", "l2"):
+            result["dimension"] = int(args.case)
+        try:
+            with PIN.pinned_affinity(args.cpus):
+                if args.case == "inline":
+                    result.update(inline_roundtrip(root))
+                elif args.case == "l2":
+                    result.update(dense_l2(root))
+                else:
+                    exercise(root, int(args.case), result, Path(os.environ["TMPDIR"]))
+        except BaseException as error:
+            result.update(status="failed", error=f"{type(error).__name__}: {error}")
+            raise
+        finally:
+            if root.is_dir():
+                (root / "report.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+        return
     root.mkdir(mode=0o700)
     scratch = root / "private"
     scratch.mkdir(mode=0o700)
@@ -295,6 +406,9 @@ def main():
         Path(BASE.__file__),
         Path(BASE.SEARCH.__file__),
         Path(PIN.__file__),
+        INLINE_SQL,
+        Path(__file__).resolve().parents[2] / "src/common/ducklake_util.cpp",
+        Path(__file__).resolve().parents[2] / "src/vortex_query/src/mixed.rs",
     ]
     source_hashes = {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in tracked}
     threads = PIN.thread_environment()
@@ -315,17 +429,51 @@ def main():
         "cases": [],
     }
     started = time.monotonic()
+
+    def run_case(kind):
+        name = "inline-roundtrip" if kind == "inline" else "dense-l2" if kind == "l2" else "dimension-" + kind
+        directory = root / name
+        with (root / (name + ".log")).open("w") as log:
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(Path(__file__).resolve()),
+                    "--case",
+                    kind,
+                    "--cpus",
+                    ",".join(map(str, args.cpus)),
+                    "--output-dir",
+                    str(directory),
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        path = directory / "report.json"
+        result = json.loads(path.read_text()) if path.is_file() else {"status": "failed"}
+        result.update(exit_code=child.returncode, report=str(path))
+        if kind == "inline":
+            report["inline_roundtrip"] = result
+        elif kind == "l2":
+            report["dense_l2"] = result
+        else:
+            report["cases"].append(result)
+        require(
+            child.returncode == 0 and result["status"] == "passed", f"Functional child failed: {root / (name + '.log')}"
+        )
+        require(
+            result["affinity"] == args.cpus and result["thread_environment"] == threads,
+            "Child changed CPU/thread settings",
+        )
+        print(name, "passed", flush=True)
+
     try:
         with PIN.pinned_affinity(args.cpus):
             report["applied_affinity"] = sorted(os.sched_getaffinity(0))
+            run_case("inline")
+            run_case("l2")
             for dimension in DIMENSIONS:
-                case = {"dimension": dimension, "phases": [], "status": "running"}
-                report["cases"].append(case)
-                try:
-                    exercise(root / f"dimension-{dimension}", dimension, case, scratch)
-                except BaseException as error:
-                    case.update(status="failed", error=f"{type(error).__name__}: {error}")
-                    raise
+                run_case(str(dimension))
                 require(PIN.thread_environment() == threads, "Thread settings changed")
             require(not list(scratch.iterdir()), "Private staging leaked")
             require(
