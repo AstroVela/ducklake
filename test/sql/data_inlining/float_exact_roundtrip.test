@@ -1,0 +1,50 @@
+# name: test/sql/data_inlining/float_exact_roundtrip.test
+# description: native DuckDB inline floating values preserve exact scalar and nested values
+# group: [data_inlining]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/float_exact_roundtrip.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/float_roundtrip_files', DATA_INLINING_ROW_LIMIT 1000)
+
+statement ok
+CREATE TABLE expected AS SELECT f,d,[f,NULL::FLOAT] AS fs,[d,NULL::DOUBLE] AS ds,[f,f]::FLOAT[2] AS fa,{'f':f,'d':d} AS s,MAP([1],[f]) AS m FROM (VALUES (CAST('-0.49972534' AS FLOAT),CAST('0.9397519445337031' AS DOUBLE)),(CAST('-0.49212646' AS FLOAT),CAST('1.0000000000000002' AS DOUBLE)),(CAST('1e-45' AS FLOAT),CAST('5e-324' AS DOUBLE)),(CAST('3.4028235e38' AS FLOAT),CAST('1.7976931348623157e308' AS DOUBLE)),(CAST('-0.0' AS FLOAT),CAST('-0.0' AS DOUBLE)),(CAST('NaN' AS FLOAT),CAST('NaN' AS DOUBLE)),(CAST('Infinity' AS FLOAT),CAST('-Infinity' AS DOUBLE)),(NULL::FLOAT,NULL::DOUBLE)) v(f,d)
+
+statement ok
+CREATE TABLE lake.roundtrip AS FROM expected
+
+query I
+SELECT count(*) FROM ((FROM expected EXCEPT ALL FROM lake.roundtrip) UNION ALL (FROM lake.roundtrip EXCEPT ALL FROM expected))
+----
+0
+
+query I
+SELECT count(*) FROM lake.roundtrip WHERE signbit(f) AND f=0 AND signbit(d) AND d=0
+----
+1
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'roundtrip')
+
+query I
+SELECT count(*) FROM ((FROM expected EXCEPT ALL FROM lake.roundtrip) UNION ALL (FROM lake.roundtrip EXCEPT ALL FROM expected))
+----
+0
+
+query I
+SELECT count(*) FROM lake.roundtrip WHERE signbit(f) AND f=0 AND signbit(d) AND d=0
+----
+1
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/float_exact_roundtrip.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/float_roundtrip_files', DATA_INLINING_ROW_LIMIT 1000)
+
+query I
+SELECT count(*) FROM ((FROM expected EXCEPT ALL FROM lake.roundtrip) UNION ALL (FROM lake.roundtrip EXCEPT ALL FROM expected))
+----
+0
