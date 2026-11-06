@@ -316,6 +316,19 @@ unique_ptr<BaseStatistics> GetColumnStats(const DuckLakeFieldId &field_id, const
 	}
 }
 
+void DuckLakeTableEntry::VerifyNotNull(DataChunk &chunk) const {
+	for (auto &constraint : GetConstraints()) {
+		if (constraint->type != ConstraintType::NOT_NULL) {
+			continue;
+		}
+		auto &not_null = constraint->Cast<NotNullConstraint>();
+		auto &column = GetColumn(not_null.index);
+		if (VectorOperations::HasNull(chunk.data[column.Physical().index], chunk.size())) {
+			throw ConstraintException("NOT NULL constraint failed: %s.%s", name, column.Name());
+		}
+	}
+}
+
 case_insensitive_set_t DuckLakeTableEntry::GetNotNullFields() const {
 	case_insensitive_set_t result;
 	for (auto &constraint : GetConstraints()) {
