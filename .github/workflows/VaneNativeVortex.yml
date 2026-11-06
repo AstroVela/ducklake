@@ -197,6 +197,8 @@ jobs:
             2>&1 | tee build/logs/vane-vortex-source-gc-aa-stats.log
           python -I extension/test/vane/test_vane_vortex_source_gc_affinity_stats.py \
             2>&1 | tee build/logs/vane-vortex-source-gc-affinity-stats.log
+          python -I extension/test/vane/test_vane_vortex_source_gc_metadata_stats.py \
+            2>&1 | tee build/logs/vane-vortex-source-gc-metadata-stats.log
           VANE_RUNNER=local-fast python -I extension/test/vane/test_vane_vortex_expiry_interval.py \
             --output-dir "$PWD/build/expiry-interval-proof" \
             2>&1 | tee build/logs/vane-vortex-expiry-interval.log
@@ -215,6 +217,11 @@ jobs:
             --inputs "$PWD/build/source-gc-smoke-proof/report.json" --profile smoke --cpus "$gc_smoke_cpu" \
             --output-dir "$PWD/build/source-gc-affinity-smoke-proof" \
             2>&1 | tee build/logs/vane-vortex-source-gc-affinity-smoke.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_source_gc_metadata.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_source_gc_benchmark" \
+            --inputs "$PWD/build/source-gc-smoke-proof/report.json" --profile smoke --cpus "$gc_smoke_cpu" \
+            --output-dir "$PWD/build/source-gc-metadata-smoke-proof" \
+            2>&1 | tee build/logs/vane-vortex-source-gc-metadata-smoke.log
           VANE_RUNNER=local-fast python -I extension/test/vane/test_vane_vortex_expiry_lookup.py \
             --driver "$PWD/build/runtime/ducklake_vortex_expiry_lookup_driver" \
             --output-dir "$PWD/build/expiry-lookup-proof" 2>&1 | tee build/logs/vane-vortex-expiry-lookup.log
@@ -256,6 +263,7 @@ jobs:
             build/source-gc-smoke-proof/**/*.log
             build/source-gc-aa-smoke-proof
             build/source-gc-affinity-smoke-proof
+            build/source-gc-metadata-smoke-proof
             build/expiry-interval-proof
             build/expiry-lookup-proof
             build/expiry-lookup-resource-proof
