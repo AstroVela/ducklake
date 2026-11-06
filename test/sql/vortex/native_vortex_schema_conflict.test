@@ -70,6 +70,41 @@ SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata JOIN __ducklake_
 statement ok
 INSERT INTO lake.schema_first VALUES (3, [7, 8, 9], 'abc'::BLOB)
 
+# A replay failure must also remove files already written by the aborted
+# transaction, while retaining earlier committed Parquet data.
+statement ok
+CREATE TABLE lake.failed_writer(id BIGINT, embedding FLOAT[])
+
+statement ok
+INSERT INTO lake.failed_writer VALUES (5, [13, 14, 15])
+
+statement ok enabler
+BEGIN
+
+statement ok enabler
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'failed_writer')
+
+statement ok enabler
+INSERT INTO lake.failed_writer VALUES (6, [16, 17, 18])
+
+statement ok alterer
+ALTER TABLE lake.failed_writer ADD COLUMN payload BLOB
+
+statement error enabler
+COMMIT
+----
+do not support type BLOB
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/schema_conflict-data/main/failed_writer/*.vortex')
+----
+0
+
+query IIIII
+SELECT id, embedding[1], embedding[2], embedding[3], payload IS NULL FROM lake.failed_writer
+----
+5	13	14	15	true
+
 # A serial compatible ALTER before enabling is still allowed.
 statement ok
 CREATE TABLE lake.serial(id BIGINT)
@@ -123,6 +158,11 @@ query IIII
 SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.serial
 ----
 4	10	11	12
+
+query IIIII
+SELECT id, embedding[1], embedding[2], embedding[3], payload IS NULL FROM lake.failed_writer
+----
+5	13	14	15	true
 
 statement ok
 DETACH lake

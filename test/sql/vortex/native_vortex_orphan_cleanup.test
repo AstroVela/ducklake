@@ -1,0 +1,88 @@
+# name: test/sql/vortex/native_vortex_orphan_cleanup.test
+# description: orphan cleanup recognizes Vortex files and retains the existing age and known-file protections
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_orphans.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_orphans', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT, embedding FLOAT[])
+
+statement ok
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
+
+statement ok
+INSERT INTO lake.items VALUES (1, [1, 2, 3])
+
+# These real data files have no catalog entry, like a write left by a dead process.
+statement ok
+COPY (SELECT 99::BIGINT AS id, [9, 8, 7]::FLOAT[] AS embedding) TO '__TEST_DIR__/vortex_orphans/main/items/orphan.vortex' (FORMAT vortex)
+
+statement ok
+COPY (SELECT 99::BIGINT AS id) TO '__TEST_DIR__/vortex_orphans/main/items/orphan.parquet' (FORMAT parquet)
+
+statement ok
+COPY (SELECT 'retain unrelated files') TO '__TEST_DIR__/vortex_orphans/main/items/unrelated.txt' (FORMAT csv)
+
+# The default age limit and explicit older_than still protect recent orphans.
+query I
+SELECT count(*) FROM ducklake_delete_orphaned_files('lake', dry_run => true)
+----
+0
+
+query I
+SELECT count(*) FROM ducklake_delete_orphaned_files('lake', dry_run => true, older_than => '2000-01-01'::TIMESTAMPTZ)
+----
+0
+
+query I
+SELECT count(*) FROM ducklake_delete_orphaned_files('lake', dry_run => true, cleanup_all => true)
+----
+2
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/vortex_orphans/main/items/*.vortex')
+----
+2
+
+# With an eligible age, remove only unknown files of the supported formats.
+query TT
+SELECT suffix(path, '.parquet'), suffix(path, '.vortex') FROM ducklake_delete_orphaned_files('lake', older_than => '2100-01-01'::TIMESTAMPTZ) ORDER BY ALL
+----
+false	true
+true	false
+
+query I
+SELECT count(*) FROM ducklake_delete_orphaned_files('lake', dry_run => true, cleanup_all => true)
+----
+0
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/vortex_orphans/main/items/*.vortex')
+----
+1
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/vortex_orphans/main/items/unrelated.txt')
+----
+1
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_orphans.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_orphans', DATA_INLINING_ROW_LIMIT 0)
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.items
+----
+1	1	2	3
+
+statement ok
+DETACH lake

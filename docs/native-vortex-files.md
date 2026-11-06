@@ -97,6 +97,10 @@ logic. Flush writes the internal row-ID and snapshot columns with their bounds.
 It retains the source catalog's snapshot and delete semantics.
 Deletion-history scans also dispatch by each file's recorded format, including
 the logical row-ID lookup needed after repeated deletes, flushes and rewrites.
+Orphan cleanup recognizes both Parquet and Vortex files, using the existing
+known-file exclusions and retention-time filters.
+If restoring transaction-local options fails before a retry, the existing commit
+outcome guard cleans up aborted writes and retains files for uncertain commits.
 
 The initial writer emits row counts, byte sizes, and top-level NULL counts.
 Complete business-column and nested-column bounds are not implemented.
