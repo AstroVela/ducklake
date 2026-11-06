@@ -21,6 +21,7 @@ def load(filename):
 
 
 EPOCH = load("test_vane_vortex_request_epochs.py")
+SCRATCH = load("vortex_query_scratch_model.py")
 KEYED, WRITE, BASE, PIN = EPOCH.KEYED, EPOCH.WRITE, EPOCH.BASE, EPOCH.PIN
 require, query, quote = BASE.require, BASE.query, BASE.quote
 META = "__ducklake_metadata_lake"
@@ -220,7 +221,7 @@ def exercise(driver, root, report):
             )
         require(result.returncode == 0, "Native lifecycle case failed: " + str(case / "driver.log"))
         require((case / "checkpoint").read_text() == "complete", "Lifecycle fixture did not finish its old-view checks")
-        require(not list(case.joinpath("private").iterdir()), "Completed query did not release private staging")
+        SCRATCH.assert_released(case / "private")
         prepare_recovery(case, report["thread_environment"])
         run_recovery(case, False)
         report["native_cases"].append(mode)
@@ -274,7 +275,7 @@ def exercise(driver, root, report):
                     require(wal_bytes(case) == 0, "Checkpoint did not finish before the declared boundary")
                 prepare_recovery(case, report["thread_environment"])
                 require(
-                    any(key.startswith("private/") for key in files(case)),
+                    any(key.startswith("private/") and "/payload/" in key for key in files(case)),
                     "Crash fixture did not retain its private ReadView",
                 )
                 process.kill()
@@ -348,7 +349,7 @@ def main():
         with PIN.pinned_affinity(args.cpus):
             report["applied_affinity"] = sorted(os.sched_getaffinity(0))
             exercise(args.driver.resolve(), root, report)
-            require(not list(private.iterdir()), "Lifecycle proof leaked query-private staging")
+            SCRATCH.assert_released(private)
             require(PIN.thread_environment() == threads, "Thread environment changed")
             require(
                 all(hashlib.sha256(p.read_bytes()).hexdigest() == hashes[str(p)] for p in tracked),

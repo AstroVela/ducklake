@@ -7,6 +7,7 @@ pub mod file_index;
 pub mod lease;
 pub mod mixed;
 mod rebind;
+pub mod scratch;
 pub mod source;
 pub use build::{build_generation, write_reference};
 use std::path::Path;

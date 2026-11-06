@@ -441,7 +441,7 @@ def main():
             directory = root / ("publication-" + stage)
             directory.mkdir()
             report["publication_crashes"].append(publication_crash(driver, directory, stage, report["checks"]))
-        require(not list(private.iterdir()), "Generation GC left private query leases")
+        BASE.assert_query_scratch_released(private)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

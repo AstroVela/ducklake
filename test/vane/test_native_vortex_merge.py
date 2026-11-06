@@ -109,7 +109,7 @@ def exercise(proof, native, root, checks, workers):
         damaged.write_bytes(original)
     for stage in ["segment_opened", "after_open", "after_ann"]:
         native.call("cancel-search", stage, expected="Interrupted")
-        require(not list((root.parent / "private").iterdir()), "Interrupted three-B search leaked partial leases")
+        BASE.assert_query_scratch_released((root.parent / "private"))
     native.call("capture", "held", "knn")
     worker = CAT.Worker(proof, "held", max_views=2)
     workers.append(worker)
@@ -465,7 +465,7 @@ def main():
             directory = root / stage
             directory.mkdir()
             report[stage] = crash(driver, directory, stage, report["checks"])
-        require(not list(private.iterdir()), "Merge qualification retained private leases")
+        BASE.assert_query_scratch_released(private)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

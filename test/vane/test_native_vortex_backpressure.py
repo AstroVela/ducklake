@@ -298,7 +298,7 @@ def main():
             native = CAT.Native(driver, case_root / "native")
             report["cases"][name] = case(native, case_root, report["checks"])
             native.finish()
-            require(not list(private.iterdir()), f"{name} retained private leases")
+            BASE.assert_query_scratch_released(private)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

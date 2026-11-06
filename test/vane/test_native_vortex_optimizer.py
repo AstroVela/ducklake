@@ -419,7 +419,7 @@ def main():
         report.update(bytes_and_close(driver, root, checks))
         report.update(table_identity(driver, root, checks))
         report.update(flush_recovery(driver, root, checks))
-        require(list(scratch.iterdir()) == [], "Optimizer leaked private staging")
+        BASE.assert_query_scratch_released(scratch)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

@@ -176,47 +176,121 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
     .map_err(|error| vortex_err!("Invalid UTF-8 data path: {error}"))?;
     let data_path = std::path::Path::new(data_path).canonicalize()?;
     let scratch_root = std::env::temp_dir().canonicalize()?;
-    if scratch_root.starts_with(data_path) {
+    if scratch_root.starts_with(&data_path) {
         vortex_bail!("Vortex SQL scratch directory must be outside the managed data path");
     }
-    let scratch = tempfile::Builder::new()
-        .prefix(".ducklake-vortex-query-")
-        .tempdir_in(scratch_root)?;
-    block_on(|handle| async {
-        let session = VortexSession::default().with_handle(handle);
-        let buffers = unsafe { copy_sources(input.sources, input.source_count) }?;
-        let handoff_bytes = buffers.values().map(|bytes| bytes.len()).sum::<usize>();
-        let source_count = buffers.len();
-        let view = MixedView::from_binary(
-            bytes,
-            name,
-            buffers,
-            scratch.path(),
-            ViewBudget {
-                source_bytes: 64 * 1024 * 1024,
-                artifact_bytes: 64 * 1024 * 1024,
-                inline_rows: 100_000,
-                inline_bytes: 4 * 1024 * 1024,
-            },
-            session.clone(),
-            &check,
-        )
-        .await?;
-        let result = view
-            .search_category(query, input.k as usize, category, session, &check)
+    let scratch = crate::scratch::OwnedScratch::create(&scratch_root, &data_path, &check)?;
+    let root = scratch.root().to_path_buf();
+    let result = (|| {
+        check("scratch_registered")?;
+        block_on(|handle| async {
+            let session = VortexSession::default().with_handle(handle);
+            let buffers = unsafe { copy_sources(input.sources, input.source_count) }?;
+            let handoff_bytes = buffers.values().map(|bytes| bytes.len()).sum::<usize>();
+            let source_count = buffers.len();
+            let view = MixedView::from_binary(
+                bytes,
+                name,
+                buffers,
+                scratch.path(),
+                ViewBudget {
+                    source_bytes: 64 * 1024 * 1024,
+                    artifact_bytes: 64 * 1024 * 1024,
+                    inline_rows: 100_000,
+                    inline_bytes: 4 * 1024 * 1024,
+                },
+                session.clone(),
+                &check,
+            )
             .await?;
-        let diagnostics = serde_json::to_vec(&serde_json::json!({"routes":result.routes,
+            let result = view
+                .search_category(query, input.k as usize, category, session, &check)
+                .await?;
+            let diagnostics = serde_json::to_vec(&serde_json::json!({"routes":result.routes,
             "index_revision":view.catalog_revision,"generation":view.generation(),"generations":view.generations(),
-            "snapshot_id":view.source.capture.snapshot_id, "cost":{"phases_us":phases.borrow().clone(),
+            "snapshot_id":view.source.capture.snapshot_id, "scratch_root":root, "cost":{"phases_us":phases.borrow().clone(),
             "projection_rows":view.source.projection_counts(),"source_bytes":view.source.pinned_bytes(),
             "artifact_bytes":view.artifact_bytes(),"binary_handoff_bytes":handoff_bytes,"source_buffer_count":source_count,"source_staging_bytes":0,"elapsed_us":started.elapsed().as_micros() as u64}}))
             .map_err(|e| vortex_err!("{e}"))?;
-        Ok(Output {
-            hits: result.hits,
-            diagnostics: CString::new(diagnostics).map_err(|e| vortex_err!("{e}"))?,
-            error: None,
+            Ok(Output {
+                hits: result.hits,
+                diagnostics: CString::new(diagnostics).map_err(|e| vortex_err!("{e}"))?,
+                error: None,
+            })
         })
+    })();
+    let cleanup = scratch.close();
+    match (result, cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(vortex_err!(
+            "Query failed: {error}; scratch close failed: {cleanup}"
+        )),
+    }
+}
+
+#[repr(C)]
+pub struct ScratchInput {
+    data_path: *const u8,
+    data_path_len: u64,
+    root: *const u8,
+    root_len: u64,
+    max_objects: u64,
+    max_bytes: u64,
+    control: extern "C" fn(*mut c_void, *const u8, u64) -> u8,
+    context: *mut c_void,
+}
+
+unsafe fn collect_scratch(input: &ScratchInput) -> VortexResult<Output> {
+    if input.data_path.is_null()
+        || input.root.is_null()
+        || !(1..=65536).contains(&input.data_path_len)
+        || !(1..=65536).contains(&input.root_len)
+    {
+        vortex_bail!("Invalid native scratch collection paths");
+    }
+    let data_path = str::from_utf8(unsafe {
+        slice::from_raw_parts(input.data_path, input.data_path_len as usize)
     })
+    .map_err(|e| vortex_err!("{e}"))?;
+    let root =
+        str::from_utf8(unsafe { slice::from_raw_parts(input.root, input.root_len as usize) })
+            .map_err(|e| vortex_err!("{e}"))?;
+    let check = |stage: &str| {
+        if (input.control)(input.context, stage.as_ptr(), stage.len() as u64) != 0 {
+            vortex_bail!("Native scratch collection interrupted");
+        }
+        Ok(())
+    };
+    let data_path = std::path::Path::new(data_path).canonicalize()?;
+    let result = crate::scratch::collect(
+        &data_path,
+        std::path::Path::new(root),
+        input.max_objects,
+        input.max_bytes,
+        &check,
+    )?;
+    let bytes = serde_json::to_vec(&result).map_err(|e| vortex_err!("{e}"))?;
+    Ok(Output {
+        hits: vec![],
+        diagnostics: CString::new(bytes).map_err(|e| vortex_err!("{e}"))?,
+        error: None,
+    })
+}
+
+/// # Safety
+/// Input paths and callbacks must remain valid until this synchronous call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ducklake_vortex_collect_query_scratch(
+    input: &ScratchInput,
+) -> *mut Output {
+    let result = catch_unwind(AssertUnwindSafe(|| unsafe { collect_scratch(input) }));
+    Box::into_raw(Box::new(match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => Output::error(error.to_string()),
+        Err(_) => Output::error("Native scratch collection panicked".to_owned()),
+    }))
 }
 
 /// # Safety

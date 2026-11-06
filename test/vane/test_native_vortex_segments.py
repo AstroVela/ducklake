@@ -160,7 +160,7 @@ def exercise(proof, native, root, checks, workers):
         ("fail-search", "after_open", "Injected query lease failure"),
     ]:
         native.call(op, stage, expected=expected)
-        require(not list((root.parent / "private").iterdir()), "Two-segment failure retained private leases")
+        BASE.assert_query_scratch_released((root.parent / "private"))
     native.call("capture", "held", "knn")
     worker = CAT.Worker(proof, "held-worker", max_views=2)
     workers.append(worker)
@@ -403,7 +403,7 @@ def main():
         directory = root / "background"
         directory.mkdir()
         report["background"] = background(args.driver.resolve(strict=True), directory, report["checks"])
-        require(not list(private.iterdir()), "Segment qualification retained private query leases")
+        BASE.assert_query_scratch_released(private)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

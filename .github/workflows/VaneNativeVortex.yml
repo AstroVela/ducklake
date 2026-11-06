@@ -193,6 +193,11 @@ jobs:
             --probe "$PWD/build/runtime/cargo/build/x86_64-unknown-linux-gnu/ci/ducklake-vortex-index-probe" \
             --output-dir "$PWD/build/capacity-proof" \
             2>&1 | tee build/logs/vane-vortex-capacity.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_query_scratch.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --cpus "$lifecycle_cpu" \
+            --probe "$PWD/build/runtime/cargo/build/x86_64-unknown-linux-gnu/ci/ducklake-vortex-index-probe" \
+            --output-dir "$PWD/build/query-scratch-proof" \
+            2>&1 | tee build/logs/vane-vortex-query-scratch.log
           python -I extension/test/vane/test_vane_vortex_functional_oracle.py \
             2>&1 | tee build/logs/vane-vortex-functional-oracle.log
           functional_cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
@@ -346,6 +351,11 @@ jobs:
             build/capacity-proof/**/expected.json
             build/capacity-proof/**/files.json
             build/capacity-proof/**/sealed.json
+            build/query-scratch-proof/report.json
+            build/query-scratch-proof/**/*.log
+            build/query-scratch-proof/**/*.json
+            build/query-scratch-proof/**/checkpoint
+            build/query-scratch-proof/**/scratch-root
             build/functional-matrix-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log

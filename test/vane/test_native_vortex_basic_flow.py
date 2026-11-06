@@ -178,7 +178,7 @@ def main():
     started = time.monotonic()
     try:
         report.update(exercise(proof, native, root, report["checks"], workers))
-        require(not list(private.iterdir()), "Basic flow leaked private view leases")
+        BASE.assert_query_scratch_released(private)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

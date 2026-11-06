@@ -57,7 +57,7 @@ def qualify(result, oracle, vector, category=None, k=10):
 
 
 def no_leases(scratch):
-    require(list(scratch.iterdir()) == [], "native SQL query leaked private source/index staging")
+    BASE.assert_query_scratch_released(scratch)
 
 
 def exercise(proof, native, scratch, checks):
