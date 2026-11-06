@@ -55,10 +55,10 @@ SELECT * FROM ducklake_collect_vortex_sources('lake',17,67108864)
 Invalid Vortex source collection budgets
 
 statement ok
-SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','seed',[{'id':1,'embedding':[1,0],'category':'A','payload':'原始'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}])
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','seed',[{'id':1,'embedding':[1,0],'category':'A','payload':'原始'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],1::UBIGINT)
 
 statement ok
-SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','next',[{'id':100,'embedding':[100,0],'category':'A','payload':'后续'}])
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','next',[{'id':100,'embedding':[100,0],'category':'A','payload':'后续'}],1::UBIGINT)
 
 statement ok
 DELETE FROM lake.items WHERE id=1
@@ -119,12 +119,12 @@ SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot
 1
 
 query I
-SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1 r JOIN __ducklake_metadata_lake.ducklake_snapshot s USING(snapshot_id) WHERE request_id='seed'
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2 r JOIN __ducklake_metadata_lake.ducklake_snapshot s USING(snapshot_id) WHERE request_id='seed'
 ----
 0
 
 query TI
-SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','seed',[{'id':1,'embedding':[1,0],'category':'A','payload':'原始'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}])
+SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','seed',[{'id':1,'embedding':[1,0],'category':'A','payload':'原始'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],1::UBIGINT)
 ----
 seed	2
 

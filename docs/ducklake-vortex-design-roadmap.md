@@ -1,6 +1,6 @@
 # DuckLake＋Vortex 总设计与 roadmap
 
-本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，按 **2026-11-03 的实现基线与截至 2026-11-06 的验证结果**整理。分项 proof 文档保留各次实验的历史；本文说明当前采用的方案、能力边界和后续顺序。
+本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，按 **截至 2026-11-06 的实现与验证结果**整理。分项 proof 文档保留各次实验的历史；本文说明当前采用的方案、能力边界和后续顺序。
 
 配套阅读：[ChatGPT Page](https://chatgpt.com/space/page_0c2fa263e4dc81919bfaea100e8008cd)。本文是后续随代码维护的仓库总纲。
 
@@ -10,7 +10,7 @@
 
 实现基线为 [DuckLake Draft #74](https://github.com/AstroVela/ducklake/pull/74)，head 为 `2a9377062cddc0c222d8dd99e4d5efee3a298c76`。#74 的受控 A/B 未达到预设收益门槛，已撤回生产查询合并；其生产 `src/` 与 [#73](https://github.com/AstroVela/ducklake/pull/73) 的 `9819016e841ea79c8eea054415f4724fa2270e85` 相同。本文的“已验证”指该实现闭包的本地验证，不代表这些 Draft 已合入、发布或通过全部远端 CI。
 
-本轮在上述架构基线上增加[数值修复与确定性功能验收](native-vortex-functional-matrix.md)：inline FLOAT／DOUBLE 使用显式浮点类型解析，B/F/T 的平方 L2 使用双精度累加后返回 Float32。生产变更仅涉及这两条数值路径；#83 的文件名候选仍未采用，既有预算和事务保护保持。
+上述架构基线之后，[#84](https://github.com/AstroVela/ducklake/pull/84) 增加[数值修复与确定性功能验收](native-vortex-functional-matrix.md)：inline FLOAT／DOUBLE 使用显式浮点类型解析，B/F/T 的平方 L2 使用双精度累加后返回 Float32。本轮进一步增加[显式请求 epoch 与回执清理](native-vortex-request-epochs.md)，把写入身份扩展为表 UUID、epoch、请求 ID，并在同一原生事务中推进窗口和删除旧回执。#83 的文件名候选仍未采用，既有预算和事务保护保持。这些验证性 Draft 均不代表已合入或发布。
 
 当前限定：单进程独占 native DuckDB 元数据目录、本地受管 POSIX 文件、无分区／未加密的固定业务 schema、Float32 有限向量、平方 L2 距离。并发客户端与后台维护位于这一所有权范围内；多进程写者、跨主机 fencing、远程对象存储和分布式 ANN 不在当前验证范围。
 
@@ -82,16 +82,18 @@ T/F/B 是**同一份逻辑数据在某个 ReadView 下的物理分区**，不要
 
 1. 初始化索引、optimizer 和写入 catalog，在空表建立带维度的零 B 定义。
 2. 调用 `ducklake_manage_vortex_writes` 注册空表所有权；配置写入预算与后台策略。
-3. 调用 `ducklake_mutate_vortex_batch`，提交请求 ID、完整 upsert 行和待删除 ID。
+3. 创建请求时记录当前正整数 `request_epoch`；调用 `ducklake_mutate_vortex_batch`，提交请求 ID、完整 upsert 行、待删除 ID 和该 epoch。所有重试保留原 epoch。
 4. 在同一原生事务内删除旧版本、插入新 T 行并登记回执；成功提交后返回 ACK。
 
-upsert 是整行替换。一个批次内 upsert/delete 的 ID 必须非 NULL 且互不重复。同一个 ID 同时出现在两类操作中会失败。回执包含 `table_uuid, request_id, payload_hash, row_count, snapshot_id`；`row_count` 是请求操作数，删除不存在的键也计入。没有实际数据变化的删除可沿用当前快照号，但回执仍持久提交。
+upsert 是整行替换。一个批次内 upsert/delete 的 ID 必须非 NULL 且互不重复。同一个 ID 同时出现在两类操作中会失败。回执包含 `table_uuid, request_id, payload_hash, row_count, snapshot_id, request_epoch`；`row_count` 是请求操作数，删除不存在的键也计入。没有实际数据变化的删除可沿用当前快照号，但回执仍持久提交。
 
-幂等身份为 `(table_uuid, request_id)`。相同内容重试返回原回执；更改内容复用请求 ID 会失败。重放旧 upsert 不会复活后来删除的数据，重放旧 delete 不会删除后来新写入的版本。提交冲突向客户端返回，内部提交重试次数为零；客户端可在新事务中显式重提同一请求。
+幂等身份为 `(table_uuid, request_epoch, request_id)`。新表从 epoch 1 开始；当前窗口内相同内容重试返回原回执，更改内容复用请求 ID 会失败。重放旧 upsert 不会复活后来删除的数据，重放旧 delete 不会删除后来新写入的版本。提交冲突向客户端返回，内部提交重试次数为零；客户端可在新事务中显式重提同一身份。过期 epoch 一律返回 `EXPIRED_REQUEST`，包括从未提交的请求 ID；未来 epoch 也拒绝。不能在重试时读取最新 epoch 并改写旧请求身份。
 
 受管表拒绝普通 SQL INSERT/UPDATE/DELETE、append API，以及 schema、rename、drop 变更；flush、重写与回收通过已有内部授权路径执行。非受管表保留普通 SQL／append 语义。这里复用 DuckLake 原生 MVCC 和元数据 WAL，没有第二份写入 WAL 或独立的逐键版本目录。
 
-回执记录上限为**每个元数据 catalog 合计 100,000 条**，没有自动过期。快照过期和源文件 GC 不会删除回执；必须在扩大长期写入范围前确定回执保留与过期请求的语义。详见[受管写入](native-vortex-keyed-writes.md)和[写入实现](../src/storage/ducklake_vortex_write.cpp)。
+回执记录上限仍为**每个元数据 catalog 合计 100,000 条**，没有自动过期。`ducklake_vortex_request_status` 返回当前窗口及表／catalog 计数；显式 `ducklake_advance_vortex_request_epoch` 与写入共用串行化锁，在同一原生元数据事务内核对 expected epoch、删除该表旧窗口回执并持久推进 epoch。最近一次推进可返回原结果，重试不会删除新窗口的回执。推进意味着接受当前及尚未提交的旧请求失去重试窗口；达到 uint64 上限则拒绝推进。
+
+快照过期和源文件 GC 不会删除回执。显式推进释放逻辑回执槽位，不承诺立即缩减元数据文件、WAL 或 RSS；每表 UUID 的 epoch 记录、reference 和原生元数据仍有独立生命周期。新布局为 requests-v2／epochs-v1，保留原 managed 注册表；旧写入 SQL 参数个数和旧回执布局直接拒绝，不迁移、不加兼容模式。详见[回执生命周期](native-vortex-request-epochs.md)、[受管写入](native-vortex-keyed-writes.md)和[写入实现](../src/storage/ducklake_vortex_write.cpp)。
 
 ## 5. 一次查询如何覆盖 B/F/T
 
@@ -172,7 +174,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 ### 7.4 持久状态与恢复边界
 
-原生元数据保存命名索引、generation／引用、build／rewrite 所有权、optimizer／maintenance 策略、写预算、受管表、请求回执、源保留策略和删除意图。候选产物与删除意图遵守持久登记协议，不把任意残留目录当作可接管工作。
+原生元数据保存命名索引、generation／引用、build／rewrite 所有权、optimizer／maintenance 策略、写预算、受管表、请求回执及 epoch、源保留策略和删除意图。候选产物与删除意图遵守持久登记协议，不把任意残留目录当作可接管工作。
 
 提交前失败回滚，提交后丢失 ACK 通过回执／发布身份核对。原生元数据 WAL 恢复已提交状态；进程重启本身不启动后台工作，需要显式 `ducklake_resume_vortex_optimizer` 和 `ducklake_resume_vortex_maintenance`。错误或取消停止对应调度；resume 重新检查持久状态和输入，不静默重放失败任务。
 
@@ -192,7 +194,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | 编码源／索引产物 | 分别全局 64 MiB，不按 B 段数倍增 |
 | catalog manifest | 1 MiB |
 | mutation 批次 | 1–1,000 个操作，规范化内容最多 4 MiB |
-| 请求回执 | 每个元数据 catalog 合计 100,000 条，不自动过期 |
+| 请求回执 | 每个元数据 catalog 合计 100,000 条；不自动过期，显式推进单表 epoch 后清理旧窗口 |
 | T/F 写入配额 | 显式配置；提交前对现有物理输入和保留 inline 版本重新 admission |
 
 没有扩大预算就支持无限数据增长的结论。源／索引 GC 排空也不等于总磁盘有界：回执、原生元数据／WAL、调用方 reference JSON 有独立生命周期。上述输入限额同样不构成进程 RSS 上限。
@@ -211,9 +213,11 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 本轮 R5 的四维度功能矩阵通过 36 个阶段、432 次普通查询、432 次实际快照诊断及 56 项拒绝检查，最低 fixture recall 1.0。另通过 inline 精确 SQL 的 11 个断言块、高维平方 L2 闭式回归、溢出拒绝及合法查询恢复；两项数值回归已在对应旧 provider 上复现失败。本轮受管／append 回归共 20 项原生／恢复用例通过，Vane 基础套件再次通过 1,254 项、15 项可选跳过。详见[确定性维度与查询契约](native-vortex-functional-matrix.md)。
 
+[显式请求 epoch](native-vortex-request-epochs.md)通过 8 组公开契约与 14 项原生／故障／恢复用例，包括 10 万条全局回执上限、表间隔离、两种写入／推进顺序、八个并发相同推进、真实元数据冲突、取消及四个实际 SIGKILL 边界。四维度矩阵在新接口上再次通过；现有六组链路回归覆盖 67 项原生／恢复用例、172 次安装态查询比较，另通过 189 个相关 SQL 断言块与 6 项 oracle；本轮 Vane 基础套件通过 1,254 项、15 项可选跳过。回执槽位释放不代表文件／WAL 已收缩，也不构成长期容量资格。
+
 ### 9.2 #73 基线的历史 30 分钟观察
 
-下表是 #73 的独立本地 trace；#74 撤回查询合并后曾恢复相同生产源码。本轮 R5 的数值修复改变了相关生产路径，尚未进行新的 30 分钟验证；以下历史数据不作为当前版本的稳态资格。配置为 512 个活跃键、8D、4 个读者，maintenance 每轮 2 对象／64 MiB；T/F 配额分别为 256／1,024 行，字节配额分别为 4／64 MiB。结果仅适用于这个负载与配置。
+下表是 #73 的独立本地 trace；#74 撤回查询合并后曾恢复相同生产源码。本轮 R5 的数值修复与写入 epoch 改变了相关生产路径，尚未进行新的 30 分钟验证；以下历史数据不作为当前版本的稳态资格。配置为 512 个活跃键、8D、4 个读者，maintenance 每轮 2 对象／64 MiB；T/F 配额分别为 256／1,024 行，字节配额分别为 4／64 MiB。结果仅适用于这个负载与配置。
 
 | 指标 | 观察 |
 | --- | --- |
@@ -248,7 +252,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **因本机负载波动暂缓，未完成**：[文件名预筛选](native-vortex-filename-prefilter.md)通过每侧 53,322 项路径 oracle 和 2,144 项真实元数据检查；预先提交协议后的受控 A/B 完成 768 次主采样，两个目标改善 5.28%／15.70%，但一个对照增加 3.84%，按规则撤回候选。生产引用检查未改，CPU／线程／事务／预算保持 | 稳定资源环境具备后再恢复 A/A、性能 A/B 与长期稳态验证；既有 A/A 未达 2% 门槛、候选撤回、积压有界与开放停滞未关闭的结论均保留 |
-| R5 容量与产品契约 | **当前优先项，部分完成**：[确定性矩阵](native-vortex-functional-matrix.md)通过四维度、36 阶段、864 次查询及 56 项拒绝检查，最低 recall 1.0；已修复 inline 浮点保真和高维 L2 累加误差 | 继续回执保留及过期请求、reference／WAL 管理、容量 admission 的确定性契约；更大数据、延迟、吞吐及资源稳态仍待验证 |
+| R5 容量与产品契约 | **当前优先项，部分完成**：[确定性矩阵](native-vortex-functional-matrix.md)覆盖四维度、B/F/T 和数值边界；新增[显式请求 epoch](native-vortex-request-epochs.md)，原子清理单表回执并持久拒绝旧请求，保留 100,000 条全局上限 | 下一项为 reference／WAL 生命周期与容量 admission 的确定性契约；更大数据、延迟、吞吐及资源稳态仍待验证 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
@@ -258,12 +262,12 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 ## 11. 下一份验证性 Draft PR
 
-**继续优先推进 R5 的回执生命周期契约。** 按 2026-11-06 的用户安排，依赖稳定资源负载的 R4 相同基线 A/A、优化 A/B、30 分钟及更长稳态验证暂缓；R5 的延迟、吞吐与长期容量结论也等待合适环境。首份[确定性功能矩阵](native-vortex-functional-matrix.md)已通过，并发现／修复 inline 浮点保真和高维 L2 两项正确性问题；R5 仍有生命周期与 admission 工作。
+**继续优先推进 R5 的 reference／WAL 生命周期契约。** 按 2026-11-06 的用户安排，依赖稳定资源负载的 R4 相同基线 A/A、优化 A/B、30 分钟及更长稳态验证暂缓；R5 的延迟、吞吐与长期容量结论也等待合适环境。[确定性功能矩阵](native-vortex-functional-matrix.md)与[显式请求 epoch](native-vortex-request-epochs.md)提供当前功能基线，仍未建立总磁盘或 RSS 有界结论。
 
-1. 先明确有界幂等窗口：目前每 catalog 回执合计最多 100,000 条且不自动过期。新协议必须使过期请求在重启后仍被明确拒绝，不能删除回执后把旧请求当作新 mutation 执行。
-2. 为显式推进窗口、回执清理和普通写入定义同一事务内的原子边界、并发顺序及失败状态。保留受管写者保护与当前预算，新请求身份及 API 变化在下一份设计中明确，不加入隐式兼容模式。
-3. 用确定性测试覆盖清理前后、取消、提交前后失败、丢 ACK、实际崩溃恢复、旧请求重放和新请求；验证业务行与回执一致，不以吞吐或耗时作为验收门槛。
-4. 随后推进 reference／WAL 生命周期与容量 admission 的明确契约。已通过的四维度、B/F/T、过滤、k、数值和错误恢复矩阵作为回归，继续保留 CPU 6–11、线程、事务保护与预算，不加 fallback。
+1. 先盘点已持久化的 reference、generation、请求 epoch 记录及元数据／WAL 的实际所有权、保留者和清理入口，区分可回收对象与调用方仍持有的引用，不根据目录扫描猜测所有权。
+2. 在现有单进程、本地受管 POSIX 范围内定义可显式调用的生命周期操作与失败状态。涉及文件删除时继续复用事务、ReadView、引用和持久删除意图保护；不能把逻辑回执减少写成物理文件已缩小。
+3. 用固定输入验证活跃／旧视图、取消、提交前后失败、实际 SIGKILL 与重启后的所有权守恒，以内容和引用不变量验收。WAL checkpoint／文件大小只作为协议结果观察，不设置负载相关耗时门槛。
+4. 随后补齐容量 admission 的边界与错误恢复矩阵。保留当前向量、T/F、索引、manifest 及回执预算；四维度、B/F/T、过滤、k、数值、epoch 和并发恢复矩阵持续作为回归，继续使用 CPU 6–11 与现有线程设置，不加 fallback。
 5. 具备稳定资源环境后再恢复 R4：先独立声明相同基线 A/A 与过期阶段归因，保留既有失败及撤回结果；可信候选再进入性能 A/B 和长时间持续写入验证，不混合旧实验或放宽门槛。
 
 R4 的开放问题保持未完成，但不阻塞 R5 的功能契约工作。R6 需要独立远程与分布式设计，R7 按收益证据决定；本轮不改变本地所有权范围、质量门槛或资源预算。
@@ -287,6 +291,7 @@ R4 的开放问题保持未完成，但不阻塞 R5 的功能契约工作。R6 �
 | [引用检查内部诊断](native-vortex-reference-diagnostics.md) | 私有真实调用计时、Fetch／路径循环拆分、默认构建资格校验与后续否定预筛选验证 |
 | [文件名预筛选 oracle 与 A/B](native-vortex-filename-prefilter.md) | 独立路径／真实元数据等价性、匹配链接的 12 输入 A/B、对照门槛失败与撤回决定 |
 | [确定性维度与查询契约](native-vortex-functional-matrix.md) | 不依赖稳定负载的 R5 功能验收、B/F/T、过滤与拒绝边界 |
+| [显式请求 epoch 与回执生命周期](native-vortex-request-epochs.md) | 单表原子清理、旧请求拒绝、推进重试、并发／取消／崩溃恢复 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。

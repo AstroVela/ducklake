@@ -1,6 +1,7 @@
 #include "native_vortex_fixture.hpp"
 #include "native_vortex_keyed_fixture.hpp"
 #include "native_vortex_automatic_fixture.hpp"
+#include "native_vortex_epoch_fixture.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -31,6 +32,10 @@ int RunWriteFixture(const string &root, const string &mode, weak_ptr<DatabaseIns
 		           "SELECT * FROM ducklake_initialize_vortex_writes('lake');"
 		           "SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn'," +
 		               Value(root + "/indexes").ToSQLString() + ",2)");
+	}
+	if (StringUtil::StartsWith(mode, "epoch-")) {
+		RunEpochFixture(database, setup, root, mode);
+		return 0;
 	}
 	if (StringUtil::StartsWith(mode, "automatic-")) {
 		RunAutomaticFixture(database, setup, root, mode);
@@ -71,7 +76,7 @@ int RunWriteFixture(const string &root, const string &mode, weak_ptr<DatabaseIns
 	};
 	try {
 		auto result =
-		    DuckLakeVortexWriteBatch::Append(owner, "lake", "main", "items", "knn", "request", rows, observer);
+		    DuckLakeVortexWriteBatch::Append(owner, "lake", "main", "items", "knn", "request", rows, 1, observer);
 		Require(mode == "ok" || mode == "retry" || StringUtil::StartsWith(mode, "pause-"),
 		        "WriteBatch fault did not fire");
 		std::cout << result.request_id << " " << result.row_count << " " << result.snapshot_id << std::endl;
@@ -83,12 +88,12 @@ int RunWriteFixture(const string &root, const string &mode, weak_ptr<DatabaseIns
 	}
 	if (observed) {
 		auto committed = mode == "fail-after_commit";
-		auto requests = SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1");
+		auto requests = SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2");
 		Require(requests->GetValue(0, 0).GetValue<idx_t>() == (committed ? 1 : 0), "Incorrect durable request count");
 		auto count = SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>();
 		Require(count == (committed ? 2 : conflict ? 1 : 0), "Incorrect atomic batch count");
 		Connection retry(database);
-		auto result = DuckLakeVortexWriteBatch::Append(retry, "lake", "main", "items", "knn", "request", rows);
+		auto result = DuckLakeVortexWriteBatch::Append(retry, "lake", "main", "items", "knn", "request", rows, 1);
 		Require(result.row_count == 2, "Retry changed WriteBatch result");
 		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == (conflict ? 3 : 2),
 		        "Retry duplicated or lost WriteBatch rows");

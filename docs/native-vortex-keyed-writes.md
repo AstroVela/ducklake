@@ -16,11 +16,15 @@ managed writes before submitting any batches:
 connection.execute("SELECT * FROM ducklake_manage_vortex_writes('lake','main','items','knn')")
 sql = (
     "SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn',?,"
-    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[])"
+    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT)"
 )
 rows = [{'id': 1, 'embedding': [0.125, 0.0], 'category': 'A', 'payload': '最新向量'}]
-receipt = connection.execute(sql, ['request-1', rows, [2]]).fetchone()
-assert connection.execute(sql, ['request-1', rows, [2]]).fetchone() == receipt
+epoch = connection.execute(
+    "SELECT * FROM ducklake_vortex_request_status('lake','main','items','knn')"
+).fetchone()[1]
+request = ['request-1', rows, [2], epoch]  # Keep the same epoch on every retry.
+receipt = connection.execute(sql, request).fetchone()
+assert connection.execute(sql, request).fetchone() == receipt
 ```
 
 The named index must exist with the matching dimension. Opt-in requires no
@@ -63,21 +67,28 @@ table execution and configured write budgets still apply. Configure those
 budgets before a growing workload: a per-batch bound alone does not establish
 a table-size or process-memory bound.
 
-The result retains `table_uuid, request_id, payload_hash, row_count, snapshot_id`.
+The result is `table_uuid, request_id, payload_hash, row_count, snapshot_id, request_epoch`.
 Here `row_count` counts requested upserts plus deletes, including missing-key
 deletes. `snapshot_id` identifies the actual native snapshot: when a missing-key
 delete creates no data change it reports the existing snapshot. Its receipt
 still commits durably. The request catalog keeps its existing 100,000-record
-limit and never automatically expires records.
+limit and never automatically expires records. Explicit [epoch retirement](native-vortex-request-epochs.md)
+atomically advances one table's durable fence and deletes its old-window receipts.
+It leaves business versions and index generations unchanged.
 
-Identity remains `(table_uuid, request_id)`. An exact retry returns its original
+Identity is `(table_uuid, request_epoch, request_id)`. An exact current-epoch retry returns its original
 receipt without repeating any mutation. Changed content fails. Replaying an old
 upsert after a later deletion cannot resurrect the row; replaying an old delete
 after an explicit new upsert cannot remove that newer row. Concurrent requests
 for the same id serialize and the later successful native commit wins. Ordinary
 writers to other tables or maintenance may cause a native conflict; it propagates
 with zero internal commit retries. The client explicitly resubmits the same
-request from a fresh transaction.
+request from a fresh transaction, retaining its original epoch. A retired
+epoch fails with `EXPIRED_REQUEST`, including IDs without a retained receipt;
+future epochs fail too. Reusing an ID under a new epoch explicitly creates a
+new operation. Do not fetch the latest epoch and relabel an old retry. Old SQL
+arities are not registered and legacy receipt catalogs require a new layout;
+no migration or compatibility mode is supplied.
 
 The canonical mutation bytes use ASCII `ducklake-vortex-mutate-v1`, uint32
 little-endian dimension, uint64 upsert count, then the existing ordered row

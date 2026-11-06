@@ -19,19 +19,19 @@ assert SPEC is not None and SPEC.loader is not None
 BASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BASE)
 query, require, quote = BASE.query, BASE.require, BASE.quote
-REQUESTS = "__ducklake_metadata_lake.ducklake_vortex_write_requests_v1"
+REQUESTS = "__ducklake_metadata_lake.ducklake_vortex_write_requests_v2"
 DRIVER_ROWS = [
     {"id": 1, "embedding": [1.0, 0.0], "category": "A", "payload": "一"},
     {"id": 2, "embedding": [2.0, 0.0], "category": None, "payload": None},
 ]
 
 
-def batch(connection, request_id, rows, table="items"):
+def batch(connection, request_id, rows, table="items", epoch=1):
     return query_parameters(
         connection,
         "SELECT * FROM ducklake_write_vortex_batch('lake','main',?,'knn',?,"
-        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[])",
-        [table, request_id, rows],
+        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::UBIGINT)",
+        [table, request_id, rows, epoch],
     )[0]
 
 
@@ -232,7 +232,7 @@ def exercise(root, report):
         connection.execute(
             "INSERT INTO "
             + REQUESTS
-            + " SELECT 'capacity-test',i::VARCHAR,'hash',1,0 FROM range("
+            + " SELECT 'capacity-test',i::VARCHAR,'hash',1,0,1 FROM range("
             + str(100000 - used)
             + ")t(i)"
         )
