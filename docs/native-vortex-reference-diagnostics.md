@@ -1,5 +1,7 @@
 # Transaction-scoped source-reference diagnostics
 
+**Qualified replacement result on 2026-11-06: all 128 diagnostics, eight warmups
+and eight oracle cases pass; the large-input path loop averages 30.637 ms.**
 The [repeated metadata diagnostic](native-vortex-source-gc-metadata.md) found
 36.763 ms outside SQL in an 84.165-ms large-input collector mean. That envelope
 does not identify a C++ cause. This study measures the existing
@@ -27,7 +29,8 @@ The cause was the missing CI environment flag, not a timing/precision result.
 After fixing and checking that configuration, run one fixed replacement with
 the same two inputs, CPUs, threads, budgets, ordering and sixteen rounds below.
 Do not pool the two collections, change counts or use the rejected timings to
-select another criterion. No qualified timing result is claimed yet.
+select another criterion. Only the fixed replacement below contributes to the
+qualified result.
 
 Commit this protocol, private builder, patch, trace header and analyzer before
 the one formal run. Reuse CPUs **6,7,8,9,10,11**, DuckDB `SET threads=2`, existing
@@ -134,7 +137,108 @@ python -I test/vane/test_vane_vortex_source_gc_reference.py \
 Build and output directories must be new. Preserve the build manifest, consumer
 declaration, raw native JSON/logs, shared sampling report and final analysis.
 
-## Result
+## Qualified replacement result
 
-Formal sampling is pending. Retain current production checks and budgets; choose
-a runtime candidate only after the new measurements identify its target.
+The initial protocol commit is `ad4555a1b7afc35332127dfd4d359af95f6e6753`;
+the qualification amendment is `3d7359a56d3761ea10f38894a5f6047e0c5c5c3a`.
+The corrected run completes in 210.387 seconds, including the two separate
+four-case oracles, restoration and validation. The approved build links exactly
+the six base extensions plus explicit DuckLake/Vortex; both producer/source
+identity and runtime extension-set checks pass before sampling. Its executable
+SHA-256 is `8629cfa0bbd85f41d6bc0062d23cc661e806791e4ff1f1fa7c5b761437d6b30f`.
+
+Every native invocation retains ordinary-transaction deferral, exact two-file
+progress, intent completion, current typed business rows/ANN and retained
+data/index checks. Both labels use this executable, with 32 measured calls per
+label per case. All reference intervals, same-connection SQL matches, full row
+coverage and timing partitions pass. No invalid-configuration or smoke samples
+enter the following statistics.
+
+Original 0–23 affinity narrows to 6–11 and restores to 0–23; the inherited child
+mask matches. All twelve recorded thread variables remain unset. Topology,
+tracked scripts, original producer/report, sealed images and the approved
+source/archive/consumer identities verify unchanged during sampling. The
+governor is `schedutil` at both boundaries; observed frequencies span roughly
+1.2–3.2 GHz. These boundary observations do not establish in-call frequency or
+exclusive hardware. No build or base-test process overlaps the replacement.
+
+| Input | Collector mean / p50 / p95 ms | Whole reference calls mean ms | Metadata phase mean ms | Unlink phase mean ms | Collector min / max ms |
+| --- | --- | ---: | ---: | ---: | --- |
+| 8 / inline | 38.554 / 38.203 / 41.187 | 9.534 | 35.818 | 2.339 | 34.935 / 48.848 |
+| 4,096 / materialized | 83.773 / 83.659 / 88.738 | 55.151 | 81.062 | 2.329 | 76.066 / 112.207 |
+
+Whole reference calls and native phases overlap the disjoint partition below;
+they are not additional parts. All raw nanosecond parts conserve each collector.
+
+| Disjoint partition | 8-inline mean / p95 ms | 4,096-file mean / p95 ms | Large mean fraction |
+| --- | --- | --- | ---: |
+| Known-source SQL, four calls | 9.006 / 10.148 | 23.228 / 24.469 | 27.73% |
+| Scheduled ownership SQL | 2.084 / 2.418 | 2.025 / 2.224 | 2.42% |
+| Index-reference SQL | 1.177 / 1.304 | 1.164 / 1.277 | 1.39% |
+| BEGIN SQL | 1.089 / 1.348 | 1.047 / 1.212 | 1.25% |
+| Outer COMMIT SQL | 6.922 / 7.367 | 6.882 / 7.208 | 8.22% |
+| Other SQL | 13.030 / 14.570 | 12.795 / 13.745 | 15.27% |
+| Reference Fetch | 0.026 / 0.035 | 0.774 / 0.867 | 0.92% |
+| Reference path loop | 0.034 / 0.043 | 30.637 / 33.139 | 36.57% |
+| Reference remainder | 0.468 / 0.552 | 0.512 / 0.562 | 0.61% |
+| Outside reference calls and SQL | 4.719 / 5.140 | 4.708 / 4.923 | 5.62% |
+
+Each small collector visits four rows across four chunks and eight Fetch calls.
+Each large collector visits **16,392 rows across twelve chunks and sixteen Fetch
+calls**: all 4,098 known data-file paths in each of four transactions. No native
+delete-file rows are present in these inputs. Each completed unreferenced scan
+includes one terminal empty Fetch.
+
+Within this run, large-input outside-SQL time totals 36.631 ms on average. The
+path loop contributes 30.637 ms, or **83.64% of that envelope**. This locates
+measured work in the combined extraction/normalization/comparison loop; it does
+not separately identify the cost of pure canonicalization or CPU versus waiting.
+It also does not subtract from, or causally explain, the earlier #81 build.
+
+All declared tail samples remain. The largest large-input sample is round 1,
+block 0, candidate: 112.207 ms collector, 30.481 ms known-source SQL and 47.980 ms
+path loop. The large loop's signed covariance share is 53.38%; the known-source
+SQL share is 28.31%. These sample-dependent, total-coupled quantities include that
+tail and are not independent variance explained. Raw reports retain every
+category, exact SQL/planning split, round mean and label summary. Baseline/
+candidate collector means are 38.252/38.855 ms and 83.449/84.096 ms; these labels
+are one binary, and no A/A precision or optimization verdict is inferred.
+
+Qualified analysis: `/tmp/ducklake-vortex-reference-formal-default-20261106/report.json`.
+SHA-256: `8086a7fb57a8576513990920d8d0bec15cba3521cde9feea979a42efb45df448`.
+Raw sampling: `/tmp/ducklake-vortex-reference-formal-default-20261106/sampling/report.json`.
+SHA-256: `626d5c7df96736b62d437f968abffac8591d23f6ebdf73fa8a1afa6e6808d6a3`.
+The separate corrected smoke passes sixteen diagnostics, eight warmups and
+eight oracle cases; it is functional evidence only.
+
+Local qualification passes 43 analysis checks, including the two new build
+profile/source-root rejection checks, and thirty installed package-profile
+checks with one optional skip. The full base launcher on the corrected,
+non-editable runtime passes **1,254 tests with fifteen optional skips**, using
+separate non-Ray/Ray processes. Formatting, workflow YAML, 55 relative links,
+copyleft and measured source/driver/corpus/archive identities pass. The original
+three archived wheels and five previous samplers remain unchanged. Only the
+new default-profile collection is qualified; the earlier failed base check and
+excluded timing report remain available as separate evidence.
+
+## Next bounded candidate
+
+Validate a **sound filename-mismatch prefilter** before the existing full
+canonical-path equality check. A final ordinary path component that differs
+from the target filename can exclude a match; potentially matching names and
+special endings such as `.`, `..` and trailing separators still need complete
+path checking. This targets measured loop work without caching references or
+discarding metadata history. No such candidate is adopted in this PR.
+
+First prove equivalence against the existing canonicalization/equality behavior
+with an independent path oracle, including relative/absolute paths, aliases,
+dot components, trailing separators, repeated filenames in different directories
+and historical references. Then predeclare a matched explicit-object A/B on the
+same restored corpus, with the existing quality and control requirements. Keep
+all per-transaction ownership/index/native-reference/intent checks and budgets;
+no cross-transaction reference cache, compatibility layer or error fallback.
+
+R4 remains open. This result is a diagnostic target, not a runtime speedup,
+reclassification of earlier A/A precision or a new 30-minute sustained-load
+qualification. Continuous-write backlog/resource stability and the existing
+actual-snapshot, recall and drain checks remain to be completed.
