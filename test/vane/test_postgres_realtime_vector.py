@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.util
 import os
 import subprocess
@@ -26,6 +27,29 @@ RANK = (
     "FROM lake.items WHERE category = 'A' ORDER BY distance, id LIMIT 2"
 )
 INITIAL = [{"id": 1, "payload": "initial", "distance": 0}, {"id": 2, "payload": "delete", "distance": 1}]
+ROWS = "SELECT id, embedding, category, payload FROM lake.items ORDER BY id"
+REQUESTS = "SELECT request_id, payload_hash FROM lake.requests ORDER BY request_id"
+INITIAL_ROWS = [
+    {"id": 1, "embedding": [0, 0, 0], "category": "A", "payload": "initial"},
+    {"id": 2, "embedding": [1, 0, 0], "category": "A", "payload": "delete"},
+    {"id": 3, "embedding": [2, 0, 0], "category": "A", "payload": "stable"},
+    {"id": 8, "embedding": [0.125, -0.5, 1.25], "category": "C", "payload": "business'quoted-中文"},
+]
+UPDATED_ROWS = [
+    {"id": 1, "embedding": [9, 0, 0], "category": "B", "payload": "moved"},
+    INITIAL_ROWS[2],
+    {"id": 4, "embedding": [0, 1, 0], "category": "A", "payload": "new"},
+    INITIAL_ROWS[3],
+]
+LATEST_ROWS = [
+    UPDATED_ROWS[0],
+    INITIAL_ROWS[2],
+    {"id": 5, "embedding": [0, 0, 0], "category": "A", "payload": "hot"},
+    INITIAL_ROWS[3],
+]
+INITIAL_REQUESTS = {"r1": "initial-batch"}
+UPDATED_REQUESTS = {**INITIAL_REQUESTS, "r2": "update-batch"}
+LATEST_REQUESTS = {**UPDATED_REQUESTS, "r3": "mixed-batch"}
 GUARD = (
     "CREATE MACRO should_apply(incoming_id, incoming_hash) AS "
     "(SELECT CASE WHEN matches = 0 THEN true WHEN matches = 1 AND stored_hash = incoming_hash THEN false "
@@ -33,6 +57,18 @@ GUARD = (
     "FROM (SELECT count(*) AS matches, min(payload_hash) AS stored_hash "
     "FROM lake.requests WHERE request_id = incoming_id));"
 )
+
+
+def expected_requests(requests: dict[str, str]) -> list[dict]:
+    return [
+        {"request_id": key, "payload_hash": hashlib.sha256(value.encode()).hexdigest()}
+        for key, value in sorted(requests.items())
+    ]
+
+
+def check_state(probe: PostgresProbe, rows: list[dict], requests: dict[str, str], description: str) -> None:
+    require_equal(probe.query(ROWS), rows, description + " complete rows")
+    require_equal(probe.query(REQUESTS), expected_requests(requests), description + " request hashes")
 
 
 class PostgresProbe(native.RecoveryProbe):
@@ -47,11 +83,20 @@ class PostgresProbe(native.RecoveryProbe):
     ):
         super().__init__(duckdb, extension, root)
         self.schema = "vector_proof_" + uuid.uuid4().hex
-        load_lake = "LOAD ducklake;" if extension is None else f"LOAD {sql_string(extension)};"
         load_pg = "LOAD postgres_scanner;" if postgres_extension is None else f"LOAD {sql_string(postgres_extension)};"
+        if postgres_extension is not None:
+            load_pg = (
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_extensions() "
+                "WHERE extension_name='postgres_scanner' AND loaded) THEN "
+                "error('--postgres-extension requires a CLI without preloaded PostgreSQL scanner') ELSE true END;"
+                + load_pg
+                + "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_extensions() "
+                "WHERE extension_name='postgres_scanner' AND loaded AND install_mode<>'STATICALLY_LINKED') "
+                "THEN true ELSE error('Requested PostgreSQL scanner artifact was not selected') END;"
+            )
         self.driver_prefix = (
             "SET autoinstall_known_extensions = false;SET autoload_known_extensions = false;"
-            "SET threads = 1;SET memory_limit = '512MiB';LOAD parquet;" + load_lake + load_pg
+            "SET threads = 1;SET memory_limit = '512MiB';LOAD parquet;" + self.load_ducklake_sql + load_pg
         )
         self.dsn = dsn
         self.prefix = (
@@ -83,12 +128,21 @@ class SnapshotReader:
         self.process.stdin.write((sql + "\n").encode())
         self.process.stdin.flush()
 
-    def copy_rank(self, name: str) -> str:
-        return f"COPY ({RANK}) TO {sql_string(self.probe.root / (name + '.csv'))} (HEADER true);"
+    def copy_snapshot(self, name: str) -> str:
+        state = (
+            "SELECT id, embedding[1] AS x, embedding[2] AS y, embedding[3] AS z, category, payload "
+            "FROM lake.items ORDER BY id"
+        )
+        return "".join(
+            f"COPY ({sql}) TO {sql_string(self.probe.root / (name + suffix + '.csv'))} (HEADER true);"
+            for sql, suffix in [(RANK, ""), (state, "_rows"), (REQUESTS, "_requests")]
+        )
 
     def start(self) -> None:
         ready = self.probe.root / "reader.ready"
-        self.send(self.probe.prefix + "BEGIN;" + self.copy_rank("before") + f"COPY (SELECT 1) TO {sql_string(ready)};")
+        self.send(
+            self.probe.prefix + "BEGIN;" + self.copy_snapshot("before") + f"COPY (SELECT 1) TO {sql_string(ready)};"
+        )
         deadline = time.monotonic() + 30
         while not ready.exists():
             if self.process.poll() is not None or time.monotonic() >= deadline:
@@ -98,16 +152,31 @@ class SnapshotReader:
             time.sleep(0.02)
 
     def finish(self) -> None:
-        self.send(self.copy_rank("after") + "COMMIT;")
+        self.send(self.copy_snapshot("after") + "COMMIT;")
         self.process.stdin.close()
         require_equal(self.process.wait(timeout=30), 0, "snapshot reader exit")
-        expected = [{k: str(v) for k, v in row.items()} for row in INITIAL]
         for name in ["before", "after"]:
-            with (self.probe.root / (name + ".csv")).open() as handle:
+            with (self.probe.root / (name + ".csv")).open(encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             for row in rows:
-                row["distance"] = str(int(float(row["distance"])))
-            require_equal(rows, expected, "held reader " + name)
+                row["id"] = int(row["id"])
+                row["distance"] = float(row["distance"])
+            require_equal(rows, INITIAL, "held reader " + name)
+            with (self.probe.root / (name + "_rows.csv")).open(encoding="utf-8") as handle:
+                rows = [
+                    {
+                        "id": int(row["id"]),
+                        "embedding": [float(row[k]) for k in ("x", "y", "z")],
+                        "category": row["category"],
+                        "payload": row["payload"],
+                    }
+                    for row in csv.DictReader(handle)
+                ]
+            require_equal(rows, INITIAL_ROWS, "held reader complete rows " + name)
+            with (self.probe.root / (name + "_requests.csv")).open(encoding="utf-8") as handle:
+                require_equal(
+                    list(csv.DictReader(handle)), expected_requests(INITIAL_REQUESTS), "held reader requests " + name
+                )
 
     def close(self) -> None:
         if self.process.poll() is None:
@@ -142,6 +211,7 @@ def exercise(probe: PostgresProbe) -> None:
         "INSERT INTO lake.requests VALUES ('r1',sha256('initial-batch'));COMMIT;"
     )
     require_equal(probe.query(RANK), INITIAL, "initial exact retrieval")
+    check_state(probe, INITIAL_ROWS, INITIAL_REQUESTS, "initial")
     require_equal(
         probe.query("SELECT embedding, payload FROM lake.items WHERE id = 8;"),
         [{"embedding": [0.125, -0.5, 1.25], "payload": "business'quoted-中文"}],
@@ -158,9 +228,11 @@ def exercise(probe: PostgresProbe) -> None:
     try:
         reader.start()
         probe.query(mutation())
+        check_state(probe, UPDATED_ROWS, UPDATED_REQUESTS, "committed mutation")
         updated = [{"id": 4, "payload": "new", "distance": 1}, {"id": 3, "payload": "stable", "distance": 2}]
         require_equal(probe.query(RANK), updated, "fresh process sees the complete committed mutation")
         probe.query("CALL ducklake_flush_inlined_data('lake');")
+        check_state(probe, UPDATED_ROWS, UPDATED_REQUESTS, "materialized mutation")
         require_equal(probe.query(RANK), updated, "flush preserves current retrieval")
         require_equal(
             probe.query("SELECT count(*) AS rows FROM lake.items WHERE filename LIKE 'ducklake_inlined_data_%';"),
@@ -177,6 +249,13 @@ def exercise(probe: PostgresProbe) -> None:
         INITIAL,
         "old snapshot after materialization",
     )
+    for sql, expected in [(ROWS, INITIAL_ROWS), (REQUESTS, expected_requests(INITIAL_REQUESTS))]:
+        table = "items" if sql == ROWS else "requests"
+        require_equal(
+            probe.query(sql.replace(f"FROM lake.{table} ", f"FROM lake.{table} AT (VERSION => {original_snapshot}) ")),
+            expected,
+            "historical complete " + table,
+        )
 
     probe.query(
         "BEGIN;INSERT INTO lake.items VALUES (5,[0,0,0],'A','hot');DELETE FROM lake.items WHERE id=4;"
@@ -184,7 +263,9 @@ def exercise(probe: PostgresProbe) -> None:
     )
     latest = [{"id": 5, "payload": "hot", "distance": 0}, {"id": 3, "payload": "stable", "distance": 2}]
     require_equal(probe.query(RANK), latest, "inlined vectors plus deletion of a materialized vector")
+    check_state(probe, LATEST_ROWS, LATEST_REQUESTS, "mixed storage")
     probe.query(mutation())
+    check_state(probe, LATEST_ROWS, LATEST_REQUESTS, "old request retry")
     require_equal(probe.query(RANK), latest, "old request retry cannot resurrect the deleted vector")
     require_equal(
         probe.query("SELECT count(*) AS rows, count(DISTINCT request_id) AS ids FROM lake.requests;"),
@@ -204,6 +285,7 @@ def exercise(probe: PostgresProbe) -> None:
     else:
         raise AssertionError("invalid batch unexpectedly succeeded")
     require_equal(probe.query(RANK), latest, "failed batch rollback")
+    check_state(probe, LATEST_ROWS, LATEST_REQUESTS, "failed batch rollback")
     require_equal(
         probe.query("SELECT request_id FROM lake.requests WHERE request_id='failed';"), [], "request rollback"
     )
@@ -223,17 +305,58 @@ def exercise(probe: PostgresProbe) -> None:
         [{"request_id": "ack-lost"}],
         "committed request after client death",
     )
+    committed_rows = sorted(
+        LATEST_ROWS + [{"id": 6, "embedding": [0, 0, 0], "category": "D", "payload": "ack-lost"}],
+        key=lambda row: row["id"],
+    )
+    committed_requests = {**LATEST_REQUESTS, "ack-lost": "committed"}
+    check_state(probe, committed_rows, committed_requests, "client death after commit")
     probe.kill_after(
         "pg_uncommitted",
         "BEGIN;UPDATE lake.items SET embedding=[0,0,0] WHERE id=3;DELETE FROM lake.items WHERE id=5;"
         "INSERT INTO lake.requests VALUES ('inflight',sha256('uncommitted'));",
     )
     require_equal(probe.query(RANK), latest, "client death before commit rolls back all rows")
+    check_state(probe, committed_rows, committed_requests, "client death before commit")
     require_equal(
         probe.query("SELECT request_id FROM lake.requests WHERE request_id='inflight';"),
         [],
         "inflight request rollback",
     )
+
+
+def exercise_not_null(probe: PostgresProbe) -> None:
+    probe.query(
+        "CREATE TABLE lake.null_checks(id INTEGER, embedding FLOAT[] NOT NULL);"
+        "INSERT INTO lake.null_checks VALUES (1,[]),(2,[NULL]);"
+    )
+    statements = [
+        "INSERT INTO lake.null_checks VALUES (3,NULL);",
+        "UPDATE lake.null_checks SET embedding=NULL WHERE id=1;",
+        "MERGE INTO lake.null_checks AS target USING (SELECT 1 AS id) AS source ON target.id=source.id "
+        "WHEN MATCHED THEN UPDATE SET embedding=NULL;",
+        "MERGE INTO lake.null_checks AS target USING (SELECT 3 AS id) AS source ON target.id=source.id "
+        "WHEN NOT MATCHED THEN INSERT VALUES (source.id,NULL);",
+    ]
+    for statement in statements:
+        try:
+            probe.query(statement)
+        except AssertionError as error:
+            if "NOT NULL constraint failed" not in str(error):
+                raise
+        else:
+            raise AssertionError("top-level vector NULL unexpectedly accepted: " + statement)
+        require_equal(
+            probe.query(
+                "SELECT id,len(embedding) AS dimension,embedding IS NULL AS root_null,"
+                "embedding[1] IS NULL AS child_null FROM lake.null_checks ORDER BY id;"
+            ),
+            [
+                {"id": 1, "dimension": 0, "root_null": False, "child_null": True},
+                {"id": 2, "dimension": 1, "root_null": False, "child_null": True},
+            ],
+            "failed nested write leaves original rows and valid child NULL unchanged",
+        )
 
 
 def main() -> None:
@@ -247,21 +370,23 @@ def main() -> None:
     args = parser.parse_args()
     if os.name != "posix":
         parser.error("this probe requires POSIX SIGKILL")
-    with tempfile.TemporaryDirectory(prefix="ducklake-postgres-vectors-") as directory:
-        probe = PostgresProbe(
-            args.duckdb.resolve(strict=True),
-            args.extension.resolve(strict=True) if args.extension else None,
-            args.postgres_extension.resolve(strict=True) if args.postgres_extension else None,
-            Path(directory),
-            args.dsn,
-        )
-        try:
-            exercise(probe)
-        finally:
-            probe.cleanup()
-        print(
-            "PASS: PostgreSQL inlined vectors, cross-process snapshots, flush, serialized retry, rollback, client death"
-        )
+    for row_limit in [100, 0]:
+        with tempfile.TemporaryDirectory(prefix="ducklake-postgres-vectors-") as directory:
+            probe = PostgresProbe(
+                args.duckdb.resolve(strict=True),
+                args.extension.resolve(strict=True) if args.extension else None,
+                args.postgres_extension.resolve(strict=True) if args.postgres_extension else None,
+                Path(directory),
+                args.dsn,
+                row_limit=row_limit,
+            )
+            try:
+                if row_limit == 100:
+                    exercise(probe)
+                exercise_not_null(probe)
+            finally:
+                probe.cleanup()
+    print("PASS: PostgreSQL vector lifecycle and nested NOT NULL for both inline and file-backed writes")
 
 
 if __name__ == "__main__":
