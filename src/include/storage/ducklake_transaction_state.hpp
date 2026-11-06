@@ -13,6 +13,8 @@
 
 namespace duckdb {
 
+enum class DuckLakeCommitOutcome { NOT_COMMITTED, UNKNOWN, COMMITTED };
+
 struct DuckLakeColumnSchemaEntry {
 	FieldIndex field_index;
 	string column_name;
@@ -68,13 +70,12 @@ struct DuckLakeCommitContext {
 	std::function<shared_ptr<DuckLakeTableStats>(TableIndex)> get_table_stats;
 	//! Top-level columns of a table at the commit snapshot — needed by stats-refresh to iterate
 	//! columns and look up types when merging per-file stats.
-	std::function<vector<DuckLakeColumnSchemaEntry>(TableIndex)> get_table_column_schema =
-	    [](TableIndex) {
-		    return vector<DuckLakeColumnSchemaEntry>{};
-	    };
+	std::function<vector<DuckLakeColumnSchemaEntry>(TableIndex)> get_table_column_schema = [](TableIndex) {
+		return vector<DuckLakeColumnSchemaEntry> {};
+	};
 	//! Names of the inlined-data tables associated with a table id at the commit snapshot.
 	std::function<vector<string>(TableIndex)> get_inlined_table_names = [](TableIndex) {
-		return vector<string>{};
+		return vector<string> {};
 	};
 	//! Net (delete-adjusted) row count of a table's regular data files.
 	std::function<idx_t(TableIndex)> get_net_data_file_row_count = [](TableIndex) {
@@ -110,6 +111,8 @@ public:
 
 	void Commit(DuckLakeSnapshot transaction_snapshot, const TransactionChangeInformation &transaction_changes,
 	            const DuckLakeRetryConfig &retry_config, const DuckLakeCommitContext &context);
+	//! Commit metadata while preserving retries only for confirmed native aborts.
+	void CommitMetadataConnection(Connection &connection, Catalog &metadata_catalog);
 
 	SnapshotAndStats CheckForConflicts(DuckLakeSnapshot transaction_snapshot,
 	                                   const TransactionChangeInformation &changes,
@@ -198,6 +201,7 @@ public:
 	map<SchemaIndex, reference<DuckLakeSchemaEntry>> dropped_schemas;
 	LocalTableChanges local_changes;
 	vector<FlushedInlinedTableInfo> flushed_inlined_tables;
+	DuckLakeCommitOutcome commit_outcome = DuckLakeCommitOutcome::NOT_COMMITTED;
 };
 
 } // namespace duckdb

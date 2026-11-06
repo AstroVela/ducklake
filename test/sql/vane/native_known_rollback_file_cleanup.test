@@ -1,0 +1,102 @@
+# name: test/sql/vane/native_known_rollback_file_cleanup.test
+# description: known aborts clean unpublished files and native commit conflicts still retry
+# group: [vane]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/known_abort.ducklake' AS lake (DATA_PATH '__TEST_DIR__/known_abort', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id INTEGER NOT NULL)
+
+statement ok
+INSERT INTO lake.items VALUES (1)
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/known_abort/**/*.parquet')
+----
+1
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.items VALUES (2)
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/known_abort/**/*.parquet')
+----
+2
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/known_abort/**/*.parquet')
+----
+1
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.items VALUES (3)
+
+statement error
+INSERT INTO lake.items VALUES (NULL)
+----
+NOT NULL constraint failed
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/known_abort/**/*.parquet')
+----
+1
+
+query I
+SELECT id FROM lake.items
+----
+1
+
+# Concurrent native metadata commits can discover a conflict at COMMIT itself.
+# Each file must survive its transaction's retry and remain readable after reopen.
+statement ok
+SET ducklake_retry_wait_ms=10
+
+statement ok
+SET ducklake_retry_backoff=1.0
+
+concurrentloop i 2 6
+
+query I
+INSERT INTO lake.items VALUES (${i})
+----
+1
+
+endloop
+
+query II
+SELECT count(*), sum(id) FROM lake.items
+----
+5	15
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/known_abort/**/*.parquet')
+----
+5
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/known_abort.ducklake' AS lake
+
+query II
+SELECT count(*), sum(id) FROM lake.items
+----
+5	15

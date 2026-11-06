@@ -77,14 +77,17 @@ def fault_commit(probe, args, mode: str) -> dict:
                     str(path.relative_to(probe.root)) for path in probe.root.rglob("*.parquet")
                 )
                 observation["removed_files"] = sorted(set(files_before) - set(observation["files_after"]))
+                observation["client_reported_unknown"] = "commit outcome is unknown" in log_path.read_text().lower()
                 probe.commit_observation = observation
                 require_equal(observation["injected"], 1, "exactly one COMMIT fault")
                 require_equal(observation["commit_forwarded"], mode == "ack_lost", "COMMIT forwarding boundary")
                 require_equal(observation["server_committed"], mode == "ack_lost", "server COMMIT boundary")
+                require_equal(observation["client_reported_unknown"], True, "explicit uncertain-commit result")
+                require_equal(observation["removed_files"], [], "uncertain commit preserves prepared files")
                 if "proxy_error" in observation:
                     raise AssertionError("unexpected protocol proxy error: " + observation["proxy_error"])
-                if exit_code == 0 and mode == "before_forward":
-                    raise AssertionError("client acknowledged a transaction whose COMMIT never reached PostgreSQL")
+                if exit_code == 0:
+                    raise AssertionError("client acknowledged a transaction whose COMMIT outcome it could not verify")
                 return observation
             finally:
                 if worker.poll() is None:
