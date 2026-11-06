@@ -124,7 +124,7 @@ def qualify(connection, model, dimension, phase, segments, report, scratch):
 
 
 def bootstrap(root, dimension):
-    (root / "indexes").mkdir()
+    (root / "indexes").mkdir(mode=0o700)
     connection = BASE.connect(root)
     for sql in (
         "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)",
@@ -188,7 +188,7 @@ def rejections(connection, dimension, model, report):
 
 
 def exercise(root, dimension, report, scratch):
-    root.mkdir()
+    root.mkdir(mode=0o700)
     connection = bootstrap(root, dimension)
     model = {}
     receipts = []
@@ -274,9 +274,9 @@ def main():
     parser.add_argument("--cpus", required=True, type=PIN.parse_cpus)
     args = parser.parse_args()
     root = args.output_dir.resolve()
-    root.mkdir()
+    root.mkdir(mode=0o700)
     scratch = root / "private"
-    scratch.mkdir()
+    scratch.mkdir(mode=0o700)
     os.environ["TMPDIR"] = str(scratch)
     import vane
     import vane._native
@@ -321,7 +321,11 @@ def main():
             for dimension in DIMENSIONS:
                 case = {"dimension": dimension, "phases": [], "status": "running"}
                 report["cases"].append(case)
-                exercise(root / f"dimension-{dimension}", dimension, case, scratch)
+                try:
+                    exercise(root / f"dimension-{dimension}", dimension, case, scratch)
+                except BaseException as error:
+                    case.update(status="failed", error=f"{type(error).__name__}: {error}")
+                    raise
                 require(PIN.thread_environment() == threads, "Thread settings changed")
             require(not list(scratch.iterdir()), "Private staging leaked")
             require(
@@ -333,6 +337,7 @@ def main():
         report.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:
+        report["restored_affinity"] = sorted(os.sched_getaffinity(0))
         report["seconds_observation_only"] = time.monotonic() - started
         (root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps({"status": report["status"], "dimensions": list(DIMENSIONS)}, ensure_ascii=False))
