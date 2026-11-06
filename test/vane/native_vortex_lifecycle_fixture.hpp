@@ -215,11 +215,13 @@ struct LifecycleFixture : KeyedFixture {
 
 	void Window() {
 		Connection owner(database);
-		auto result = DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, "lake", "main", "items", "knn", 1);
+		auto result =
+		    DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, "lake", "main", "items", "knn", 1, TableUUID(owner));
 		Require(result.expired_requests == 2, "Lifecycle fixture lost its existing receipts");
 		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "window",
 		                                 Value::LIST(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), {}),
-		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(-999999)}), 2);
+		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(-999999)}), 2,
+		                                 TableUUID(owner));
 	}
 };
 
@@ -328,7 +330,8 @@ inline void RunLifecycleFixture(DuckDB &database, Connection &setup, const strin
 		                       "'category':'A'::VARCHAR,'payload':'after-checkpoint'::VARCHAR}]")
 		                ->GetValue(0, 0);
 		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "after-checkpoint", rows,
-		                                 Value::LIST(LogicalType::BIGINT, {}), 2, [&](const string &stage) {
+		                                 Value::LIST(LogicalType::BIGINT, {}), 2, TableUUID(owner),
+		                                 [&](const string &stage) {
 			                                 if (mode == "lifecycle-pause-write-" + stage) {
 				                                 f.Wait("write-" + stage);
 			                                 }

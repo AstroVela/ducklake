@@ -164,7 +164,7 @@ struct AutomaticFixture {
 			try {
 				pending.receipt =
 				    DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", request, Rows(pending.rows),
-				                                     Deletes(pending.deletes), 1, observe);
+				                                     Deletes(pending.deletes), 1, TableUUID(owner), observe);
 				break;
 			} catch (std::exception &error) {
 				auto message = StringUtil::Lower(error.what());
@@ -316,7 +316,7 @@ struct AutomaticFixture {
 		for (auto &plan : plans) {
 			Connection owner(database);
 			auto result = DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", plan.request,
-			                                               Rows(plan.rows), Deletes(plan.deletes), 1);
+			                                               Rows(plan.rows), Deletes(plan.deletes), 1, TableUUID(owner));
 			Require(result.snapshot_id == plan.receipt.snapshot_id && result.payload_hash == plan.receipt.payload_hash,
 			        "Old automatic-flow request changed its receipt");
 		}
@@ -498,7 +498,7 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		bool rejected = false;
 		try {
 			DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "blocked",
-			                                 f.Rows({f.Row(10000, 1)}), f.Deletes({}), 1);
+			                                 f.Rows({f.Row(10000, 1)}), f.Deletes({}), 1, TableUUID(owner));
 		} catch (std::exception &error) {
 			rejected = string(error.what()).find("RESOURCE_EXHAUSTED") != string::npos;
 		}

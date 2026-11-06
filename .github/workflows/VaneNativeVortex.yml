@@ -198,6 +198,10 @@ jobs:
             --probe "$PWD/build/runtime/cargo/build/x86_64-unknown-linux-gnu/ci/ducklake-vortex-index-probe" \
             --output-dir "$PWD/build/query-scratch-proof" \
             2>&1 | tee build/logs/vane-vortex-query-scratch.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_table_uuid.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --cpus "$lifecycle_cpu" \
+            --output-dir "$PWD/build/table-uuid-proof" \
+            2>&1 | tee build/logs/vane-vortex-table-uuid.log
           python -I extension/test/vane/test_vane_vortex_functional_oracle.py \
             2>&1 | tee build/logs/vane-vortex-functional-oracle.log
           functional_cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
@@ -356,6 +360,11 @@ jobs:
             build/query-scratch-proof/**/*.json
             build/query-scratch-proof/**/checkpoint
             build/query-scratch-proof/**/scratch-root
+            build/table-uuid-proof/report.json
+            build/table-uuid-proof/**/*.log
+            build/table-uuid-proof/**/*.json
+            build/table-uuid-proof/**/checkpoint
+            build/table-uuid-proof/**/table-uuid
             build/functional-matrix-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log

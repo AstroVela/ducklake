@@ -728,6 +728,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	uint64_t source_wake_epoch = 0;
 	std::thread::id worker_id;
 	std::map<Key, Pending> policies;
+	std::set<Key> in_flight;
 	std::set<Key> cancelled;
 	std::map<Key, string> errors;
 	std::map<string, PendingMaintenance> maintenance;
@@ -846,7 +847,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	}
 	bool IsActive(const Key &key) {
 		std::lock_guard<std::mutex> guard(lock);
-		return active == key;
+		return active == key || in_flight.count(key);
 	}
 	void Check(const Key &key) {
 		std::lock_guard<std::mutex> guard(lock);
@@ -1324,13 +1325,27 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				if (!db) {
 					break;
 				}
+				{
+					std::lock_guard<std::mutex> guard(lock);
+					if (!policies.count(pending.policy.Id()) || cancelled.count(pending.policy.Id())) {
+						continue;
+					}
+					in_flight.insert(pending.policy.Id());
+				}
 				try {
+					if (pending.observe) {
+						pending.observe("optimizer_before_load");
+					}
 					Run(*db, pending);
 				} catch (const std::exception &error) {
 					Clear();
 					std::lock_guard<std::mutex> guard(lock);
 					cancelled.insert(pending.policy.Id());
 					errors[pending.policy.Id()] = error.what();
+				}
+				{
+					std::lock_guard<std::mutex> guard(lock);
+					in_flight.erase(pending.policy.Id());
 				}
 			}
 			for (auto &pending : cleanup) {
@@ -1672,6 +1687,54 @@ unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransacti
 
 unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::ReserveWrite(ClientContext &context) {
 	return GetOwner(*context.db)->write_admission.GetExclusiveLock();
+}
+
+std::unique_lock<std::mutex> DuckLakeVortexOptimizer::LockTableRetirement(ClientContext &context, const string &catalog,
+                                                                          const string &table_uuid) {
+	auto owner = GetOwner(*context.db);
+	std::unique_lock<std::mutex> guard(owner->runtime->io);
+	Metadata meta(*context.db, catalog);
+	try {
+		Initialized(meta);
+		auto rows = meta.Query("SELECT index_name,enabled FROM {METADATA_CATALOG}." + string(POLICIES) +
+		                       " WHERE table_uuid=" + Quote(table_uuid));
+		while (auto chunk = rows->Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				if (chunk->GetValue(1, row).GetValue<bool>()) {
+					throw InvalidInputException("Cancel Vortex optimizer tasks before retiring the table UUID");
+				}
+			}
+		}
+		{
+			std::lock_guard<std::mutex> running(owner->runtime->lock);
+			for (auto &key : owner->runtime->in_flight) {
+				if (key.first == table_uuid) {
+					throw InvalidInputException("Vortex table retirement is blocked by an in-flight optimizer task");
+				}
+			}
+		}
+		meta.Commit();
+	} catch (...) {
+		VortexCatalog::Rollback(meta.connection);
+		throw;
+	}
+	return guard;
+}
+
+void DuckLakeVortexOptimizer::FinishTableRetirement(ClientContext &context, const string &table_uuid) {
+	auto runtime = GetOwner(*context.db)->runtime;
+	// The caller holds runtime->io through the native commit and this removal.
+	std::lock_guard<std::mutex> guard(runtime->lock);
+	for (auto it = runtime->policies.begin(); it != runtime->policies.end();) {
+		it = it->first.first == table_uuid ? runtime->policies.erase(it) : std::next(it);
+	}
+	for (auto it = runtime->cancelled.begin(); it != runtime->cancelled.end();) {
+		it = it->first == table_uuid ? runtime->cancelled.erase(it) : std::next(it);
+	}
+	for (auto it = runtime->errors.begin(); it != runtime->errors.end();) {
+		it = it->first.first == table_uuid ? runtime->errors.erase(it) : std::next(it);
+	}
+	runtime->changed.notify_all();
 }
 
 void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const string &catalog, const string &schema,

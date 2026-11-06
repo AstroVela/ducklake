@@ -2,6 +2,7 @@
 
 #include "common/ducklake_vortex_json.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -26,6 +27,7 @@ constexpr const char *REQUESTS = "ducklake_vortex_write_requests_v2";
 constexpr const char *EPOCHS = "ducklake_vortex_request_epochs_v1";
 constexpr const char *MANAGED = "ducklake_vortex_keyed_tables_v1";
 constexpr const char *MUTATION = "ducklake_vortex_mutation";
+constexpr const char *RETIREMENT = "ducklake_vortex_table_retirement";
 constexpr idx_t MAX_ROWS = 1000;
 constexpr idx_t MAX_BYTES = 4 * 1024 * 1024;
 constexpr idx_t MAX_REQUESTS = 100000;
@@ -41,6 +43,23 @@ struct MutationScope {
 	}
 	~MutationScope() {
 		state->uuid.clear();
+	}
+};
+
+struct RetirementContext final : public ClientContextState {
+	string catalog, uuid;
+	idx_t table_id = 0;
+	std::function<void(const string &)> check;
+};
+
+struct RetirementScope {
+	shared_ptr<RetirementContext> state;
+	explicit RetirementScope(ClientContext &context)
+	    : state(context.registered_state->GetOrCreate<RetirementContext>(RETIREMENT)) {
+	}
+	~RetirementScope() {
+		state->uuid.clear();
+		state->check = nullptr;
 	}
 };
 
@@ -211,6 +230,15 @@ idx_t RequestCount(DuckLakeTransaction &transaction, const string &where = "") {
 	    .GetValue<idx_t>();
 }
 
+void CheckTableUUID(const string &expected, const string &actual) {
+	if (UUID::ToString(UUID::FromString(expected)) != expected) {
+		throw InvalidInputException("Vortex table UUID must be canonical");
+	}
+	if (expected != actual) {
+		throw InvalidInputException("STALE_TABLE: Vortex table UUID does not match the current table");
+	}
+}
+
 void NoCommitRetry(Connection &owner) {
 	auto setting = owner.Query("SET SESSION ducklake_max_retry_count=0");
 	if (setting->HasError()) {
@@ -350,7 +378,8 @@ DuckLakeVortexRequestStatus DuckLakeVortexWriteBatch::RequestStatus(Connection &
 
 DuckLakeVortexRequestAdvance DuckLakeVortexWriteBatch::AdvanceRequestEpoch(
     Connection &owner, const string &catalog, const string &schema, const string &table_name, const string &index,
-    uint64_t expected_epoch, const std::function<void(const string &)> &observe, optional_ptr<ClientContext> caller) {
+    uint64_t expected_epoch, const string &expected_table_uuid, const std::function<void(const string &)> &observe,
+    optional_ptr<ClientContext> caller) {
 	if (owner.context->transaction.HasActiveTransaction() || expected_epoch == 0) {
 		throw InvalidInputException("Vortex request epoch advance requires an idle connection and a positive epoch");
 	}
@@ -371,6 +400,7 @@ DuckLakeVortexRequestAdvance DuckLakeVortexWriteBatch::AdvanceRequestEpoch(
 		Initialized(transaction);
 		auto target = Target(owner, transaction, schema, table_name, index);
 		auto uuid = target.table.GetTableUUID();
+		CheckTableUUID(expected_table_uuid, uuid);
 		auto epoch = ReadEpoch(transaction, uuid);
 		check("after_lookup");
 		if (expected_epoch < std::numeric_limits<uint64_t>::max() && epoch.epoch == expected_epoch + 1) {
@@ -416,24 +446,31 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Append(Connection &owner, co
                                                            const string &schema, const string &table_name,
                                                            const string &index_name, const string &request_id,
                                                            const Value &rows, uint64_t request_epoch,
+                                                           const string &expected_table_uuid,
                                                            const std::function<void(const string &)> &observe,
                                                            optional_ptr<ClientContext> caller) {
 	return Write(owner, catalog_name, schema, table_name, index_name, request_id, rows,
-	             Value::LIST(LogicalType::BIGINT, {}), false, request_epoch, observe, caller);
+	             Value::LIST(LogicalType::BIGINT, {}), false, request_epoch, expected_table_uuid, observe, caller);
 }
 
-DuckLakeVortexWriteResult
-DuckLakeVortexWriteBatch::Mutate(Connection &owner, const string &catalog, const string &schema, const string &table,
-                                 const string &index, const string &request_id, const Value &rows, const Value &deletes,
-                                 uint64_t request_epoch, const std::function<void(const string &)> &observe,
-                                 optional_ptr<ClientContext> caller) {
-	return Write(owner, catalog, schema, table, index, request_id, rows, deletes, true, request_epoch, observe, caller);
+DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Mutate(Connection &owner, const string &catalog,
+                                                           const string &schema, const string &table,
+                                                           const string &index, const string &request_id,
+                                                           const Value &rows, const Value &deletes,
+                                                           uint64_t request_epoch, const string &expected_table_uuid,
+                                                           const std::function<void(const string &)> &observe,
+                                                           optional_ptr<ClientContext> caller) {
+	return Write(owner, catalog, schema, table, index, request_id, rows, deletes, true, request_epoch,
+	             expected_table_uuid, observe, caller);
 }
 
-DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Write(
-    Connection &owner, const string &catalog_name, const string &schema, const string &table_name,
-    const string &index_name, const string &request_id, const Value &rows, const Value &deletes, bool mutate,
-    uint64_t request_epoch, const std::function<void(const string &)> &observe, optional_ptr<ClientContext> caller) {
+DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Write(Connection &owner, const string &catalog_name,
+                                                          const string &schema, const string &table_name,
+                                                          const string &index_name, const string &request_id,
+                                                          const Value &rows, const Value &deletes, bool mutate,
+                                                          uint64_t request_epoch, const string &expected_table_uuid,
+                                                          const std::function<void(const string &)> &observe,
+                                                          optional_ptr<ClientContext> caller) {
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex WriteBatch requires an idle dedicated connection");
 	}
@@ -461,6 +498,7 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Write(
 		Initialized(transaction);
 		auto target = Target(owner, transaction, schema, table_name, index_name);
 		auto &table = target.table;
+		CheckTableUUID(expected_table_uuid, table.GetTableUUID());
 		if (mutate != target.managed) {
 			throw InvalidInputException(
 			    "Vortex batch operation does not match the table's explicitly managed write mode");
@@ -554,4 +592,128 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Write(
 		throw;
 	}
 }
+string DuckLakeVortexWriteBatch::RetiringTable(ClientContext &context, const string &catalog) {
+	auto state = context.registered_state->Get<RetirementContext>(RETIREMENT);
+	return state && state->catalog == catalog ? state->uuid : string();
+}
+
+void DuckLakeVortexWriteBatch::StageTableRetirement(ClientContext &context, DuckLakeTransaction &transaction) {
+	auto state = context.registered_state->Get<RetirementContext>(RETIREMENT);
+	if (!state || state->uuid.empty() || state->catalog != transaction.GetCatalog().GetName() ||
+	    transaction.GetDroppedTables().size() != 1 ||
+	    !transaction.GetDroppedTables().count(TableIndex(state->table_id))) {
+		throw InternalException("Vortex table retirement lost its exact DROP ownership");
+	}
+	Connection reader(*context.db);
+	try {
+		auto &fresh = DuckLakeVortexIndex::Begin(reader, state->catalog);
+		auto entry = fresh.GetCatalog().GetEntryById(fresh, fresh.GetSnapshot(), TableIndex(state->table_id));
+		if (!entry || entry->type != CatalogType::TABLE_ENTRY ||
+		    entry->Cast<DuckLakeTableEntry>().GetTableUUID() != state->uuid) {
+			throw TransactionException("STALE_TABLE: Vortex retirement target no longer exists");
+		}
+		reader.Commit();
+	} catch (...) {
+		DuckLakeVortexIndex::Rollback(reader);
+		throw;
+	}
+	state->check("retire_before_stage");
+	DuckLakeVortexIndex::RetireTableMetadata(transaction, state->uuid);
+	state->check("retire_after_indexes");
+	auto where = " WHERE table_uuid=" + Value(state->uuid).ToSQLString();
+	for (auto name : {REQUESTS, EPOCHS, MANAGED, "ducklake_vortex_write_budgets_v1", "ducklake_vortex_optimizer_v2"}) {
+		DuckLakeVortexIndex::Query(transaction, "DELETE FROM {METADATA_CATALOG}." + string(name) + where);
+		if (string(name) == REQUESTS) {
+			state->check("retire_after_requests");
+		}
+	}
+	state->check("retire_after_stage");
+}
+
+string DuckLakeVortexWriteBatch::RetireTable(Connection &owner, const string &catalog_name, const string &schema,
+                                             const string &table_name, const string &expected_table_uuid,
+                                             const std::function<void(const string &)> &observe,
+                                             optional_ptr<ClientContext> caller) {
+	if (owner.context->transaction.HasActiveTransaction()) {
+		throw InvalidInputException("Vortex table retirement requires an idle dedicated connection");
+	}
+	CheckTableUUID(expected_table_uuid, expected_table_uuid);
+	auto check = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		if (owner.context->IsInterrupted() || (caller && caller->IsInterrupted())) {
+			throw InterruptException();
+		}
+	};
+	check("retire_waiting");
+	auto writer = AcquireWriter();
+	check("retire_acquired");
+	NoCommitRetry(owner);
+	MutationScope mutation(*owner.context);
+	RetirementScope retirement(*owner.context);
+	try {
+		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog_name);
+		Initialized(transaction);
+		DuckLakeVortexIndex::Initialized(transaction);
+		auto &catalog = transaction.GetCatalog();
+		auto entry = catalog.GetEntry(*owner.context, CatalogType::TABLE_ENTRY, schema, table_name,
+		                              OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
+			auto prior =
+			    DuckLakeVortexIndex::Query(
+			        transaction,
+			        "SELECT 1 FROM {METADATA_CATALOG}.ducklake_table t JOIN {METADATA_CATALOG}.ducklake_schema s "
+			        "ON t.schema_id=s.schema_id WHERE t.table_uuid=" +
+			            Value(expected_table_uuid).ToSQLString() +
+			            " AND t.table_name=" + Value(table_name).ToSQLString() +
+			            " AND s.schema_name=" + Value(schema).ToSQLString() + " AND t.end_snapshot IS NOT NULL LIMIT 1")
+			        ->Fetch();
+			if (!prior) {
+				throw InvalidInputException("Unknown Vortex table retirement UUID");
+			}
+			for (auto name :
+			     {REQUESTS, EPOCHS, MANAGED, "ducklake_vortex_write_budgets_v1", "ducklake_vortex_optimizer_v2",
+			      "ducklake_vortex_indexes_v1", "ducklake_vortex_generation_refs_v1", "ducklake_vortex_builds_v1",
+			      "ducklake_vortex_rewrites_v1"}) {
+				auto residual =
+				    DuckLakeVortexIndex::Query(
+				        transaction, "SELECT 1 FROM {METADATA_CATALOG}." + string(name) +
+				                         " WHERE table_uuid=" + Value(expected_table_uuid).ToSQLString() + " LIMIT 1")
+				        ->Fetch();
+				if (residual) {
+					throw InvalidInputException("Dropped Vortex table still owns state; retirement replay refused");
+				}
+			}
+			owner.Commit();
+			return expected_table_uuid;
+		}
+		auto &table = entry->Cast<DuckLakeTableEntry>();
+		CheckTableUUID(expected_table_uuid, table.GetTableUUID());
+		DuckLakeVortex::ValidateTable(table);
+		DuckLakeVortexReadView::ValidateFields(table);
+		if (DuckLakeVortex::GetFormat(table) != DataFileFormat::VORTEX ||
+		    table.GetColumns().PhysicalColumnCount() != 4 || table.GetColumns().LogicalColumnCount() != 4) {
+			throw InvalidInputException("Vortex table retirement requires the four-column Vortex schema");
+		}
+		mutation.state->uuid = expected_table_uuid;
+		retirement.state->catalog = catalog_name;
+		retirement.state->uuid = expected_table_uuid;
+		retirement.state->table_id = table.GetTableId().index;
+		retirement.state->check = check;
+		check("retire_after_lookup");
+		auto dropped = owner.Query("DROP TABLE " + Qualified(catalog_name, schema, table_name));
+		if (dropped->HasError()) {
+			dropped->ThrowError();
+		}
+		check("retire_before_commit");
+		owner.Commit();
+		check("retire_after_commit");
+		return expected_table_uuid;
+	} catch (...) {
+		DuckLakeVortexIndex::Rollback(owner);
+		throw;
+	}
+}
+
 } // namespace duckdb

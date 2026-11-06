@@ -31,9 +31,9 @@ struct EpochFixture {
 		                  "'payload':'late'::VARCHAR}]")
 		           ->GetValue(0, 0);
 		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "seed", seed,
-		                                 Value::LIST(LogicalType::BIGINT, {}), 1);
+		                                 Value::LIST(LogicalType::BIGINT, {}), 1, TableUUID(owner));
 		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "latest", latest,
-		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(2)}), 1);
+		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(2)}), 1, TableUUID(owner));
 	}
 
 	DuckLakeVortexRequestStatus Status() {
@@ -42,12 +42,13 @@ struct EpochFixture {
 	}
 
 	DuckLakeVortexRequestAdvance Advance(Connection &owner, const std::function<void(const string &)> &observe = {}) {
-		return DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, "lake", "main", "items", "knn", 1, observe);
+		return DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, "lake", "main", "items", "knn", 1, TableUUID(owner),
+		                                                     observe);
 	}
 
 	DuckLakeVortexWriteResult Late(Connection &owner, const std::function<void(const string &)> &observe = {}) {
 		return DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "late", late,
-		                                        Value::LIST(LogicalType::BIGINT, {}), 1, observe);
+		                                        Value::LIST(LogicalType::BIGINT, {}), 1, TableUUID(owner), observe);
 	}
 
 	void CurrentRows(idx_t count = 1) {
@@ -205,7 +206,7 @@ inline void RunEpochFixture(DuckDB &database, Connection &setup, const string &r
 	Require(advanced.previous_epoch == 1 && advanced.request_epoch == 2 && advanced.expired_requests == 2,
 	        "Advance recovery changed the retired receipt count");
 	auto fresh = DuckLakeVortexWriteBatch::Mutate(retry, "lake", "main", "items", "knn", "new-window", f.late,
-	                                              Value::LIST(LogicalType::BIGINT, {}), 2);
+	                                              Value::LIST(LogicalType::BIGINT, {}), 2, TableUUID(retry));
 	EpochFixture::Same(advanced, f.Advance(retry));
 	Require(fresh.request_epoch == 2 && f.Status().retained_requests == 1, "Advance retry deleted a newer receipt");
 	bool expired = false;

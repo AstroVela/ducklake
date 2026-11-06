@@ -1584,6 +1584,42 @@ bool DuckLakeVortexIndex::ReferencesSource(DuckLakeTransaction &transaction, con
 	return false;
 }
 
+void DuckLakeVortexIndex::RetireTableMetadata(DuckLakeTransaction &transaction, const string &table_uuid) {
+	Initialized(transaction);
+	auto where = " WHERE table_uuid=" + Value(table_uuid).ToSQLString();
+	for (auto name : {BUILDS, REWRITES}) {
+		if (Query(transaction, "SELECT 1 FROM {METADATA_CATALOG}." + string(name) + where + " LIMIT 1")->Fetch()) {
+			throw InvalidInputException("Recover and collect Vortex build/rewrite ownership before table retirement");
+		}
+	}
+	auto rows =
+	    Query(transaction, "SELECT DISTINCT r.index_root,r.generation,g.state FROM {METADATA_CATALOG}." +
+	                           string(GENERATION_REFS) + " r LEFT JOIN {METADATA_CATALOG}." + string(GENERATIONS) +
+	                           " g ON r.index_root=g.index_root AND r.generation=g.generation WHERE r.table_uuid=" +
+	                           Value(table_uuid).ToSQLString());
+	vector<std::pair<string, string>> generations;
+	while (auto chunk = rows->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			if (chunk->GetValue(2, row).IsNull() || StringValue::Get(chunk->GetValue(2, row)) != "active") {
+				throw InvalidInputException("Vortex table retirement found invalid generation ownership");
+			}
+			generations.emplace_back(StringValue::Get(chunk->GetValue(0, row)),
+			                         StringValue::Get(chunk->GetValue(1, row)));
+		}
+	}
+	Query(transaction, "DELETE FROM {METADATA_CATALOG}." + string(GENERATION_REFS) + where);
+	Query(transaction, "DELETE FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) + where);
+	for (auto &entry : generations) {
+		auto generation = GenerationWhere(entry.first, entry.second);
+		auto remaining =
+		    Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(GENERATION_REFS) + generation);
+		if (remaining->Fetch()->GetValue(0, 0).GetValue<idx_t>() == 0) {
+			Query(transaction,
+			      "UPDATE {METADATA_CATALOG}." + string(GENERATIONS) + " SET state='retired'" + generation);
+		}
+	}
+}
+
 DuckLakeVortexIndex DuckLakeVortexIndex::Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table,
                                                 const string &name) {
 	Name(name);
