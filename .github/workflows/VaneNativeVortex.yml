@@ -68,6 +68,12 @@ jobs:
           rustup toolchain install 1.91.0 --profile minimal
           mkdir -p .cache/vcpkg build/wheels build/logs
           printf 'BINDGEN_EXTRA_CLANG_ARGS=-isystem%s\n' "$(cc -print-file-name=include)" >> "$GITHUB_ENV"
+      - name: Verify remote ownership and publication protocol model
+        run: |
+          protocol_cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          python -I extension/test/vane/test_vane_vortex_remote_protocol.py \
+            --cpus "$protocol_cpu" --output-dir "$PWD/build/remote-publication-proof" \
+            2>&1 | tee build/logs/vane-vortex-remote-publication.log
       - name: Restore build caches
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -308,6 +314,7 @@ jobs:
           name: vane-native-vortex-proof
           path: |
             build/logs
+            build/remote-publication-proof
             build/proof/report.json
             build/write-proof/report.json
             build/write-proof/**/driver.log

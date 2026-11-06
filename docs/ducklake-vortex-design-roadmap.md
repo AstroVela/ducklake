@@ -10,7 +10,7 @@
 
 实现基线为 [DuckLake Draft #74](https://github.com/AstroVela/ducklake/pull/74)，head 为 `2a9377062cddc0c222d8dd99e4d5efee3a298c76`。#74 的受控 A/B 未达到预设收益门槛，已撤回生产查询合并；其生产 `src/` 与 [#73](https://github.com/AstroVela/ducklake/pull/73) 的 `9819016e841ea79c8eea054415f4724fa2270e85` 相同。本文的“已验证”指该实现闭包的本地验证，不代表这些 Draft 已合入、发布或通过全部远端 CI。
 
-上述架构基线之后，[#84](https://github.com/AstroVela/ducklake/pull/84) 增加[数值修复与确定性功能验收](native-vortex-functional-matrix.md)：inline FLOAT／DOUBLE 使用显式浮点类型解析，B/F/T 的平方 L2 使用双精度累加后返回 Float32。[#85](https://github.com/AstroVela/ducklake/pull/85) 增加[显式请求 epoch 与回执清理](native-vortex-request-epochs.md)，在同一原生事务中推进窗口和删除旧回执。[#86](https://github.com/AstroVela/ducklake/pull/86) 补充 [reference／WAL 生命周期契约](native-vortex-reference-wal-lifecycle.md)；[#87](https://github.com/AstroVela/ducklake/pull/87) 验证[容量 admission 边界](native-vortex-capacity-admission.md)，该轮生产 `src/` 与 #85 的 `f67dd3bfe31278bf425435e9a3822d07d04b9774` 相同。[#88](https://github.com/AstroVela/ducklake/pull/88) 新增[查询 scratch 所有权与显式回收](native-vortex-query-scratch-lifecycle.md)，为私有副本建立登记、活跃文件锁及有预算的崩溃回收。[#89](https://github.com/AstroVela/ducklake/pull/89) 进一步实现[表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md)：请求显式绑定 UUID，表 DROP 与该 UUID 的状态释放原子提交。本轮补充[已退休表的原生历史与物理回收契约](native-vortex-retired-history.md)，修复过期后遗留 table-scoped 配置的问题。#83 的文件名候选仍未采用，既有预算和事务保护保持。这些验证性 Draft 均不代表已合入或发布。
+上述架构基线之后，[#84](https://github.com/AstroVela/ducklake/pull/84) 增加[数值修复与确定性功能验收](native-vortex-functional-matrix.md)：inline FLOAT／DOUBLE 使用显式浮点类型解析，B/F/T 的平方 L2 使用双精度累加后返回 Float32。[#85](https://github.com/AstroVela/ducklake/pull/85) 增加[显式请求 epoch 与回执清理](native-vortex-request-epochs.md)，在同一原生事务中推进窗口和删除旧回执。[#86](https://github.com/AstroVela/ducklake/pull/86) 补充 [reference／WAL 生命周期契约](native-vortex-reference-wal-lifecycle.md)；[#87](https://github.com/AstroVela/ducklake/pull/87) 验证[容量 admission 边界](native-vortex-capacity-admission.md)，该轮生产 `src/` 与 #85 的 `f67dd3bfe31278bf425435e9a3822d07d04b9774` 相同。[#88](https://github.com/AstroVela/ducklake/pull/88) 新增[查询 scratch 所有权与显式回收](native-vortex-query-scratch-lifecycle.md)，为私有副本建立登记、活跃文件锁及有预算的崩溃回收。[#89](https://github.com/AstroVela/ducklake/pull/89) 进一步实现[表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md)：请求显式绑定 UUID，表 DROP 与该 UUID 的状态释放原子提交。[#90](https://github.com/AstroVela/ducklake/pull/90) 补充[已退休表的原生历史与物理回收契约](native-vortex-retired-history.md)，修复过期后遗留 table-scoped 配置的问题。本轮基于 #90 提供 [R6 远程发布协议与独立模型](native-vortex-remote-publication.md)，生产源码不变。#83 的文件名候选仍未采用，既有预算和事务保护保持。这些验证性 Draft 均不代表已合入或发布。
 
 当前限定：单进程独占 native DuckDB 元数据目录、本地受管 POSIX 文件、无分区／未加密的固定业务 schema、Float32 有限向量、平方 L2 距离。并发客户端与后台维护位于这一所有权范围内；多进程写者、跨主机 fencing、远程对象存储和分布式 ANN 不在当前验证范围。
 
@@ -283,8 +283,8 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **因本机负载波动暂缓，未完成**：[文件名预筛选](native-vortex-filename-prefilter.md)通过每侧 53,322 项路径 oracle 和 2,144 项真实元数据检查；预先提交协议后的受控 A/B 完成 768 次主采样，两个目标改善 5.28%／15.70%，但一个对照增加 3.84%，按规则撤回候选。生产引用检查未改，CPU／线程／事务／预算保持 | 稳定资源环境具备后再恢复 A/A、性能 A/B 与长期稳态验证；既有 A/A 未达 2% 门槛、候选撤回、积压有界与开放停滞未关闭的结论均保留 |
-| R5 容量与产品契约 | **当前优先项，部分完成**：[确定性矩阵](native-vortex-functional-matrix.md)、[显式请求 epoch](native-vortex-request-epochs.md)，[reference／WAL 契约](native-vortex-reference-wal-lifecycle.md)、[容量 admission 边界](native-vortex-capacity-admission.md)、[查询 scratch 生命周期](native-vortex-query-scratch-lifecycle.md)、[表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md)与[退休历史／物理回收契约](native-vortex-retired-history.md)；已覆盖本地确定性生命周期及固定循环的原生块复用 | 更大数据、质量、延迟、吞吐、长期容量与总磁盘／RSS 资格仍待验证，依赖稳定负载的项目继续暂缓 |
-| R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
+| R5 容量与产品契约 | **部分完成，本地确定性生命周期已覆盖**：[确定性矩阵](native-vortex-functional-matrix.md)、[显式请求 epoch](native-vortex-request-epochs.md)，[reference／WAL 契约](native-vortex-reference-wal-lifecycle.md)、[容量 admission 边界](native-vortex-capacity-admission.md)、[查询 scratch 生命周期](native-vortex-query-scratch-lifecycle.md)、[表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md)与[退休历史／物理回收契约](native-vortex-retired-history.md)；已验证固定循环的原生块复用 | 更大数据、质量、延迟、吞吐、长期容量与总磁盘／RSS 资格仍待验证，依赖稳定负载的项目继续暂缓 |
+| R6 云端与分布式 | **部分完成协议设计，整体未完成**：[远程对象所有权与原子发布协议](native-vortex-remote-publication.md)已提供 owner fencing、同事务 head／引用／回执、ReadView pin、晚到上传屏障与独立有界模型；生产仍限定 native DuckDB／本地 POSIX | 单一真实 PostgreSQL／S3 adapter 与能力 conformance、reader session／pin 回收、固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
 原 RFC 的静态索引、实时可见、B/F/T、compaction／GC 目标在 R0–R3 有对应实现；其 Iceberg 专属物化、云端 fencing 和分布式 serving 并未因 DuckLake 本地链路通过而完成。保留原 RFC 作为历史来源，本文件作为 DuckLake 路线的总纲。
@@ -293,15 +293,15 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 ## 11. 下一份验证性 Draft PR
 
-**本地 R5 的确定性生命周期已覆盖，容量与性能资格仍未完成。下一项可先做 R6 远程对象所有权与原子发布协议设计。** [退休历史与物理回收契约](native-vortex-retired-history.md)明确原生历史、实际 inline 表、表级配置、source／generation 和 WAL 的不同生命周期；块复用与物理文件尺寸分别核对，不再把逻辑释放解释为总磁盘有界。
+**下一项推荐 R6 单一真实远程后端的最小 adapter 与能力 conformance。** [远程协议设计与确定性模型](native-vortex-remote-publication.md)已完成首轮有界验证，尚未调用真实 PostgreSQL／S3。生产 `src/` 仍为 [#90](https://github.com/AstroVela/ducklake/pull/90) 的 `48293724a8d3b0652a689a7c85e01e7892369ca8`；不把模型通过等同于远程产品能力。
 
-1. 先确定远程 metadata 与对象存储的所有者、不可变对象身份、持久发布点及跨进程 fencing；明确本地单进程／POSIX 假设中哪些需要替换。
-2. 为上传、封存、发布、ACK、不确定提交及删除意图列出状态机和恢复责任，保留 UUID／epoch 请求身份、固定 ReadView 与现有预算语义。
-3. 先给出固定输入的协议 oracle 与故障矩阵，再实现所选远程后端；本地验证通过不代表已经支持云端或分布式 ANN。
+1. 先在隔离的 versioned S3 服务与 PostgreSQL 上，验证条件创建、普通 STOP 对象保护、精确版本 GET／DELETE、未知响应，以及 metadata 同事务 head／引用／回执和 owner fencing；用本轮固定故障序列作真实 adapter 的 conformance 输入。
+2. 保留 UUID／epoch 请求身份、固定 ReadView、普通事务保护与现有预算；补齐远程类型编码、reader session fencing／持久 pin 回收及认证缓存契约后，再讨论解除 native DuckDB 限制。
+3. R6 的分布式 fan-out、读位置等待、全局 top-k 与服务故障切换仍需真实端到端证据；STOP 与协议 metadata 的累积也尚无总空间上界。
 4. R5 的更大数据／质量与容量资格仍须单独声明输入、资源和退出条件；当前 fixture 及三轮块复用不替代持续容量验证。
 5. 具备稳定资源环境后恢复 R4：保留既有 A/A 失败、候选撤回和未关闭稳态问题，按原门槛验证。R4 A/A、性能 A/B 与长期负载继续暂缓。
 
-R4 的开放问题保持未完成，但不阻塞 R5 的功能契约工作。R6 需要独立远程与分布式设计，R7 按收益证据决定；本轮不改变本地所有权范围、质量门槛或资源预算。
+本地 R5 已覆盖确定性生命周期；[退休历史／物理回收契约](native-vortex-retired-history.md)继续区分逻辑释放、原生块复用与实际文件尺寸。R4 的开放问题保持未完成。R6 继续按真实后端、远程视图、分布式查询分别验收；R7 按收益证据决定。本轮不改变本地所有权范围、质量门槛或资源预算。
 
 ## 12. 文档与实现导航
 
@@ -328,6 +328,7 @@ R4 的开放问题保持未完成，但不阻塞 R5 的功能契约工作。R6 �
 | [查询 scratch 所有权与回收](native-vortex-query-scratch-lifecycle.md) | 登记、活跃锁、显式预算、删除意图及 SIGKILL／重开验收 |
 | [表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md) | 请求 UUID fence、原子 DROP／状态释放、后台任务与恢复契约 |
 | [已退休表原生历史与物理回收](native-vortex-retired-history.md) | catalog 历史范围、实际 inline／表级配置、受预算回收、块复用与恢复 |
+| [R6 远程对象所有权与原子发布](native-vortex-remote-publication.md) | 能力配置、owner fencing、同事务发布／回执、读者 pin、晚到上传屏障与独立有界模型；真实后端待接入 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。
