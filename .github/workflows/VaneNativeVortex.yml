@@ -202,6 +202,10 @@ jobs:
             --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --cpus "$lifecycle_cpu" \
             --output-dir "$PWD/build/table-uuid-proof" \
             2>&1 | tee build/logs/vane-vortex-table-uuid.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_retired_history.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --cpus "$lifecycle_cpu" \
+            --output-dir "$PWD/build/retired-history-proof" \
+            2>&1 | tee build/logs/vane-vortex-retired-history.log
           python -I extension/test/vane/test_vane_vortex_functional_oracle.py \
             2>&1 | tee build/logs/vane-vortex-functional-oracle.log
           functional_cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
@@ -365,6 +369,9 @@ jobs:
             build/table-uuid-proof/**/*.json
             build/table-uuid-proof/**/checkpoint
             build/table-uuid-proof/**/table-uuid
+            build/retired-history-proof/**/*.log
+            build/retired-history-proof/**/*.json
+            build/retired-history-proof/**/checkpoint
             build/functional-matrix-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log
