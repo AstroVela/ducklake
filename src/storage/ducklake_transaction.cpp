@@ -1,4 +1,5 @@
 #include "storage/ducklake_transaction.hpp"
+#include "storage/ducklake_vortex.hpp"
 
 #include "storage/ducklake_commit_state.hpp"
 #include "storage/ducklake_transaction_state.hpp"
@@ -785,6 +786,7 @@ void DuckLakeTransaction::Commit() {
 		throw;
 	}
 	connection.reset();
+	data_file_formats.clear();
 	state->local_changes.Clear();
 	SetRequiresNewInlinedTable(false);
 }
@@ -798,6 +800,7 @@ void DuckLakeTransaction::Rollback() {
 		connection.reset();
 	}
 	state->CleanupFiles();
+	data_file_formats.clear();
 	state->local_changes.Clear();
 	SetRequiresNewInlinedTable(false);
 }
@@ -1522,7 +1525,48 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 #endif
 }
 
+DataFileFormat DuckLakeTransaction::GetDataFileFormat(TableIndex table_id) {
+	if (!table_id.IsValid() || table_id.IsTransactionLocal()) {
+		return DataFileFormat::PARQUET;
+	}
+	auto cached = data_file_formats.find(table_id);
+	if (cached != data_file_formats.end()) {
+		return cached->second;
+	}
+	auto result =
+	    Query(StringUtil::Format("SELECT value FROM {METADATA_CATALOG}.ducklake_metadata "
+	                             "WHERE key = 'experimental_data_file_format' AND scope = 'table' AND scope_id = %d",
+	                             table_id.index));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to read DuckLake data file format: ");
+	}
+	auto chunk = result->Fetch();
+	auto format = chunk && chunk->size() ? DataFileFormatFromString(chunk->GetValue(0, 0).GetValue<string>())
+	                                     : DataFileFormat::PARQUET;
+	data_file_formats.emplace(table_id, format);
+	return format;
+}
+
 void DuckLakeTransaction::SetConfigOption(const DuckLakeConfigOption &option) {
+	if (option.option.key == "experimental_data_file_format") {
+		if (!option.table_id.IsValid() || option.table_id.IsTransactionLocal() || option.schema_id.IsValid()) {
+			throw InvalidInputException("experimental_data_file_format requires a committed table scope");
+		}
+		auto entry = ducklake_catalog.GetEntryById(*this, GetSnapshot(), option.table_id);
+		if (!entry) {
+			throw CatalogException("DuckLake format option table no longer exists");
+		}
+		auto &table = entry->Cast<DuckLakeTableEntry>();
+		auto format = DataFileFormatFromString(option.option.value);
+		if (format == DataFileFormat::VORTEX) {
+			DuckLakeVortex::ValidateTable(table);
+		} else if (GetDataFileFormat(option.table_id) == DataFileFormat::VORTEX) {
+			throw NotImplementedException("Experimental Vortex tables cannot change their data file format");
+		}
+		metadata_manager->SetConfigOption(option);
+		data_file_formats[option.table_id] = format;
+		return;
+	}
 	// write the config option to the metadata
 	metadata_manager->SetConfigOption(option);
 	// set the option in the catalog

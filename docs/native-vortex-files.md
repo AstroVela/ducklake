@@ -63,6 +63,14 @@ new Vortex files. Vortex output cannot be switched back through this option.
 Column and table renames retain field identities; other schema changes and
 partitioning changes are rejected for these experimental tables.
 
+Format options follow the metadata transaction: a rollback also rolls back the
+format used by subsequent statements. Empty table names are rejected, and
+prepared option statements recheck the current table and transition when they
+execute. Each writer records the format selected by its physical plan. A
+Parquet writer prepared before the switch can still produce a correctly labeled
+Parquet file in the mixed table. A prepared Vortex writer whose enabling option
+was rolled back must be prepared again before it can write.
+
 ## File and row contract
 
 Each committed data file records its actual format in
@@ -82,6 +90,8 @@ The reader uses the native DuckDB filesystem adapter, explicitly projects
 physical row positions, and applies DuckLake's existing deletion and row-filter
 logic. Flush writes the internal row-ID and snapshot columns with their bounds.
 It retains the source catalog's snapshot and delete semantics.
+Deletion-history scans also dispatch by each file's recorded format, including
+the logical row-ID lookup needed after repeated deletes, flushes and rewrites.
 
 The initial writer emits row counts, byte sizes, and top-level NULL counts.
 Complete business-column and nested-column bounds are not implemented.
@@ -124,5 +134,5 @@ ordinary scan or row-mutation tasks. Default provider manifests and release
 configurations do not enable the experimental format.
 
 Local builds reuse native engine and Vortex objects from the exact pins above
-and rebuild the DuckLake sources. Clean ON/OFF builds remain a hosted CI gate;
-the draft does not claim that an uncompleted hosted run passed.
+and rebuild the DuckLake sources. The hosted workflow performs clean ON/OFF
+qualification for each submitted revision.

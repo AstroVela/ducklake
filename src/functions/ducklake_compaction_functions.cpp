@@ -126,7 +126,8 @@ SourceResultType DuckLakeCompaction::GetDataInternal(ExecutionContext &context, 
 // Sink
 //===--------------------------------------------------------------------===//
 unique_ptr<GlobalSinkState> DuckLakeCompaction::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<DuckLakeInsertGlobalState>(table);
+	return make_uniq<DuckLakeInsertGlobalState>(
+	    context, table, DataFileFormatFromString(children[0].get().Cast<PhysicalCopyToFile>().file_extension));
 }
 
 SinkResultType DuckLakeCompaction::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {

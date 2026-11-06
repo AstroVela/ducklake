@@ -96,7 +96,8 @@ SourceResultType DuckLakeFlushData::GetDataInternal(ExecutionContext &context, D
 // Sink
 //===--------------------------------------------------------------------===//
 unique_ptr<GlobalSinkState> DuckLakeFlushData::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<DuckLakeInsertGlobalState>(table);
+	return make_uniq<DuckLakeInsertGlobalState>(
+	    context, table, DataFileFormatFromString(children[0].get().Cast<PhysicalCopyToFile>().file_extension));
 }
 
 SinkResultType DuckLakeFlushData::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
