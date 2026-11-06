@@ -1313,6 +1313,33 @@ static optional_ptr<PhysicalOperator> PlanInsertSort(ClientContext &context, Phy
 	return &order_op;
 }
 
+class DuckLakeVerifyNotNull : public PhysicalOperator {
+public:
+	DuckLakeVerifyNotNull(PhysicalPlan &physical_plan, PhysicalOperator &child, DuckLakeTableEntry &table)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, child.types, child.estimated_cardinality),
+	      table(table) {
+		children.push_back(child);
+	}
+
+	OperatorResultType Execute(ExecutionContext &, DataChunk &input, DataChunk &chunk, GlobalOperatorState &,
+	                           OperatorState &) const override {
+		table.VerifyNotNull(input);
+		chunk.Reference(input);
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	bool ParallelOperator() const override {
+		return true;
+	}
+
+	string GetName() const override {
+		return "DUCKLAKE_VERIFY_NOT_NULL";
+	}
+
+private:
+	DuckLakeTableEntry &table;
+};
+
 PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                               optional_ptr<PhysicalOperator> plan) {
 	if (op.return_chunk) {
@@ -1341,6 +1368,10 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 	optional_ptr<PhysicalOperator> distributed_plan = plan;
 #endif
+
+	if (!ducklake_table.GetNotNullFields().empty()) {
+		plan = planner.Make<DuckLakeVerifyNotNull>(*plan, ducklake_table);
+	}
 
 	optional_ptr<DuckLakeInlineData> inline_data;
 

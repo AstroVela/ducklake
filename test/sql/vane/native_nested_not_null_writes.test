@@ -1,0 +1,117 @@
+# name: test/sql/vane/native_nested_not_null_writes.test
+# description: native nested NOT NULL checks precede insert, update, and merge writes
+# group: [vane]
+
+require ducklake
+
+require parquet
+
+foreach inline_limit 0 100
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/nested_null_${inline_limit}.ducklake' AS lake (DATA_PATH '__TEST_DIR__/nested_null_${inline_limit}', DATA_INLINING_ROW_LIMIT ${inline_limit})
+
+statement ok
+CREATE TABLE lake.items(id INTEGER NOT NULL, embedding FLOAT[] NOT NULL, business STRUCT(x INTEGER) NOT NULL, attributes MAP(VARCHAR, INTEGER) NOT NULL, label VARCHAR DEFAULT 'default')
+
+# NOT NULL constrains the root value, not children or list length.
+statement ok
+INSERT INTO lake.items VALUES (1, [], {'x': NULL}, map(), 'empty'), (2, [NULL], {'x': 1}, map(['k'], [NULL]), 'child-null')
+
+query III
+SELECT id, embedding, label FROM lake.items ORDER BY id
+----
+1	[]	empty
+2	[NULL]	child-null
+
+statement error
+INSERT INTO lake.items VALUES (3, NULL, {'x': 1}, map(), 'bad')
+----
+NOT NULL constraint failed: items.embedding
+
+statement error
+INSERT INTO lake.items VALUES (3, [1], NULL, map(), 'bad')
+----
+NOT NULL constraint failed: items.business
+
+statement error
+INSERT INTO lake.items VALUES (3, [1], {'x': 1}, NULL, 'bad')
+----
+NOT NULL constraint failed: items.attributes
+
+# Reordered input and defaults must preserve physical column identities.
+statement error
+INSERT INTO lake.items(embedding, id, business, attributes) VALUES (NULL, 3, {'x': 1}, map())
+----
+NOT NULL constraint failed: items.embedding
+
+statement error
+INSERT INTO lake.items VALUES (3, [3], {'x': 1}, map(), 'valid'), (4, NULL, {'x': 1}, map(), 'invalid')
+----
+NOT NULL constraint failed: items.embedding
+
+query I
+SELECT count(*) FROM lake.items
+----
+2
+
+statement error
+INSERT INTO lake.items SELECT i+10, CASE WHEN i=2 THEN NULL ELSE [i] END, {'x': i}, map(), 'selected' FROM range(10) AS source(i) WHERE i%2=0
+----
+NOT NULL constraint failed: items.embedding
+
+statement error
+UPDATE lake.items SET embedding=NULL WHERE id=1
+----
+NOT NULL constraint failed: items.embedding
+
+statement error
+UPDATE lake.items SET business=NULL WHERE id=1
+----
+NOT NULL constraint failed: items.business
+
+statement error
+UPDATE lake.items SET attributes=NULL WHERE id=1
+----
+NOT NULL constraint failed: items.attributes
+
+statement error
+MERGE INTO lake.items AS target USING (SELECT 1 AS id) AS source ON target.id=source.id WHEN MATCHED THEN UPDATE SET embedding=NULL
+----
+NOT NULL constraint failed: items.embedding
+
+statement error
+MERGE INTO lake.items AS target USING (SELECT 3 AS id) AS source ON target.id=source.id WHEN NOT MATCHED THEN INSERT VALUES (source.id, NULL, {'x': 1}, map(), 'bad')
+----
+NOT NULL constraint failed: items.embedding
+
+query III
+SELECT id, embedding, label FROM lake.items ORDER BY id
+----
+1	[]	empty
+2	[NULL]	child-null
+
+statement ok
+UPDATE lake.items SET embedding=[NULL] WHERE id=1
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/nested_null_${inline_limit}.ducklake' AS lake (DATA_PATH '__TEST_DIR__/nested_null_${inline_limit}', DATA_INLINING_ROW_LIMIT ${inline_limit})
+
+statement error
+INSERT INTO lake.items VALUES (3, NULL, {'x': 1}, map(), 'reopened')
+----
+NOT NULL constraint failed: items.embedding
+
+query II
+SELECT id, embedding FROM lake.items ORDER BY id
+----
+1	[NULL]
+2	[NULL]
+
+statement ok
+DETACH lake
+
+endloop
