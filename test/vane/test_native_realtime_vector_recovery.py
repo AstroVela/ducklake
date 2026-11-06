@@ -28,7 +28,23 @@ class RecoveryProbe:
         self.root = root
         self.metadata = root / "metadata.ducklake"
         self.command = [str(duckdb), "-unsigned", "-batch", "-bail", "-json", "-c"]
-        load = "LOAD ducklake;" if extension is None else f"LOAD {sql_string(extension)};"
+        if extension is None:
+            load = (
+                "LOAD ducklake;"
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_extensions() "
+                "WHERE extension_name='ducklake' AND loaded AND install_mode='STATICALLY_LINKED') "
+                "THEN true ELSE error('Static recovery mode requires statically linked DuckLake') END;"
+            )
+        else:
+            load = (
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_extensions() "
+                "WHERE extension_name='ducklake' AND loaded) THEN "
+                "error('--extension requires a CLI without preloaded DuckLake') ELSE true END;"
+                f"LOAD {sql_string(extension)};"
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_extensions() "
+                "WHERE extension_name='ducklake' AND loaded AND install_mode<>'STATICALLY_LINKED') "
+                "THEN true ELSE error('Requested DuckLake artifact was not selected') END;"
+            )
         self.prefix = (
             "SET autoinstall_known_extensions = false;"
             "SET autoload_known_extensions = false;"
@@ -156,7 +172,9 @@ def exercise(probe: RecoveryProbe) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", required=True, type=Path, help="native DuckDB CLI matching the extension")
-    parser.add_argument("--extension", type=Path, help="loadable artifact; omit for a statically linked DuckLake")
+    parser.add_argument(
+        "--extension", type=Path, help="loadable artifact; requires a matching CLI without preloaded DuckLake"
+    )
     args = parser.parse_args()
     if os.name != "posix":
         parser.error("this probe requires POSIX SIGKILL")
