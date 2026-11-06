@@ -5100,6 +5100,14 @@ WHERE table_id IN (%s);)",
 			}
 		}
 
+		// A table's scoped settings are needed until its final retained history entry is removed.
+		auto options = transaction.Query(StringUtil::Format(
+		    "DELETE FROM {METADATA_CATALOG}.ducklake_metadata WHERE scope = 'table' AND scope_id IN (%s);",
+		    deleted_table_ids));
+		if (options->HasError()) {
+			options->GetErrorObject().Throw("Failed to delete expired table configuration in DuckLake: ");
+		}
+
 		// Drop orphaned inlined tables
 		for (auto &inlined_table_name : inlined_tables_to_drop) {
 			auto result = transaction.Query(
