@@ -75,10 +75,11 @@ DuckLakeCompaction::DuckLakeCompaction(PhysicalPlan &physical_plan, const vector
                                        DuckLakeTableEntry &table, vector<DuckLakeCompactionFileEntry> source_files_p,
                                        string encryption_key_p, optional_idx partition_id,
                                        vector<Value> partition_values_p, optional_idx row_id_start,
-                                       PhysicalOperator &child, CompactionType type)
+                                       PhysicalOperator &child, CompactionType type, DataFileFormat file_format_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 0), table(table),
       source_files(std::move(source_files_p)), encryption_key(std::move(encryption_key_p)), partition_id(partition_id),
-      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type) {
+      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type),
+      file_format(file_format_p) {
 	children.push_back(child);
 }
 
@@ -126,7 +127,7 @@ SourceResultType DuckLakeCompaction::GetDataInternal(ExecutionContext &context, 
 // Sink
 //===--------------------------------------------------------------------===//
 unique_ptr<GlobalSinkState> DuckLakeCompaction::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<DuckLakeInsertGlobalState>(table);
+	return make_uniq<DuckLakeInsertGlobalState>(context, table, file_format);
 }
 
 SinkResultType DuckLakeCompaction::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
@@ -633,7 +634,8 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	                                         std::move(copy_options.info));
 
 	auto &fs = FileSystem::GetFileSystem(context);
-	copy->file_path = copy_options.filename_pattern.CreateFilename(fs, copy_options.file_path, "parquet", 0);
+	copy->file_path =
+	    copy_options.filename_pattern.CreateFilename(fs, copy_options.file_path, copy_options.file_extension, 0);
 	copy->use_tmp_file = copy_options.use_tmp_file;
 	copy->filename_pattern = std::move(copy_options.filename_pattern);
 	copy->file_extension = std::move(copy_options.file_extension);

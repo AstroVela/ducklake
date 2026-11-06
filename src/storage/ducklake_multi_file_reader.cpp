@@ -1,6 +1,9 @@
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
+#include "storage/ducklake_vortex.hpp"
+#include "duckdb/storage/table/column_segment.hpp"
+#include "duckdb/planner/table_filter_state.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete_filter.hpp"
 #include "common/ducklake_util.hpp"
@@ -433,6 +436,9 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &
 	if (reader) {
 		return reader;
 	}
+	if (DuckLakeVortex::IsVortex(file)) {
+		return DuckLakeVortex::CreateReader(context, file, read_info.table);
+	}
 	return MultiFileReader::CreateReader(context, gstate, file, file_idx, bind_data);
 }
 
@@ -444,7 +450,37 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &
 	if (reader) {
 		return reader;
 	}
+	if (DuckLakeVortex::IsVortex(file)) {
+		return DuckLakeVortex::CreateReader(context, file, read_info.table);
+	}
 	return MultiFileReader::CreateReader(context, file, options, file_options, interface);
+}
+
+void DuckLakeMultiFileReader::ApplyRowFilters(ClientContext &context, BaseFileReader &reader, idx_t row_offset,
+                                              DataChunk &chunk) {
+	if (!reader.filters && !reader.deletion_filter) {
+		return;
+	}
+	SelectionVector selection;
+	idx_t count = chunk.size();
+	if (reader.deletion_filter) {
+		count = reader.deletion_filter->Filter(row_offset, count, selection);
+	}
+	if (reader.filters) {
+		for (auto &entry : reader.filters->filters) {
+			if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+				continue;
+			}
+			auto &vector = chunk.data[entry.first];
+			UnifiedVectorFormat data;
+			vector.ToUnifiedFormat(chunk.size(), data);
+			auto state = TableFilterState::Initialize(context, *entry.second);
+			count = ColumnSegment::FilterSelection(selection, vector, data, *entry.second, *state, chunk.size(), count);
+		}
+	}
+	if (count != chunk.size()) {
+		chunk.Slice(selection, count);
+	}
 }
 
 vector<MultiFileColumnDefinition> MapColumns(ClientContext &context, MultiFileReaderData &reader_data,

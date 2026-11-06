@@ -1,0 +1,143 @@
+# name: test/sql/vortex/native_vortex_scan.test
+# description: native Vortex vectors preserve physical positions, deletes, fields and projections
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+SET threads = 1
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_scan.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_scan', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT NOT NULL, embedding FLOAT[] NOT NULL, category VARCHAR, payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'items')
+
+statement ok
+INSERT INTO lake.items SELECT i, [i::FLOAT, -0.25::FLOAT, 1.5::FLOAT], CASE WHEN i % 2 = 0 THEN 'A' ELSE 'B' END, 'row-' || i FROM range(65537) t(i)
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/vortex_scan/**/*.parquet')
+----
+0
+
+query I
+SELECT bool_and(ends_with(data_file, '.vortex') AND data_file_size_bytes > 0) FROM ducklake_list_files('lake', 'items')
+----
+true
+
+statement ok
+CREATE TABLE original_files AS SELECT data_file_id, path, file_format, record_count FROM __ducklake_metadata_lake.ducklake_data_file
+
+query III
+SELECT file_format, record_count, data_file_id >= 0 FROM original_files
+----
+vortex	65537	true
+
+statement ok
+SET threads = 4
+
+query IIII
+SELECT id, file_row_number, embedding[2], payload FROM lake.items WHERE id IN (0, 2048, 65535, 65536) ORDER BY id
+----
+0	0	-0.25	row-0
+2048	2048	-0.25	row-2048
+65535	65535	-0.25	row-65535
+65536	65536	-0.25	row-65536
+
+query I
+SELECT count(*) FROM lake.items WHERE id > 65530 AND category = 'A'
+----
+3
+
+statement ok
+PREPARE projected AS SELECT payload, embedding[3], file_row_number FROM lake.items WHERE id = $1
+
+query III
+EXECUTE projected(65536)
+----
+row-65536	1.5	65536
+
+query III
+EXECUTE projected(0)
+----
+row-0	1.5	0
+
+statement ok
+UPDATE lake.items SET embedding = [9, 8, 7], category = 'B', payload = 'updated' WHERE id = 12
+
+statement ok
+DELETE FROM lake.items WHERE id = 65536
+
+query III
+EXECUTE projected(65536)
+----
+
+query III
+EXECUTE projected(12)
+----
+updated	7	0
+
+query III
+SELECT id, embedding[1], payload FROM lake.items WHERE id IN (0, 12, 65535, 65536) ORDER BY id
+----
+0	0	row-0
+12	9	updated
+65535	65535	row-65535
+
+query II
+SELECT id, file_row_number FROM lake.items WHERE id IN (0, 65535) ORDER BY id
+----
+0	0
+65535	65535
+
+query I
+SELECT count(*) FROM original_files b JOIN __ducklake_metadata_lake.ducklake_data_file a USING(data_file_id, path, file_format, record_count)
+----
+1
+
+query I
+SELECT count(*) FROM lake.items WHERE id = 12 AND category = 'A'
+----
+0
+
+statement error
+INSERT INTO lake.items VALUES (70000, NULL, 'A', 'bad')
+----
+NOT NULL constraint failed
+
+statement ok
+ALTER TABLE lake.items RENAME payload TO "new label"
+
+query III
+SELECT "new label", embedding[1], file_row_number FROM lake.items WHERE id = 12
+----
+updated	9	0
+
+statement error
+ALTER TABLE lake.items ADD COLUMN added INTEGER
+----
+fixed schema
+
+statement error
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'parquet', table_name => 'items')
+----
+cannot change
+
+restart
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_scan.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_scan', DATA_INLINING_ROW_LIMIT 0)
+
+query III
+SELECT id, embedding[1], "new label" FROM lake.items WHERE id IN (12, 65535, 65536) ORDER BY id
+----
+12	9	updated
+65535	65535	row-65535

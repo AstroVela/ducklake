@@ -36,12 +36,14 @@ enum class InsertVirtualColumns { NONE, WRITE_ROW_ID, WRITE_SNAPSHOT_ID, WRITE_R
 
 class DuckLakeInsertGlobalState : public GlobalSinkState {
 public:
-	explicit DuckLakeInsertGlobalState(DuckLakeTableEntry &table);
+	DuckLakeInsertGlobalState(ClientContext &context, DuckLakeTableEntry &table,
+	                          DataFileFormat file_format = DataFileFormat::PARQUET);
 
 	DuckLakeTableEntry &table;
 	vector<DuckLakeDataFile> written_files;
 	idx_t total_insert_count;
 	case_insensitive_set_t not_null_fields;
+	DataFileFormat file_format;
 	//! Total rows flushed (used by flush_inlined_data)
 	idx_t rows_flushed = 0;
 };
@@ -54,7 +56,7 @@ class DuckLakeInsert : public PhysicalOperator {
 public:
 	//! INSERT INTO
 	DuckLakeInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types, DuckLakeTableEntry &table,
-	               optional_idx partition_id, string encryption_key);
+	               optional_idx partition_id, string encryption_key, DataFileFormat file_format);
 	//! CREATE TABLE AS
 	DuckLakeInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types, SchemaCatalogEntry &schema,
 	               unique_ptr<BoundCreateTableInfo> info, string table_uuid, string table_data_path,
@@ -74,6 +76,8 @@ public:
 	optional_idx partition_id;
 	//! The encryption key used for writing the Parquet files
 	string encryption_key;
+	//! The format selected by the planned physical writer.
+	DataFileFormat file_format = DataFileFormat::PARQUET;
 
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 	distributed::DistributedExtensionWritePlan distributed_write_plan;
@@ -138,7 +142,7 @@ public:
 	static PhysicalOperator &PlanCopyForInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                           DuckLakeCopyInput &copy_input, optional_ptr<PhysicalOperator> plan);
 	static PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
-	                                    DuckLakeTableEntry &table, string encryption_key);
+	                                    DuckLakeTableEntry &table, string encryption_key, DataFileFormat file_format);
 	static void AddWrittenFiles(DuckLakeInsertGlobalState &gstate, DataChunk &chunk, const string &encryption_key,
 	                            optional_idx partition_id, bool set_snapshot_id = false);
 

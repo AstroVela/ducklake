@@ -2,6 +2,7 @@
 #include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "storage/ducklake_insert.hpp"
+#include "storage/ducklake_vortex.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
@@ -44,9 +45,9 @@
 namespace duckdb {
 
 DuckLakeInsert::DuckLakeInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types, DuckLakeTableEntry &table,
-                               optional_idx partition_id, string encryption_key_p)
+                               optional_idx partition_id, string encryption_key_p, DataFileFormat file_format_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 1), table(&table), schema(nullptr),
-      partition_id(partition_id), encryption_key(std::move(encryption_key_p)) {
+      partition_id(partition_id), encryption_key(std::move(encryption_key_p)), file_format(file_format_p) {
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 	InitializeDistributedWritePlan();
 #endif
@@ -485,7 +486,7 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 			auto delete_files = BuildDuckLakeDistributedDeleteFiles(
 			    context, distributed_update_delete->distributed_source_files, distributed_write_plan.worker_bind_data,
 			    decoded.delete_files, "UPDATE");
-			DuckLakeInsertGlobalState insert_state(target_table);
+			DuckLakeInsertGlobalState insert_state(context, target_table);
 			AddDuckLakeDistributedDataFiles(context, insert_state, decoded.data_files, partition_id);
 			idx_t data_row_count = 0;
 			for (const auto &file : insert_state.written_files) {
@@ -553,7 +554,7 @@ idx_t DuckLakeInsert::FinalizeDistributedWrite(ClientContext &context,
 			target_partition_id = partition_id;
 		}
 
-		DuckLakeInsertGlobalState global_state(*target_table);
+		DuckLakeInsertGlobalState global_state(context, *target_table);
 		AddDuckLakeDistributedDataFiles(context, global_state, files, target_partition_id);
 		for (const auto &data_file : global_state.written_files) {
 			global_state.total_insert_count += data_file.row_count;
@@ -596,8 +597,13 @@ void DuckLakeInsert::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeli
 //===--------------------------------------------------------------------===//
 // States
 //===--------------------------------------------------------------------===//
-DuckLakeInsertGlobalState::DuckLakeInsertGlobalState(DuckLakeTableEntry &table)
-    : table(table), total_insert_count(0), not_null_fields(table.GetNotNullFields()) {
+DuckLakeInsertGlobalState::DuckLakeInsertGlobalState(ClientContext &context, DuckLakeTableEntry &table,
+                                                     DataFileFormat file_format_p)
+    : table(table), total_insert_count(0), not_null_fields(table.GetNotNullFields()), file_format(file_format_p) {
+	if (file_format == DataFileFormat::VORTEX && DuckLakeVortex::GetFormat(context, table) != DataFileFormat::VORTEX) {
+		throw TransactionException("DuckLake data file format changed since the write was planned; "
+		                           "prepare the statement again");
+	}
 }
 
 unique_ptr<GlobalSinkState> DuckLakeInsert::GetGlobalSinkState(ClientContext &context) const {
@@ -613,7 +619,7 @@ unique_ptr<GlobalSinkState> DuckLakeInsert::GetGlobalSinkState(ClientContext &co
 		// INSERT INTO
 		table_ptr = table;
 	}
-	return make_uniq<DuckLakeInsertGlobalState>(*table_ptr);
+	return make_uniq<DuckLakeInsertGlobalState>(context, *table_ptr, file_format);
 }
 
 //===--------------------------------------------------------------------===//
@@ -660,6 +666,7 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		DuckLakeDataFile data_file;
 		data_file.file_name = chunk.GetValue(0, r).GetValue<string>();
+		data_file.format = global_state.file_format;
 		data_file.row_count = chunk.GetValue(1, r).GetValue<idx_t>();
 		data_file.file_size_bytes = chunk.GetValue(2, r).GetValue<idx_t>();
 		data_file.footer_size = chunk.GetValue(3, r).GetValue<idx_t>();
@@ -1010,6 +1017,11 @@ static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInp
 }
 
 DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input) {
+	if (DuckLakeVortex::GetFormat(context, copy_input.catalog, copy_input.table_id) == DataFileFormat::VORTEX) {
+		auto result = DuckLakeVortex::CopyOptions(context, copy_input);
+		StripTrailingSeparator(FileSystem::GetFileSystem(context), result.file_path);
+		return result;
+	}
 	auto info = make_uniq<CopyInfo>();
 	auto &catalog = copy_input.catalog;
 	info->file_path = copy_input.data_path;
@@ -1243,7 +1255,8 @@ PhysicalOperator &DuckLakeInsert::PlanCopyForInsert(ClientContext &context, Phys
 }
 
 PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
-                                             DuckLakeTableEntry &table, string encryption_key) {
+                                             DuckLakeTableEntry &table, string encryption_key,
+                                             DataFileFormat file_format) {
 	auto partition_data = table.GetPartitionData();
 	optional_idx partition_id;
 	if (partition_data) {
@@ -1251,7 +1264,7 @@ PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPla
 	}
 	vector<LogicalType> return_types;
 	return_types.emplace_back(LogicalType::BIGINT);
-	return planner.Make<DuckLakeInsert>(return_types, table, partition_id, std::move(encryption_key));
+	return planner.Make<DuckLakeInsert>(return_types, table, partition_id, std::move(encryption_key), file_format);
 }
 
 string DuckLakeCatalog::GenerateEncryptionKey(ClientContext &context) const {
@@ -1401,7 +1414,9 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 	}
 	DuckLakeCopyInput copy_input(context, ducklake_table);
 	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
-	auto &insert = DuckLakeInsert::PlanInsert(context, planner, ducklake_table, std::move(copy_input.encryption_key));
+	auto &insert =
+	    DuckLakeInsert::PlanInsert(context, planner, ducklake_table, std::move(copy_input.encryption_key),
+	                               DataFileFormatFromString(physical_copy.Cast<PhysicalCopyToFile>().file_extension));
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 	DuckLakeCopyInput distributed_copy_input(context, ducklake_table);
 	auto &distributed_copy =

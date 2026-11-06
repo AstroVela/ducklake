@@ -23,10 +23,11 @@ def require_equal(actual: object, expected: object, description: str) -> None:
 
 
 class RecoveryProbe:
-    def __init__(self, duckdb: Path, extension: Path | None, root: Path) -> None:
+    def __init__(self, duckdb: Path, extension: Path | None, root: Path, file_format: str = "parquet") -> None:
         self.duckdb = duckdb
         self.root = root
         self.metadata = root / "metadata.ducklake"
+        self.file_format = file_format
         self.command = [str(duckdb), "-unsigned", "-batch", "-bail", "-json", "-c"]
         load = "LOAD ducklake;" if extension is None else f"LOAD {sql_string(extension)};"
         self.prefix = (
@@ -39,6 +40,16 @@ class RecoveryProbe:
             f"{load}"
             f"ATTACH {sql_string('ducklake:' + str(self.metadata))} AS lake "
             f"(DATA_PATH {sql_string(root / 'data')}, DATA_INLINING_ROW_LIMIT 100);"
+        )
+        if file_format == "vortex":
+            self.prefix += "LOAD vortex;"
+
+    def configure_format(self, table: str) -> str:
+        if self.file_format == "parquet":
+            return ""
+        return (
+            "CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', "
+            f"table_name => {sql_string(table)});"
         )
 
     def query(self, sql: str) -> list[dict]:
@@ -98,7 +109,9 @@ def exercise(probe: RecoveryProbe) -> None:
         "committed",
         "CREATE TABLE lake.items(id BIGINT, embedding FLOAT[], category VARCHAR, payload VARCHAR);"
         "CREATE TABLE lake.requests(request_id VARCHAR, payload_hash VARCHAR);"
-        "BEGIN;"
+        + probe.configure_format("items")
+        + probe.configure_format("requests")
+        + "BEGIN;"
         "INSERT INTO lake.items VALUES (1, [0, 0, 0], 'A', 'initial'), (2, [1, 0, 0], 'A', 'delete');"
         "INSERT INTO lake.requests VALUES ('r1', sha256('initial-batch'));"
         "COMMIT;",
@@ -125,6 +138,15 @@ def exercise(probe: RecoveryProbe) -> None:
 
     probe.query("BEGIN;" + mutation + "COMMIT;")
     probe.kill_after("materialized", "CALL ducklake_flush_inlined_data('lake');", require_wal=True)
+    require_equal(
+        probe.query(
+            "SELECT bool_and(ends_with(data_file, "
+            + sql_string("." + probe.file_format)
+            + ")) AS matches FROM ducklake_list_files('lake', 'items');"
+        ),
+        [{"matches": True}],
+        "materialization used the selected physical format",
+    )
     require_equal(probe.query(rank), [{"id": 3, "payload": "new", "distance": 1}], "materialized vector recovery")
     require_equal(
         probe.query("SELECT id, embedding[1] AS x, category, payload FROM lake.items ORDER BY id;"),
@@ -157,13 +179,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", required=True, type=Path, help="native DuckDB CLI matching the extension")
     parser.add_argument("--extension", type=Path, help="loadable artifact; omit for a statically linked DuckLake")
+    parser.add_argument("--file-format", choices=("parquet", "vortex"), default="parquet")
     args = parser.parse_args()
     if os.name != "posix":
         parser.error("this probe requires POSIX SIGKILL")
     duckdb = args.duckdb.resolve(strict=True)
     extension = args.extension.resolve(strict=True) if args.extension else None
     with tempfile.TemporaryDirectory(prefix="ducklake-native-vector-recovery-") as directory:
-        probe = RecoveryProbe(duckdb, extension, Path(directory))
+        probe = RecoveryProbe(duckdb, extension, Path(directory), args.file_format)
         exercise(probe)
         print("PASS: committed WAL recovery, uncommitted batch rollback, materialization recovery, historical vectors")
 
