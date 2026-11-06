@@ -38,7 +38,7 @@ RULE = {
     "precision": "Every case has its complete 95% interval and each consecutive 16-round block median inside [0.98,1.02].",
     "prefix": "Report the first 16 full-matrix rounds separately; compute all analyses after fixed sampling ends.",
     "order": AB.RULE["order"],
-    "sampling": "Run focus then full irrespective of focus precision; stop only for execution, semantic or integrity failure. No adaptive sampling or rerun-until-pass.",
+    "sampling": "Each requested profile runs its fixed count; stop only for execution, semantic or integrity failure. No adaptive sampling or rerun-until-pass. A parent protocol declares phase advancement.",
     "interpretation": "Per-case descriptive equivalence of this aggregate protocol; no runtime adoption, old-result reclassification or sustained-stability claim.",
 }
 COUNTERS = ("ru_utime", "ru_stime", "ru_minflt", "ru_majflt", "ru_nvcsw", "ru_nivcsw")
