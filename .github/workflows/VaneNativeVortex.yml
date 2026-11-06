@@ -172,6 +172,12 @@ jobs:
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_keyed_writes.py \
             --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --output-dir "$PWD/build/keyed-proof" \
             2>&1 | tee build/logs/vane-vortex-keyed-writes.log
+          python -I extension/test/vane/test_vane_vortex_functional_oracle.py \
+            2>&1 | tee build/logs/vane-vortex-functional-oracle.log
+          functional_cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_functional_matrix.py \
+            --cpus "$functional_cpu" --output-dir "$PWD/build/functional-matrix-proof" \
+            2>&1 | tee build/logs/vane-vortex-functional-matrix.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_automatic_flow.py \
             --driver "$PWD/build/runtime/ducklake_vortex_write_driver" --output-dir "$PWD/build/automatic-proof" \
             2>&1 | tee build/logs/vane-vortex-automatic-flow.log
@@ -301,6 +307,7 @@ jobs:
             build/expiry-lookup-proof
             build/expiry-lookup-resource-proof
             build/keyed-proof/report.json
+            build/functional-matrix-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log
             build/automatic-proof/report.json
