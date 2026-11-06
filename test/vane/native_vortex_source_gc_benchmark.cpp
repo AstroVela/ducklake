@@ -13,6 +13,12 @@
 #include <iostream>
 #include <thread>
 
+#ifdef DUCKLAKE_REFERENCE_DIAGNOSTIC
+#include "native_vortex_reference_trace.hpp"
+#include "storage/ducklake_metadata_manager.hpp"
+#include "storage/ducklake_transaction.hpp"
+#endif
+
 using namespace duckdb;
 using namespace duckdb::vortex_test;
 using namespace duckdb::vortex_detail;
@@ -244,6 +250,55 @@ void Prepare(Connection &writer, const string &root, idx_t history, const string
 	Write(root + "/input.json", json.Finish(value));
 }
 
+#ifdef DUCKLAKE_REFERENCE_DIAGNOSTIC
+void ReferenceOracle(DuckDB &database, Connection &writer, const string &root) {
+	State before(writer);
+	Connection owner(database);
+	auto &transaction = Index::Begin(owner, "lake");
+	auto known = Index::Query(
+	    transaction, "SELECT f.data_file_id,s.path||t.path||f.path FROM {METADATA_CATALOG}.ducklake_data_file f "
+	                 "JOIN {METADATA_CATALOG}.ducklake_table t ON f.table_id=t.table_id "
+	                 "JOIN {METADATA_CATALOG}.ducklake_schema s ON t.schema_id=s.schema_id "
+	                 "WHERE f.path_is_relative AND t.path_is_relative AND s.path_is_relative "
+	                 "ORDER BY f.data_file_id LIMIT 1");
+	auto row = known->Fetch();
+	Require(row && row->size() == 1, "Reference oracle requires a relative live source");
+	auto id = row->GetValue(0, 0).GetValue<idx_t>();
+	auto path = FileSystem::GetFileSystem(*writer.context)
+	                .FileSystem::CanonicalizePath(root + "/data/" + row->GetValue(1, 0).ToString());
+	Require(FileSystem::GetFileSystem(*writer.context).FileExists(path), "Reference oracle source is missing");
+	reference_trace::Start();
+	auto begin = Now();
+	auto &metadata = transaction.GetMetadataManager();
+	Require(metadata.HasFileReference(path, "/"), "Reference oracle lost a live source");
+	Index::Query(transaction, "UPDATE {METADATA_CATALOG}.ducklake_data_file SET path='./'||path WHERE data_file_id=" +
+	                              to_string(id));
+	Require(metadata.HasFileReference(path, "/"), "Reference oracle lost a canonical path alias");
+	Require(!metadata.HasFileReference(root + "/data/absent-reference-oracle", "/"),
+	        "Reference oracle accepted an absent source");
+	Index::Query(transaction,
+	             "ALTER TABLE {METADATA_CATALOG}.ducklake_data_file RENAME TO reference_oracle_hidden_file");
+	bool raised = false;
+	try {
+		metadata.HasFileReference(path, "/");
+	} catch (Exception &) {
+		raised = true;
+	}
+	auto end = Now();
+	reference_trace::Stop();
+	owner.Rollback();
+	Require(raised && reference_trace::Get().samples.size() == 4 && !reference_trace::Get().samples.back().completed,
+	        "Reference oracle swallowed the query error");
+	Require(State(writer) == before, "Rolled-back reference oracle changed the input");
+	ViewJSON json;
+	auto report = json.Object();
+	json.Text(report, "status", "passed");
+	json.Number(report, "cases", 4);
+	reference_trace::Add(json, report, begin, end, false);
+	Write(root + "/reference-oracle.json", json.Finish(report));
+}
+#endif
+
 void Measure(DuckDB &database, Connection &writer, const string &root, idx_t history, const string &task,
              const string &storage, bool diagnostic, const shared_ptr<Trace> &trace) {
 	CheckBusiness(writer, history);
@@ -282,9 +337,15 @@ void Measure(DuckDB &database, Connection &writer, const string &root, idx_t his
 		};
 	}
 	trace->active = diagnostic;
+#ifdef DUCKLAKE_REFERENCE_DIAGNOSTIC
+	reference_trace::Start();
+#endif
 	auto begin = Now();
 	auto collected = Source::Collect(*writer.context, "lake", 2, BYTE_BUDGET, observe, &profile);
 	auto end = Now();
+#ifdef DUCKLAKE_REFERENCE_DIAGNOSTIC
+	reference_trace::Stop();
+#endif
 	trace->active = false;
 	Require(trace->depth == 0, "Diagnostic SQL callback was not completed");
 	State after(writer);
@@ -367,6 +428,25 @@ void Measure(DuckDB &database, Connection &writer, const string &root, idx_t his
 		yyjson_mut_arr_append(checkpoints, checkpoint);
 	}
 	json.Add(report, "checkpoints", checkpoints);
+#ifdef DUCKLAKE_REFERENCE_DIAGNOSTIC
+	for (auto &call : reference_trace::Get().samples) {
+		Require(call.rows == before.data_files + before.delete_files && call.chunks,
+		        "Reference diagnostic did not scan the full native inventory");
+		idx_t matches = 0;
+		for (auto &statement : trace->queries) {
+			if (statement.depth || statement.begin >= call.end || statement.end <= call.begin) {
+				continue;
+			}
+			Require(statement.begin >= call.begin && statement.end <= call.end &&
+			            statement.sql.find("SELECT REPLACE(") == 0 && statement.connection == call.connection &&
+			            statement.end - statement.begin + call.fetch_ns + call.path_loop_ns <= call.end - call.begin,
+			        "Reference call does not contain its complete metadata SQL scope");
+			matches++;
+		}
+		Require(matches == 1, "Reference call must contain exactly one known-source SQL query");
+	}
+	reference_trace::Add(json, report, begin, end, true);
+#endif
 	Write(root + "/sample.json", json.Finish(report));
 }
 } // namespace
@@ -376,9 +456,13 @@ int main(int argc, char **argv) {
 		Require(argc == 7, "Usage: benchmark ROOT prepare|run HISTORY expire|files DIAGNOSTIC inline|file");
 		string root = argv[1], mode = argv[2], task = argv[4], storage = argv[6];
 		auto history = std::stoull(argv[3]);
-		Require((mode == "prepare" || mode == "run") && (task == "expire" || task == "files") && history >= 8 &&
-		            history <= 10000 && (string(argv[5]) == "0" || string(argv[5]) == "1") &&
-		            (storage == "inline" || storage == "file"),
+		bool valid_mode = mode == "prepare" || mode == "run";
+#ifdef DUCKLAKE_REFERENCE_DIAGNOSTIC
+		valid_mode = mode == "run" || mode == "reference-oracle";
+		Require(task == "files" && string(argv[5]) == "1", "Reference driver requires diagnostic file collection");
+#endif
+		Require(valid_mode && (task == "expire" || task == "files") && history >= 8 && history <= 10000 &&
+		            (string(argv[5]) == "0" || string(argv[5]) == "1") && (storage == "inline" || storage == "file"),
 		        "Invalid source GC benchmark parameters");
 		bool diagnostic = string(argv[5]) == "1";
 		DuckDB database(nullptr);
@@ -392,6 +476,20 @@ int main(int argc, char **argv) {
 		SQL(writer, "SET threads=2; LOAD parquet; ATTACH " +
 		                Value("ducklake:" + root + "/metadata.ducklake").ToSQLString() + " AS lake(DATA_PATH " +
 		                Value(root + "/data").ToSQLString() + ",DATA_INLINING_ROW_LIMIT 1000)");
+#ifdef DUCKLAKE_REFERENCE_DIAGNOSTIC
+		const string base_extensions = "'core_functions','file','httpfs','icu','json','parquet'";
+		Require(Scalar(writer, "SELECT count(*) FROM duckdb_extensions() WHERE install_mode='STATICALLY_LINKED' "
+		                       "AND extension_name IN (" +
+		                           base_extensions + ")") == 6 &&
+		            !Scalar(writer, "SELECT count(*) FROM duckdb_extensions() WHERE install_mode='STATICALLY_LINKED' "
+		                            "AND extension_name NOT IN (" +
+		                                base_extensions + ",'ducklake','vortex')"),
+		        "Reference driver requires the default base extension profile; use DISABLE_EXTENSIONS_FOR_TEST=1");
+		if (mode == "reference-oracle") {
+			ReferenceOracle(database, writer, root);
+			return 0;
+		}
+#endif
 		if (mode == "prepare") {
 			Prepare(writer, root, history, task, storage);
 		} else {

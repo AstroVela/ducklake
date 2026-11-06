@@ -1,0 +1,244 @@
+# Transaction-scoped source-reference diagnostics
+
+**Qualified replacement result on 2026-11-06: all 128 diagnostics, eight warmups
+and eight oracle cases pass; the large-input path loop averages 30.637 ms.**
+The [repeated metadata diagnostic](native-vortex-source-gc-metadata.md) found
+36.763 ms outside SQL in an 84.165-ms large-input collector mean. That envelope
+does not identify a C++ cause. This study measures the existing
+`HasFileReference` body, its result Fetch and its path-processing loop in a
+private diagnostic executable. No production reference algorithm, guards,
+transaction lifetime, COMMIT order, policy, budget or installed provider changes.
+
+## Protocol frozen before formal sampling
+
+Qualification amendment, also committed before replacement sampling: require
+the default six base extensions and only the two explicitly linked native
+providers. Set `DISABLE_EXTENSIONS_FOR_TEST=1` and explicit
+`DUCKDB_DUCKLAKE_DIRECTORY` / `DUCKDB_VORTEX_DIRECTORY` when configuring or
+reinstalling the runtime, as in
+[the CI workflow](../.github/workflows/VaneNativeVortex.yml). Reject cached
+provider source paths, extra/missing extension archives and an unexpected
+runtime static-extension set before collecting a diagnostic.
+
+An earlier 128-call collection passed native semantic/trace checks, but its
+subsequent base qualification found an unintended `tpch` extension. Its raw
+report is retained as **configuration-invalid**, excluded from qualified results:
+`/tmp/ducklake-vortex-reference-formal-20261106/report.json`, SHA-256
+`e1035583265780a5c1424d27658c7722b84011696ded32a4b0d0ef7e07f085ee`.
+The cause was the missing CI environment flag, not a timing/precision result.
+After fixing and checking that configuration, run one fixed replacement with
+the same two inputs, CPUs, threads, budgets, ordering and sixteen rounds below.
+Do not pool the two collections, change counts or use the rejected timings to
+select another criterion. Only the fixed replacement below contributes to the
+qualified result.
+
+Commit this protocol, private builder, patch, trace header and analyzer before
+the one formal run. Reuse CPUs **6,7,8,9,10,11**, DuckDB `SET threads=2`, existing
+SPFresh settings and inherited thread environment. Preserve exact-affinity,
+physical-core/NUMA validation, child inheritance and finally restoration.
+The set reserves no cores or memory and changes no governor or frequency.
+
+Use the original twelve-case sealed corpus, SHA-256
+`48855d42a60fd423caf0df052e46bb95050003e61f0ac83b570f03be3f5cf042`, and its original
+producer executable, SHA-256
+`168562ccee3d4cc66659d4bb8b18a5b891a33ecbdd2424f99736a22e0ec0f400`.
+Select the same two file-unlink inputs: 8-inline and 4,096-materialized.
+Run **16 rounds per case, four diagnostics per round: 128 measured calls and
+eight excluded diagnostic warmups**. Preserve ABBA/BAAB labels and the existing
+case order. Both labels run the same instrumented executable. Counts are fixed;
+there is no timing gate, adaptive increase, primary sample or A/A verdict.
+Stop for execution, semantic, trace or integrity failure.
+
+Before sampling, run one four-case semantic oracle per selected input, outside
+collector statistics: a live source is referenced, a `./` metadata-path alias
+still resolves to the same canonical source, an absent source is unreferenced,
+and a missing metadata table raises its original error. Roll back the oracle's
+metadata edits and verify unchanged logical state and retained data/index bytes.
+The ordinary-transaction deferral and full native GC checks still run on every
+collector invocation. Keep the two-object/64-MiB budget and keep-two/min-age-zero
+policy. Every call restores fresh single-link images at original canonical paths.
+
+The functional smoke uses two history-8 file inputs, two rounds, sixteen measured
+diagnostics, eight warmups and two four-case oracles. It has no timing claim.
+CI uses one explicit available CPU; formal uses 6–11 with unchanged threads.
+
+## Private build and provenance
+
+The [builder](../test/vane/build_vortex_reference_diagnostic.py) requires exact
+production metadata-source SHA-256
+`97a4b1cf7d1a00c7846a974fee77647649c8b18c7ae6ae254097b9d474ffe96e`.
+It applies [one test patch](../test/vane/reference_diagnostic.patch) to a private
+copy with zero fuzz, compiles it with the configured metadata flags and links
+that complete object explicitly before the unchanged extension archives.
+The benchmark uses its configured flags plus the diagnostic-only definition.
+Source/patch/header, compile commands, explicit object order, archive hashes and
+executable hash are retained. No provider source/archive is patched or replaced.
+The normal benchmark excludes the additional code at preprocessing time.
+
+The [runner](../test/vane/test_vane_vortex_source_gc_reference.py) verifies the
+original producer, sealed report/images, private build and input archive hashes.
+It writes a **separate consumer declaration**, retaining original producer/report
+hashes and canonical paths, to identify the instrumented executable consuming
+those images. The sealed input report is never rewritten. An artifact copy of
+the declaration is retained in the result directory. The unchanged #81 metadata
+sampler restores and validates each call, then this study validates and analyzes
+all added reference scopes. Native guards reject incomplete captures per call.
+
+This build has instrumentation and an explicit metadata object, unlike #81.
+No timing subtraction across those binaries or a claim of performance improvement
+is valid. A later runtime A/B still needs matched explicit-object placement and
+compiler flags on both sides. Builds/tests do not overlap formal sampling.
+
+## Declared accounting
+
+Record four reference-call scopes within the native collector, each matched to
+exactly one contained known-source SQL query on the same metadata connection.
+Scopes are disjoint; each deleted source is checked twice in its existing
+transactions. Verify false/completed results and full row coverage against the
+data-file plus delete-file inventory. Each unreferenced call has nonempty chunks
+and one terminal empty Fetch. Preserve exact query and checkpoint checks from #81.
+
+Fetch is timed per result chunk, including the terminal empty call. The **path
+loop** has one timer per nonempty chunk and includes Value/string extraction,
+`CanonicalizePath`, comparison and diagnostic overhead. No per-row clock is
+inserted. This does not separately measure pure canonicalization, CPU, I/O or
+scheduler wait. The call scope retains result/chunk destruction; bookkeeping
+outside the scope remains in the collector residual.
+
+Keep disjoint outer SQL categories unchanged and split their `outside_sql` into
+reference Fetch, reference path loop, reference remainder and outside-reference
+time. Reference remainder is its measured call duration minus its contained SQL,
+Fetch and path loop; outside-reference is the rest of the original collector
+residual. Require every part nonnegative and their sum equal to collector time.
+Do not add whole reference calls, SQL and native metadata phases together.
+
+Report counts, mean/p50/nearest-rank-p95/min/max, rows/chunks/Fetch calls, exact
+SQL/planning splits, label summaries and round means. Retain all tail samples.
+Signed covariance shares remain descriptive and coupled to total time, not causal
+variance explained; constant total variance remains undefined. Earlier primary
+and A/A decisions stay unchanged. R4 remains open, without a new 30-minute or
+sustained-write stability claim.
+
+## Reproduce
+
+```sh
+python -I test/vane/build_vortex_reference_diagnostic.py \
+    --build-dir /tmp/vane-native-vortex-runtime-20261030/build/python-release \
+    --output-dir /tmp/source-reference-build
+python -I test/vane/test_vane_vortex_source_gc_reference_stats.py
+python -I test/vane/test_vane_vortex_source_gc_reference.py \
+    --producer-driver /tmp/ducklake-vortex-expiry-ab-baseline-20261106 \
+    --build-report /tmp/source-reference-build/build.json \
+    --inputs /tmp/ducklake-vortex-source-gc-full-v3-20261106/report.json \
+    --cpus 6,7,8,9,10,11 --profile formal \
+    --output-dir /tmp/source-reference-formal
+```
+
+Build and output directories must be new. Preserve the build manifest, consumer
+declaration, raw native JSON/logs, shared sampling report and final analysis.
+
+## Qualified replacement result
+
+The initial protocol commit is `ad4555a1b7afc35332127dfd4d359af95f6e6753`;
+the qualification amendment is `3d7359a56d3761ea10f38894a5f6047e0c5c5c3a`.
+The corrected run completes in 210.387 seconds, including the two separate
+four-case oracles, restoration and validation. The approved build links exactly
+the six base extensions plus explicit DuckLake/Vortex; both producer/source
+identity and runtime extension-set checks pass before sampling. Its executable
+SHA-256 is `8629cfa0bbd85f41d6bc0062d23cc661e806791e4ff1f1fa7c5b761437d6b30f`.
+
+Every native invocation retains ordinary-transaction deferral, exact two-file
+progress, intent completion, current typed business rows/ANN and retained
+data/index checks. Both labels use this executable, with 32 measured calls per
+label per case. All reference intervals, same-connection SQL matches, full row
+coverage and timing partitions pass. No invalid-configuration or smoke samples
+enter the following statistics.
+
+Original 0–23 affinity narrows to 6–11 and restores to 0–23; the inherited child
+mask matches. All twelve recorded thread variables remain unset. Topology,
+tracked scripts, original producer/report, sealed images and the approved
+source/archive/consumer identities verify unchanged during sampling. The
+governor is `schedutil` at both boundaries; observed frequencies span roughly
+1.2–3.2 GHz. These boundary observations do not establish in-call frequency or
+exclusive hardware. No build or base-test process overlaps the replacement.
+
+| Input | Collector mean / p50 / p95 ms | Whole reference calls mean ms | Metadata phase mean ms | Unlink phase mean ms | Collector min / max ms |
+| --- | --- | ---: | ---: | ---: | --- |
+| 8 / inline | 38.554 / 38.203 / 41.187 | 9.534 | 35.818 | 2.339 | 34.935 / 48.848 |
+| 4,096 / materialized | 83.773 / 83.659 / 88.738 | 55.151 | 81.062 | 2.329 | 76.066 / 112.207 |
+
+Whole reference calls and native phases overlap the disjoint partition below;
+they are not additional parts. All raw nanosecond parts conserve each collector.
+
+| Disjoint partition | 8-inline mean / p95 ms | 4,096-file mean / p95 ms | Large mean fraction |
+| --- | --- | --- | ---: |
+| Known-source SQL, four calls | 9.006 / 10.148 | 23.228 / 24.469 | 27.73% |
+| Scheduled ownership SQL | 2.084 / 2.418 | 2.025 / 2.224 | 2.42% |
+| Index-reference SQL | 1.177 / 1.304 | 1.164 / 1.277 | 1.39% |
+| BEGIN SQL | 1.089 / 1.348 | 1.047 / 1.212 | 1.25% |
+| Outer COMMIT SQL | 6.922 / 7.367 | 6.882 / 7.208 | 8.22% |
+| Other SQL | 13.030 / 14.570 | 12.795 / 13.745 | 15.27% |
+| Reference Fetch | 0.026 / 0.035 | 0.774 / 0.867 | 0.92% |
+| Reference path loop | 0.034 / 0.043 | 30.637 / 33.139 | 36.57% |
+| Reference remainder | 0.468 / 0.552 | 0.512 / 0.562 | 0.61% |
+| Outside reference calls and SQL | 4.719 / 5.140 | 4.708 / 4.923 | 5.62% |
+
+Each small collector visits four rows across four chunks and eight Fetch calls.
+Each large collector visits **16,392 rows across twelve chunks and sixteen Fetch
+calls**: all 4,098 known data-file paths in each of four transactions. No native
+delete-file rows are present in these inputs. Each completed unreferenced scan
+includes one terminal empty Fetch.
+
+Within this run, large-input outside-SQL time totals 36.631 ms on average. The
+path loop contributes 30.637 ms, or **83.64% of that envelope**. This locates
+measured work in the combined extraction/normalization/comparison loop; it does
+not separately identify the cost of pure canonicalization or CPU versus waiting.
+It also does not subtract from, or causally explain, the earlier #81 build.
+
+All declared tail samples remain. The largest large-input sample is round 1,
+block 0, candidate: 112.207 ms collector, 30.481 ms known-source SQL and 47.980 ms
+path loop. The large loop's signed covariance share is 53.38%; the known-source
+SQL share is 28.31%. These sample-dependent, total-coupled quantities include that
+tail and are not independent variance explained. Raw reports retain every
+category, exact SQL/planning split, round mean and label summary. Baseline/
+candidate collector means are 38.252/38.855 ms and 83.449/84.096 ms; these labels
+are one binary, and no A/A precision or optimization verdict is inferred.
+
+Qualified analysis: `/tmp/ducklake-vortex-reference-formal-default-20261106/report.json`.
+SHA-256: `8086a7fb57a8576513990920d8d0bec15cba3521cde9feea979a42efb45df448`.
+Raw sampling: `/tmp/ducklake-vortex-reference-formal-default-20261106/sampling/report.json`.
+SHA-256: `626d5c7df96736b62d437f968abffac8591d23f6ebdf73fa8a1afa6e6808d6a3`.
+The separate corrected smoke passes sixteen diagnostics, eight warmups and
+eight oracle cases; it is functional evidence only.
+
+Local qualification passes 43 analysis checks, including the two new build
+profile/source-root rejection checks, and thirty installed package-profile
+checks with one optional skip. The full base launcher on the corrected,
+non-editable runtime passes **1,254 tests with fifteen optional skips**, using
+separate non-Ray/Ray processes. Formatting, workflow YAML, 55 relative links,
+copyleft and measured source/driver/corpus/archive identities pass. The original
+three archived wheels and five previous samplers remain unchanged. Only the
+new default-profile collection is qualified; the earlier failed base check and
+excluded timing report remain available as separate evidence.
+
+## Next bounded candidate
+
+Validate a **sound filename-mismatch prefilter** before the existing full
+canonical-path equality check. A final ordinary path component that differs
+from the target filename can exclude a match; potentially matching names and
+special endings such as `.`, `..` and trailing separators still need complete
+path checking. This targets measured loop work without caching references or
+discarding metadata history. No such candidate is adopted in this PR.
+
+First prove equivalence against the existing canonicalization/equality behavior
+with an independent path oracle, including relative/absolute paths, aliases,
+dot components, trailing separators, repeated filenames in different directories
+and historical references. Then predeclare a matched explicit-object A/B on the
+same restored corpus, with the existing quality and control requirements. Keep
+all per-transaction ownership/index/native-reference/intent checks and budgets;
+no cross-transaction reference cache, compatibility layer or error fallback.
+
+R4 remains open. This result is a diagnostic target, not a runtime speedup,
+reclassification of earlier A/A precision or a new 30-minute sustained-load
+qualification. Continuous-write backlog/resource stability and the existing
+actual-snapshot, recall and drain checks remain to be completed.
