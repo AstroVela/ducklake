@@ -3,6 +3,7 @@
 #include "native_vortex_automatic_fixture.hpp"
 #include "native_vortex_epoch_fixture.hpp"
 #include "native_vortex_lifecycle_fixture.hpp"
+#include "native_vortex_capacity_fixture.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -33,6 +34,10 @@ int RunWriteFixture(const string &root, const string &mode, weak_ptr<DatabaseIns
 		           "SELECT * FROM ducklake_initialize_vortex_writes('lake');"
 		           "SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn'," +
 		               Value(root + "/indexes").ToSQLString() + ",2)");
+	}
+	if (StringUtil::StartsWith(mode, "capacity-")) {
+		RunCapacityFixture(database, setup, root, mode);
+		return 0;
 	}
 	if (StringUtil::StartsWith(mode, "lifecycle-")) {
 		RunLifecycleFixture(database, setup, root, mode);

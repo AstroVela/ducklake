@@ -3,6 +3,7 @@
 use ducklake_vortex_query::admission;
 use ducklake_vortex_query::file_index;
 use ducklake_vortex_query::mixed;
+mod capacity;
 mod read_view;
 use ducklake_vortex_query::source;
 
@@ -231,16 +232,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "build" | "build-file-index" | "build-admitted-file-index",
             4
         ) | ("search", 6)
-            | ("serve", 4)
+            | ("serve" | "capacity-store", 4)
     ) {
         return Err(
-            "usage: probe build|build-file-index CAPTURE REFERENCE | search CAPTURE REFERENCE REQUEST OUTPUT | serve ROOT LIMITS_JSON".into(),
+            "usage: probe build|build-file-index CAPTURE REFERENCE | search CAPTURE REFERENCE REQUEST OUTPUT | serve ROOT LIMITS_JSON | capacity-store ROOT OUTPUT".into(),
         );
     }
     block_on(|handle| async move {
         let session = VortexSession::default().with_handle(handle);
         if command == "serve" {
             return read_view::serve(Path::new(&args[2]), &args[3], session).await;
+        }
+        if command == "capacity-store" {
+            let result = capacity::run(Path::new(&args[2])).await?;
+            fs::write(
+                &args[3],
+                serde_json::to_vec(&result).map_err(|e| vortex_err!("{e}"))?,
+            )?;
+            return Ok(());
         }
         let reference = Path::new(&args[3]);
         if !reference.is_absolute() {
