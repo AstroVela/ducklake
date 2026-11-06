@@ -626,6 +626,19 @@ static void ValidateWorkerColumns(const vector<MultiFileColumnDefinition> &colum
 	}
 }
 
+static void AddInlineMapEntries(vector<MultiFileColumnDefinition> &columns) {
+	for (auto &column : columns) {
+		AddInlineMapEntries(column.children);
+		if (column.type.id() == LogicalTypeId::MAP) {
+			// The reader mapper needs a structural node that has no field id.
+			// Keep it local to the reader, outside the transported field schema.
+			MultiFileColumnDefinition key_value("key_value", LogicalTypeId::INVALID);
+			key_value.children = std::move(column.children);
+			column.children.push_back(std::move(key_value));
+		}
+	}
+}
+
 static OpenFileInfo CreateOpenFileInfo(const DuckLakeFileListEntry &file_entry) {
 	OpenFileInfo result(file_entry.file.path);
 	auto extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
@@ -789,7 +802,9 @@ public:
 			data->data->Append(chunk);
 			auto source_file = file;
 			source_file.path = entry->inline_source_name;
-			return make_shared_ptr<DuckLakeInlinedDataReader>(source_file, std::move(data), entry->inline_columns);
+			auto columns = entry->inline_columns;
+			AddInlineMapEntries(columns);
+			return make_shared_ptr<DuckLakeInlinedDataReader>(source_file, std::move(data), std::move(columns));
 		}
 		return nullptr;
 	}
@@ -1442,7 +1457,7 @@ static void FreezeInlineSplits(const DuckLakeDistributedScanIdentity &identity, 
 		throw TransactionException("DuckLake inline schema is unavailable at the scan snapshot");
 	}
 	schema_table = entry->Cast<DuckLakeTableEntry>();
-	auto columns = DuckLakeMultiFileReader::ColumnsFromFieldData(schema_table.get().GetFieldData(), true);
+	auto columns = DuckLakeMultiFileReader::ColumnsFromFieldData(schema_table.get().GetFieldData());
 	MultiFileColumnDefinition row_id("_ducklake_internal_row_id", LogicalType::BIGINT);
 	row_id.identifier = Value::INTEGER(MultiFileReader::ROW_ID_FIELD_ID);
 	MultiFileColumnDefinition snapshot_id("_ducklake_internal_snapshot_id", LogicalType::BIGINT);

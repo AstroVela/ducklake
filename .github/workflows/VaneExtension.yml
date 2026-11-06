@@ -139,6 +139,7 @@ jobs:
         run: |
           set -euo pipefail
           . .venv-vane-wheel-ray-integration/bin/activate
+          python -I test/vane/test_vane_inline_map.py
           python -I test/vane/test_vane_wheel_ray_ducklake.py
 
       - name: Qualify realtime vectors through two Ray workers
