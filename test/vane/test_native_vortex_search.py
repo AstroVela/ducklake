@@ -354,9 +354,11 @@ def exercise_column_renames(proof, driver, scratch, checks):
         no_leases(scratch)
 
         native.sql(
-            "INSERT INTO lake.items VALUES(9002,[133.0625,4,2,0,1,8,7,16],'second-category','second-payload');"
+            "INSERT INTO lake.items(id,embedding,category,payload) "
+            "VALUES(9002,[133.0625,4,2,0,1,8,7,16],'second-category','second-payload');"
             'ALTER TABLE lake.items RENAME payload TO "body ""value""";'
-            "INSERT INTO lake.items VALUES(9003,[133.125,4,2,0,1,8,7,16],'quoted-category','renamed-value');"
+            'INSERT INTO lake.items(id,embedding,category,"body ""value""") '
+            "VALUES(9003,[133.125,4,2,0,1,8,7,16],'quoted-category','renamed-value');"
             'ALTER TABLE lake.items RENAME "body ""value""" TO payload;'
         )
         native.call("raw", "multiple-schemas")
