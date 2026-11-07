@@ -14,6 +14,10 @@
 #include "storage/ducklake_distributed_write.hpp"
 #endif
 
+#ifdef DUCKLAKE_ENABLE_VORTEX
+#include "storage/ducklake_vortex_read_view.hpp"
+#endif
+
 namespace duckdb {
 
 ScalarFunction DuckLakeMurmur3Function();
@@ -99,6 +103,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	DuckLakeCurrentSnapshotFunction current_snapshot;
 	loader.RegisterFunction(current_snapshot);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	RegisterDuckLakeVortexReadView(loader);
+#endif
 
 	DuckLakeLastCommittedSnapshotFunction last_committed;
 	loader.RegisterFunction(last_committed);

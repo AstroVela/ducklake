@@ -221,6 +221,11 @@ enum Command {
         capture: PathBuf,
         reference: PathBuf,
     },
+    OpenAdmitted {
+        view: String,
+        capture: PathBuf,
+        reference: PathBuf,
+    },
     SearchMixed {
         view: String,
         capture_digest: String,
@@ -333,7 +338,11 @@ impl Registry {
     }
 
     async fn execute(&mut self, command: Command) -> VortexResult<Value> {
-        let mixed = matches!(&command, Command::OpenMixed { .. });
+        let mixed = matches!(
+            &command,
+            Command::OpenMixed { .. } | Command::OpenAdmitted { .. }
+        );
+        let admitted = matches!(&command, Command::OpenAdmitted { .. });
         match command {
             Command::Open {
                 view,
@@ -341,6 +350,11 @@ impl Registry {
                 reference,
             }
             | Command::OpenMixed {
+                view,
+                capture,
+                reference,
+            }
+            | Command::OpenAdmitted {
                 view,
                 capture,
                 reference,
@@ -378,6 +392,7 @@ impl Registry {
                                     .saturating_sub(self.inline_bytes()),
                             },
                             self.session.clone(),
+                            admitted,
                         )
                         .await?,
                     )
