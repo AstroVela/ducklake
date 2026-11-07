@@ -11,12 +11,16 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
+use serde::Serialize;
+use vortex::array::ArrayRef;
+use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::FixedSizeListArray;
 use vortex::array::arrays::ListViewArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
+use vortex::array::arrays::VarBinViewArray;
 use vortex::array::arrays::list::ListArrayExt;
 use vortex::array::arrays::list::ListArraySlotsExt;
 use vortex::array::arrays::listview::list_from_list_view;
@@ -54,6 +58,28 @@ pub struct Capture {
     pub dimension: u32,
     pub files: Vec<SourceFile>,
     pub visible: Vec<RowAddress>,
+    #[serde(default)]
+    pub business_fields: Option<BusinessFields>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusinessFields {
+    pub id: u32,
+    pub category: u32,
+    pub payload: u32,
+}
+
+#[derive(Clone, Serialize)]
+pub struct BusinessRow {
+    pub id: Option<i64>,
+    pub embedding: Vec<f32>,
+    pub category: Option<String>,
+    pub payload: Option<String>,
+}
+
+fn physical_name(field: u32) -> String {
+    format!("__ducklake_vortex_v1_field_{field}")
 }
 
 pub struct PhysicalSource {
@@ -75,6 +101,14 @@ struct VectorAdapter {
 
 impl PhysicalSource {
     pub async fn open(bytes: &[u8], session: VortexSession) -> VortexResult<Self> {
+        Self::open_with_budget(bytes, session, MAX_SOURCE_BYTES).await
+    }
+
+    pub async fn open_with_budget(
+        bytes: &[u8],
+        session: VortexSession,
+        budget: usize,
+    ) -> VortexResult<Self> {
         let capture: Capture =
             serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
         if capture.format_version != 1
@@ -85,7 +119,7 @@ impl PhysicalSource {
             vortex_bail!("Invalid DuckLake capture or vector dimension");
         }
         let digest = file_version(bytes);
-        let field = format!("__ducklake_vortex_v1_field_{}", capture.field_id);
+        let field = physical_name(capture.field_id);
         let snapshot = Snapshot {
             dataset_id: format!("ducklake-table:{}", capture.table_uuid),
             version: format!("ducklake-snapshot:{}:{digest}", capture.snapshot_id),
@@ -104,7 +138,7 @@ impl PhysicalSource {
             }
         }
         let mut files = BTreeMap::new();
-        let mut remaining = MAX_SOURCE_BYTES;
+        let mut remaining = budget.min(MAX_SOURCE_BYTES);
         for file in &snapshot.files {
             let metadata = fs::metadata(&file.uri)?;
             if !metadata.is_file() || metadata.len() > remaining as u64 {
@@ -129,6 +163,33 @@ impl PhysicalSource {
                 if matches!(element.as_ref(), DType::Primitive(PType::F32, _)))
             {
                 vortex_bail!("DuckLake indexed field requires FLOAT[]");
+            }
+            if let Some(business) = &capture.business_fields {
+                if [
+                    capture.field_id,
+                    business.id,
+                    business.category,
+                    business.payload,
+                ]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                    != 4
+                {
+                    vortex_bail!("Business projection requires distinct field IDs");
+                }
+                if !matches!(
+                    fields.field(physical_name(business.id)),
+                    Some(DType::Primitive(PType::I64, _))
+                ) || !matches!(
+                    fields.field(physical_name(business.category)),
+                    Some(DType::Utf8(_))
+                ) || !matches!(
+                    fields.field(physical_name(business.payload)),
+                    Some(DType::Utf8(_))
+                ) {
+                    vortex_bail!("Business projection schema does not match the capture");
+                }
             }
             let mut physical_snapshot = snapshot.clone();
             physical_snapshot.schema_fingerprint = schema_fingerprint(&dtype)?;
@@ -159,6 +220,69 @@ impl PhysicalSource {
         Ok(())
     }
 
+    pub fn pinned_bytes(&self) -> usize {
+        self.files
+            .values()
+            .map(|source| source.pinned_bytes())
+            .sum()
+    }
+
+    pub async fn take_business(&self, rows: &[RowAddress]) -> VortexResult<Vec<BusinessRow>> {
+        let business = self
+            .capture
+            .business_fields
+            .as_ref()
+            .ok_or_else(|| vortex_err!("Retained views require captured business field IDs"))?;
+        let fields = [
+            self.field.clone(),
+            physical_name(business.id),
+            physical_name(business.category),
+            physical_name(business.payload),
+        ];
+        let mut groups: BTreeMap<u64, Vec<(usize, RowAddress)>> = BTreeMap::new();
+        for (rank, row) in rows.iter().enumerate() {
+            self.snapshot.validate_row(*row)?;
+            groups.entry(row.file_id).or_default().push((rank, *row));
+        }
+        let mut result = vec![None; rows.len()];
+        let dimension = self.capture.dimension as usize;
+        let mut context = self.session.create_execution_ctx();
+        for (id, group) in groups {
+            let selected: Vec<_> = group.iter().map(|(_, row)| *row).collect();
+            let source = self
+                .files
+                .get(&id)
+                .ok_or_else(|| vortex_err!("Unknown physical file ID"))?;
+            let taken = source.take(&selected, &fields).await?;
+            if taken.rows != selected {
+                vortex_bail!("Business take changed row order");
+            }
+            let vectors = self.adapter().vectors(&taken)?;
+            let data = taken.data.execute::<StructArray>(&mut context)?;
+            let ids = data
+                .unmasked_field(1)
+                .clone()
+                .execute::<PrimitiveArray>(&mut context)?;
+            let validity = ids.validity()?.execute_mask(ids.len(), &mut context)?;
+            let categories = strings(data.unmasked_field(2).clone(), &mut context)?;
+            let payloads = strings(data.unmasked_field(3).clone(), &mut context)?;
+            for (offset, (rank, _)) in group.iter().enumerate() {
+                result[*rank] = Some(BusinessRow {
+                    id: validity
+                        .value(offset)
+                        .then(|| ids.as_slice::<i64>()[offset]),
+                    embedding: vectors[offset * dimension..(offset + 1) * dimension].to_vec(),
+                    category: categories[offset].clone(),
+                    payload: payloads[offset].clone(),
+                });
+            }
+        }
+        result
+            .into_iter()
+            .map(|row| row.ok_or_else(|| vortex_err!("Missing business row")))
+            .collect()
+    }
+
     fn adapter(&self) -> VectorAdapter {
         VectorAdapter {
             dimension: self.capture.dimension,
@@ -167,6 +291,26 @@ impl PhysicalSource {
             session: self.session.clone(),
         }
     }
+}
+
+fn strings(array: ArrayRef, context: &mut ExecutionCtx) -> VortexResult<Vec<Option<String>>> {
+    let values = array.execute::<VarBinViewArray>(context)?;
+    let validity = values.validity()?.execute_mask(values.len(), context)?;
+    validity
+        .iter()
+        .enumerate()
+        .map(|(index, valid)| {
+            if valid {
+                Ok(Some(
+                    std::str::from_utf8(&values.bytes_at(index))
+                        .map_err(|error| vortex_err!("Invalid business UTF-8: {error}"))?
+                        .to_owned(),
+                ))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect()
 }
 
 impl VectorAdapter {

@@ -1,5 +1,6 @@
 //! Test-only DuckLake bridge to the existing Vortex SPFresh provider.
 
+mod read_view;
 mod source;
 
 use std::collections::BTreeSet;
@@ -27,6 +28,7 @@ use vortex::error::vortex_err;
 use vortex::io::runtime::single::block_on;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
+use vortex_index::Index;
 use vortex_index::IndexBuildRequest;
 use vortex_index::IndexBuilder;
 use vortex_index::IndexMetadata;
@@ -169,13 +171,7 @@ async fn build(
     Ok(())
 }
 
-async fn search(
-    source: Arc<PhysicalSource>,
-    reference: &Path,
-    request: &Path,
-    output: &Path,
-    session: VortexSession,
-) -> VortexResult<()> {
+fn reference_for(source: &PhysicalSource, reference: &Path) -> VortexResult<Reference> {
     let descriptor: Reference =
         serde_json::from_slice(&fs::read(reference)?).map_err(|error| vortex_err!("{error}"))?;
     if descriptor.format_version != 1
@@ -184,8 +180,15 @@ async fn search(
     {
         vortex_bail!("DuckLake snapshot does not match the index capture");
     }
-    let request: Request =
-        serde_json::from_slice(&fs::read(request)?).map_err(|error| vortex_err!("{error}"))?;
+    Ok(descriptor)
+}
+
+async fn query_hits(
+    source: &PhysicalSource,
+    index: &dyn Index,
+    request: Request,
+    session: VortexSession,
+) -> VortexResult<Vec<Hit>> {
     let k = NonZeroUsize::new(request.k).ok_or_else(|| vortex_err!("k must be nonzero"))?;
     let visible: BTreeSet<_> = source.capture.visible.iter().copied().collect();
     let excluded = source
@@ -202,17 +205,6 @@ async fn search(
         .collect();
     let allow = request.allow.map(|rows| rows.into_iter().collect());
     let filter = RowFilter::try_new(source.snapshot().clone(), allow, excluded)?;
-    let root = reference
-        .parent()
-        .ok_or_else(|| vortex_err!("Reference parent required"))?;
-    let scratch = tempfile::Builder::new()
-        .prefix(".scratch-")
-        .tempdir_in(root)?;
-    let (store, metadata) =
-        LocalIndexStore::open(root, &descriptor.generation, source.snapshot(), LIMITS)?;
-    let index = provider(scratch.path())?
-        .open(&metadata, Arc::new(store))
-        .await?;
     let vector = index
         .as_vector()
         .ok_or_else(|| vortex_err!("Vector capability required"))?;
@@ -273,6 +265,31 @@ async fn search(
             embedding: values[rank * dimension..(rank + 1) * dimension].to_vec(),
         })
         .collect();
+    Ok(result)
+}
+
+async fn search(
+    source: Arc<PhysicalSource>,
+    reference: &Path,
+    request: &Path,
+    output: &Path,
+    session: VortexSession,
+) -> VortexResult<()> {
+    let descriptor = reference_for(&source, reference)?;
+    let request: Request =
+        serde_json::from_slice(&fs::read(request)?).map_err(|error| vortex_err!("{error}"))?;
+    let root = reference
+        .parent()
+        .ok_or_else(|| vortex_err!("Reference parent required"))?;
+    let scratch = tempfile::Builder::new()
+        .prefix(".scratch-")
+        .tempdir_in(root)?;
+    let (store, metadata) =
+        LocalIndexStore::open(root, &descriptor.generation, source.snapshot(), LIMITS)?;
+    let index = provider(scratch.path())?
+        .open(&metadata, Arc::new(store))
+        .await?;
+    let result = query_hits(&source, index.as_ref(), request, session).await?;
     fs::write(
         output,
         serde_json::to_vec(&result).map_err(|error| vortex_err!("{error}"))?,
@@ -283,13 +300,19 @@ async fn search(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().collect();
     let command = args.get(1).cloned().unwrap_or_default();
-    if !matches!((command.as_str(), args.len()), ("build", 4) | ("search", 6)) {
+    if !matches!(
+        (command.as_str(), args.len()),
+        ("build", 4) | ("search", 6) | ("serve", 4)
+    ) {
         return Err(
-            "usage: probe build CAPTURE REFERENCE | search CAPTURE REFERENCE REQUEST OUTPUT".into(),
+            "usage: probe build CAPTURE REFERENCE | search CAPTURE REFERENCE REQUEST OUTPUT | serve ROOT LIMITS_JSON".into(),
         );
     }
     block_on(|handle| async move {
         let session = VortexSession::default().with_handle(handle);
+        if command == "serve" {
+            return read_view::serve(Path::new(&args[2]), &args[3], session).await;
+        }
         let source = Arc::new(PhysicalSource::open(&fs::read(&args[2])?, session.clone()).await?);
         let reference = Path::new(&args[3]);
         if !reference.is_absolute() {

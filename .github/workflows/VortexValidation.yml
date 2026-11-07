@@ -181,6 +181,12 @@ jobs:
             --duckdb build/index-shell/duckdb \
             --probe build/index-cargo/ci/ducklake-vortex-index-probe \
             --output-dir build/index-logs/proof
+      - name: Validate retained read views and resource release
+        run: |
+          python3 -I test/vane/test_native_vortex_read_view.py \
+            --duckdb build/index-shell/duckdb \
+            --probe build/index-cargo/ci/ducklake-vortex-index-probe \
+            --output-dir build/index-logs/read-view
       - name: Upload index validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
