@@ -113,7 +113,7 @@ records both driver hashes and the explicit baseline revision. CI runs the
 optimized projection gates and uploads raw samples; a baseline is optional
 and is never inferred from a failed command.
 
-## Local results
+## Earlier local results (2026-10-29)
 
 The local comparison used the preceding implementation at
 `c65f90cabfa5922b64f649ffe537b8c0bd31d4d7`, the same qualified SPFresh SDK and
@@ -150,7 +150,7 @@ in physical storage reads. Warm write-call and kernel-write accounting remained
 unchanged at about 9.25 and 9.29 million bytes respectively. Eliminating whole-file
 ownership and the JSON/hex transport is separate work.
 
-The expanded SQL proof passed nine fixture recall checks at 1.0, 51 native
+The earlier expanded SQL proof passed nine fixture recall checks at 1.0, 51 native
 requests with 13 expected rejections, and actual reclamation of four B/F files.
 It includes the visibility-to-T-read commit/flush window and six interruption
 checkpoints. All six existing process proofs, ON/default-OFF native gates,
@@ -169,3 +169,29 @@ now explicitly excludes `build`; this fix is also pushed to #33 at
 `c65f90cabfa5922b64f649ffe537b8c0bd31d4d7`. Cargo metadata reproduces the failure
 before the exclusion and succeeds after it. Local ON CMake configuration now
 uses a wrapper inside the repository build directory to exercise that layout.
+
+## Field-mapping validation (2026-11-07)
+
+The follow-up integrates #33 at `f57546b7` and resolves inline projections by
+field ID under each source's historical schema. The new rename fixture uses
+one unchanged B generation and three T sources: ten recall checks pass at 1.0
+across swapped names, quoted historical names, prepared queries and a rename
+committed after visibility selection. The original #34 implementation fails
+the swapped-name predicate with recall 0 and rejects the quoted-name source
+with a Binder error. These are deterministic correctness controls.
+
+The complete SQL process proof retains its original lifecycle, Float32 and
+managed-path checks and now uses ten explicit index builds including the rename
+fixture. All six process proofs pass, as do the sixteen Vortex SQL cases with
+709 assertions inherited from the latest parent. The follow-up cost check uses
+three repetitions for each implementation, scale and predicate: all 24 queries
+match the same-view oracle and the baseline's ranked results with recall 1.0,
+and retain the expected logical projection counts. This limited run validates
+correctness and counters; it does not update the earlier performance results.
+
+Current DuckLake C++ and native drivers were rebuilt in ON/default-OFF modes
+using qualified DuckDB v1.5.5 engine objects. The unchanged Rust sources, query
+archive, probe and codec/SDK inputs were hash-checked before reuse. Transaction
+guards, source/T/business budgets, score tolerances and recall thresholds remain
+unchanged. Clean engine builds and stable-load performance remain separate
+validation scopes; CI was not queried or operated for this follow-up.
