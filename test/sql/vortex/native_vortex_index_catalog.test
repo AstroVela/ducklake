@@ -48,7 +48,7 @@ No published Vortex index
 statement error
 SELECT * FROM ducklake_publish_vortex_index('lake','main','items','knn','/missing-vortex-reference.json',0)
 ----
-paths must be canonical
+Cannot resolve local Vortex index path
 
 statement error
 SELECT * FROM ducklake_vortex_index_view('lake','main','items','',67108864,100000)
