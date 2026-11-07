@@ -119,8 +119,8 @@ public:
 			ReleasePause release {pause};
 			pause.Wait();
 			Connection publisher(database);
-			DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "knn", args.at(2),
-			                             std::stoull(args.at(3)), *publisher.context);
+			DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "knn", args.at(2), std::stoull(args.at(3)),
+			                             *publisher.context);
 			SQL(writer, ReadText(args.at(4)));
 			FileSystem::GetFileSystem(*writer.context).RemoveDirectory(args.at(5));
 			pause.Release();
