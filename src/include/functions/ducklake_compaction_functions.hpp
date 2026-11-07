@@ -51,9 +51,11 @@ public:
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		auto file_format = DataFileFormatFromString(children[0]->Cast<LogicalCopyToFile>().file_extension);
 		auto &child = planner.CreatePlan(*children[0]);
 		return planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
-		                                        partition_id, std::move(partition_values), row_id_start, child, type);
+		                                        partition_id, std::move(partition_values), row_id_start, child, type,
+		                                        file_format);
 	}
 
 	string GetName() const override {

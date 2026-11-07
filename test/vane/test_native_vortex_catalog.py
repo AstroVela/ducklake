@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -110,6 +111,7 @@ def artifact(path: Path) -> Path:
 def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) -> dict:
     native.call("raw", "bootstrap")
     native.call("capture", "no-init", "knn", expected="catalog is not initialized")
+    native.call("cancel-init")
     native.call("init")
     native.call("init", expected="already exists")
     native.call("capture", "no-index", "knn", expected="No published Vortex index")
@@ -127,6 +129,22 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
     require(
         published["revision"] == 1 and published["generation"] == generations["a"],
         "initial publication identity changed",
+    )
+    native.call("cancel-publish", "knn", refs["b"], 1)
+    cancelled = native.call("head", "knn")
+    require(
+        cancelled["revision"] == 1 and cancelled["reference"] == descriptors["a"],
+        "publication cancelled before its metadata transaction changed the ready index",
+    )
+    for stage in ("after_validation", "before_commit"):
+        native.call("cancel-stage", "knn", refs["b"], 1, stage)
+        cancelled = native.call("head", "knn")
+        require(
+            cancelled["revision"] == 1 and cancelled["reference"] == descriptors["a"],
+            f"publication cancelled at {stage} changed the ready index",
+        )
+    checks.append(
+        "caller cancellation before metadata transaction, after validation and before commit preserves ready identity; initialization cancellation releases its owner"
     )
     refs["a"].unlink()
     native.call("capture", "initial", "knn")
@@ -346,11 +364,153 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
         "index_builds": 7,
         "final_revision": 7,
         "crash_boundaries": 2,
+        "cancelled_catalog_requests": 4,
         "reclaimed_source_files": len(old_files),
         "fixture_recalls": recalls,
         "recall_threshold": 0.8,
         "winner_generation": recovered["reference"]["generation"]["generation"],
     }
+
+
+def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
+    root.mkdir()
+    cases = []
+    for mode in ("canonical", "dot", "relative", "symlink"):
+        case = root / mode
+        case.mkdir()
+        # Exercise a managed artifact directory whose generation parent is outside it.
+        data = case / "generation" / "artifacts" if mode == "canonical" else case / "data"
+        data.mkdir(parents=True)
+        data_path = str(data)
+        if mode == "dot":
+            data_path = str(case) + "/./data"
+        elif mode == "relative":
+            data_path = os.path.relpath(data, Path.cwd())
+        elif mode == "symlink":
+            (case / "data-link").symlink_to(data, target_is_directory=True)
+            data_path = str(case / "data-link")
+        prefix = (
+            "SET autoinstall_known_extensions=false;SET autoload_known_extensions=false;"
+            "LOAD ducklake;LOAD parquet;LOAD vortex;SET threads=1;ATTACH "
+            + BASE.quote("ducklake:" + str(case / "metadata.ducklake"))
+            + " AS lake(DATA_PATH "
+            + BASE.quote(data_path)
+            + ",DATA_INLINING_ROW_LIMIT 0);"
+        )
+
+        def sql(statement: str, expected: str | None = None):
+            return proof.run([str(proof.duckdb), "-batch", "-bail", "-json", "-c", prefix + statement], expected)
+
+        sql(
+            "CREATE TABLE lake.items(id BIGINT NOT NULL,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
+            "INSERT INTO lake.items SELECT i,[i::FLOAT,4,2,0,1,8,7,16],'A','row-'||i FROM range(4096)t(i);"
+            "SELECT * FROM ducklake_initialize_vortex_indexes('lake');"
+        )
+        admission = json.loads(
+            sql("SELECT admission FROM ducklake_vortex_read_view('lake','main','items',8,67108864,100000)")
+        )[0]["admission"]
+        capture = case / "capture.json"
+        capture.write_text(admission)
+        # A sibling with the same prefix is outside the managed directory.
+        index = data.parent / (data.name + "-index")
+        index.mkdir()
+        reference = index / "reference.json"
+        proof.run([str(proof.probe), "build-admitted-file-index", str(capture), str(reference)])
+
+        def publish(path: Path, revision: int, expected: str | None = None):
+            return sql(
+                "SELECT * FROM ducklake_publish_vortex_index('lake','main','items','knn',"
+                + BASE.quote(path)
+                + f",{revision})",
+                expected,
+            )
+
+        published = json.loads(publish(reference, 0))[0]
+        require(int(published["revision"]) == 1, f"valid {mode} DATA_PATH could not publish")
+        inside = data / "index"
+        shutil.copytree(index, inside)
+        publish(inside / "reference.json", 1, "outside the managed data path")
+        rejected = ["inside managed data path"]
+
+        def relocated_reference(directory: Path, path: Path) -> Path:
+            source = index / generation(reference)
+            shutil.copytree(source / "artifacts", directory / "artifacts", dirs_exist_ok=True)
+            manifest = json.loads((source / "manifest.json").read_text())
+            manifest["generation"] = directory.name
+            manifest_path = directory / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, separators=(",", ":")))
+            descriptor = json.loads(reference.read_text())
+            descriptor["generation"]["generation"] = directory.name
+            descriptor["generation"]["manifest"].update(
+                size=manifest_path.stat().st_size, checksum=BASE.digest(manifest_path)
+            )
+            path.write_text(json.dumps(descriptor, separators=(",", ":")))
+            return path
+
+        # An external reference must not admit a generation inside the managed root.
+        nested_generation = relocated_reference(data, data.parent / "managed-generation.reference.json")
+        publish(nested_generation, 1, "outside the managed data path")
+        rejected.append("managed generation with external reference")
+        if mode == "canonical":
+            # Here the generation directory is outside DATA_PATH, but its artifacts are inside.
+            nested_artifacts = relocated_reference(data.parent, case / "managed-artifacts.reference.json")
+            publish(nested_artifacts, 1, "outside the managed data path")
+            rejected.append("managed artifacts with external generation")
+            link = case / "reference-link.json"
+            link.symlink_to(reference)
+            publish(link, 1, "must be canonical")
+            rejected.append("reference symlink")
+            protected = artifact(reference)
+            original = protected.read_bytes()
+            target = case / "artifact-copy"
+            target.write_bytes(original)
+            protected.unlink()
+            protected.symlink_to(target)
+            try:
+                publish(reference, 1, "must be canonical")
+            finally:
+                protected.unlink()
+                protected.write_bytes(original)
+            rejected.append("artifact symlink")
+
+        unchanged = json.loads(
+            sql("SELECT admission FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)")
+        )[0]["admission"]
+        named_before = json.loads(unchanged)["index"]
+        require(
+            named_before["revision"] == 1
+            and named_before["root"] == str(index)
+            and named_before["reference"] == json.loads(reference.read_text()),
+            f"path rejections changed the ready identity for {mode}",
+        )
+
+        # An ancestor reference root is valid when its actual generation is a sibling of DATA_PATH.
+        shutil.copytree(index / generation(reference), data.parent / generation(reference))
+        ancestor_reference = data.parent / "ancestor.reference.json"
+        ancestor_reference.write_text(reference.read_text())
+        ancestor = json.loads(publish(ancestor_reference, 1))[0]
+        require(int(ancestor["revision"]) == 2, f"valid ancestor index root was rejected for {mode}")
+        acquired = json.loads(
+            sql(
+                "SELECT visible_rows,admission FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)"
+            )
+        )[0]
+        named = json.loads(acquired["admission"])["index"]
+        require(
+            int(acquired["visible_rows"]) == 4096
+            and named["revision"] == 2
+            and named["root"] == str(data.parent)
+            and named["reference"]["generation"]["generation"] == generation(reference),
+            f"path validation changed the ready index for {mode}",
+        )
+        cases.append(
+            {"data_path": mode, "visible_rows": 4096, "revision": 2, "ancestor_root": True, "rejections": rejected}
+        )
+    checks.append(
+        "canonical/dot/relative/symlink managed paths and valid ancestor roots publish and acquire; actual generation/artifact containment and strict reference/artifact paths remain enforced"
+    )
+    return cases
 
 
 def main():
@@ -374,6 +534,9 @@ def main():
     try:
         native = Native(args.driver.resolve(strict=True), root / "native")
         report.update(exercise(proof, native, workers, checks))
+        report["data_path_regressions"] = exercise_data_paths(proof, root / "data-paths", checks)
+        report["catalog_index_builds"] = report["index_builds"]
+        report["index_builds"] += len(report["data_path_regressions"])
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

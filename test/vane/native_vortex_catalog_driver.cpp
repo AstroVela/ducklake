@@ -2,6 +2,10 @@
 #include "native_vortex_fixture.hpp"
 #include "common/ducklake_vortex_json.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection_manager.hpp"
+#include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/transaction/transaction_context.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_table_entry.hpp"
@@ -12,6 +16,7 @@
 
 #include <iostream>
 #include <sstream>
+#include <thread>
 
 using namespace duckdb;
 using namespace duckdb::vortex_test;
@@ -143,12 +148,27 @@ public:
 			}
 			return SearchJSON(rows, "{}");
 		}
-		if (op == "core-search" || op == "cancel-search" || op == "fail-search" || op == "held-search" ||
-		    op == "split-search") {
+		if (op == "core-search" || op == "cache-search" || op == "cancel-search" || op == "fail-search" ||
+		    op == "held-search" || op == "split-search") {
 			Connection query(database);
 			DuckLakeVortexSearchRequest request;
 			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
 			request.k = 10;
+			if (op == "cache-search") {
+				bool evicted = false;
+				auto result =
+				    DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request, [&](const string &stage) {
+					    if (stage == "after_visibility") {
+						    auto &cache = ObjectCache::GetObjectCache(*query.context);
+						    auto bytes = cache.GetCurrentMemory();
+						    Require(bytes > 0 && cache.EvictToReduceMemory(bytes) > 0,
+						            "Schema cache eviction did not run");
+						    evicted = true;
+					    }
+				    });
+				Require(evicted, "Cache query missed the visibility boundary");
+				return SearchJSON(result.rows, result.diagnostics);
+			}
 			if (op == "core-search") {
 				auto result = DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request);
 				return SearchJSON(result.rows, result.diagnostics);
@@ -186,7 +206,7 @@ public:
 			} else {
 				Connection publisher(database);
 				DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "knn", args.at(2),
-				                             std::stoull(args.at(3)));
+				                             std::stoull(args.at(3)), *publisher.context);
 				SQL(writer, ReadText(args.at(4)));
 				FileSystem::GetFileSystem(*writer.context).RemoveDirectory(args.at(5));
 			}
@@ -221,6 +241,72 @@ public:
 		if (op == "head") {
 			return Head(args.at(2)).ToJSON();
 		}
+		if (op == "cancel-init" || op == "cancel-publish") {
+			Connection caller(database);
+			auto guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			auto &connections = ConnectionManager::Get(*caller.context);
+			auto existing = connections.GetConnectionList();
+			auto before = existing.size();
+			auto pending = std::async(std::launch::async, [&] {
+				if (op == "cancel-init") {
+					return caller.Query("SELECT * FROM ducklake_initialize_vortex_indexes('lake')");
+				}
+				return caller.Query("SELECT * FROM ducklake_publish_vortex_index('lake','main','items'," +
+				                    Value(args.at(2)).ToSQLString() + "," + Value(args.at(3)).ToSQLString() + "," +
+				                    args.at(4) + ")");
+			});
+			struct Unlock {
+				decltype(guard) &key;
+				~Unlock() {
+					key.reset();
+				}
+			} release {guard};
+			// The additional owner connection marks entry into ExecuteCatalog.
+			// Holding the shared lock keeps its metadata transaction from starting.
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+			while (connections.GetConnectionCount() <= before) {
+				Require(pending.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout,
+				        "Catalog request exited before creating its owner");
+				Require(std::chrono::steady_clock::now() < deadline, "Catalog owner creation timed out");
+				std::this_thread::yield();
+			}
+			Require(pending.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout,
+			        "Catalog request did not wait for publication lock");
+			caller.Interrupt();
+			guard.reset();
+			auto result = pending.get();
+			Require(result->HasError() && result->GetErrorType() == ExceptionType::INTERRUPT,
+			        "Cancelled catalog request did not report interruption");
+			Require(bool(DuckLakeVortexIndex::PublicationLock().TryGetExclusiveLock()),
+			        "Cancelled catalog request retained publication lock");
+			Require(!caller.context->transaction.HasActiveTransaction(),
+			        "Cancelled catalog request retained caller transaction");
+			SQL(caller, "SELECT 1");
+			return "{}";
+		}
+		if (op == "cancel-stage") {
+			Connection caller(database), owner(database);
+			bool interrupted = false;
+			try {
+				DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), args.at(3),
+				                             std::stoull(args.at(4)), *caller.context, [&](const string &stage) {
+					                             if (stage == args.at(5)) {
+						                             caller.Interrupt();
+					                             }
+				                             });
+			} catch (const InterruptException &) {
+				interrupted = true;
+			}
+			Require(interrupted, "Cancelled publication stage committed");
+			Require(!owner.context->transaction.HasActiveTransaction(),
+			        "Cancelled publication retained owner transaction");
+			Require(bool(DuckLakeVortexIndex::PublicationLock().TryGetExclusiveLock()),
+			        "Cancelled publication retained publication lock");
+			Require(bool(DuckLakeVortexReadView::AdmissionLock().TryGetExclusiveLock()),
+			        "Cancelled publication retained source guard");
+			SQL(owner, "SELECT 1");
+			return "{}";
+		}
 		if (op == "old-read") {
 			Connection reader(database), publisher(database);
 			Pause pause;
@@ -234,7 +320,7 @@ public:
 			ReleasePause release {pause};
 			pause.Wait();
 			auto published = DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", args.at(2), args.at(3),
-			                                              std::stoull(args.at(4)));
+			                                              std::stoull(args.at(4)), *publisher.context);
 			pause.Release();
 			Save(args.at(5), pending.get());
 			return published.ToJSON();
@@ -247,7 +333,7 @@ public:
 				Connection owner(database);
 				try {
 					DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), path,
-					                             std::stoull(args.at(5)));
+					                             std::stoull(args.at(5)), *owner.context);
 					return true;
 				} catch (const TransactionException &error) {
 					Require(string(error.what()).find("revision conflict") != string::npos,
@@ -269,7 +355,7 @@ public:
 			Pause pause;
 			auto publish = std::async(std::launch::async, [&] {
 				return DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), args.at(3),
-				                                    std::stoull(args.at(4)), [&](const string &stage) {
+				                                    std::stoull(args.at(4)), *owner.context, [&](const string &stage) {
 					                                    if (stage == "after_validation") {
 						                                    pause.Stop();
 					                                    }
@@ -295,7 +381,7 @@ public:
 		if (op == "ack" || op == "crash-before" || op == "crash-after") {
 			Connection owner(database);
 			auto result = DuckLakeVortexIndex::Publish(
-			    owner, "lake", "main", "items", args.at(2), args.at(3), std::stoull(args.at(4)),
+			    owner, "lake", "main", "items", args.at(2), args.at(3), std::stoull(args.at(4)), *owner.context,
 			    [&](const string &stage) {
 				    if (op == "ack" && stage == "after_commit") {
 					    throw InvalidInputException("injected lost acknowledgement");

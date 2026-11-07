@@ -39,6 +39,19 @@ def key(row_ref: dict) -> tuple:
     return 1, row_ref["source"], row_ref["row_id"]
 
 
+def float32_squared_l2(query: list[float], vector: list[float]) -> float:
+    require(len(query) == len(vector), "mixed oracle vector dimension mismatch")
+    query = BASE.float32_vector(query)
+    vector = BASE.float32_vector(vector)
+    total = 0.0
+    # Match mixed.rs: round subtraction, multiplication and each addition to f32.
+    for left, right in zip(query, vector):
+        difference = BASE.float32_vector([left - right])[0]
+        squared = BASE.float32_vector([difference * difference])[0]
+        total = BASE.float32_vector([total + squared])[0]
+    return total
+
+
 def capture(proof, directory: Path, name: str) -> tuple[Path, list[dict]]:
     files, rows = proof.capture_rows(directory)
     mixed = {
@@ -74,9 +87,10 @@ class Worker(READ.Worker):
         )
 
     def fetch(self, name: str, rows: list[dict], expected: str | None = None):
-        return self.call(
+        result = self.call(
             {"op": "fetch_mixed", "view": name, "capture_digest": self.digests[name], "rows": rows}, expected
         )
+        return [READ.float32_business(row) for row in result] if expected is None else None
 
 
 def qualify(
@@ -87,7 +101,7 @@ def qualify(
     lookup = {key(ref(row)): row for row in eligible}
     expected = sorted(
         eligible,
-        key=lambda row: (sum((a - b) ** 2 for a, b in zip(query, row["embedding"])), key(ref(row))),
+        key=lambda row: (float32_squared_l2(query, row["embedding"]), key(ref(row))),
     )[:k]
     hits = result["hits"]
     require(len(hits) <= min(k, len(eligible)), "mixed branch exceeded eligible candidates")
@@ -96,8 +110,11 @@ def qualify(
     for hit in hits:
         require(key(hit["row_ref"]) in lookup, "mixed result contains an invisible or disallowed version")
         row = lookup[key(hit["row_ref"])]
-        require(hit["row"] == READ.business(row), "ranked business fetch changed the selected version")
-        distance = sum((a - b) ** 2 for a, b in zip(query, row["embedding"]))
+        require(
+            READ.float32_business(hit["row"]) == READ.business(row),
+            "ranked business fetch changed the selected version",
+        )
+        distance = float32_squared_l2(query, row["embedding"])
         require(
             math.isfinite(hit["distance"]) and math.isclose(hit["distance"], distance, rel_tol=1e-5, abs_tol=1e-4),
             "mixed squared L2 disagrees with its returned vector",
@@ -129,6 +146,74 @@ def check_routes(result: dict, path: Path, indexed_ids: set[int], k: int = 10) -
     )
     require(routes["inline_rows"] == len(captured["inline_rows"]), "T did not use the captured inlined inventory")
     require(routes["ann_calls"] == 1 and routes["ann_candidates"] <= k, "B did not execute bounded native ANN")
+
+
+def exercise_float32(proof, directory: Path, reference: Path, workers: list[Worker], checks: list[str]) -> list[float]:
+    proof.sql(
+        directory,
+        "CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0, table_name => 'items');"
+        "INSERT INTO lake.items VALUES (10000,[10000,1,0,0,0,0,0,0],'F','rounding-A'),"
+        "(10001,[10000,0,0,0,0,0,0,0],'F','rounding-B'),"
+        "(10002,[100000112,1,0,0,0,0,0,0],'F','rounded-query');",
+    )
+    proof.sql(
+        directory,
+        "CALL ducklake_set_option('lake', 'data_inlining_row_limit', 100, table_name => 'items');"
+        "INSERT INTO lake.items VALUES (11000,[10000,1,0,0,0,0,0,0],'T','rounding-A'),"
+        "(11001,[10000,0,0,0,0,0,0,0],'T','rounding-B'),"
+        "(11002,[0.1,0,0,0,0,0,0,0],'T','fractional');",
+    )
+    captured, rows = capture(proof, directory, "float32")
+    by_id = {row["id"]: row for row in rows}
+    files = [ref(by_id[value]) for value in (10000, 10001)]
+    inline = [ref(by_id[value]) for value in (11000, 11001)]
+    require(
+        all(row["kind"] == "file" for row in files)
+        and all(row["kind"] == "inline" for row in inline)
+        and key(files[0]) < key(files[1]) < key(inline[0]) < key(inline[1]),
+        "Float32 fixture did not establish its declared typed-address order",
+    )
+    indexed_ids = {file["id"] for file in json.loads(reference.read_text())["snapshot"]["files"]}
+    worker = Worker(proof, "float32-retained")
+    workers.append(worker)
+    worker.open("float32", captured, reference)
+    recalls = []
+    for allowed, identifier in ((files, 10000), (inline, 11000), (files + inline, 10000)):
+        result = worker.search("float32", [0.0] * 8, allowed, k=1)
+        recalls.append(qualify(result, rows, [0.0] * 8, k=1, allowed=allowed))
+        require(
+            [hit["row"]["id"] for hit in result["hits"]] == [identifier]
+            and result["hits"][0]["distance"] == 100000000.0
+            and recalls[-1] == 1.0
+            and result["routes"]["ann_candidates"] == 0,
+            "Float32 equal distances did not use typed addresses for exact F/T top-k",
+        )
+        check_routes(result, captured, indexed_ids, k=1)
+    selected = [inline[0], files[0], inline[0]]
+    require(
+        worker.fetch("float32", selected) == [READ.business(by_id[value]) for value in (11000, 10000, 11000)],
+        "Float32 mixed business fetch changed typed duplicate order",
+    )
+    for identifier, query in ((11002, [0.1, 0, 0, 0, 0, 0, 0, 0]), (10002, [100000110.0, 1, 0, 0, 0, 0, 0, 0])):
+        allowed = [ref(by_id[identifier])]
+        result = worker.search("float32", query, allowed, k=1)
+        recalls.append(qualify(result, rows, query, k=1, allowed=allowed))
+        require(
+            [hit["row"]["id"] for hit in result["hits"]] == [identifier]
+            and result["hits"][0]["distance"] == 0.0
+            and recalls[-1] == 1.0,
+            "Float32 JSON or query rounding changed an exact self-neighbor",
+        )
+    require(
+        worker.fetch("float32", [ref(by_id[11002])]) == [READ.business(by_id[11002])],
+        "Float32 fractional inline business fetch changed its value",
+    )
+    require(worker.close_view("float32") == READ.empty_stats(), "Float32 mixed regression retained resources")
+    worker.finish(eof=True)
+    checks.append(
+        "Float32 F/T and merged ties follow typed addresses; fractional values and raw queries share the metric"
+    )
+    return recalls
 
 
 def exercise(proof, workers: list[Worker], checks: list[str]) -> dict:
@@ -172,8 +257,7 @@ def exercise(proof, workers: list[Worker], checks: list[str]) -> dict:
     )
     proof.sql(
         directory,
-        "BEGIN; UPDATE lake.items SET payload='内联-live' WHERE id=6000;"
-        "DELETE FROM lake.items WHERE id=6001; COMMIT;",
+        "BEGIN; UPDATE lake.items SET payload='内联-live' WHERE id=6000;DELETE FROM lake.items WHERE id=6001; COMMIT;",
     )
     current, rows = capture(proof, directory, "current")
     opened = worker.open("current", current, reference)
@@ -347,11 +431,17 @@ def exercise(proof, workers: list[Worker], checks: list[str]) -> dict:
         "T-to-F flush preserves logical top-k, retains original B generation and leaves the old inline view usable"
     )
 
+    float32_recalls = exercise_float32(proof, directory, reference, workers, checks)
+    require(
+        BASE.digest(reference) == reference_digest
+        and {str(path.relative_to(generation)): BASE.digest(path) for path in generation.rglob("*") if path.is_file()}
+        == artifact_digests,
+        "Float32 regressions rebuilt or mutated the original B index",
+    )
     worker.close_view("old")
     proof.sql(
         directory,
-        "CALL ducklake_rewrite_data_files('lake', delete_threshold => 0);"
-        "CALL ducklake_merge_adjacent_files('lake');",
+        "CALL ducklake_rewrite_data_files('lake', delete_threshold => 0);CALL ducklake_merge_adjacent_files('lake');",
     )
     compacted, _ = capture(proof, directory, "compacted")
     require(
@@ -399,6 +489,7 @@ def exercise(proof, workers: list[Worker], checks: list[str]) -> dict:
         "fixture_recalls": recalls,
         "b_fixture_recalls": b_recalls,
         "recall_threshold": 0.8,
+        "float32_regression_recalls": float32_recalls,
         "sparse_ann_probe": {"eligible_rows": 1, "hits": len(sparse["hits"]), "recall": sparse_recall},
         "old_source_bytes": opened["source_bytes"],
         "old_artifact_bytes": opened["artifact_bytes"],
