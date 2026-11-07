@@ -34,6 +34,8 @@ jobs:
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg,readwrite
       VCPKG_MAX_CONCURRENCY: '2'
       DISABLE_EXTENSIONS_FOR_TEST: '1'
+      VORTEX_REVISION: 145f816102d6024a12164e37737ff8864faf5033
+      VORTEX_SPFRESH_NATIVE: ${{ github.workspace }}/build/spfresh/build
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -43,7 +45,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config
+          sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config libzstd-dev
           mkdir -p .cache/vcpkg build/validation-logs
       - name: Restore native caches
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -71,9 +73,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             build/vortex-validation/cargo/build
-          key: ducklake-vortex-rust-v1-${{ runner.os }}-${{ hashFiles('extension_config.cmake', '.gitmodules') }}-${{ github.sha }}
+          key: ducklake-vortex-rust-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'extension_config.cmake', '.gitmodules') }}-${{ github.sha }}
           restore-keys: |
-            ducklake-vortex-rust-v1-${{ runner.os }}-${{ hashFiles('extension_config.cmake', '.gitmodules') }}-
+            ducklake-vortex-rust-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'extension_config.cmake', '.gitmodules') }}-
+      - name: Qualify the pinned native SPFresh backend for SQL search
+        if: matrix.vortex == 'ON'
+        run: |
+          git init build/vortex-source
+          git -C build/vortex-source fetch --depth 1 https://github.com/AstroVela/vortex.git "$VORTEX_REVISION"
+          git -C build/vortex-source checkout --detach FETCH_HEAD
+          test "$(git -C build/vortex-source rev-parse HEAD)" = "$VORTEX_REVISION"
+          bash build/vortex-source/vortex-index-spfresh/native/build.sh "$PWD/build/spfresh" \
+            2>&1 | tee build/validation-logs/spfresh-build.log
       - name: Configure
         run: |
           flags=()
@@ -137,7 +148,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_TARGET_DIR: ${{ github.workspace }}/build/index-cargo
       VORTEX_SPFRESH_NATIVE: ${{ github.workspace }}/build/spfresh/build
-      VORTEX_REVISION: ee085f55a705cb9b2edab18d392dd822540774d7
+      VORTEX_REVISION: 145f816102d6024a12164e37737ff8864faf5033
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -160,9 +171,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             build/index-cargo
-          key: ducklake-index-v1-${{ runner.os }}-${{ hashFiles('test/vane/vortex_index_probe/Cargo.lock') }}-${{ github.sha }}
+          key: ducklake-index-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            ducklake-index-v1-${{ runner.os }}-${{ hashFiles('test/vane/vortex_index_probe/Cargo.lock') }}-
+            ducklake-index-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
       - name: Check out the existing Vortex index implementation
         run: |
           git init build/vortex-source
@@ -173,13 +184,12 @@ jobs:
         run: |
           bash build/vortex-source/vortex-index-spfresh/native/build.sh "$PWD/build/spfresh" \
             2>&1 | tee build/index-logs/native-build.log
-      - name: Build and lint the test-only bridge
+      - name: Build and lint the shared query library and validation probe
         run: |
-          manifest=test/vane/vortex_index_probe/Cargo.toml
-          cargo +1.91.0 fmt --manifest-path "$manifest" --all -- --check
-          cargo +1.91.0 clippy --manifest-path "$manifest" --profile ci --locked \
+          cargo +1.91.0 fmt --all -- --check
+          cargo +1.91.0 clippy --workspace --profile ci --locked \
             --all-targets --all-features -- -D warnings 2>&1 | tee build/index-logs/clippy.log
-          cargo +1.91.0 build --manifest-path "$manifest" --profile ci --locked \
+          cargo +1.91.0 build --package ducklake-vortex-index-probe --profile ci --locked \
             2>&1 | tee build/index-logs/bridge-build.log
       - name: Validate the DuckLake and Vortex index boundary
         run: |
@@ -213,6 +223,13 @@ jobs:
             --driver build/index-shell/ducklake_vortex_catalog_driver \
             --probe build/index-cargo/ci/ducklake-vortex-index-probe \
             --output-dir build/index-logs/catalog
+      - name: Validate native SQL vector search and resource release
+        run: |
+          python3 -I test/vane/test_native_vortex_search.py \
+            --duckdb build/index-shell/duckdb \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --probe build/index-cargo/ci/ducklake-vortex-index-probe \
+            --output-dir build/index-logs/sql-search
       - name: Upload index validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

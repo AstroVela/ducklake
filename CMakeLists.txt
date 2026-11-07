@@ -15,6 +15,25 @@ if(DUCKLAKE_ENABLE_VORTEX)
     message(FATAL_ERROR "Experimental DuckLake Vortex files require native execution")
   endif()
   add_definitions(-DDUCKLAKE_ENABLE_VORTEX)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    message(FATAL_ERROR "Native DuckLake SPFresh search requires Linux x86_64")
+  endif()
+  set(VORTEX_SPFRESH_NATIVE "$ENV{VORTEX_SPFRESH_NATIVE}" CACHE PATH "Qualified SPFresh native build directory")
+  if(NOT IS_ABSOLUTE "${VORTEX_SPFRESH_NATIVE}" OR NOT EXISTS "${VORTEX_SPFRESH_NATIVE}/libspfresh_core.a"
+     OR NOT EXISTS "${VORTEX_SPFRESH_NATIVE}/libspfresh_distance.a")
+    message(FATAL_ERROR "DUCKLAKE_ENABLE_VORTEX requires a qualified VORTEX_SPFRESH_NATIVE build")
+  endif()
+  find_package(OpenMP REQUIRED COMPONENTS CXX)
+  file(STRINGS "${VORTEX_SPFRESH_NATIVE}/zstd-library.txt" DUCKLAKE_SPFRESH_ZSTD LIMIT_COUNT 1)
+  if(NOT IS_ABSOLUTE "${DUCKLAKE_SPFRESH_ZSTD}" OR NOT EXISTS "${DUCKLAKE_SPFRESH_ZSTD}")
+    message(FATAL_ERROR "SPFresh qualification must identify an existing zstd library")
+  endif()
+  corrosion_import_crate(
+    MANIFEST_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src/vortex_query/Cargo.toml"
+    CRATES ducklake-vortex-query CRATE_TYPES staticlib FLAGS --locked PROFILE ci)
+  corrosion_set_env_vars(ducklake_vortex_query "VORTEX_SPFRESH_NATIVE=${VORTEX_SPFRESH_NATIVE}")
+  # Keep Rust runtime objects separate so both static archives share one copy.
+  corrosion_set_cargo_flags(vortex_duckdb --locked --config=profile.release-lto.lto=false)
 endif()
 
 option(DUCKLAKE_VANE_DISTRIBUTED
@@ -43,6 +62,11 @@ set(EXTENSION_SOURCES ${ALL_OBJECT_FILES})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+if(DUCKLAKE_ENABLE_VORTEX)
+  target_link_libraries(${EXTENSION_NAME} ducklake_vortex_query-static OpenMP::OpenMP_CXX "${DUCKLAKE_SPFRESH_ZSTD}")
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} ducklake_vortex_query-static OpenMP::OpenMP_CXX "${DUCKLAKE_SPFRESH_ZSTD}")
+endif()
 
 # Distributed scans call Parquet's C++ interface, which Vane does not export.
 if(DUCKLAKE_VANE_DISTRIBUTED AND EXTENSION_STATIC_BUILD)

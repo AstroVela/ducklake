@@ -1,0 +1,81 @@
+# name: test/sql/vortex/native_vortex_search.test
+# description: native SQL vector search validates query arguments and requires a published index
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_search.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_search')
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[1,2,3]::FLOAT[],10)
+----
+catalog is not initialized
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[1,2,3]::FLOAT[],10)
+----
+No published Vortex index
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','',[1,2,3]::FLOAT[],10)
+----
+index name cannot be empty
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[]::FLOAT[],10)
+----
+dimension must be between 1 and 4096
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[1,NULL,3]::FLOAT[],10)
+----
+finite non-NULL FLOAT components
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',['NaN'::FLOAT,2,3],10)
+----
+finite non-NULL FLOAT components
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',['Infinity'::FLOAT,2,3],10)
+----
+finite non-NULL FLOAT components
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',NULL::FLOAT[],10)
+----
+arguments cannot be NULL
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[1,2,3]::FLOAT[],0)
+----
+k must be between 1 and 64
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[1,2,3]::FLOAT[],65)
+----
+k must be between 1 and 64
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[1,2,3]::FLOAT[],10,category=>NULL)
+----
+category filter cannot be NULL
+
+statement error
+SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[1,2,3]::FLOAT[],10,category=>repeat('a',65537))
+----
+category filter exceeds its byte budget
+
+statement ok
+DETACH lake

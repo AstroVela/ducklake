@@ -72,7 +72,7 @@ inline void Attach(Connection &writer, const string &root) {
 	                Value(root + "/data").ToSQLString() + ", DATA_INLINING_ROW_LIMIT 0);");
 }
 inline void CreateItems(Connection &writer) {
-	SQL(writer, "CREATE TABLE lake.items(id BIGINT NOT NULL,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+	SQL(writer, "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
 	            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');");
 	for (idx_t parity = 0; parity < 2; parity++) {
 		SQL(writer, "INSERT INTO lake.items SELECT id,[id::FLOAT,((id*4)%12)::FLOAT,((id*5)%13)::FLOAT,"
