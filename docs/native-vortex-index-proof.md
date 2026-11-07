@@ -3,9 +3,12 @@
 This DL3b validation draft connects DuckLake's native Vortex files to the
 existing `vortex-index` contracts and `vortex-index-spfresh` provider in
 [AstroVela/vortex, feat/vortex-index](https://github.com/AstroVela/vortex/tree/feat/vortex-index).
-The exact core revision is `145f816102d6024a12164e37737ff8864faf5033`, also
-used by the [DL3a file proof](native-vortex-files.md) in
-[DuckLake #27](https://github.com/AstroVela/ducklake/pull/27).
+The index and shared query library pin core revision
+`145f816102d6024a12164e37737ff8864faf5033`. The file-format wrapper used by the
+[DL3a file proof](native-vortex-files.md) in
+[DuckLake #27](https://github.com/AstroVela/ducklake/pull/27) remains at
+duckdb-vortex `b2253585db8fef4fa490e312841c6e8fa6479fd9`, which pins core
+`ee085f55a705cb9b2edab18d392dd822540774d7`.
 
 The implementation is a test-only Rust bridge and a Python process harness.
 It calls Vortex's `SpFreshIndexBuilder`, `LocalIndexStore`, `SpFreshProvider`,
