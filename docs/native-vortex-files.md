@@ -63,6 +63,19 @@ new Vortex files. Vortex output cannot be switched back through this option.
 Column and table renames retain field identities; other schema changes and
 partitioning changes are rejected for these experimental tables.
 
+Format options follow the metadata transaction: a rollback also rolls back the
+format used by subsequent statements. Empty table names are rejected, and
+prepared option statements recheck the current table and transition when they
+execute. A first Vortex transition commits a snapshot with an `altered_table`
+change, so concurrent schema changes and first transitions use DuckLake's
+existing table conflict checks. The schema version does not change. Setting the
+already active format is a no-op. Format changes are replayed if a commit retries
+its metadata transaction, with the existing retry policy unchanged. Each writer
+records the format selected by its physical plan. A Parquet writer prepared
+before the switch can still produce a correctly labeled
+Parquet file in the mixed table. A prepared Vortex writer whose enabling option
+was rolled back must be prepared again before it can write.
+
 ## File and row contract
 
 Each committed data file records its actual format in
@@ -82,6 +95,14 @@ The reader uses the native DuckDB filesystem adapter, explicitly projects
 physical row positions, and applies DuckLake's existing deletion and row-filter
 logic. Flush writes the internal row-ID and snapshot columns with their bounds.
 It retains the source catalog's snapshot and delete semantics.
+Deletion-history scans also dispatch by each file's recorded format, including
+the logical row-ID lookup needed after repeated deletes, flushes and rewrites.
+Orphan cleanup recognizes both Parquet and Vortex files, using the existing
+known-file exclusions and retention-time filters.
+The COPY output keeps the catalog's absolute or relative path representation,
+so filesystem enumeration and known-file exclusion refer to the same paths.
+If restoring transaction-local options fails before a retry, the existing commit
+outcome guard cleans up aborted writes and retains files for uncertain commits.
 
 The initial writer emits row counts, byte sizes, and top-level NULL counts.
 Complete business-column and nested-column bounds are not implemented.
@@ -98,6 +119,8 @@ renames, mixed Parquet/Vortex files, NULL/NaN/infinity/signed-zero values, empty
 writes, rollback, exact filtered top-k, active readers across flush, historical
 snapshots, and compaction. Unsupported options, types and partitioning fail
 explicitly. File IDs remain stable until a rewrite replaces their files.
+The cleanup proof runs real deletion with absolute, relative and dot-relative
+data paths, then reopens the catalog and checks every vector component.
 
 The process-recovery proof also runs with `--file-format vortex`. It kills a
 process after a committed inline batch, during an uncommitted batch, and after
@@ -129,7 +152,6 @@ scan or row-mutation tasks. Default provider manifests and release configuration
 do not enable the experimental format.
 
 Local builds reuse native engine and Vortex objects from the exact pins above
-and rebuild the DuckLake sources. The DL3a clean ON/OFF builds passed for
-`71e1281dc9030418257bb5c2571c52a2e3ab57d4` in
-[Native Vortex validation](https://github.com/AstroVela/ducklake/actions/runs/40646127607).
-The index proof has an additional hosted gate.
+and rebuild the DuckLake sources. The hosted workflow performs clean ON/OFF
+qualification for each submitted revision, followed by a separate SPFresh index
+proof gate.

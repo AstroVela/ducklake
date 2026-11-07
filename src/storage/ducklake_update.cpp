@@ -344,7 +344,9 @@ PhysicalOperator &DuckLakeCatalog::PlanUpdate(ClientContext &context, PhysicalPl
 
 	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
 
-	auto &insert_op = DuckLakeInsert::PlanInsert(context, planner, table, std::move(copy_input.encryption_key));
+	auto &insert_op =
+	    DuckLakeInsert::PlanInsert(context, planner, table, std::move(copy_input.encryption_key),
+	                               DataFileFormatFromString(physical_copy.Cast<PhysicalCopyToFile>().file_extension));
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
 	DuckLakeCopyInput distributed_copy_input(context, table);
 	distributed_copy_input.virtual_columns = InsertVirtualColumns::WRITE_ROW_ID;

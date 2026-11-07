@@ -344,7 +344,7 @@ case_insensitive_set_t DuckLakeTableEntry::GetNotNullFields() const {
 }
 
 unique_ptr<BaseStatistics> DuckLakeTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
-	if (DuckLakeVortex::GetFormat(*this) == DataFileFormat::VORTEX) {
+	if (DuckLakeVortex::GetFormat(context, *this) == DataFileFormat::VORTEX) {
 		// Vortex currently emits counts, not complete bounds for the file and its nested columns.
 		return nullptr;
 	}
@@ -1368,7 +1368,7 @@ unique_ptr<CatalogEntry> DuckLakeTableEntry::AlterTable(DuckLakeTransaction &tra
 
 unique_ptr<CatalogEntry> DuckLakeTableEntry::Alter(ClientContext &context, DuckLakeTransaction &transaction,
                                                    AlterTableInfo &info) {
-	if (DuckLakeVortex::GetFormat(*this) == DataFileFormat::VORTEX &&
+	if (DuckLakeVortex::GetFormat(context, *this) == DataFileFormat::VORTEX &&
 	    info.alter_table_type != AlterTableType::RENAME_TABLE &&
 	    info.alter_table_type != AlterTableType::RENAME_COLUMN) {
 		throw NotImplementedException("Experimental Vortex tables require a fixed schema and partitioning");
