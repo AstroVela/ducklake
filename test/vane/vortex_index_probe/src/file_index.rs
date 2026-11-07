@@ -54,6 +54,11 @@ fn snapshot(source: &PhysicalSource, files: Vec<SourceFile>) -> VortexResult<Sna
 pub fn reference_for(source: &PhysicalSource, reference: &Path) -> VortexResult<Reference> {
     let descriptor: Reference =
         serde_json::from_slice(&fs::read(reference)?).map_err(|error| vortex_err!("{error}"))?;
+    validate_reference(source, &descriptor)?;
+    Ok(descriptor)
+}
+
+pub fn validate_reference(source: &PhysicalSource, descriptor: &Reference) -> VortexResult<()> {
     if descriptor.format_version != 1
         || descriptor.table_uuid != source.capture.table_uuid
         || descriptor.field_id != source.capture.field_id
@@ -80,7 +85,7 @@ pub fn reference_for(source: &PhysicalSource, reference: &Path) -> VortexResult<
     if snapshot(source, files)? != descriptor.snapshot {
         vortex_bail!("File index physical snapshot mismatch");
     }
-    Ok(descriptor)
+    Ok(())
 }
 
 struct FileSource {

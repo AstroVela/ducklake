@@ -74,4 +74,11 @@ if(DUCKLAKE_ENABLE_VORTEX AND BUILD_UNITTESTS)
   link_extension_libraries(ducklake_vortex_view_driver "")
   set_target_properties(ducklake_vortex_view_driver PROPERTIES
                         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_executable(ducklake_vortex_catalog_driver EXCLUDE_FROM_ALL
+                 test/vane/native_vortex_catalog_driver.cpp)
+  target_link_libraries(ducklake_vortex_catalog_driver duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+  link_threads(ducklake_vortex_catalog_driver "")
+  link_extension_libraries(ducklake_vortex_catalog_driver "")
+  set_target_properties(ducklake_vortex_catalog_driver PROPERTIES
+                        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endif()

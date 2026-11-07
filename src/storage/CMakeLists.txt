@@ -53,7 +53,8 @@ if(DUCKLAKE_VANE_DISTRIBUTED)
 endif()
 
 if(DUCKLAKE_ENABLE_VORTEX)
-  target_sources(ducklake_storage PRIVATE ducklake_vortex_read_view.cpp)
+  target_sources(ducklake_storage PRIVATE ducklake_vortex_read_view.cpp
+                                          ducklake_vortex_index_catalog.cpp)
 endif()
 
 set(ALL_OBJECT_FILES

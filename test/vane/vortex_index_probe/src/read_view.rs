@@ -33,6 +33,7 @@ use crate::Request;
 use crate::mixed::MixedRequest;
 use crate::mixed::MixedView;
 use crate::mixed::RowRef;
+use crate::mixed::ViewInput;
 use crate::provider;
 use crate::query_hits;
 use crate::reference_for;
@@ -81,6 +82,16 @@ impl IndexLease {
         let root = reference
             .parent()
             .ok_or_else(|| vortex_err!("Reference parent required"))?;
+        Self::open_root(root, generation, snapshot, leases, artifact_budget).await
+    }
+
+    pub async fn open_root(
+        root: &Path,
+        generation: &LocalGeneration,
+        snapshot: &Snapshot,
+        leases: &Path,
+        artifact_budget: u64,
+    ) -> VortexResult<Self> {
         let pending = LocalIndexStore::prepare_open(root, generation, snapshot, LIMITS)?;
         let artifact_bytes =
             pending
@@ -225,6 +236,11 @@ enum Command {
         view: String,
         capture: PathBuf,
         reference: PathBuf,
+    },
+    OpenCatalogued {
+        view: String,
+        capture: PathBuf,
+        index_name: String,
     },
     SearchMixed {
         view: String,
@@ -377,7 +393,11 @@ impl Registry {
                     RetainedView::Mixed(
                         MixedView::open(
                             &capture,
-                            &reference,
+                            if admitted {
+                                ViewInput::Admitted { reference }
+                            } else {
+                                ViewInput::Mixed { reference }
+                            },
                             &self.leases,
                             ViewBudget {
                                 source_bytes: source_budget,
@@ -392,7 +412,6 @@ impl Registry {
                                     .saturating_sub(self.inline_bytes()),
                             },
                             self.session.clone(),
-                            admitted,
                         )
                         .await?,
                     )
@@ -418,6 +437,49 @@ impl Registry {
                     "source_bytes":opened.source().pinned_bytes(), "artifact_bytes":opened.artifact_bytes(),
                     "inline_rows":opened.inline_rows(), "inline_bytes":opened.inline_bytes()});
                 self.views.insert(view, opened);
+                Ok(result)
+            }
+            Command::OpenCatalogued {
+                view,
+                capture,
+                index_name,
+            } => {
+                if view.is_empty() || self.views.contains_key(&view) {
+                    vortex_bail!("Read view identity is empty or already open");
+                }
+                if self.views.len() >= self.limits.max_views {
+                    vortex_bail!("Read view count budget exceeded");
+                }
+                let opened = MixedView::open(
+                    &capture,
+                    ViewInput::Catalogued { index_name },
+                    &self.leases,
+                    ViewBudget {
+                        source_bytes: self
+                            .limits
+                            .max_source_bytes
+                            .saturating_sub(self.source_bytes()),
+                        artifact_bytes: self
+                            .limits
+                            .max_artifact_bytes
+                            .saturating_sub(self.artifact_bytes()),
+                        inline_rows: self
+                            .limits
+                            .max_inline_rows
+                            .saturating_sub(self.inline_rows()),
+                        inline_bytes: self
+                            .limits
+                            .max_inline_bytes
+                            .saturating_sub(self.inline_bytes()),
+                    },
+                    self.session.clone(),
+                )
+                .await?;
+                let result = json!({"capture_digest":opened.digest,"snapshot_id":opened.source.capture.snapshot_id,
+                    "source_bytes":opened.source.pinned_bytes(),"artifact_bytes":opened.lease.artifact_bytes,
+                    "inline_rows":opened.inline_rows(),"inline_bytes":opened.inline_bytes,
+                    "index_revision":opened.catalog_revision,"generation":opened.lease.index.metadata().generation});
+                self.views.insert(view, RetainedView::Mixed(opened));
                 Ok(result)
             }
             Command::Search {

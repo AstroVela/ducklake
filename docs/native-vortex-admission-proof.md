@@ -131,9 +131,10 @@ separate fixture gate; approximate underfill does not trigger scan.
 
 CI runs the native ON/default-OFF gates, both new SQL regressions and all four
 index/read-view process proofs. This remains a validation interface with bounded
-in-memory source ownership. Catalog index publication, background indexing,
-out-of-core ownership and a production SQL vector-search operator are later
-integration steps.
+in-memory source ownership. The next [catalog publication proof](native-vortex-index-catalog-proof.md)
+adds atomic ready-generation publication and same-transaction named discovery.
+Background indexing, out-of-core ownership and a production SQL vector-search
+operator remain later integration steps.
 
 The local native admission run passed seven fixture queries with recall 1.0,
 40 consumer requests with seven expected rejections, and four native

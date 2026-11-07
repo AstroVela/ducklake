@@ -16,6 +16,7 @@
 
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_read_view.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
 #endif
 
 namespace duckdb {
@@ -105,6 +106,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(current_snapshot);
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	RegisterDuckLakeVortexReadView(loader);
+	RegisterDuckLakeVortexIndexCatalog(loader);
 #endif
 
 	DuckLakeLastCommittedSnapshotFunction last_committed;

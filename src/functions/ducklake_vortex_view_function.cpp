@@ -21,9 +21,13 @@ static unique_ptr<FunctionData> BindVortexView(ClientContext &, TableFunctionBin
 		}
 	}
 	auto result = make_uniq<VortexViewBindData>();
-	result->options = {StringValue::Get(input.inputs[0]), StringValue::Get(input.inputs[1]),
-	                   StringValue::Get(input.inputs[2]), input.inputs[3].GetValue<uint32_t>(),
-	                   input.inputs[4].GetValue<idx_t>(), input.inputs[5].GetValue<idx_t>()};
+	result->options = {StringValue::Get(input.inputs[0]),
+	                   StringValue::Get(input.inputs[1]),
+	                   StringValue::Get(input.inputs[2]),
+	                   input.inputs[3].GetValue<uint32_t>(),
+	                   input.inputs[4].GetValue<idx_t>(),
+	                   input.inputs[5].GetValue<idx_t>(),
+	                   ""};
 	names = {"snapshot_id", "source_bytes", "visible_rows", "inline_rows", "admission", "rows"};
 	types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 	         LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};

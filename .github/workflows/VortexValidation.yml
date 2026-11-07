@@ -98,9 +98,9 @@ jobs:
             "${flags[@]}" 2>&1 | tee build/validation-logs/configure.log
       - name: Build
         run: cmake --build build/vortex-validation --target duckdb unittest 2>&1 | tee build/validation-logs/build.log
-      - name: Build the native read-view concurrency driver
+      - name: Build the native read-view and catalog drivers
         if: matrix.vortex == 'ON'
-        run: cmake --build build/vortex-validation --target ducklake_vortex_view_driver 2>&1 | tee build/validation-logs/read-view-driver-build.log
+        run: cmake --build build/vortex-validation --target ducklake_vortex_view_driver ducklake_vortex_catalog_driver 2>&1 | tee build/validation-logs/read-view-driver-build.log
       - name: Validate native files and recovery
         run: |
           python3 -I scripts/run_native_vortex_validation.py \
@@ -115,6 +115,7 @@ jobs:
           path: |
             build/vortex-validation/duckdb
             build/vortex-validation/ducklake_vortex_view_driver
+            build/vortex-validation/ducklake_vortex_catalog_driver
           retention-days: 7
       - name: Upload validation evidence
         if: always()
@@ -150,7 +151,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake g++ libzstd-dev
           rustup toolchain install 1.91.0 --profile minimal --component clippy --component rustfmt
-          chmod +x build/index-shell/duckdb build/index-shell/ducklake_vortex_view_driver
+          chmod +x build/index-shell/duckdb build/index-shell/ducklake_vortex_view_driver build/index-shell/ducklake_vortex_catalog_driver
           mkdir -p build/index-logs
       - name: Restore Rust build cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -205,6 +206,13 @@ jobs:
             --driver build/index-shell/ducklake_vortex_view_driver \
             --probe build/index-cargo/ci/ducklake-vortex-index-probe \
             --output-dir build/index-logs/admission
+      - name: Validate native catalog index publication and recovery
+        run: |
+          python3 -I test/vane/test_native_vortex_catalog.py \
+            --duckdb build/index-shell/duckdb \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --probe build/index-cargo/ci/ducklake-vortex-index-probe \
+            --output-dir build/index-logs/catalog
       - name: Upload index validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
