@@ -1115,7 +1115,7 @@ idx_t DuckLakeDistributedMergeInto::FinalizeDistributedWrite(ClientContext &cont
 			return 0;
 		}
 
-		DuckLakeInsertGlobalState insert_state(table);
+		DuckLakeInsertGlobalState insert_state(context, table);
 		vector<DuckLakeDeleteFile> delete_files;
 		idx_t affected_rows = 0;
 		for (idx_t action_index = 0; action_index < distributed_actions.size(); action_index++) {
