@@ -117,6 +117,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		json.Number(captured, "dimension", dimension);
 		auto business = json.Object();
 		json.Add(captured, "business_fields", business);
+		vector<pair<FieldIndex, LogicalType>> business_fields;
 		for (auto &name : {"id", "embedding", "category", "payload"}) {
 			auto &field = table.GetFieldId(vector<string> {name});
 			auto expected = string(name) == "id"          ? LogicalType::BIGINT
@@ -127,6 +128,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			}
 			json.Number(string(name) == "embedding" ? captured : business,
 			            string(name) == "embedding" ? "field_id" : name, field.GetFieldIndex().index);
+			business_fields.emplace_back(field.GetFieldIndex(), field.Type());
 		}
 		auto files = transaction.GetMetadataManager().GetExtendedFilesForTable(table, snapshot);
 		std::sort(files.begin(), files.end(),
@@ -268,6 +270,9 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			}
 			result.rows_json = oracle.Finish(expected);
 		} else {
+			// QueryEnd releases catalog pins, so own the metadata needed after the visibility scan.
+			auto table_id = table.GetTableId();
+			auto inlined_tables = table.GetInlinedDataTables();
 			auto rows = reader.SendQuery("SELECT filename,file_row_number,rowid FROM " + name + " AT (VERSION => " +
 			                             to_string(snapshot.snapshot_id) + ") LIMIT " + to_string(row_limit + 1));
 			if (rows->HasError()) {
@@ -301,27 +306,25 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			idx_t inline_bytes = 0;
 			for (auto &source : inline_visible) {
 				// Resolve physical names using the source schema, as the native inlined reader does.
-				auto &inlined_tables = table.GetInlinedDataTables();
 				auto source_table =
 				    std::find_if(inlined_tables.begin(), inlined_tables.end(),
 				                 [&](const DuckLakeInlinedTableInfo &info) { return info.table_name == source.first; });
 				if (source_table == inlined_tables.end()) {
 					throw InvalidInputException("Visible inline source is outside the native table inventory");
 				}
-				DuckLakeSnapshot source_snapshot(catalog.GetBeginSnapshotForSchemaVersion(
-				                                     table.GetTableId(), source_table->schema_version, transaction),
-				                                 source_table->schema_version, 0, 0);
-				auto source_entry = catalog.GetEntryById(transaction, source_snapshot, table.GetTableId());
+				DuckLakeSnapshot source_snapshot(
+				    catalog.GetBeginSnapshotForSchemaVersion(table_id, source_table->schema_version, transaction),
+				    source_table->schema_version, 0, 0);
+				auto source_entry = catalog.GetEntryById(transaction, source_snapshot, table_id);
 				if (!source_entry) {
 					throw InvalidInputException("Missing native inline source schema");
 				}
 				auto &source_schema = source_entry->Cast<DuckLakeTableEntry>();
 				vector<string> projections;
-				for (auto &name : {"id", "embedding", "category", "payload"}) {
-					auto &field = table.GetFieldId(vector<string> {name});
-					auto source_field = source_schema.GetFieldId(field.GetFieldIndex());
-					if (!source_field || source_field->Type() != field.Type()) {
-						throw InvalidInputException("Native inline source field mismatch: %s", name);
+				for (auto &field : business_fields) {
+					auto source_field = source_schema.GetFieldId(field.first);
+					if (!source_field || source_field->Type() != field.second) {
+						throw InvalidInputException("Native inline source field mismatch: %llu", field.first.index);
 					}
 					projections.push_back(KeywordHelper::WriteOptionallyQuoted(source_field->Name()));
 				}

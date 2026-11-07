@@ -82,12 +82,27 @@ public:
 			}
 			return SearchJSON(rows, "{}");
 		}
-		if (op == "core-search" || op == "cancel-search" || op == "fail-search" || op == "held-search" ||
-		    op == "split-search") {
+		if (op == "core-search" || op == "cache-search" || op == "cancel-search" || op == "fail-search" ||
+		    op == "held-search" || op == "split-search") {
 			Connection query(database);
 			DuckLakeVortexSearchRequest request;
 			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
 			request.k = 10;
+			if (op == "cache-search") {
+				bool evicted = false;
+				auto result =
+				    DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request, [&](const string &stage) {
+					    if (stage == "after_visibility") {
+						    auto &cache = ObjectCache::GetObjectCache(*query.context);
+						    auto bytes = cache.GetCurrentMemory();
+						    Require(bytes > 0 && cache.EvictToReduceMemory(bytes) > 0,
+						            "Schema cache eviction did not run");
+						    evicted = true;
+					    }
+				    });
+				Require(evicted, "Cache query missed the visibility boundary");
+				return SearchJSON(result.rows, result.diagnostics);
+			}
 			if (op == "core-search") {
 				auto result = DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request);
 				return SearchJSON(result.rows, result.diagnostics);

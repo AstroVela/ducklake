@@ -23,7 +23,9 @@ historical schema. It quotes the resulting physical column names before the
 metadata read. Column renames therefore preserve T values and category
 predicates even when several inline sources retain different historical names.
 The historical schema selects column names only; row visibility still uses the
-held query snapshot and transaction.
+held query snapshot and transaction. Acquisition owns the table ID, business
+field IDs/types and inline source descriptors before the visibility query ends;
+it does not retain table references across query-scoped catalog pin release.
 
 The SQL path never constructs the full business-row oracle. The explicit
 `Acquire` proof interface still exports it for correctness comparisons and
@@ -175,7 +177,8 @@ uses a wrapper inside the repository build directory to exercise that layout.
 The follow-up integrates #33 at `f57546b7` and resolves inline projections by
 field ID under each source's historical schema. The new rename fixture uses
 one unchanged B generation and three T sources: ten recall checks pass at 1.0
-across swapped names, quoted historical names, prepared queries and a rename
+across swapped names, quoted historical names, prepared queries, cache eviction
+and a rename
 committed after visibility selection. The original #34 implementation fails
 the swapped-name predicate with recall 0 and rejects the quoted-name source
 with a Binder error. These are deterministic correctness controls.

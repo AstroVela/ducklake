@@ -379,6 +379,9 @@ def exercise_column_renames(proof, driver, scratch, checks):
         recalls.append(qualify(prepared, oracle, vector))
         require({9000, 9001, 9002, 9003} <= {row["id"] for row in prepared["rows"]}, "mixed schema search lost F/T")
         no_leases(scratch)
+        cached = native.call("cache-search")
+        require(cached["rows"] == prepared["rows"], "schema cache eviction changed mixed-schema business rows")
+        no_leases(scratch)
 
         # Resolve historical columns after a concurrent rename, using the held query schema.
         rename = root / "rename-after-visibility.sql"
@@ -404,7 +407,7 @@ def exercise_column_renames(proof, driver, scratch, checks):
         if native.process.poll() is None:
             native.finish()
     checks.append(
-        "field IDs preserve T/F business values and category predicates across swapped names, quoted historical columns, three inline schemas, prepared execution and concurrent rename after visibility"
+        "field IDs preserve T/F business values and category predicates across swapped names, quoted historical columns, three inline schemas, prepared execution, cache eviction and concurrent rename after visibility"
     )
     return {"recalls": recalls, "native_requests": native.requests, "inline_sources": 3, "index_builds": 1}
 

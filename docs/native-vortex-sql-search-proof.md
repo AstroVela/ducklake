@@ -157,9 +157,9 @@ A column-rename fixture retains one published B generation, adds F and creates
 three inline sources under different schema versions. It swaps category/payload
 names and inserts while payload has a quoted name, then restores the SQL
 contract. Exact business-value and category checks cover prepared execution and
-a further rename committed after visibility selection. The held query preserves
+cache eviction and a further rename committed after visibility selection. The held query preserves
 its field meanings while a fresh execution sees the new names. This fixture
-uses one additional index build; its ten recall checks and 21 native requests
+uses one additional index build; its ten recall checks and 22 native requests
 also verify that the original B generation remains ready.
 
 Five independent 4,096-row fixtures capture, build, publish and search with
