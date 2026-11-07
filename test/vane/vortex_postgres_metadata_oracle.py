@@ -221,7 +221,7 @@ def observe(backend):
 def inspect(image, model):
     require(
         image["state"]
-        == {"snapshot": model.snapshot, "next_table_id": model.next_table, "next_row_id": model.next_row, "layout": 1},
+        == {"snapshot": model.snapshot, "next_table_id": model.next_table, "next_row_id": model.next_row, "layout": 2},
         "Typed snapshot / allocation mismatch",
     )
     expected = []
