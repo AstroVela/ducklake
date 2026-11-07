@@ -378,8 +378,9 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
     for mode in ("canonical", "dot", "relative", "symlink"):
         case = root / mode
         case.mkdir()
-        data = case / "data"
-        data.mkdir()
+        # Exercise a managed artifact directory whose generation parent is outside it.
+        data = case / "generation" / "artifacts" if mode == "canonical" else case / "data"
+        data.mkdir(parents=True)
         data_path = str(data)
         if mode == "dot":
             data_path = str(case) + "/./data"
@@ -412,7 +413,7 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
         capture = case / "capture.json"
         capture.write_text(admission)
         # A sibling with the same prefix is outside the managed directory.
-        index = case / "data-index"
+        index = data.parent / (data.name + "-index")
         index.mkdir()
         reference = index / "reference.json"
         proof.run([str(proof.probe), "build-admitted-file-index", str(capture), str(reference)])
@@ -431,7 +432,31 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
         shutil.copytree(index, inside)
         publish(inside / "reference.json", 1, "outside the managed data path")
         rejected = ["inside managed data path"]
+
+        def relocated_reference(directory: Path, path: Path) -> Path:
+            source = index / generation(reference)
+            shutil.copytree(source / "artifacts", directory / "artifacts", dirs_exist_ok=True)
+            manifest = json.loads((source / "manifest.json").read_text())
+            manifest["generation"] = directory.name
+            manifest_path = directory / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, separators=(",", ":")))
+            descriptor = json.loads(reference.read_text())
+            descriptor["generation"]["generation"] = directory.name
+            descriptor["generation"]["manifest"].update(
+                size=manifest_path.stat().st_size, checksum=BASE.digest(manifest_path)
+            )
+            path.write_text(json.dumps(descriptor, separators=(",", ":")))
+            return path
+
+        # An external reference must not admit a generation inside the managed root.
+        nested_generation = relocated_reference(data, data.parent / "managed-generation.reference.json")
+        publish(nested_generation, 1, "outside the managed data path")
+        rejected.append("managed generation with external reference")
         if mode == "canonical":
+            # Here the generation directory is outside DATA_PATH, but its artifacts are inside.
+            nested_artifacts = relocated_reference(data.parent, case / "managed-artifacts.reference.json")
+            publish(nested_artifacts, 1, "outside the managed data path")
+            rejected.append("managed artifacts with external generation")
             link = case / "reference-link.json"
             link.symlink_to(reference)
             publish(link, 1, "must be canonical")
@@ -448,6 +473,24 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
                 protected.unlink()
                 protected.write_bytes(original)
             rejected.append("artifact symlink")
+
+        unchanged = json.loads(
+            sql("SELECT admission FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)")
+        )[0]["admission"]
+        named_before = json.loads(unchanged)["index"]
+        require(
+            named_before["revision"] == 1
+            and named_before["root"] == str(index)
+            and named_before["reference"] == json.loads(reference.read_text()),
+            f"path rejections changed the ready identity for {mode}",
+        )
+
+        # An ancestor reference root is valid when its actual generation is a sibling of DATA_PATH.
+        shutil.copytree(index / generation(reference), data.parent / generation(reference))
+        ancestor_reference = data.parent / "ancestor.reference.json"
+        ancestor_reference.write_text(reference.read_text())
+        ancestor = json.loads(publish(ancestor_reference, 1))[0]
+        require(int(ancestor["revision"]) == 2, f"valid ancestor index root was rejected for {mode}")
         acquired = json.loads(
             sql(
                 "SELECT visible_rows,admission FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)"
@@ -456,13 +499,16 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
         named = json.loads(acquired["admission"])["index"]
         require(
             int(acquired["visible_rows"]) == 4096
-            and named["revision"] == 1
+            and named["revision"] == 2
+            and named["root"] == str(data.parent)
             and named["reference"]["generation"]["generation"] == generation(reference),
             f"path validation changed the ready index for {mode}",
         )
-        cases.append({"data_path": mode, "visible_rows": 4096, "revision": 1, "rejections": rejected})
+        cases.append(
+            {"data_path": mode, "visible_rows": 4096, "revision": 2, "ancestor_root": True, "rejections": rejected}
+        )
     checks.append(
-        "canonical/dot/relative/symlink managed paths publish and acquire; physical directory containment and strict reference/artifact paths remain enforced"
+        "canonical/dot/relative/symlink managed paths and valid ancestor roots publish and acquire; actual generation/artifact containment and strict reference/artifact paths remain enforced"
     )
     return cases
 

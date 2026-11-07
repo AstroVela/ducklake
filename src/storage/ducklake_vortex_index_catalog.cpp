@@ -120,6 +120,13 @@ void CheckInterrupted(Connection &owner, ClientContext &caller) {
 	}
 }
 
+void OutsideManagedDataPath(const string &path, const string &data_path) {
+	auto prefix = data_path == "/" ? data_path : data_path + "/";
+	if (path == data_path || StringUtil::StartsWith(path, prefix)) {
+		throw InvalidInputException("Vortex index artifacts must be outside the managed data path");
+	}
+}
+
 string Read(FileSystem &fs, const string &path, idx_t limit, bool canonical) {
 	if (canonical && !fs.IsPathAbsolute(path)) {
 		throw InvalidInputException("Vortex index paths must be absolute");
@@ -139,8 +146,9 @@ string Read(FileSystem &fs, const string &path, idx_t limit, bool canonical) {
 	return bytes;
 }
 
-string Verify(FileSystem &fs, const string &path, yyjson_val *artifact, idx_t limit) {
+string Verify(FileSystem &fs, const string &path, yyjson_val *artifact, idx_t limit, const string &data_path) {
 	Object(artifact, 3);
+	OutsideManagedDataPath(path, data_path);
 	auto bytes = Read(fs, path, limit, true);
 	if (bytes.size() != Number(artifact, "size") || Hash(bytes) != Text(artifact, "checksum")) {
 		throw InvalidInputException("Sealed Vortex artifact size/checksum mismatch");
@@ -207,12 +215,14 @@ DuckLakeVortexIndex ParseReference(const string &bytes, const string &uuid, idx_
 	return result;
 }
 
-void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index) {
+void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index, const string &data_path) {
 	Parsed reference(index.reference);
 	auto descriptor = Member(reference.Root(), "generation");
 	auto directory = fs.JoinPath(index.root, index.generation);
 	Canonical(directory);
-	auto bytes = Verify(fs, fs.JoinPath(directory, "manifest.json"), Member(descriptor, "manifest"), MAX_MANIFEST);
+	OutsideManagedDataPath(directory, data_path);
+	auto bytes =
+	    Verify(fs, fs.JoinPath(directory, "manifest.json"), Member(descriptor, "manifest"), MAX_MANIFEST, data_path);
 	Parsed parsed(bytes);
 	auto metadata = parsed.Root();
 	Object(metadata, 9);
@@ -259,7 +269,7 @@ void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index) {
 		if (!paths.insert(path).second) {
 			throw InvalidInputException("Duplicate sealed Vortex artifact");
 		}
-		auto data = Verify(fs, fs.JoinPath(directory, "artifacts", path), artifact, remaining);
+		auto data = Verify(fs, fs.JoinPath(directory, "artifacts", path), artifact, remaining, data_path);
 		remaining -= data.size();
 	}
 }
@@ -405,11 +415,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 		candidate.root = Canonical(
 		    reference_path.substr(0, reference_path.find_last_of('/') == 0 ? 1 : reference_path.find_last_of('/')));
 		auto data_path = ResolveLocalPath(fs.ExpandPath(catalog.DataPath()));
-		auto managed_prefix = data_path == "/" ? data_path : data_path + "/";
-		if (candidate.root == data_path || StringUtil::StartsWith(candidate.root, managed_prefix)) {
-			throw InvalidInputException("Vortex index artifacts must be outside the managed data path");
-		}
-		VerifyGeneration(fs, candidate);
+		OutsideManagedDataPath(candidate.root, data_path);
+		VerifyGeneration(fs, candidate, data_path);
 		CheckInterrupted(owner, caller);
 		auto source_guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
 		CheckInterrupted(owner, caller);
