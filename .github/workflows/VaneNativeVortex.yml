@@ -57,6 +57,12 @@ jobs:
           ref: 122b63e0408a187a9d0ecdd129f1cbe12b6b46b2
           path: vortex-source
           persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: SPFresh/SPFresh
+          ref: 5893eb61ee3b18610b6b00f1939be7dae1af8904
+          path: spfresh-update-source
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
@@ -64,6 +70,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config gdb
+          sudo apt-get install -y 'librocksdb-dev=8.9.1-2' 'libtbb-dev=2021.11.0-2ubuntu2'
           python -m pip install uv cmake 'scikit-build-core>=0.11.4' 'pybind11[global]>=3' 'setuptools-scm>=9.2' numpy packaging pytest pytest-timeout
           rustup toolchain install 1.91.0 --profile minimal
           mkdir -p .cache/vcpkg build/wheels build/logs
@@ -167,6 +174,20 @@ jobs:
             --license-file build/notices/Vane-native-dependencies.txt \
             --license-file build/notices/DuckDB-MIT.txt --output-directory build/wheels --test-only
           uv pip install --system --no-index --find-links build/wheels build/wheels/vane_extension_ducklake-*.whl
+      - name: Verify local SPFresh native updates and frozen ReadViews
+        env:
+          VANE_RUNNER: local-fast
+        run: |
+          r7_cpus="$(python -c 'import os; print(",".join(str(cpu) for cpu in sorted(os.sched_getaffinity(0))))')"
+          python -I extension/test/vane/build_vortex_spfresh_updates.py \
+            --spfresh-source "$PWD/spfresh-update-source" --vortex-source "$PWD/vortex-source" \
+            --dependency-prefix /usr --build-dir "$PWD/build/spfresh-update-build" --cpus "$r7_cpus" \
+            2>&1 | tee build/logs/spfresh-update-build.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_spfresh_updates.py \
+            --probe "$PWD/build/spfresh-update-build/build/ducklake_spfresh_update_probe" \
+            --build-report "$PWD/build/spfresh-update-build/build.json" --cpus "$r7_cpus" \
+            --output-dir "$PWD/build/spfresh-update-proof" \
+            2>&1 | tee build/logs/spfresh-updates.log
       - name: Qualify installed Vane native vector retrieval
         env:
           VANE_RUNNER: local-fast
@@ -314,6 +335,12 @@ jobs:
           name: vane-native-vortex-proof
           path: |
             build/logs
+            build/spfresh-update-build/build.json
+            build/spfresh-update-proof/report.json
+            build/spfresh-update-proof/rule.json
+            build/spfresh-update-proof/*.log
+            build/spfresh-update-proof/catalog/head.json
+            build/spfresh-update-proof/catalog/**/seal.json
             build/remote-publication-proof
             build/proof/report.json
             build/write-proof/report.json
