@@ -232,7 +232,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 已覆盖独立 B₂ 不重建 B₁、原子发布竞争、取消、实际 SIGKILL、提交后丢 ACK、旧请求重放、普通事务阻止 GC，以及旧 ReadView 在规范文件／generation GC 后继续查询。详见[#74 最终资格记录](native-vortex-maintenance-probe-ab.md#final-installed-qualification-after-withdrawal)。
 
-本轮 R5 的四维度功能矩阵通过 36 个阶段、432 次普通查询、432 次实际快照诊断及 56 项拒绝检查，最低 fixture recall 1.0。另通过 inline 精确 SQL 的 11 个断言块、高维平方 L2 闭式回归、溢出拒绝及合法查询恢复；两项数值回归已在对应旧 provider 上复现失败。本轮受管／append 回归共 20 项原生／恢复用例通过，Vane 基础套件再次通过 1,254 项、15 项可选跳过。详见[确定性维度与查询契约](native-vortex-functional-matrix.md)。
+本轮 R5 的四维度功能矩阵通过 36 个阶段、432 次普通查询、432 次实际快照诊断及 56 项拒绝检查，最低 fixture recall 1.0。另通过 inline 精确 SQL 的 11 个断言块、高维平方 L2 闭式回归、溢出拒绝及合法查询恢复；两项数值回归已在对应旧 provider 上复现失败。本轮受管／append 回归共 21 项原生／恢复用例通过，Vane 基础套件再次通过 1,254 项、15 项可选跳过。详见[确定性维度与查询契约](native-vortex-functional-matrix.md)。
 
 [显式请求 epoch](native-vortex-request-epochs.md)通过 8 组公开契约与 14 项原生／故障／恢复用例，包括 10 万条全局回执上限、表间隔离、两种写入／推进顺序、八个并发相同推进、真实元数据冲突、取消及四个实际 SIGKILL 边界。四维度矩阵在新接口上再次通过；现有六组链路回归覆盖 67 项原生／恢复用例、172 次安装态查询比较，另通过 189 个相关 SQL 断言块与 6 项 oracle；本轮 Vane 基础套件通过 1,254 项、15 项可选跳过。回执槽位释放不代表文件／WAL 已收缩，也不构成长期容量资格。
 
@@ -290,7 +290,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 [动态候选持久登记、取消与崩溃回收](native-vortex-spfresh-candidates.md)在 #97 的实际原生 checkpoint 上增加严格的新 registry。单一提交根原子保存发布 head、候选与退休状态，绑定 owner／表 UUID、源及目标 ReadView、水位和 revision。继承给原生子进程的 POSIX 文件锁保护活跃候选，取消与分批清理完成前持续 pin 构建源；没有 TTL、PID 推断、自动采用或兼容解码。
 
-专项通过 **315 次 ANN 查询比较**（其中 135 次位于分区边界）、**13 个实际 SIGKILL 边界、83 次 GC 调用、20 项拒绝与 4 项独立 oracle 控制**，fixture 最低 recall **1.0**。仅父进程被杀、原生子进程仍持锁时，恢复和 GC 均暂缓；发布前 pending 必须显式丢弃，发布后的未知响应确认已经提交的 head。两次删除中途崩溃后，以 1 项预算续收，缺失的已计划项仍保守计原字节；旧视图在 canonical GC 后继续查询。
+专项通过 **315 次 ANN 查询比较**（其中 135 次位于分区边界）、**13 个实际 SIGKILL 边界、83 次 GC 调用、21 项拒绝与 4 项独立 oracle 控制**，fixture 最低 recall **1.0**。仅父进程被杀、原生子进程仍持锁时，恢复和 GC 均暂缓；发布前 pending 必须显式丢弃，发布后的未知响应确认已经提交的 head。两次删除中途崩溃后，以 1 项预算续收，缺失的已计划项仍保守计原字节；旧视图在 canonical GC 后继续查询。
 
 该组件最多 16 个登记／1 MiB registry，GC 每次最多 16 项／64 MiB，逐文件、目录、lease 与最终登记计项，未改变生产预算或普通 DuckLake 事务保护。实现仍位于独立 Python 实验中，尚未接入原生动态 provider 或 DuckLake 元数据事务；不能把该本地协议验证等同于生产在线更新已完成。
 

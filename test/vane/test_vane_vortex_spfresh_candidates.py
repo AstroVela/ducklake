@@ -359,6 +359,11 @@ def exercise(args, report):
                 oversized = deepcopy(captures[1])
                 oversized["rows"][0]["row"]["payload"] = "x" * F.MIB
                 rejected(report, "oversized-capture", lambda: registry.register(oversized, 1), "MANIFEST_BUDGET")
+                overflow = deepcopy(captures[1])
+                overflow["file_capture"]["snapshot_id"] = 1 << 64
+                before = O.files(registry.root)
+                rejected(report, "snapshot-overflow", lambda: registry.register(overflow, 1), "SNAPSHOT_RANGE")
+                require(O.files(registry.root) == before, "Invalid snapshot changed durable registry")
                 winner = C.Session(registry, args.probe, captures[1], 1, args.output_dir / "winner.log")
                 sessions.append(winner)
                 model.registered(winner.handle["id"], captures[1])

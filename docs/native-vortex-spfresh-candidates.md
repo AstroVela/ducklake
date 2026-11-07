@@ -48,7 +48,7 @@ GC 每次最多 **16 项／64 MiB**。本组件采用更细的计费：每个文
 
 [协调器](../test/vane/test_vane_vortex_spfresh_candidates.py)使用实际 DuckLake 事务、请求回执、flush、Vortex 与捕获的 ReadView；[独立事件模型](../test/vane/vortex_spfresh_candidate_oracle.py)不导入 registry，实现对提交 head、候选状态、目标绑定、源引用和物理删除的独立核对。原生查询沿用历史 SQL、实际 Vortex、IEEE／typed 行、距离／排序／recall 检查，并独立解码最终原生 posting／version／head。
 
-正式专项通过 **315 次实际 ANN 查询比较**（含 135 次分区边界查询），最低 recall **1.0**；**13 个实际 SIGKILL 边界、83 次 GC 调用、20 项明确拒绝、4 项故意错误 registry 结果**均符合预期。
+正式专项通过 **315 次实际 ANN 查询比较**（含 135 次分区边界查询），最低 recall **1.0**；**13 个实际 SIGKILL 边界、83 次 GC 调用、21 项明确拒绝、4 项故意错误 registry 结果**均符合预期。
 
 | 场景 | 结果 |
 | --- | --- |
@@ -63,9 +63,11 @@ GC 每次最多 **16 项／64 MiB**。本组件采用更细的计费：每个文
 
 13 个 SIGKILL 点为：登记提交、lease 提交、复制后、原生增量后、取消提交、真实 split 后、seal 文件完成、seal 登记提交、发布 rename 前、发布提交后、仅父进程死亡、GC unlink 后、GC 进度 rename 前。测试用 subreaper 仅回收自己的进程组，并在结束后恢复设置；这些 PID 只用于确定性测试控制，不是协议的所有权依据。
 
-20 项拒绝覆盖 UUID／字段／snapshot／revision、布尔 revision、超大 capture、未封存发布、过期 worker、错误 owner、取消 worker、旧格式、路径越界、当前引用、四种 GC 预算、已回收 handle、满 registry 及 pending 元数据。四项 oracle 控制分别篡改 head、水位、状态与源所有权，均被独立事件模型拒绝。
+21 项拒绝覆盖 UUID／字段／snapshot／revision、布尔 revision、超大 capture、越界 snapshot、未封存发布、过期 worker、错误 owner、取消 worker、旧格式、路径越界、当前引用、四种 GC 预算、已回收 handle、满 registry 及 pending 元数据。四项 oracle 控制分别篡改 head、水位、状态与源所有权，均被独立事件模型拒绝。
 
-GC 共记 **305 项／5,414,718 字节**，单次实测最大 **16 项／686,013 字节**；这些仅是本 fixture 的观测，不是大型容量或性能资格。本地完整 fixture `/dev/shm/dvcandidate-final-20261107`，持久摘要 `/tmp/ducklake-r7-candidates-proof-20261107/report.json`，SHA `76a2bbcc1c035592c76c6dcec3112910ee9ff492a65fd02b4dd165308f1812d6`。
+边界审查还修复目标 snapshot 超出 uint64 时可写入不能重开的登记。以相同 capture 的 `snapshot_id=2^64` 对照，修复前登记成功但重开报 `REGISTRY_FORMAT`，修复后在落盘前报 `SNAPSHOT_RANGE`，提交根及文件清单字节不变；反例保存为摘要目录 `snapshot-control.json`。该本地历史源码控制仅用于验证，没有运行时兼容入口。
+
+GC 共记 **305 项／5,414,900 字节**，单次实测最大 **16 项／686,022 字节**；这些仅是本 fixture 的观测，不是大型容量或性能资格。本地完整 fixture `/dev/shm/dvcandidate-final-v2-20261107`，持久摘要 `/tmp/ducklake-r7-candidates-proof-20261107/report.json`，SHA `a8dab5c5b2843e75d4d0678acd89644681b6b01584e66aa53da4900507f17756`。
 
 本轮只改测试 Python 与 CI／文档，复用 #97 从干净固定源码构建的探针，SHA `7dc36b75722e88e7903c2780f538d9042b300d98072b30f3f1f81f118bd3ec02`。专项检查二进制、原构建输入及当前 checkout 对应 C++／patch 字节；生产 `src/`、C++／Rust／SDK pins、已安装 Vane／DuckLake／Vortex 构件保持，不需要无关 native 重建。CPU 6–11、13 项继承线程环境、原生单线程与 DuckDB threads=2 保持。
 

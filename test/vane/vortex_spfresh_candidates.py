@@ -32,7 +32,9 @@ def identity(capture):
 
 
 def target(capture):
-    return {"snapshot_id": capture["file_capture"]["snapshot_id"], "capture_sha256": F.sha(F.encoded(capture))}
+    snapshot = capture["file_capture"]["snapshot_id"]
+    F.require(type(snapshot) is int and 1 <= snapshot <= MAX_REVISION, "SNAPSHOT_RANGE")
+    return {"snapshot_id": snapshot, "capture_sha256": F.sha(F.encoded(capture))}
 
 
 def uid(value):
@@ -277,6 +279,7 @@ class Registry:
         F.validate_capture(capture)
         F.require(type(expected_revision) is int and 1 <= expected_revision <= MAX_REVISION, "PUBLICATION_CONFLICT")
         F.require(len(F.encoded(capture)) <= F.MIB, "MANIFEST_BUDGET")
+        captured_target = target(capture)
         with self.lock(True):
             state = self._load()
             F.require(len(state["records"]) < SLOTS, "REGISTRY_CAPACITY")
@@ -289,7 +292,7 @@ class Registry:
                 "owner": owner,
                 "phase": "building",
                 "base": dict(state["head"], capture_sha256=target(source["capture"])["capture_sha256"]),
-                "target": target(capture),
+                "target": captured_target,
                 "pin_source": True,
                 "lease": None,
                 "seal_sha256": None,
