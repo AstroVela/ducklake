@@ -4,6 +4,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 use std::str;
+use std::{cell::RefCell, collections::BTreeMap, time::Instant};
 
 use crate::{
     lease::ViewBudget,
@@ -99,7 +100,31 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
     } else {
         None
     };
+    let started = Instant::now();
+    let last = RefCell::new(started);
+    let phases = RefCell::new(BTreeMap::<&str, u64>::new());
     let check = |stage: &str| {
+        let phase = match stage {
+            "before_open" => Some("setup_us"),
+            "sources_staged" => Some("decode_stage_us"),
+            "source_pinned" => Some("source_open_us"),
+            "after_open" => Some("index_open_us"),
+            "before_ann" => Some("filter_us"),
+            "after_ann" => Some("ann_us"),
+            "before_scan" => Some("rerank_us"),
+            "inline_top_k" => Some("file_scan_us"),
+            "before_fetch" => Some("inline_merge_us"),
+            "after_fetch" => Some("ranked_take_us"),
+            _ => None,
+        };
+        if let Some(phase) = phase {
+            let now = Instant::now();
+            phases
+                .borrow_mut()
+                .insert(phase, now.duration_since(*last.borrow()).as_micros() as u64);
+            *last.borrow_mut() = now;
+        }
+
         if (input.control)(input.context, stage.as_ptr(), stage.len() as u64) != 0 {
             vortex_bail!("Native Vortex SQL query interrupted");
         }
@@ -118,7 +143,7 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
     let scratch = tempfile::Builder::new()
         .prefix(".ducklake-vortex-query-")
         .tempdir_in(scratch_root)?;
-    block_on(|handle| async move {
+    block_on(|handle| async {
         let session = VortexSession::default().with_handle(handle);
         let view = MixedView::from_bytes(
             bytes,
@@ -141,7 +166,9 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
             .await?;
         let diagnostics = serde_json::to_vec(&serde_json::json!({"routes":result.routes,
             "index_revision":view.catalog_revision,"generation":view.lease.index.metadata().generation,
-            "snapshot_id":view.source.capture.snapshot_id}))
+            "snapshot_id":view.source.capture.snapshot_id, "cost":{"phases_us":phases.borrow().clone(),
+            "projection_rows":view.source.projection_counts(),"source_bytes":view.source.pinned_bytes(),
+            "artifact_bytes":view.lease.artifact_bytes,"elapsed_us":started.elapsed().as_micros() as u64}}))
             .map_err(|e| vortex_err!("{e}"))?;
         Ok(Output {
             hits: result.hits,

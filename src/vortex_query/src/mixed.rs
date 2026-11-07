@@ -275,6 +275,7 @@ impl MixedView {
                 vortex_bail!("Duplicate inline row address");
             }
         }
+        check("sources_staged")?;
         let source_capture =
             serde_json::to_vec(&captured.file_capture).map_err(|error| vortex_err!("{error}"))?;
         let source = Arc::new(match &pins {
@@ -409,7 +410,8 @@ impl MixedView {
             })
             .collect();
         let mut fetched = self.source.take_business(&files).await?.into_iter();
-        rows.iter()
+        let result = rows
+            .iter()
             .map(|row| match row {
                 RowRef::File { .. } => fetched
                     .next()
@@ -420,7 +422,19 @@ impl MixedView {
                     .cloned()
                     .ok_or_else(|| vortex_err!("Missing inline business row")),
             })
-            .collect()
+            .collect::<VortexResult<Vec<_>>>()?;
+        let mut remaining = 64 * 1024 * 1024;
+        for row in &result {
+            let bytes = row.embedding.len() * std::mem::size_of::<f32>()
+                + 64
+                + row.category.as_ref().map_or(0, String::len)
+                + row.payload.as_ref().map_or(0, String::len);
+            if bytes > remaining {
+                vortex_bail!("Ranked business take exceeds its byte budget");
+            }
+            remaining -= bytes;
+        }
+        Ok(result)
     }
 
     fn validate_query(&self, query: &[f32], k: usize) -> VortexResult<()> {
@@ -448,8 +462,9 @@ impl MixedView {
             let mut allowed = Vec::new();
             for chunk in rows.chunks(1024) {
                 check("category_filter")?;
-                for (address, row) in chunk.iter().zip(self.source.take_business(chunk).await?) {
-                    if row.category.as_deref() == Some(category) {
+                for (address, value) in chunk.iter().zip(self.source.take_categories(chunk).await?)
+                {
+                    if value.as_deref() == Some(category) {
                         allowed.push(RowRef::from(*address));
                     }
                 }
@@ -552,12 +567,12 @@ impl MixedView {
                 vortex_bail!("ANN returned an invisible, disallowed or invalid candidate");
             }
         }
-        let b_business = self.source.take_business(&b_rows).await?;
+        let b_vectors = self.source.take_vectors(&b_rows).await?;
         let mut b = TopK::new(request.k);
-        for (row, business) in b_rows.into_iter().zip(b_business) {
+        for (row, vector) in b_rows.into_iter().zip(b_vectors.chunks_exact(dimension)) {
             b.offer(Candidate {
                 row_ref: row.into(),
-                distance: squared_l2(&request.query, &business.embedding)?,
+                distance: squared_l2(&request.query, vector)?,
             });
         }
         let mut routes = Routes {
@@ -571,6 +586,7 @@ impl MixedView {
             inline_eligible_rows: 0,
             merge_candidates: 0,
         };
+        check("before_scan")?;
         let mut f = TopK::new(request.k);
         let mut stream = self
             .source
