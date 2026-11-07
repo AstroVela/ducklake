@@ -1,0 +1,73 @@
+--- a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
++++ b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
+@@ -702,8 +702,6 @@
+                     mergedPostingList += currentPostingList.substr(j * m_vectorInfoSize, m_vectorInfoSize);
+                     currentLength++;
+                 }
+-                // Reassignment counts refer to these filtered records, not the raw prefix.
+-                std::string currentLivePosting = mergedPostingList;
+                 int totalLength = currentLength;
+ 
+                 if (currentLength > m_mergeThreshold)
+@@ -722,7 +720,6 @@
+                 p_index->SearchIndex(queryResults);
+ 
+                 std::string nextPostingList;
+-                std::string nextLivePosting;
+ 
+                 for (int i = 1; i < queryResults.GetResultNum(); ++i)
+                 {
+@@ -744,14 +741,12 @@
+                             postingP = reinterpret_cast<uint8_t*>(&nextPostingList.front());
+                             postVectorNum = nextPostingList.size() / m_vectorInfoSize;
+                             nextLength = 0;
+-                            nextLivePosting.clear();
+                             vectorId = postingP;
+                             for (int j = 0; j < postVectorNum; j++, vectorId += m_vectorInfoSize)
+                             {
+                                 int VID = *((int*)(vectorId));
+                                 uint8_t version = *(vectorId + sizeof(int));
+                                 if (m_versionMap->Deleted(VID) || m_versionMap->GetVersion(VID) != version) continue;
+-                                nextLivePosting += nextPostingList.substr(j * m_vectorInfoSize, m_vectorInfoSize);
+                                 if (vectorIdSet.find(VID) == vectorIdSet.end()) {
+                                     mergedPostingList += nextPostingList.substr(j * m_vectorInfoSize, m_vectorInfoSize);
+                                     totalLength++;
+@@ -786,12 +781,11 @@
+ 
+                         if (reassign) 
+                         {
+-                            // The previous head must be the retired head. A surviving replica
+-                            // would make RNGSelection skip a required nearest-partition repair.
++                            /* ReAssign */
+                             if (currentLength > nextLength) 
+                             {
+                                 /* ReAssign queryResult->VID*/
+-                                postingP = reinterpret_cast<uint8_t*>(nextLivePosting.data());
++                                postingP = reinterpret_cast<uint8_t*>(&nextPostingList.front());
+                                 for (int j = 0; j < nextLength; j++) {
+                                     uint8_t* vectorId = postingP + j * m_vectorInfoSize;
+                                     // SizeType vid = *(reinterpret_cast<SizeType*>(vectorId));
+@@ -799,12 +793,12 @@
+                                     float origin_dist = p_index->ComputeDistance(p_index->GetSample(queryResult->VID), vector);
+                                     float current_dist = p_index->ComputeDistance(p_index->GetSample(headID), vector);
+                                     if (current_dist > origin_dist)
+-                                        ReassignAsync(p_index, std::make_shared<std::string>((char*)vectorId, m_vectorInfoSize), queryResult->VID);
++                                        ReassignAsync(p_index, std::make_shared<std::string>((char*)vectorId, m_vectorInfoSize), headID);
+                                 }
+                             } else
+                             {
+                                 /* ReAssign headID*/
+-                                postingP = reinterpret_cast<uint8_t*>(currentLivePosting.data());
++                                postingP = reinterpret_cast<uint8_t*>(&currentPostingList.front());
+                                 for (int j = 0; j < currentLength; j++) {
+                                     uint8_t* vectorId = postingP + j * m_vectorInfoSize;
+                                     // SizeType vid = *(reinterpret_cast<SizeType*>(vectorId));
+@@ -812,7 +806,7 @@
+                                     float origin_dist = p_index->ComputeDistance(p_index->GetSample(headID), vector);
+                                     float current_dist = p_index->ComputeDistance(p_index->GetSample(queryResult->VID), vector);
+                                     if (current_dist > origin_dist)
+-                                        ReassignAsync(p_index, std::make_shared<std::string>((char*)vectorId, m_vectorInfoSize), headID);
++                                        ReassignAsync(p_index, std::make_shared<std::string>((char*)vectorId, m_vectorInfoSize), queryResult->VID);
+                                 }
+                             }
+                         }

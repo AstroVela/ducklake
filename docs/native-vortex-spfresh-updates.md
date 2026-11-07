@@ -81,4 +81,6 @@ VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_spfresh_updates.py \
 
 下一项推荐 R7 有预算的 LIRE split／merge／reassign 确定性专项，先验证重平衡时 native VID、posting、version labels 和 checkpoint 是否一致，以及旧视图是否保持。随后再决定动态 provider 的生产接口、DuckLake 元数据原子绑定、增量游标、候选生命周期和并发协议。
 
+后续已补充[受控串行 LIRE 的独立确定性验证](native-vortex-spfresh-lire.md)，包括原始 posting oracle、merge 缺陷的同输入控制构建、重平衡中实际 SIGKILL 和旧视图；本页保留 #96 当轮范围与历史结果，最新顺序以总 roadmap 为准。
+
 固定输入上的复制／重开证明不等于高吞吐在线 serving。任意 filter、现有全局 top-k／稳定平局顺序、维度矩阵、长期质量、掉电持久性、原生 SQL 自动接线与长期磁盘／RSS 资格仍需单独验证。R6 继续暂缓；R4 A/A、性能 A/B、长期稳态和依赖稳定负载的 R5 项目也继续暂缓。

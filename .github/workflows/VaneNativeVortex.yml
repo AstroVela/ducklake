@@ -188,6 +188,23 @@ jobs:
             --build-report "$PWD/build/spfresh-update-build/build.json" --cpus "$r7_cpus" \
             --output-dir "$PWD/build/spfresh-update-proof" \
             2>&1 | tee build/logs/spfresh-updates.log
+      - name: Verify controlled native LIRE and the merge counterexample
+        env:
+          VANE_RUNNER: local-fast
+        run: |
+          r7_cpus="$(python -c 'import os; print(",".join(str(cpu) for cpu in sorted(os.sched_getaffinity(0))))')"
+          python -I extension/test/vane/build_vortex_spfresh_updates.py \
+            --spfresh-source "$PWD/spfresh-update-source" --vortex-source "$PWD/vortex-source" \
+            --dependency-prefix /usr --build-dir "$PWD/build/spfresh-merge-control-build" \
+            --cpus "$r7_cpus" --merge-control \
+            2>&1 | tee build/logs/spfresh-merge-control-build.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_spfresh_lire.py \
+            --probe "$PWD/build/spfresh-update-build/build/ducklake_spfresh_update_probe" \
+            --build-report "$PWD/build/spfresh-update-build/build.json" \
+            --merge-control-probe "$PWD/build/spfresh-merge-control-build/build/ducklake_spfresh_update_probe" \
+            --merge-control-build-report "$PWD/build/spfresh-merge-control-build/build.json" \
+            --cpus "$r7_cpus" --output-dir "$PWD/build/spfresh-lire-proof" \
+            2>&1 | tee build/logs/spfresh-lire.log
       - name: Qualify installed Vane native vector retrieval
         env:
           VANE_RUNNER: local-fast
@@ -336,6 +353,8 @@ jobs:
           path: |
             build/logs
             build/spfresh-update-build/build.json
+            build/spfresh-merge-control-build/build.json
+            build/spfresh-lire-proof
             build/spfresh-update-proof/report.json
             build/spfresh-update-proof/rule.json
             build/spfresh-update-proof/*.log

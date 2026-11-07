@@ -4,7 +4,7 @@
 
 配套阅读：[ChatGPT Page](https://chatgpt.com/space/page_0c2fa263e4dc81919bfaea100e8008cd)。本文是后续随代码维护的仓库总纲。
 
-**当前结论：本地原生基本链路已实现并通过端到端验证；持续写入下的长期维护稳态尚未完成。** 已支持提交后即时查询、后台 flush、独立 B 段构建、选择性合并、数据重写、受事务保护的 GC 和崩溃恢复。生产仍使用静态 SPFresh；本轮新增独立的 R7 原生增删／重开／旧视图组件验证，尚未接入生产 SQL 或完成 LIRE 重平衡。云端与分布式向量查询仍未完成，R6 按当前优先级暂缓。
+**当前结论：本地原生基本链路已实现并通过端到端验证；持续写入下的长期维护稳态尚未完成。** 已支持提交后即时查询、后台 flush、独立 B 段构建、选择性合并、数据重写、受事务保护的 GC 和崩溃恢复。生产仍使用静态 SPFresh；R7 已有原生增删／重开／旧视图及受控串行 LIRE split／merge／reassign 的本地组件证据，尚未接入生产 SQL 或验证后台并发。云端与分布式向量查询仍未完成，R6 按当前优先级暂缓。
 
 ## 1. 基线与设计范围
 
@@ -276,7 +276,15 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 [R7 本地原生增删／checkpoint／旧 ReadView](native-vortex-spfresh-updates.md)使用实际 RocksDB 和 SPFresh AddIndexSPFresh／DeleteIndex，通过 156 次 ANN 查询比较、23 项拒绝检查和 6 个真实 SIGKILL 边界，fixture 最低 recall 1.0。业务写入继续走 DuckLake 原生受管事务、回执与 flush；业务已提交而 ANN 落后时崩溃，重开保留 T 数据和回执，只有显式推进才更新动态实验水位。完整私有旧视图在 canonical checkpoint GC 后仍可查询。
 
-该证据限于同步 posting 增删、关闭 checkpoint 与明确的私有版本副本。实验发布指针尚未接入 DuckLake 元数据事务，生产 SQL／optimizer 仍使用 `spfresh.static`；没有完成 LIRE split／merge／reassign，也没有证明复制 checkpoint 的性能收益。R6 未提交的 codec 工作区继续独立暂缓。
+该轮证据限于同步 posting 增删、关闭 checkpoint 与明确的私有版本副本。实验发布指针尚未接入 DuckLake 元数据事务，生产 SQL／optimizer 仍使用 `spfresh.static`；LIRE 的后续组件证据见下一节，整份 checkpoint 复制的性能收益尚未证明。R6 未提交的 codec 工作区继续独立暂缓。
+
+### 9.5 R7 受控 LIRE 的本地组件证据
+
+[受控 LIRE split／merge／reassign](native-vortex-spfresh-lire.md)在 #96 之上运行真实原生任务和 RocksDB，完成 **252 次 ANN 查询比较**（其中 108 次位于追加数据的分区边界）、**388 次有预算的显式 drain**、**3 个实际 SIGKILL 边界**及 **10 项拒绝检查**，fixture 最低 recall **1.0**。独立读取所有持久 posting，核对 VID／IEEE 向量、version、head／posting size、全体可见向量覆盖和最近分区分配；旧视图在规范 checkpoint GC 后继续查询。
+
+同输入的独立原生反例捕获两处 merge 问题：按 live 数量遍历未过滤的原记录前缀，以及把 keeper head 传给重分配而提前跳过修复。测试 SDK 修正后，同一个关闭 checkpoint 的原生控制构建被最近分区验收拒绝，修正版通过；控制构建仅作验收。该 synthetic VID 反例与真实 DuckLake RowRef 的端到端证据分别记录。
+
+任务由单线程显式队列执行，保持 CPU 6–11、现有线程、事务保护和 admission；每次最多 16 次嵌套原生操作／64 MiB posting 写入，Reassign 出队前预留嵌套 Split 的操作数。该预算不代表总 I/O／RSS；检查读取、checkpoint 复制及 RocksDB 写放大另计。没有验证原生后台并发，动态候选的持久登记／取消／崩溃回收与生产元数据原子接线仍未完成。
 
 ## 10. 统一 roadmap
 
@@ -291,7 +299,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R4 长期维护稳态 | **因本机负载波动暂缓，未完成**：[文件名预筛选](native-vortex-filename-prefilter.md)通过每侧 53,322 项路径 oracle 和 2,144 项真实元数据检查；预先提交协议后的受控 A/B 完成 768 次主采样，两个目标改善 5.28%／15.70%，但一个对照增加 3.84%，按规则撤回候选。生产引用检查未改，CPU／线程／事务／预算保持 | 稳定资源环境具备后再恢复 A/A、性能 A/B 与长期稳态验证；既有 A/A 未达 2% 门槛、候选撤回、积压有界与开放停滞未关闭的结论均保留 |
 | R5 容量与产品契约 | **部分完成，本地确定性生命周期已覆盖**：[确定性矩阵](native-vortex-functional-matrix.md)、[显式请求 epoch](native-vortex-request-epochs.md)，[reference／WAL 契约](native-vortex-reference-wal-lifecycle.md)、[容量 admission 边界](native-vortex-capacity-admission.md)、[查询 scratch 生命周期](native-vortex-query-scratch-lifecycle.md)、[表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md)与[退休历史／物理回收契约](native-vortex-retired-history.md)；已验证固定循环的原生块复用 | 更大数据、质量、延迟、吞吐、长期容量与总磁盘／RSS 资格仍待验证，依赖稳定负载的项目继续暂缓 |
 | R6 云端与分布式 | **部分完成，按当前优先级暂缓**：[协议模型](native-vortex-remote-publication.md)、[PostgreSQL／S3 backend](native-vortex-postgres-s3-backend.md)、[typed metadata／UUID／epoch](native-vortex-postgres-typed-lifecycle.md)、[UUID／发布／ReadView 绑定](native-vortex-bound-readviews.md)和 [reader session／pin 回收](native-vortex-reader-sessions.md)已有组件层实测；对象仍为 opaque fixture，实际 codec 未提交工作区保留，原生 SQL 仍限定 native DuckDB／本地 POSIX | 实际 Vortex／SPFresh 编码与最小查询、原生 codec／普通事务自动登记及真实 AWS／TLS／IAM、HA、分布式 fan-out／top-k 资格 |
-| R7 SPFresh 原生在线更新 | **部分完成，仅本地组件验证**：[原生增删／重开／旧 ReadView](native-vortex-spfresh-updates.md)已验证实际 Add/Delete、关闭 checkpoint、受预算 canonical GC、旧视图和业务先提交／ANN 后推进；生产仍使用静态 provider | LIRE 重平衡、动态 provider／DuckLake 元数据原子接线、并发与候选恢复／回收协议；随后单独证明质量与收益 |
+| R7 SPFresh 原生在线更新 | **部分完成，仅本地组件验证**：[原生增删／重开／旧 ReadView](native-vortex-spfresh-updates.md)及[受控串行 LIRE](native-vortex-spfresh-lire.md)已验证实际 Add/Delete、split／merge／reassign、持久物理状态、有预算推进、旧视图与恢复；生产仍使用静态 provider | 动态候选持久登记／取消／崩溃回收、动态 provider／DuckLake 元数据原子接线和后台并发；随后单独证明质量与收益 |
 
 原 RFC 的静态索引、实时可见、B/F/T、compaction／GC 目标在 R0–R3 有对应实现；其 Iceberg 专属物化、云端 fencing 和分布式 serving 并未因 DuckLake 本地链路通过而完成。保留原 RFC 作为历史来源，本文件作为 DuckLake 路线的总纲。
 
@@ -299,9 +307,9 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 ## 11. 下一份验证性 Draft PR
 
-**下一项推荐 R7 有预算的 LIRE split／merge／reassign 确定性验证。** [本轮原生增删实验](native-vortex-spfresh-updates.md)已覆盖同步 posting 更新、关闭 checkpoint、六个实际 SIGKILL 边界与旧视图。先分别验证重平衡对 native VID、posting、version labels 和持久状态的影响，再设计并发与生产接线；不运行依赖稳定负载的性能资格。
+**下一项推荐 R7 动态候选的持久登记、取消与有预算的崩溃回收契约。** [原生增删实验](native-vortex-spfresh-updates.md)与[受控 LIRE 验证](native-vortex-spfresh-lire.md)已覆盖关闭 checkpoint、实际 SIGKILL、持久 posting／version／head 和旧视图；未封存候选目前只保留作证据。先明确候选的所有权与生命周期，再接入生产发布与并发，不运行依赖稳定负载的性能资格。
 
-1. R7 下一轮先覆盖受控分裂、合并、边界重分配及重开，保持原生 RowRef 映射、旧视图、预算和失败时明确拒绝。本轮的整份 checkpoint 复制有明确 I/O 成本，不能据此声称生产低写放大。
+1. R7 下一轮显式绑定候选 UUID／源 snapshot／覆盖水位，验证登记、取消、崩溃后明确判定和有预算回收；不能把未封存目录自动采用为已发布版本。继续保持现有事务保护、原生 RowRef 映射、旧视图和预算，整份 checkpoint 复制仍有明确 I/O 成本。
 2. R7 生产接线仍需动态 provider、提交增量游标、DuckLake 元数据中的原子覆盖水位、并发快照和候选取消／恢复／回收；当前单一本地实验指针不能代替这些协议。
 3. R6 按用户优先级继续暂缓：实际远程 codec、broker 原生调用、普通事务自动登记、真实 AWS／TLS／IAM、HA、分布式 fan-out／读位置／top-k 仍待完成；既有 reader fencing 不替代任意 SQL 事务保护。
 4. R5 的更大数据／质量与容量资格仍须单独声明输入、资源和退出条件；当前 fixture 及三轮块复用不替代持续容量验证。
@@ -339,7 +347,8 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | [R6 PostgreSQL typed metadata／UUID／epoch](native-vortex-postgres-typed-lifecycle.md) | PG OID／IEEE／NULL／BYTEA、字段与行身份、全 uint64 窗口、满回执、原子退休、提交故障和独立历史模型；#93 历史基线 |
 | [R6 Typed UUID／发布／ReadView 统一绑定](native-vortex-bound-readviews.md) | 新 v2 布局、复合外键、每 UUID 发布 CAS、原子退休引用、确切快照／副本、晚到请求和真实服务恢复；尚无原生远程 ANN |
 | [R6 Reader session／fencing／持久 pin 回收](native-vortex-reader-sessions.md) | 新 typed v3、PG lifetime lock、逐 GET 验证、显式 terminal fence、共享预算、SIGSTOP／SIGKILL 和提交故障；没有 TTL／自动重连 |
-| [R7 本地 SPFresh 原生增删与旧 ReadView](native-vortex-spfresh-updates.md) | 实际 RocksDB／Add/Delete、关闭 checkpoint、物理身份、私有旧视图与 canonical GC、业务 WAL／ANN 水位分离；生产动态接线与 LIRE 待验证 |
+| [R7 本地 SPFresh 原生增删与旧 ReadView](native-vortex-spfresh-updates.md) | 实际 RocksDB／Add/Delete、关闭 checkpoint、物理身份、私有旧视图与 canonical GC、业务 WAL／ANN 水位分离；#96 历史基线 |
+| [R7 受控 LIRE split／merge／reassign](native-vortex-spfresh-lire.md) | 实际串行原生任务、嵌套预算 admission、持久 posting／version／head 与最近分区 oracle、merge 同输入反例和旧视图；生产接线与后台并发待验证 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。
