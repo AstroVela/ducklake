@@ -133,18 +133,18 @@ route counters and JSON reports are uploaded as validation evidence. This is
 not a production SQL index API, automatic catalog index publication, a new ANN
 engine, a source WAL, a cloud/Ray path or a throughput/latency benchmark.
 
-Local validation reused the qualified #27 native shell and the pinned SPFresh
-libraries, rebuilding the probe from its locked dependencies. The mixed proof
-passed 51 SQL/probe processes and 77 worker requests, including 24 expected
-rejections. Seven merged fixture queries and three B-only queries had recall
-1.0; the separate far single-row predicate probe returned zero hits. Actual
-cleanup removed all three captured B/F source files before retained queries
-and delayed fetch were rechecked.
+Local validation uses the qualified native shell whose source matches #29 and
+the locked probe built from the unchanged Rust bridge. The mixed proof passed
+61 SQL/probe processes and 86 requests across five workers, including 24 expected
+rejections. Seven merged fixture queries, three B-only queries and five Float32
+regression queries had recall 1.0; the separate far single-row predicate probe
+returned zero hits. The original B generation is built once. Actual cleanup
+removed all three captured B/F source files before retained queries and delayed
+fetch were rechecked.
 
-The same binary passed the snapshot-index regression (322 processes, 18 expected
-rejections, 11 nonempty recalls of 1.0) and retained-view regression (54 SQL/probe
-processes, 80 worker requests, 16 expected rejections). Rust build, Clippy with
-warnings denied, rustfmt, repository `make format-fix`, workflow YAML parsing and
-whitespace checks passed. Hosted native/index validation is tracked separately
-by the Draft PR; these local fixture results do not establish production recall
-or performance.
+The same binary passed the snapshot-index regression (374 processes, 18 expected
+rejections, 15 nonempty recalls of 1.0) and retained-view regression (80 SQL/probe
+processes, 88 requests across six workers, 16 expected rejections). Source and
+artifact hashes are checked before reusing the qualified native shell and probe.
+The Float32 oracle changes require no native or Rust rebuild. These bounded
+local fixture results do not establish production recall or performance.
