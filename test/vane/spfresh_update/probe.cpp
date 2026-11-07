@@ -1,6 +1,7 @@
 // Deterministic component probe. Not linked into the production provider.
 #include "inc/Core/SPANN/Index.h"
 #include "inc/Core/SPANN/ExtraRocksDBController.h"
+#include "inc/Core/SPANN/ExtraDynamicSearcher.h"
 #include "inc/Helper/SimpleIniReader.h"
 
 #include <cmath>
@@ -35,12 +36,12 @@ static void paths(SPTAG::SPANN::Index<float> &index, const fs::path &root) {
 	set(index, "BuildSSDIndex", "SsdInfoFile", (root / "posting-sizes.bin").string());
 	set(index, "BuildSSDIndex", "TmpDir", root.string());
 }
-static std::shared_ptr<SPTAG::SPANN::Index<float>> open(const fs::path &root) {
+static std::shared_ptr<SPTAG::SPANN::Index<float>> open(const fs::path &root, bool lire) {
 	auto index = std::make_shared<SPTAG::SPANN::Index<float>>();
 	SPTAG::Helper::IniReader config;
 	check(config.LoadIniFile((root / "indexloader.ini").string()), "LoadIni");
 	check(index->LoadConfig(config), "LoadConfig");
-	require(index->GetOptions()->m_useKV && !index->GetOptions()->m_useSPDK && index->GetOptions()->m_inPlace &&
+	require(index->GetOptions()->m_useKV && !index->GetOptions()->m_useSPDK && index->GetOptions()->m_inPlace != lire &&
 	            !index->GetOptions()->m_update,
 	        "Unsupported dynamic probe profile");
 	paths(*index, root);
@@ -60,7 +61,7 @@ static void checkpoint(SPTAG::SPANN::Index<float> &index, const fs::path &root) 
 	check(index.GetDiskIndex()->Checkpoint(), "CheckpointPostings");
 	check(index.SaveIndex(root.string()), "SaveIndex");
 }
-static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, const fs::path &input) {
+static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, const fs::path &input, bool lire) {
 	require(fs::create_directory(root), "Seed requires a new directory");
 	const auto bytes = fs::file_size(input);
 	require(bytes % (4 * DIM) == 0 && bytes >= 65 * 4 * DIM && bytes <= ROWS * 4 * DIM, "Seed budget");
@@ -96,7 +97,7 @@ static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, co
 	set(*index, "BuildSSDIndex", "IOThreadsPerHandler", "1");
 	set(*index, "BuildSSDIndex", "UseKV", "true");
 	set(*index, "BuildSSDIndex", "UseSPDK", "false");
-	set(*index, "BuildSSDIndex", "InPlace", "true");
+	set(*index, "BuildSSDIndex", "InPlace", lire ? "false" : "true");
 	set(*index, "BuildSSDIndex", "Update", "false");
 	set(*index, "BuildSSDIndex", "ExcludeHead", "false");
 	set(*index, "BuildSSDIndex", "PostingPageLimit", "12");
@@ -104,9 +105,60 @@ static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, co
 	set(*index, "BuildSSDIndex", "ReplicaCount", "4");
 	set(*index, "BuildSSDIndex", "InternalResultNum", "32");
 	set(*index, "BuildSSDIndex", "SearchInternalResultNum", "64");
+	if (lire) {
+		SPTAG::rg.seed(20261107);
+		std::srand(20261107);
+		set(*index, "BuildSSDIndex", "ReassignK", "64");
+		set(*index, "BuildSSDIndex", "DisableReassign", "false");
+	}
 	check(index->BuildIndex(vectors.data(), vectors.size() / DIM, DIM, false, true), "BuildIndex");
 	checkpoint(*index, root);
 	return index;
+}
+
+static auto dynamic(SPTAG::SPANN::Index<float> &index) {
+	auto result = std::dynamic_pointer_cast<SPTAG::SPANN::ExtraDynamicSearcher<float>>(index.GetDiskIndex());
+	require(bool(result), "Dynamic backend required");
+	return result;
+}
+static std::string state(SPTAG::SPANN::Index<float> &index) {
+	auto extra = dynamic(index);
+	auto heads = index.GetMemoryIndex();
+	std::ostringstream out;
+	out << std::setprecision(9) << "{\"queued\":" << SPTAG::SPANN::LireControl::jobs.size()
+	    << ",\"steps\":" << SPTAG::SPANN::LireControl::steps
+	    << ",\"posting_bytes\":" << SPTAG::SPANN::LireControl::bytes << ",\"splits\":" << extra->ProbeSplits()
+	    << ",\"merges\":" << extra->ProbeMerges() << ",\"reassigns\":" << extra->ProbeReassigns()
+	    << ",\"version_changes\":" << SPTAG::SPANN::LireControl::version_changes << ",\"heads\":[";
+	for (int i = 0; i < heads->GetNumSamples(); i++) {
+		out << (i ? "," : "") << "{\"id\":" << i << ",\"active\":" << (heads->ContainSample(i) ? "true" : "false")
+		    << ",\"size\":" << extra->ProbePostingSize(i) << ",\"vector\":[";
+		auto vector = reinterpret_cast<const float *>(heads->GetSample(i));
+		for (int d = 0; d < DIM; d++)
+			out << (d ? "," : "") << vector[d];
+		out << "]}";
+	}
+	out << "]}";
+	return out.str();
+}
+static void dump(const fs::path &root) {
+	SPTAG::SPANN::RocksDBIO::ReadOnly = true;
+	SPTAG::SPANN::RocksDBIO db((root / "kv").c_str(), false);
+	std::ostringstream out;
+	out << "{\"postings\":[";
+	bool comma = false;
+	constexpr char hex[] = "0123456789abcdef";
+	for (const auto &[key, value] : db.ProbeRecords()) {
+		require(static_cast<uint64_t>(out.tellp()) + 2 * value.size() + 64 < 32ULL * 1024 * 1024,
+		        "Dump metadata budget");
+		out << (comma ? "," : "") << "[" << key << ",\"";
+		for (unsigned char c : value)
+			out << hex[c >> 4] << hex[c & 15];
+		out << "\"]";
+		comma = true;
+	}
+	out << "]}";
+	std::cout << "R7 " << out.str() << std::endl;
 }
 
 int main(int argc, char **argv) {
@@ -114,13 +166,21 @@ int main(int argc, char **argv) {
 		require(argc == 3 || argc == 4, "Usage: probe seed ROOT VECTORS | probe open|update ROOT");
 		fs::path root(argv[2]);
 		require(root.is_absolute(), "Absolute root required");
+		std::string mode(argv[1]);
+		if (mode == "dump" && argc == 3) {
+			dump(root);
+			return 0;
+		}
+		bool lire = mode == "seed-lire" || mode == "open-lire" || mode == "update-lire";
+		SPTAG::SPANN::LireControl::enabled = lire && mode != "open-lire";
 		std::shared_ptr<SPTAG::SPANN::Index<float>> index;
-		if (std::string(argv[1]) == "seed" && argc == 4)
-			index = seed(root, argv[3]);
+		if ((mode == "seed" || mode == "seed-lire") && argc == 4)
+			index = seed(root, argv[3], lire);
 		else {
-			require((std::string(argv[1]) == "open" || std::string(argv[1]) == "update") && argc == 3, "Unknown mode");
-			SPTAG::SPANN::RocksDBIO::ReadOnly = std::string(argv[1]) == "open";
-			index = open(root);
+			require((mode == "open" || mode == "update" || mode == "open-lire" || mode == "update-lire") && argc == 3,
+			        "Unknown mode");
+			SPTAG::SPANN::RocksDBIO::ReadOnly = mode == "open" || mode == "open-lire";
+			index = open(root, lire);
 		}
 		std::cout << "R7 {\"ready\":true,\"live\":" << index->GetNumSamples() << "}" << std::endl;
 		std::string line;
@@ -131,7 +191,30 @@ int main(int argc, char **argv) {
 			in >> op;
 			std::ostringstream out;
 			out << std::setprecision(9);
-			if (op == "add") {
+			if (op == "state") {
+				out << state(*index);
+			} else if (op == "drain") {
+				uint32_t jobs;
+				uint64_t bytes;
+				require(lire && !SPTAG::SPANN::RocksDBIO::ReadOnly && bool(in >> jobs >> bytes), "Invalid drain");
+				SPTAG::SPANN::LireControl::drain(jobs, bytes);
+				out << state(*index);
+			} else if (op == "merge") {
+				int head;
+				require(lire && !SPTAG::SPANN::RocksDBIO::ReadOnly && bool(in >> head) && head >= 0 &&
+				            head < index->GetMemoryIndex()->GetNumSamples() &&
+				            index->GetMemoryIndex()->ContainSample(head),
+				        "Invalid merge head");
+				dynamic(*index)->ProbeMerge(index->GetMemoryIndex().get(), head);
+				out << state(*index);
+			} else if (op == "pause") {
+				std::string stage;
+				require(lire && !SPTAG::SPANN::RocksDBIO::ReadOnly && bool(in >> stage) &&
+				            (stage == "after_split" || stage == "after_merge" || stage == "after_reassign_version"),
+				        "Invalid pause stage");
+				SPTAG::SPANN::LireControl::pause = stage;
+				out << "{\"armed\":true}";
+			} else if (op == "add") {
 				require(!SPTAG::SPANN::RocksDBIO::ReadOnly, "Read-only view");
 				int count;
 				require(bool(in >> count) && count > 0 && count <= 1000 &&
@@ -178,6 +261,7 @@ int main(int argc, char **argv) {
 				checkpoint(*index, root);
 				out << "{\"saved\":true}";
 			} else if (op == "close") {
+				SPTAG::SPANN::LireControl::quiescent();
 				index.reset();
 				std::cout << "R7 {\"closed\":true}" << std::endl;
 				return 0;
