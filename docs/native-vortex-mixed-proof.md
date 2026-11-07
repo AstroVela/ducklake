@@ -50,6 +50,11 @@ vectors using the same Float32 squared L2 calculation. The final heap merges
 at most 3k candidates, ordered by `(distance, typed row address)`. Non-finite
 query components, dimension mismatches and distance overflow are errors.
 
+The Python exact/score/recall oracle restores Float32 inputs and rounds each
+subtraction, multiplication and left-to-right addition to Float32, matching
+the mixed metric. Equal distances use the same typed-address order. The
+existing distance tolerances and 0.8 fixture recall threshold remain unchanged.
+
 SPFresh remains approximate. A sparse predicate can leave it with fewer than k
 hits, including zero for a far allowed row. Visibility/filter correctness is
 mandatory, while ANN recall is measured separately against the exact fixture
@@ -112,6 +117,11 @@ deleted and superseded neighbors must never appear. The proof also checks:
   is in the searched ANN neighborhood; arbitrary sparse recall is not assumed.
 - Query/view/field/file/metric/inline/artifact failures without rerouting or
   leaked reservations, plus aggregate inline row/byte admission and release.
+- F-only, T-only and F/T top-k ties for `[10000,1,0,...]` and `[10000,0,0,...]`:
+  both Float32 distances are 100000000, so typed addresses decide the result.
+  These cases admit no ANN candidates and require exact recall of 1.0. They
+  reuse the original B generation, with fractional inline values and a raw
+  decimal query also checked against the same metric.
 - T-to-F flush preserves logical top-k and leaves the earlier T view intact.
 - Rewritten B files reject the old reference explicitly. Already-open views
   keep searching and fetching previously unqueried B/F/T rows after actual
