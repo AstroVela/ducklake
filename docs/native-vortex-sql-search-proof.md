@@ -1,6 +1,6 @@
 # Native DuckLake SQL vector search
 
-This validation draft extends the [native catalog proof](native-vortex-index-catalog-proof.md)
+This validation extends the [native catalog proof](native-vortex-index-catalog-proof.md)
 in [DuckLake #32](https://github.com/AstroVela/ducklake/pull/32). It connects named
 index discovery and the existing SPFresh B/F/T query plan to an experimental
 native SQL table function. Search runs inside DuckDB and returns typed business
@@ -63,7 +63,11 @@ native admission envelope is passed in memory. Queries do not launch a worker,
 invoke Python, or write a JSON handoff file. Private binary source staging and
 verified artifact leases retain the ownership already qualified by #31/#32.
 Private staging uses the canonical system temporary directory and rejects it
-when it lies inside the requested catalog's managed data path.
+when it lies inside the requested catalog's managed data path. Native acquisition
+expands the managed root with DuckDB's filesystem rules before passing it to
+Rust for physical-path resolution. This accepts supported local representations
+such as `file:/tmp/data`, alongside relative, dot-component and symlinked data
+directories. It does not rewrite source URIs or their sealed physical binding.
 
 The explicit category predicate constructs an allow set from the admitted
 business rows in bounded batches. The existing visibility exclusions and
@@ -138,7 +142,23 @@ an explicit rebuild/publication. Further checks reject corrupt artifacts and
 dropped/recreated table UUIDs, cancel at multiple execution stages, inject an
 admission failure and use SQL LIMIT. The fixture isolates private staging under
 its own temporary directory and checks that each completed/failed query leaves
-it empty. The probe is used only for three explicit index builds.
+it empty. The lifecycle uses three explicit index builds.
+
+A separate Float32 fixture uses one unchanged B generation and adds F and T
+rows. Its ten qualified queries cover raw decimal input, fractional business
+values, prepared parameters, per-operation Float32 rounding, F/T ties at the
+top-k boundary and B/F/T physical-address order. The SQL oracle reuses the
+mixed-query Float32 metric and business normalization helpers; score tolerances
+remain `rel_tol=1e-5` and `abs_tol=1e-4`, and recall remains at least 0.8.
+The decimal `[8001.1,0,...]::FLOAT[]` query against `[8000,0,...]` must return
+`1.2102148532867432`; the old double oracle incorrectly rejects that result.
+
+Five independent 4,096-row fixtures capture, build, publish and search with
+canonical, dot-component, relative, symlinked and `file:` managed paths.
+Named captures retain the original source inventory and sealed reference.
+The `file:` fixture also rejects a scratch directory physically inside the
+managed root, then repeats a successful search. These fixtures use five further
+builds, bringing the full SQL proof to nine explicit builds.
 
 The local SQL proof passed 46 native requests with 12 expected rejections,
 including five interruption checkpoints and two injected failures. Eight fixture
@@ -147,18 +167,27 @@ three B/F source files. The reusable prepared statement saw committed source
 changes, rejected stale B and discovered the explicitly rebuilt generation.
 No external query worker ran.
 
-The ON gate passed seven Vortex SQL cases with 339 assertions, including the
-new 16-assertion SQL interface case, and Vortex/Parquet process-crash recovery.
-ON and default-OFF base gates each passed 86 cases with 3,582 assertions and
-13 optional-extension skips. OFF rejected Vortex format selection and exposed
-none of the five view/catalog/search functions. All six process proofs passed
-against the final binaries and shared library; Rust Clippy with warnings denied,
-Rust formatting, `make format-fix` and ON/default-OFF CMake configuration passed.
+The ten Float32 regression queries also passed with recall 1.0, using 17
+additional native requests. Both controls reproduced the earlier problems:
+the earlier runtime rejects the committed `file:` path
+regression, and the earlier oracle rejects the same correct decimal SQL result.
+These are fixture results rather than workload or general ANN recall claims.
 
-CI qualifies the pinned native SDK before the ON build, lints the shared Rust
-workspace, runs ON/default-OFF gates and all six index/read-view/search process
-proofs. Local validation reuses qualified DuckDB v1.5.5 engine objects while
-compiling changed DuckLake code, the Rust query library and the Vortex archive
-with the required link configuration. Clean hosted builds remain a separate CI
-gate. Background indexing, index GC, cloud/multiprocess ownership, out-of-core
-queries and general SQL optimizer integration remain later work.
+With the latest #32 (`6916f705`) integrated, the ON gate passed sixteen Vortex
+SQL cases with 709 assertions, including the 16-assertion SQL interface case,
+and Vortex/Parquet process-crash recovery.
+ON and default-OFF base gates each passed 86 cases with 3,582 assertions and
+13 optional-extension skips. The separate ON deletion-inlining gate passed
+18 cases with 1,099 assertions and two optional-extension skips. OFF rejected
+Vortex format selection and exposed none of the five view/catalog/search
+functions. All six process proofs passed
+against the same rebuilt native binaries and qualified shared library. The
+held-search driver passes the parent publication API its required caller
+context. C++/Python formatting and ON/default-OFF CMake configuration passed.
+
+Local validation rebuilds DuckLake C++ and the native drivers while reusing
+qualified DuckDB v1.5.5 engine and codec objects. The unchanged Rust workspace
+retains its qualified build and lint results; source, query-library and probe
+hashes are checked before reuse. The validation workflow includes all six
+process proofs. Background indexing, index GC, cloud/multiprocess ownership,
+out-of-core queries and general SQL optimizer integration remain later work.
