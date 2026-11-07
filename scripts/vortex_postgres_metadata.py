@@ -114,9 +114,9 @@ def encoded_row(row):
 
 
 DDL = f"""
-CREATE TABLE typed_catalog(singleton boolean PRIMARY KEY CHECK(singleton),layout integer NOT NULL CHECK(layout=1),
+CREATE TABLE typed_catalog(singleton boolean PRIMARY KEY CHECK(singleton),layout integer NOT NULL CHECK(layout=2),
  snapshot bigint NOT NULL CHECK(snapshot>=0),next_table_id bigint NOT NULL,next_row_id bigint NOT NULL);
-INSERT INTO typed_catalog VALUES(true,1,0,1,1);
+INSERT INTO typed_catalog VALUES(true,2,0,1,1);
 CREATE TABLE typed_tables(table_uuid uuid PRIMARY KEY,table_id bigint NOT NULL UNIQUE,name bytea NOT NULL,
  dimension integer NOT NULL CHECK(dimension BETWEEN 1 AND 4096),schema_hash bytea NOT NULL CHECK(octet_length(schema_hash)=32),
  begin_snapshot bigint NOT NULL,end_snapshot bigint,request_epoch numeric(20,0),last_previous numeric(20,0),
@@ -126,7 +126,8 @@ CREATE TABLE typed_tables(table_uuid uuid PRIMARY KEY,table_id bigint NOT NULL U
  CHECK(end_snapshot IS NULL OR end_snapshot>begin_snapshot),
  CHECK((last_previous IS NULL AND last_expired IS NULL) OR
        (last_previous IS NOT NULL AND last_expired IS NOT NULL AND last_previous BETWEEN 1 AND {MAX_EPOCH-1}
-        AND request_epoch=last_previous+1 AND last_expired>=0)),UNIQUE(table_uuid,dimension));
+        AND request_epoch=last_previous+1 AND last_expired>=0)),UNIQUE(table_uuid,dimension),
+ UNIQUE(table_uuid,table_id,schema_hash,dimension));
 CREATE UNIQUE INDEX typed_current_name ON typed_tables(name) WHERE end_snapshot IS NULL;
 CREATE TABLE typed_fields(table_uuid uuid REFERENCES typed_tables(table_uuid),field_id bigint NOT NULL CHECK(field_id>0),
  ordinal integer NOT NULL,name bytea NOT NULL,logical_type text NOT NULL,nullable boolean NOT NULL,
@@ -149,6 +150,17 @@ CREATE TABLE typed_receipts(table_uuid uuid REFERENCES typed_tables(table_uuid),
  CHECK(request_epoch BETWEEN 1 AND {MAX_EPOCH}),request_id bytea NOT NULL CHECK(octet_length(request_id) BETWEEN 1 AND 128),
  payload_hash bytea NOT NULL CHECK(octet_length(payload_hash)=32),row_count bigint NOT NULL CHECK(row_count BETWEEN 1 AND 1000),
  snapshot_id bigint NOT NULL,PRIMARY KEY(table_uuid,request_epoch,request_id));
+CREATE TABLE bound_units(unit text PRIMARY KEY,table_uuid uuid NOT NULL,
+ table_id bigint NOT NULL,schema_hash bytea NOT NULL,dimension integer NOT NULL,identity jsonb NOT NULL,
+ FOREIGN KEY(table_uuid,table_id,schema_hash,dimension) REFERENCES typed_tables(table_uuid,table_id,schema_hash,dimension),
+ FOREIGN KEY(unit,table_uuid) REFERENCES units(id,table_uuid));
+CREATE TABLE bound_requests(request text PRIMARY KEY REFERENCES requests(id),table_uuid uuid NOT NULL REFERENCES typed_tables(table_uuid),
+ request_epoch numeric(20,0) NOT NULL CHECK(request_epoch BETWEEN 1 AND {MAX_EPOCH}),request_id text NOT NULL,
+ UNIQUE(table_uuid,request_epoch,request_id));
+CREATE TABLE bound_heads(table_uuid uuid PRIMARY KEY REFERENCES typed_tables(table_uuid),revision bigint NOT NULL,
+ request text REFERENCES requests(id));
+CREATE TABLE bound_readers(reader text PRIMARY KEY REFERENCES readers(id),table_uuid uuid NOT NULL REFERENCES typed_tables(table_uuid),
+ snapshot_id bigint NOT NULL,identity jsonb NOT NULL);
 """
 
 
@@ -163,7 +175,7 @@ class TypedMetadata:
     @staticmethod
     def catalog(c):
         state = c.execute("SELECT * FROM typed_catalog WHERE singleton").fetchone()
-        require(state and state["layout"] == 1, "UNSUPPORTED_TYPED_LAYOUT")
+        require(state and state["layout"] == 2, "UNSUPPORTED_TYPED_LAYOUT")
         return state
 
     @staticmethod
@@ -219,6 +231,7 @@ class TypedMetadata:
                     "INSERT INTO typed_fields VALUES(%s,%s,%s,%s,%s,%s)",
                     (parsed, field_id, ordinal, f[0].encode(), f[1], f[2]),
                 )
+            c.execute("INSERT INTO bound_heads VALUES(%s,0,NULL)", (parsed,))
             c.execute("UPDATE typed_catalog SET snapshot=%s,next_table_id=next_table_id+1 WHERE singleton", (snapshot,))
         return {
             "table_uuid": table_uuid,
@@ -381,6 +394,19 @@ class TypedMetadata:
                 require(old is not None, "UNKNOWN_RETIREMENT_UUID")
                 return {"table_uuid": table_uuid, "retired": True, "snapshot_id": old["end_snapshot"]}
             require(live["table_uuid"] == parsed, "STALE_TABLE")
+            require(
+                not c.execute(
+                    "SELECT 1 FROM bound_units b JOIN units u ON u.id=b.unit WHERE b.table_uuid=%s AND u.state IN ('allocated','deleting')",
+                    (parsed,),
+                ).fetchone(),
+                "BUILD_IN_PROGRESS",
+            )
+            c.execute("DELETE FROM refs WHERE kind='named' AND holder=%s", ("bound:" + table_uuid,))
+            c.execute("UPDATE bound_heads SET request=NULL WHERE table_uuid=%s", (parsed,))
+            c.execute(
+                "UPDATE units SET state='retired' WHERE kind='generation' AND state='ready' AND id IN (SELECT unit FROM bound_units WHERE table_uuid=%s) AND NOT EXISTS(SELECT 1 FROM refs WHERE refs.unit=units.id AND kind='named')",
+                (parsed,),
+            )
             snapshot = state["snapshot"] + 1
             c.execute("DELETE FROM typed_receipts WHERE table_uuid=%s", (parsed,))
             c.execute(

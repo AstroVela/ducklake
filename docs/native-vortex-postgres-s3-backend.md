@@ -2,7 +2,7 @@
 
 本轮基于 [Draft #91](https://github.com/AstroVela/ducklake/pull/91) 的 `95f82fc574a8e9741f8022d92801fea1e12e26f8`，把[远程协议模型](native-vortex-remote-publication.md)接到真实 PostgreSQL 事务与 S3 API。入口为 [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)。
 
-后续 [PostgreSQL 类型化 metadata 与 UUID／epoch 契约](native-vortex-postgres-typed-lifecycle.md)已新增独立 typed 组件与真实 PG 确定性验证；本文保留 #92 的发布 adapter 基线与历史结果。Typed UUID 和实际 source／generation 的统一绑定、原生调用接线仍需后续完成。
+后续 [PostgreSQL 类型化 metadata 与 UUID／epoch 契约](native-vortex-postgres-typed-lifecycle.md)已新增独立 typed 组件；[typed UUID、发布与 ReadView 统一绑定](native-vortex-bound-readviews.md)进一步连接 source／generation／引用／退休，采用全新 v2 布局。本文保留 #92 的发布 adapter 基线与历史结果，原生远程 SQL／ANN 接线仍需后续完成。
 
 交付的是可独立调用的[实验性 backend](../scripts/vortex_remote_backend.py)及真实服务 conformance，**尚未接入 Vane SQL、原生维护调度或 ANN 查询**。生产 C++／Rust、native DuckDB 限制、SQL 接口与 provider 保持 #91；现有原生普通事务保护不变。测试使用独立私有 schema 和受登记约束的 S3 namespace，上传受控 opaque 字节与真实 manifest；不把它们当作真实 Vortex／SPFresh 编码资格。
 

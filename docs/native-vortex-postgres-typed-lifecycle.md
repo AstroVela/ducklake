@@ -2,6 +2,8 @@
 
 本轮基于 [Draft #92](https://github.com/AstroVela/ducklake/pull/92) 的 `44b3c16e8d93f9d4beed2f406bb210dece32c4c1`，新增可独立调用的 [typed metadata 组件](../scripts/vortex_postgres_metadata.py)，复用 [PostgreSQL／S3 broker](native-vortex-postgres-s3-backend.md) 的 owner／事务边界，并在真实 PostgreSQL 上验证固定布局与生命周期。总入口为 [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)。
 
+后续 [typed UUID、发布与 ReadView 统一绑定](native-vortex-bound-readviews.md)已连接 source／generation／引用／退休，采用全新 storage／typed v2 布局。本文保留 #93 typed-v1 的历史范围与证据；原生远程 SQL／ANN 接线仍未完成。
+
 **本轮资格限于 broker 组件层。** 原生 C++／Rust、现有 DuckLake inline codec、native DuckDB 限制、SQL 接口、provider 和 #92 发布 adapter 均不修改。Vane 远程 SQL／ANN、实际 source／generation 与 typed UUID 的统一绑定仍未接入。新组件不读旧 typed 布局、不迁移、不自动转换 UUID／epoch，也不新增兼容路径或 fallback。
 
 本地保持 CPU **6–11**、原线程环境、原生 `threads=2`、既有事务保护和预算。原生 maintenance 的单 worker／全局预算保持。R4 A/A、性能 A/B、长期稳态和依赖稳定负载的 R5 资格继续暂缓；时间只作为观察值。
