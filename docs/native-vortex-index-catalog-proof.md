@@ -49,7 +49,11 @@ uses DuckLake's existing path semantics: publication resolves its physical root
 before checking directory containment, accepting relative paths, dot components
 and symlinked managed directories. Source verification reads the inventory's
 original paths without changing the sealed source identity. This does not relax
-the canonical-path requirement for references or index artifacts.
+the canonical-path requirement for references or index artifacts. Containment
+checks cover the actual generation directory, manifest and each artifact, so an
+external reference cannot admit a generation or artifact inside `DATA_PATH`.
+An index root may be an ancestor of the managed directory when its actual
+generation and artifacts remain outside that directory.
 
 The publisher takes an exclusive publication guard before choosing its source
 snapshot and holds it through metadata commit. Native source commits take the
@@ -140,8 +144,12 @@ sleeps. Two further publication cases interrupt at `after_validation` and
 `before_commit`. All four must release transaction/guard state; the publication
 cases must preserve the existing ready revision and generation. Four separate
 fixtures publish and acquire 4,096-row views using canonical, dot-component,
-relative and symlinked managed paths. Six negative controls retain physical
-directory containment and strict reference/artifact symlink rejection.
+relative and symlinked managed paths. Each also publishes from a valid ancestor
+index root. Eleven negative controls retain physical directory containment and
+strict reference/artifact symlink rejection, including external references to
+managed generations and an external generation whose artifacts are managed.
+The generation-containment regression fails against the previous implementation,
+which incorrectly publishes the invalid candidate as a successor revision.
 
 The fixture starts with two B files and 4,096 vectors, then appends F and commits
 updates, deletes and T rows. It checks explicit initialization, invalid binding
