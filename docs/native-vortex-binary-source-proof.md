@@ -32,12 +32,15 @@ interruption afterwards releases Rust source and index ownership. The callback
 catches C++ exceptions, and no unwind crosses the C ABI.
 
 [Vortex #26](https://github.com/AstroVela/vortex/pull/26), pinned at
-`664e8cb733c5fbaa2945239e806df5b22e6d190d`, adds
+`703ed464a5e03bee45c8713c5a4286571349bce1`, adds
 `LocalFileSource::from_buffers`. It shares verification with the filesystem
 constructor and reuses its scan/take implementation, including caller order
 and duplicates. Source URIs retain the catalog's physical identities and are
 never opened by this constructor. Canonical path removal or replacement cannot
-change an opened source.
+change an opened source. Relative paths and `file:` URI strings remain opaque
+bound identities in the buffer constructor. Only the filesystem constructor
+requires an absolute native path; both constructors retain the same content,
+schema, row-count and aggregate-byte checks.
 
 The explicit exported proof envelopes continue to carry encoded bytes for
 cross-process lifecycle tests. SQL selects only binary admission; malformed
@@ -47,11 +50,13 @@ remain, so this change does not remove all query writes or index-open work.
 
 ## Verification and measurement
 
-The Vortex constructor passes 136 crate tests and three doctests. Its new
+The Vortex constructor passes 138 crate tests and three doctests. Its new
 ownership test removes all source paths before constructing from buffers, drops
 the caller's buffer map and verifies scan addresses plus ordered duplicate
-take. Additional cases reject incomplete/unknown inventories, corrupt contents,
-budgets, inconsistent embedded schemas, row counts and snapshot fingerprints.
+take for absolute, relative and `file:` identities. The latter two cases fail
+with the previous buffer constructor and still fail in the filesystem
+constructor. Additional cases reject incomplete/unknown inventories, corrupt
+contents, budgets, inconsistent embedded schemas, row counts and snapshot fingerprints.
 Crate Clippy with warnings denied and nightly formatting pass.
 
 The native DuckLake driver passes missing, duplicate, unknown, corrupt, null
@@ -71,6 +76,47 @@ it requires identical ranked results and records first/warm latency, phases,
 RSS and Linux read/write accounting. Timings remain informational. Both
 variants use identical catalogs, index artifacts and query inputs; no OS cache
 is reset.
+
+### URI identity regression (2026-11-07)
+
+This revision includes #34 at `39864d2ad36dd167dc031d11b9d18ec24f68eb3c` and
+pins Vortex #26 at `703ed464a5e03bee45c8713c5a4286571349bce1`. The previous
+buffer constructor incorrectly applied the filesystem constructor's absolute
+path restriction to preserved catalog URIs. The new relative and `file:` unit
+cases reproduce that failure before the fix and pass afterwards. No source
+identity is rewritten, and no filesystem retry is introduced.
+
+The SQL proof builds indexes from exported envelopes and queries them through
+binary admission for canonical, dot, relative, symlink and `file:` data paths.
+It asserts that the relative/scheme representations are present in the original
+capture and that the complete sealed file inventory and published reference
+remain unchanged. All five cases return the expected winner. Managed scratch
+containment remains enforced for `file:` paths. Historical T field mapping,
+column renames, Float32 oracles and transaction protections from #34 pass.
+
+Local verification also passes all six process proofs, ON/default-OFF base
+SQL (86 cases / 3,582 assertions per mode, 13 optional-extension skips),
+16 ON Vortex SQL cases / 709 assertions, and deletion inlining (18 cases /
+1,099 assertions, two optional-extension skips). Vortex/Parquet recovery,
+cleanup and OFF function/format rejection pass. An independent native ABI
+probe passes 30 cases, including protected caller memory after `source_pinned`
+and canonical source deletion before querying the captured buffers.
+
+The small counter sample uses 4,096 B rows, ALL/category B and three queries
+per category. Its six queries have recall 1.0, zero retained native source
+buffers after transfer and zero source staging bytes. No stable-load performance
+comparison is rerun. Existing transaction protection, two compiler jobs,
+per-process deadlines, distance tolerances and recall threshold are retained.
+
+Evidence and raw logs are in
+`/tmp/ducklake-pr35-fix-validation-20261107`. Modified index/provider and
+query/probe Rust crates are rebuilt; reused core dependencies are qualified
+against their fingerprint graph and byte-identical source. Native verification
+qualifies 143 reused C++ units, recompiles four test-root/version bindings and
+relinks against the fixed Rust archive; it is not a clean engine build.
+Affected-crate nightly formatting passes. The workspace-wide formatting check
+reports four unchanged files with pre-existing macro formatting differences in
+`vortex-duckdb` and `vortex-ffi`.
 
 ### Local result (2026-10-29)
 

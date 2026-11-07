@@ -156,7 +156,7 @@ def main():
     report = {
         "status": "running",
         "cases": [],
-        "vortex_revision": "664e8cb733c5fbaa2945239e806df5b22e6d190d",
+        "vortex_revision": "703ed464a5e03bee45c8713c5a4286571349bce1",
         "cost_driver_sha256": BASE.digest(args.cost_driver.resolve(strict=True)),
         "baseline_driver_sha256": (
             BASE.digest(args.baseline_driver.resolve(strict=True)) if args.baseline_driver else None

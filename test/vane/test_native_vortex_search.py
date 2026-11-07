@@ -470,6 +470,18 @@ def exercise_data_paths(proof, scratch, checks):
             ]["admission"]
         )
         original_files = json.loads(capture.read_text())["capture"]["file_capture"]["files"]
+        source_uris = [file["uri"] for file in original_files]
+        require(source_uris, f"managed path fixture captured no source files for {mode}")
+        if mode == "relative":
+            require(
+                all(not Path(uri).is_absolute() and uri.startswith(represented + "/") for uri in source_uris),
+                "relative DATA_PATH fixture lost its relative source URI identity",
+            )
+        elif mode == "file-colon":
+            require(
+                all(uri.startswith(represented + "/") for uri in source_uris),
+                "file: DATA_PATH fixture lost its URI scheme before buffer admission",
+            )
         artifacts = case / "artifacts"
         artifacts.mkdir()
         reference = artifacts / "index.json"
@@ -505,7 +517,15 @@ def exercise_data_paths(proof, scratch, checks):
                 os.environ["TMPDIR"] = str(scratch)
             require(json.loads(sql(statement)) == result, "managed scratch rejection changed subsequent SQL results")
             no_leases(scratch)
-        cases.append({"data_path": mode, "visible_rows": 4096, "winner": 133, "source_identity_unchanged": True})
+        cases.append(
+            {
+                "data_path": mode,
+                "source_uris": source_uris,
+                "visible_rows": 4096,
+                "winner": 133,
+                "source_identity_unchanged": True,
+            }
+        )
     checks.append(
         "canonical/dot/relative/symlink/file: managed paths execute SQL search with unchanged source URI binding; physical managed scratch containment remains enforced"
     )
@@ -530,7 +550,7 @@ def main():
         "duckdb_sha256": BASE.digest(proof.duckdb),
         "probe_sha256": BASE.digest(proof.probe),
         "driver_sha256": BASE.digest(args.driver.resolve(strict=True)),
-        "vortex_revision": "664e8cb733c5fbaa2945239e806df5b22e6d190d",
+        "vortex_revision": "703ed464a5e03bee45c8713c5a4286571349bce1",
     }
     try:
         native = CAT.Native(args.driver.resolve(strict=True), root / "native")
