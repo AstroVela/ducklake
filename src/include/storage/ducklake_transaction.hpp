@@ -280,6 +280,7 @@ public:
 		return id >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START;
 	}
 	void SetConfigOption(const DuckLakeConfigOption &option);
+	DataFileFormat GetDataFileFormat(TableIndex table_id);
 
 	void SetCommitMessage(const DuckLakeSnapshotCommit &option);
 
@@ -367,6 +368,10 @@ private:
 	unique_ptr<DuckLakeMetadataManager> metadata_manager;
 	mutex connection_lock;
 	unique_ptr<Connection> connection;
+	//! Format options are read and updated in this metadata transaction, never in the shared catalog cache.
+	map<TableIndex, DataFileFormat> data_file_formats;
+	//! Format changes must be replayed when the metadata transaction retries.
+	map<TableIndex, DataFileFormat> pending_data_file_formats;
 	//! The snapshot of the transaction (latest snapshot in DuckLake)
 	mutex snapshot_lock;
 	unique_ptr<DuckLakeSnapshot> snapshot;

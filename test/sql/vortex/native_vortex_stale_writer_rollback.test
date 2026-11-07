@@ -1,0 +1,57 @@
+# name: test/sql/vortex/native_vortex_stale_writer_rollback.test
+# description: a prepared Vortex writer cannot outlive its rolled back format setting
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/stale_writer_rollback.ducklake' AS lake (DATA_PATH '__TEST_DIR__/stale_writer_rollback-data',DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT, embedding FLOAT[])
+
+statement ok
+CREATE TABLE lake.other(id BIGINT)
+
+statement ok
+BEGIN
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+PREPARE p AS INSERT INTO lake.items VALUES (1,[1,2,3])
+
+statement ok
+ROLLBACK
+
+statement error
+EXECUTE p
+----
+prepare the statement again
+
+query I
+SELECT count(*) FROM lake.items
+----
+0
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+----
+0
+
+statement ok
+INSERT INTO lake.items VALUES (2,[2,3,4])
+
+query IIII
+SELECT id,embedding[1],embedding[2],embedding[3] FROM lake.items
+----
+2	2	3	4
+
+
+statement ok
+DETACH lake

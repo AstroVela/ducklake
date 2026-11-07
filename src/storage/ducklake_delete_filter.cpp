@@ -1,4 +1,5 @@
 #include "storage/ducklake_delete_filter.hpp"
+#include "storage/ducklake_vortex.hpp"
 #include "storage/ducklake_deletion_vector.hpp"
 #include "common/parquet_file_scanner.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -291,6 +292,9 @@ unordered_map<idx_t, idx_t> DuckLakeDeleteFilter::ScanDataFileRowIds(ClientConte
 	unordered_map<idx_t, idx_t> result;
 	if (file_positions.empty()) {
 		return result;
+	}
+	if (data_file.data_format == DataFileFormat::VORTEX) {
+		return DuckLakeVortex::ScanRowIds(context, data_file, file_positions);
 	}
 
 	ParquetFileScanner scanner(context, data_file);

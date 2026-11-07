@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import struct
 import subprocess
 import time
 
@@ -23,6 +24,11 @@ def require(condition: bool, message: str) -> None:
 
 def address(row: dict) -> tuple[int, int]:
     return row["file_id"], row["row_offset"]
+
+
+def float32_vector(vector: list[float]) -> list[float]:
+    # JSON decoders produce binary64 values, but both sources store FLOAT32.
+    return [struct.unpack("<f", struct.pack("<f", value))[0] for value in vector]
 
 
 def digest(path: Path) -> str:
@@ -121,9 +127,7 @@ class Proof:
         schema = self.sql(
             directory,
             f"SELECT schema_version FROM lake.snapshots() WHERE snapshot_id={snapshot};",
-        )[
-            0
-        ]["schema_version"]
+        )[0]["schema_version"]
         files = self.sql(
             directory,
             "SELECT data_file_id, path, path_is_relative, record_count, file_format "
@@ -181,6 +185,8 @@ class Proof:
                 not row["filename"].startswith("ducklake_inlined_data_"),
                 "inlined rows require the separate mixed-query gate",
             )
+            if read_vectors:
+                row["embedding"] = float32_vector(row["embedding"])
             filename = str(Path(row["filename"]).resolve(strict=True))
             require(
                 filename in by_path,
@@ -249,6 +255,7 @@ class Proof:
         predicate=lambda row: True,
         k: int = 10,
     ) -> list[int]:
+        query = float32_vector(query)
         snapshot = json.loads(capture.read_text())["snapshot_id"]
         current_capture, _ = self.capture(directory, "query-inventory", snapshot=snapshot)
         require(
@@ -287,12 +294,14 @@ class Proof:
                 f"SELECT id, embedding, category, payload FROM lake.items AT (VERSION => {snapshot}) "
                 f"WHERE filename={quote(original['filename'])} AND file_row_number={hit['row_offset']};",
             )
+            for row in fetched:
+                row["embedding"] = float32_vector(row["embedding"])
             require(
                 fetched == [{key: original[key] for key in ("id", "embedding", "category", "payload")}],
                 "ranked DuckLake fetch changed the version or business fields",
             )
             require(
-                hit["embedding"] == fetched[0]["embedding"],
+                float32_vector(hit["embedding"]) == fetched[0]["embedding"],
                 "Vortex physical take and DuckLake fetch refer to different vectors",
             )
             distance = sum((a - b) ** 2 for a, b in zip(fetched[0]["embedding"], query))
@@ -304,6 +313,48 @@ class Proof:
             ids.append(original["id"])
         require(ordering == sorted(ordering), "ANN rank order changed during fetch")
         return ids
+
+    def exercise_float32(self) -> None:
+        directory = self.root / "float32-lake"
+        self.create(
+            directory,
+            rows=128,
+            embedding="[100000000::FLOAT + id::FLOAT*8,CASE WHEN id=14 THEN 1 ELSE 0 END::FLOAT,0,0,0,0,0,0]",
+        )
+        capture, rows = self.capture(directory, "float32")
+        reference = self.build(capture, "float32")
+        query = [100000104.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        # Rust and DuckDB may serialize the same FLOAT32 as different JSON numbers.
+        # id 12 is 100000096; id 14 is 100000112. Their distances are 64 and 65,
+        # so the expected top-k has no boundary tie, even though raw JSON favors id 14.
+        require(
+            self.qualify(directory, capture, reference, rows, query, k=3) == [13, 12, 14],
+            "FLOAT32 JSON round trips changed vector equality or neighbor ordering",
+        )
+        require(
+            self.qualify(
+                directory,
+                capture,
+                reference,
+                rows,
+                query,
+                lambda row: row["id"] in (13, 14),
+                k=2,
+            )
+            == [13, 14],
+            "FLOAT32 JSON round trips changed the filtered squared-L2 scores",
+        )
+        require(
+            self.qualify(directory, capture, reference, rows, query, k=2) == [13, 12] and self.recalls[-1] == 1.0,
+            "FLOAT32 JSON round trips changed the exact top-k or recall oracle",
+        )
+        # This decimal rounds to id 14's FLOAT32 value, so its native distance is zero.
+        rounded_query = [100000110.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        require(
+            self.qualify(directory, capture, reference, rows, rounded_query, k=1) == [14] and self.recalls[-1] == 1.0,
+            "the query oracle did not use the native FLOAT32 query value",
+        )
+        self.checks.append("FLOAT32 JSON round trips preserve vectors, squared-L2 scores, exact top-k and recall")
 
     def exercise(self) -> None:
         directory = self.root / "lake"
@@ -500,6 +551,7 @@ class Proof:
             self.create(bad, rows=128, embedding=embedding)
             invalid, _ = self.capture(bad, name, read_vectors=False)
             self.build(invalid, name, expected=error)
+        self.exercise_float32()
         require(
             min(self.recalls) >= 0.8,
             "fixture recall@k fell below its explicit qualification threshold",
