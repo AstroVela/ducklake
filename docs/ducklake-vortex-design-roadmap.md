@@ -4,7 +4,7 @@
 
 配套阅读：[ChatGPT Page](https://chatgpt.com/space/page_0c2fa263e4dc81919bfaea100e8008cd)。本文是后续随代码维护的仓库总纲。
 
-**当前结论：本地原生基本链路已实现并通过端到端验证；持续写入下的长期维护稳态尚未完成。** 已支持提交后即时查询、后台 flush、独立 B 段构建、选择性合并、数据重写、受事务保护的 GC 和崩溃恢复。生产仍使用静态 SPFresh；R7 已有原生增删／重开／旧视图及受控串行 LIRE split／merge／reassign 的本地组件证据，尚未接入生产 SQL 或验证后台并发。云端与分布式向量查询仍未完成，R6 按当前优先级暂缓。
+**当前结论：本地原生基本链路已实现并通过端到端验证；持续写入下的长期维护稳态尚未完成。** 已支持提交后即时查询、后台 flush、独立 B 段构建、选择性合并、数据重写、受事务保护的 GC 和崩溃恢复。生产仍使用静态 SPFresh；R7 已有原生增删、受控串行 LIRE 及持久候选／取消／回收的本地组件证据，尚未接入生产 SQL 或验证后台并发。云端与分布式向量查询仍未完成，R6 按当前优先级暂缓。
 
 ## 1. 基线与设计范围
 
@@ -232,7 +232,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 已覆盖独立 B₂ 不重建 B₁、原子发布竞争、取消、实际 SIGKILL、提交后丢 ACK、旧请求重放、普通事务阻止 GC，以及旧 ReadView 在规范文件／generation GC 后继续查询。详见[#74 最终资格记录](native-vortex-maintenance-probe-ab.md#final-installed-qualification-after-withdrawal)。
 
-本轮 R5 的四维度功能矩阵通过 36 个阶段、432 次普通查询、432 次实际快照诊断及 56 项拒绝检查，最低 fixture recall 1.0。另通过 inline 精确 SQL 的 11 个断言块、高维平方 L2 闭式回归、溢出拒绝及合法查询恢复；两项数值回归已在对应旧 provider 上复现失败。本轮受管／append 回归共 20 项原生／恢复用例通过，Vane 基础套件再次通过 1,254 项、15 项可选跳过。详见[确定性维度与查询契约](native-vortex-functional-matrix.md)。
+本轮 R5 的四维度功能矩阵通过 36 个阶段、432 次普通查询、432 次实际快照诊断及 56 项拒绝检查，最低 fixture recall 1.0。另通过 inline 精确 SQL 的 11 个断言块、高维平方 L2 闭式回归、溢出拒绝及合法查询恢复；两项数值回归已在对应旧 provider 上复现失败。本轮受管／append 回归共 21 项原生／恢复用例通过，Vane 基础套件再次通过 1,254 项、15 项可选跳过。详见[确定性维度与查询契约](native-vortex-functional-matrix.md)。
 
 [显式请求 epoch](native-vortex-request-epochs.md)通过 8 组公开契约与 14 项原生／故障／恢复用例，包括 10 万条全局回执上限、表间隔离、两种写入／推进顺序、八个并发相同推进、真实元数据冲突、取消及四个实际 SIGKILL 边界。四维度矩阵在新接口上再次通过；现有六组链路回归覆盖 67 项原生／恢复用例、172 次安装态查询比较，另通过 189 个相关 SQL 断言块与 6 项 oracle；本轮 Vane 基础套件通过 1,254 项、15 项可选跳过。回执槽位释放不代表文件／WAL 已收缩，也不构成长期容量资格。
 
@@ -284,7 +284,15 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 同输入的独立原生反例捕获两处 merge 问题：按 live 数量遍历未过滤的原记录前缀，以及把 keeper head 传给重分配而提前跳过修复。测试 SDK 修正后，同一个关闭 checkpoint 的原生控制构建被最近分区验收拒绝，修正版通过；控制构建仅作验收。该 synthetic VID 反例与真实 DuckLake RowRef 的端到端证据分别记录。
 
-任务由单线程显式队列执行，保持 CPU 6–11、现有线程、事务保护和 admission；每次最多 16 次嵌套原生操作／64 MiB posting 写入，Reassign 出队前预留嵌套 Split 的操作数。该预算不代表总 I/O／RSS；检查读取、checkpoint 复制及 RocksDB 写放大另计。没有验证原生后台并发，动态候选的持久登记／取消／崩溃回收与生产元数据原子接线仍未完成。
+任务由单线程显式队列执行，保持 CPU 6–11、现有线程、事务保护和 admission；每次最多 16 次嵌套原生操作／64 MiB posting 写入，Reassign 出队前预留嵌套 Split 的操作数。该预算不代表总 I/O／RSS；检查读取、checkpoint 复制及 RocksDB 写放大另计。该轮未覆盖的候选生命周期组件见下一节；原生后台并发与生产元数据原子接线仍未完成。
+
+### 9.6 R7 持久候选与回收的本地组件证据
+
+[动态候选持久登记、取消与崩溃回收](native-vortex-spfresh-candidates.md)在 #97 的实际原生 checkpoint 上增加严格的新 registry。单一提交根原子保存发布 head、候选与退休状态，绑定 owner／表 UUID、源及目标 ReadView、水位和 revision。继承给原生子进程的 POSIX 文件锁保护活跃候选，取消与分批清理完成前持续 pin 构建源；没有 TTL、PID 推断、自动采用或兼容解码。
+
+专项通过 **315 次 ANN 查询比较**（其中 135 次位于分区边界）、**13 个实际 SIGKILL 边界、83 次 GC 调用、21 项拒绝与 4 项独立 oracle 控制**，fixture 最低 recall **1.0**。仅父进程被杀、原生子进程仍持锁时，恢复和 GC 均暂缓；发布前 pending 必须显式丢弃，发布后的未知响应确认已经提交的 head。两次删除中途崩溃后，以 1 项预算续收，缺失的已计划项仍保守计原字节；旧视图在 canonical GC 后继续查询。
+
+该组件最多 16 个登记／1 MiB registry，GC 每次最多 16 项／64 MiB，逐文件、目录、lease 与最终登记计项，未改变生产预算或普通 DuckLake 事务保护。实现仍位于独立 Python 实验中，尚未接入原生动态 provider 或 DuckLake 元数据事务；不能把该本地协议验证等同于生产在线更新已完成。
 
 ## 10. 统一 roadmap
 
@@ -299,7 +307,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R4 长期维护稳态 | **因本机负载波动暂缓，未完成**：[文件名预筛选](native-vortex-filename-prefilter.md)通过每侧 53,322 项路径 oracle 和 2,144 项真实元数据检查；预先提交协议后的受控 A/B 完成 768 次主采样，两个目标改善 5.28%／15.70%，但一个对照增加 3.84%，按规则撤回候选。生产引用检查未改，CPU／线程／事务／预算保持 | 稳定资源环境具备后再恢复 A/A、性能 A/B 与长期稳态验证；既有 A/A 未达 2% 门槛、候选撤回、积压有界与开放停滞未关闭的结论均保留 |
 | R5 容量与产品契约 | **部分完成，本地确定性生命周期已覆盖**：[确定性矩阵](native-vortex-functional-matrix.md)、[显式请求 epoch](native-vortex-request-epochs.md)，[reference／WAL 契约](native-vortex-reference-wal-lifecycle.md)、[容量 admission 边界](native-vortex-capacity-admission.md)、[查询 scratch 生命周期](native-vortex-query-scratch-lifecycle.md)、[表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md)与[退休历史／物理回收契约](native-vortex-retired-history.md)；已验证固定循环的原生块复用 | 更大数据、质量、延迟、吞吐、长期容量与总磁盘／RSS 资格仍待验证，依赖稳定负载的项目继续暂缓 |
 | R6 云端与分布式 | **部分完成，按当前优先级暂缓**：[协议模型](native-vortex-remote-publication.md)、[PostgreSQL／S3 backend](native-vortex-postgres-s3-backend.md)、[typed metadata／UUID／epoch](native-vortex-postgres-typed-lifecycle.md)、[UUID／发布／ReadView 绑定](native-vortex-bound-readviews.md)和 [reader session／pin 回收](native-vortex-reader-sessions.md)已有组件层实测；对象仍为 opaque fixture，实际 codec 未提交工作区保留，原生 SQL 仍限定 native DuckDB／本地 POSIX | 实际 Vortex／SPFresh 编码与最小查询、原生 codec／普通事务自动登记及真实 AWS／TLS／IAM、HA、分布式 fan-out／top-k 资格 |
-| R7 SPFresh 原生在线更新 | **部分完成，仅本地组件验证**：[原生增删／重开／旧 ReadView](native-vortex-spfresh-updates.md)及[受控串行 LIRE](native-vortex-spfresh-lire.md)已验证实际 Add/Delete、split／merge／reassign、持久物理状态、有预算推进、旧视图与恢复；生产仍使用静态 provider | 动态候选持久登记／取消／崩溃回收、动态 provider／DuckLake 元数据原子接线和后台并发；随后单独证明质量与收益 |
+| R7 SPFresh 原生在线更新 | **部分完成，仅本地组件验证**：[原生增删／重开／旧 ReadView](native-vortex-spfresh-updates.md)、[受控串行 LIRE](native-vortex-spfresh-lire.md)及[持久候选／取消／回收](native-vortex-spfresh-candidates.md)已有实际文件、状态、预算、锁与恢复证据；生产仍使用静态 provider | 将动态 provider、候选登记、提交增量游标与覆盖水位接入 DuckLake 原生元数据事务，再验证后台并发、质量与收益 |
 
 原 RFC 的静态索引、实时可见、B/F/T、compaction／GC 目标在 R0–R3 有对应实现；其 Iceberg 专属物化、云端 fencing 和分布式 serving 并未因 DuckLake 本地链路通过而完成。保留原 RFC 作为历史来源，本文件作为 DuckLake 路线的总纲。
 
@@ -307,10 +315,10 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 ## 11. 下一份验证性 Draft PR
 
-**下一项推荐 R7 动态候选的持久登记、取消与有预算的崩溃回收契约。** [原生增删实验](native-vortex-spfresh-updates.md)与[受控 LIRE 验证](native-vortex-spfresh-lire.md)已覆盖关闭 checkpoint、实际 SIGKILL、持久 posting／version／head 和旧视图；未封存候选目前只保留作证据。先明确候选的所有权与生命周期，再接入生产发布与并发，不运行依赖稳定负载的性能资格。
+**下一项推荐 R7 最小原生动态 provider 与 DuckLake 元数据原子覆盖水位接线。** [持久候选组件](native-vortex-spfresh-candidates.md)已验证登记、取消、原生子进程锁、明确恢复和有预算 GC；[增删](native-vortex-spfresh-updates.md)与[受控 LIRE](native-vortex-spfresh-lire.md)已有实际文件和旧视图证据。下一轮把这些契约接入原生接口及元数据事务，继续做确定性验证，不运行依赖稳定负载的性能资格。
 
-1. R7 下一轮显式绑定候选 UUID／源 snapshot／覆盖水位，验证登记、取消、崩溃后明确判定和有预算回收；不能把未封存目录自动采用为已发布版本。继续保持现有事务保护、原生 RowRef 映射、旧视图和预算，整份 checkpoint 复制仍有明确 I/O 成本。
-2. R7 生产接线仍需动态 provider、提交增量游标、DuckLake 元数据中的原子覆盖水位、并发快照和候选取消／恢复／回收；当前单一本地实验指针不能代替这些协议。
+1. R7 下一轮提供最小动态 provider，绑定原生 RowRef／ReadView 和显式提交增量游标，在 DuckLake 元数据事务中原子注册候选与推进覆盖水位；复用本轮所有权和取消／回收规则，不采用未封存目录。
+2. 当前 Python registry 不能代替生产元数据和并发协议。继续保持现有事务保护、旧视图和预算，先验证失败／提交／重开边界，再验证后台并发；整份 checkpoint 复制仍有明确 I/O 成本，收益留待后续单独证明。
 3. R6 按用户优先级继续暂缓：实际远程 codec、broker 原生调用、普通事务自动登记、真实 AWS／TLS／IAM、HA、分布式 fan-out／读位置／top-k 仍待完成；既有 reader fencing 不替代任意 SQL 事务保护。
 4. R5 的更大数据／质量与容量资格仍须单独声明输入、资源和退出条件；当前 fixture 及三轮块复用不替代持续容量验证。
 5. 具备稳定资源环境后恢复 R4：保留既有 A/A 失败、候选撤回和未关闭稳态问题，按原门槛验证。R4 A/A、性能 A/B 与长期负载继续暂缓。
@@ -349,6 +357,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | [R6 Reader session／fencing／持久 pin 回收](native-vortex-reader-sessions.md) | 新 typed v3、PG lifetime lock、逐 GET 验证、显式 terminal fence、共享预算、SIGSTOP／SIGKILL 和提交故障；没有 TTL／自动重连 |
 | [R7 本地 SPFresh 原生增删与旧 ReadView](native-vortex-spfresh-updates.md) | 实际 RocksDB／Add/Delete、关闭 checkpoint、物理身份、私有旧视图与 canonical GC、业务 WAL／ANN 水位分离；#96 历史基线 |
 | [R7 受控 LIRE split／merge／reassign](native-vortex-spfresh-lire.md) | 实际串行原生任务、嵌套预算 admission、持久 posting／version／head 与最近分区 oracle、merge 同输入反例和旧视图；生产接线与后台并发待验证 |
+| [R7 动态候选持久登记、取消与回收](native-vortex-spfresh-candidates.md) | 单一提交根、UUID／ReadView 绑定、继承式 native owner 锁、源 pin、显式恢复、分批 GC 与旧视图；独立本地组件，生产接线待完成 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。
