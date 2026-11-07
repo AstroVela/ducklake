@@ -55,7 +55,7 @@ def seed(executable, root, capture, log):
 
 
 class Candidate:
-    def __init__(self, executable, source, target, capture, log):
+    def __init__(self, executable, source, target, capture, log, *, pass_fds=(), observe=lambda _: None):
         self.worker = None
         self.target, self.capture = target, capture
         F.validate_capture(capture)
@@ -68,6 +68,7 @@ class Candidate:
         F.require(new["snapshot_id"] > old["snapshot_id"], "STALE_SNAPSHOT")
         (target / "seal.json").unlink()
         F.sync(target)
+        observe("copied")
         self.mapping = previous["mapping"]
         current = {F.address(r): r for r in capture["rows"]}
         before = {F.address(r): r for r in previous["capture"]["rows"]}
@@ -76,7 +77,7 @@ class Candidate:
         added = sorted([r for key, r in current.items() if key not in before], key=F.address)
         F.require(len(self.mapping) + len(added) <= F.ROWS and len(removed) + len(added) <= 1000, "MUTATION_BUDGET")
         F.require(len(F.encoded({"added": added, "deleted": removed})) <= 4 * F.MIB, "MUTATION_BUDGET")
-        self.worker = F.Worker(executable, "update-lire", target / "native", log)
+        self.worker = F.Worker(executable, "update-lire", target / "native", log, pass_fds=pass_fds)
         try:
             for vid in removed:
                 F.require(self.worker.call("delete", vid) == {"deleted": True}, "DELETE_IDENTITY")
@@ -86,6 +87,7 @@ class Candidate:
                     actual == {"ids": list(range(len(self.mapping), len(self.mapping) + len(added)))}, "ADD_IDENTITY"
                 )
             self.mapping = self.mapping + added
+            observe("mutated")
         except BaseException:
             self.stop()
             raise

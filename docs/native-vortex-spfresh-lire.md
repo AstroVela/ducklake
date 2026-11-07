@@ -94,4 +94,6 @@ VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_spfresh_lire.py \
 
 下一项推荐 R7 动态候选的持久登记、取消和有预算的崩溃回收契约，先明确 UUID／源 snapshot／覆盖水位及状态转换。随后接入动态 provider、DuckLake 元数据原子发布、提交增量游标和并发快照；当前实验指针不能替代这些协议。
 
+后续已增加[持久候选／取消／崩溃回收的本地组件验证](native-vortex-spfresh-candidates.md)，包括继承式原生进程锁、单一提交根、源引用与分批 GC；本页保留 #97 历史范围和结果，最新顺序见总 roadmap。
+
 R6 继续暂缓。后台并发、任意 filter、维度／质量矩阵、断电持久性、持续容量与收益仍需独立验证；依赖稳定负载的 R4 A/A、性能 A/B、长期稳态及相关 R5 项目继续暂缓。

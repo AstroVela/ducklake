@@ -141,10 +141,12 @@ def verify(root):
 
 
 class Worker:
-    def __init__(self, executable, mode, root, log, vectors=None):
+    def __init__(self, executable, mode, root, log, vectors=None, *, pass_fds=()):
         args = [str(executable), mode, str(root)] + ([] if vectors is None else [str(vectors)])
         self.events, self.log = queue.Queue(), log.open("ab")
-        self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True)
+        self.process = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True, pass_fds=pass_fds
+        )
 
         def read():
             for line in self.process.stdout:
