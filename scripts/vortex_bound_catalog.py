@@ -12,8 +12,9 @@ import struct
 
 from psycopg.types.json import Jsonb
 
-from vortex_remote_backend import LIMITS, canonical, require, sha
+from vortex_remote_backend import CommitUnknown, LIMITS, canonical, require, sha
 from vortex_postgres_metadata import MAX_EPOCH, canonical_uuid, encoded_row, integer, normalized
+from vortex_reader_sessions import ReaderSession
 
 
 class BoundCatalog:
@@ -383,9 +384,39 @@ class BoundCatalog:
             c.execute("UPDATE requests SET state='cancelled' WHERE id=%s", (key,))
             c.execute("DELETE FROM refs WHERE kind='build' AND holder=%s", (key,))
 
-    def capture(self, name, table_uuid, schema_hash, reader_id, kind="vector", source=None):
+    def open_session(self, session_uuid, owner_uuid):
+        return ReaderSession.open(self.backend, self.metadata, session_uuid, owner_uuid)
+
+    def close_session(self, session):
+        try:
+            with session.operation(self.backend, self.metadata) as (c, _):
+                require(
+                    not c.execute(
+                        "SELECT 1 FROM reader_session_views b JOIN readers r ON r.id=b.reader WHERE b.session_uuid=%s AND NOT r.closed",
+                        (canonical_uuid(session.id),),
+                    ).fetchone(),
+                    "READER_VIEWS_REMAIN",
+                )
+                receipt = {
+                    "session_uuid": session.id,
+                    "owner_uuid": session.owner,
+                    "original_fence": session.fence,
+                    "fence": session.fence + 1,
+                    "closed": True,
+                }
+                c.execute(
+                    "UPDATE reader_sessions SET fence=fence+1,state='closed',receipt=%s WHERE session_uuid=%s",
+                    (Jsonb(receipt), canonical_uuid(session.id)),
+                )
+        except CommitUnknown:
+            session.disconnect()
+            raise
+        session.disconnect()
+        return receipt
+
+    def capture(self, session, name, table_uuid, schema_hash, reader_id, kind="vector", source=None):
         require(kind in ("vector", "sql"), "BAD_READER_KIND")
-        with self.backend.transaction() as (c, _):
+        with session.operation(self.backend, self.metadata) as (c, _):
             table = self.target(c, name, table_uuid, schema_hash)
             query, _ = self.snapshot(c, table, self.metadata.catalog(c)["snapshot"])
             head = c.execute("SELECT * FROM bound_heads WHERE table_uuid=%s", (table["table_uuid"],)).fetchone()
@@ -421,10 +452,15 @@ class BoundCatalog:
                 "INSERT INTO bound_readers VALUES(%s,%s,%s,%s)",
                 (reader_id, table["table_uuid"], query["snapshot_id"], Jsonb(identity)),
             )
+            c.execute(
+                "INSERT INTO reader_session_views VALUES(%s,%s,%s)",
+                (reader_id, canonical_uuid(session.id), session.fence),
+            )
         return identity
 
-    def materialize(self, reader_id):
-        with self.backend.transaction() as (c, _):
+    def materialize(self, session, reader_id):
+        with session.operation(self.backend, self.metadata) as (c, _):
+            session.view(c, reader_id)
             view = c.execute(
                 "SELECT r.*,b.identity,b.table_uuid,b.snapshot_id FROM readers r JOIN bound_readers b ON b.reader=r.id WHERE r.id=%s AND NOT r.closed",
                 (reader_id,),
@@ -435,19 +471,33 @@ class BoundCatalog:
             table = c.execute("SELECT * FROM typed_tables WHERE table_uuid=%s", (view["table_uuid"],)).fetchone()
             query, rows = self.snapshot(c, table, view["snapshot_id"])
             require(query == view["identity"]["query"], "READVIEW_BINDING_CHANGED")
-            result = {"identity": view["identity"], "rows": rows, "objects": {}}
+            result = {
+                "session_uuid": session.id,
+                "session_fence": session.fence,
+                "identity": view["identity"],
+                "rows": rows,
+                "objects": {},
+            }
             for unit in view["units"]:
                 self.unit(c, unit, str(view["table_uuid"]))
                 for obj in self.backend.files(c, unit):
+                    session.require_lock(c)
                     raw = self.backend.objects.read(obj["key"], obj["version"])
+                    session.require_lock(c)
                     self.backend.identity(obj, raw)
                     result["objects"][obj["key"]] = raw["data"]
-            self.copies[reader_id] = result
+        self.copies[reader_id] = result
         return result
 
-    def release_copy_pin(self, reader_id):
-        require(reader_id in self.copies, "COPY_INCOMPLETE")
-        with self.backend.transaction() as (c, _):
+    def release_copy_pin(self, session, reader_id):
+        with session.operation(self.backend, self.metadata) as (c, _):
+            session.view(c, reader_id)
+            require(
+                reader_id in self.copies
+                and self.copies[reader_id]["session_uuid"] == session.id
+                and self.copies[reader_id]["session_fence"] == session.fence,
+                "COPY_INCOMPLETE",
+            )
             require(
                 c.execute(
                     "SELECT 1 FROM bound_readers b JOIN readers r ON r.id=b.reader WHERE reader=%s AND NOT closed",
@@ -457,8 +507,9 @@ class BoundCatalog:
             )
             c.execute("DELETE FROM refs WHERE kind='reader' AND holder=%s", (reader_id,))
 
-    def close_view(self, reader_id):
-        with self.backend.transaction() as (c, _):
+    def close_view(self, session, reader_id):
+        with session.operation(self.backend, self.metadata) as (c, _):
+            session.view(c, reader_id)
             require(
                 c.execute("SELECT 1 FROM bound_readers WHERE reader=%s", (reader_id,)).fetchone(),
                 "UNKNOWN_BOUND_READER",
