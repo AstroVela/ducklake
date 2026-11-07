@@ -133,6 +133,13 @@ class CommitProxy:
                 if connection is not None:
                     with self.lock:
                         self.connections.discard(connection)
+                    # The opposite forwarding thread can still be blocked in
+                    # recv(). close() alone leaves an upstream PG session alive
+                    # after client EOF, retaining its advisory locks.
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                     connection.close()
 
     def backend(self, client: socket.socket, server: socket.socket, state: dict) -> None:

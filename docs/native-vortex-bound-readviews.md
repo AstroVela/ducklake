@@ -2,6 +2,8 @@
 
 本轮基于 [Draft #93](https://github.com/AstroVela/ducklake/pull/93) 的 `62b87b87e4dd56eed010feaadaeeb7f0ba83cb3b`，把 [typed metadata](native-vortex-postgres-typed-lifecycle.md) 与 [PostgreSQL／S3 backend](native-vortex-postgres-s3-backend.md) 接到一个严格的 [BoundCatalog 入口](../scripts/vortex_bound_catalog.py)。总入口为 [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)。
 
+后续 [reader session 所有权／fencing／pin 回收](native-vortex-reader-sessions.md)已把 typed reader 入口改为必须显式携带 session，使用 storage v2／新 typed v3。本文保留 #94 的 v2 布局及历史范围／证据；后续严格入口不兼容旧调用形参。
+
 **本轮验证组件身份与可见性契约。** Source／index 使用不透明 bytes fixture，未生成或查询原生 Vortex／SPFresh 文件，不能据此宣称远程 ANN、过滤或 top-k 已接通。原生 C++／Rust、SQL、provider 和远程配置限制保持不变。
 
 本地固定 CPU **6–11**，继承现有线程环境，原生 `threads=2` 不变；事务保护与预算保持。R4 A/A、性能 A/B、长期稳态及依赖稳定负载的 R5 资格继续暂缓，耗时仅作观察。

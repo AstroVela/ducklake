@@ -28,6 +28,7 @@ def load(name, path):
 
 B = load("vortex_remote_backend", HERE.parents[1] / "scripts/vortex_remote_backend.py")
 M = load("vortex_postgres_metadata", HERE.parents[1] / "scripts/vortex_postgres_metadata.py")
+R = load("vortex_reader_sessions", HERE.parents[1] / "scripts/vortex_reader_sessions.py")
 X = load("vortex_bound_catalog", HERE.parents[1] / "scripts/vortex_bound_catalog.py")
 O = load("bound_oracle", HERE / "vortex_bound_catalog_oracle.py")
 T = load("bound_typed_oracle", HERE / "vortex_postgres_metadata_oracle.py")
@@ -52,7 +53,7 @@ THREADS = (
 )
 RULE = {
     "schema": 1,
-    "layouts": {"storage": 2, "typed": 2},
+    "layouts": {"storage": 2, "typed": 3},
     "mode": "mandatory typed bindings",
     "acceptance": "All real-service assertions and independent physical-state checks pass; no timing gate.",
     "scope": "Component identity/visibility only; opaque object fixtures, no native remote ANN qualification.",
@@ -83,6 +84,8 @@ class Checks:
         self.model, self.tables, self.reader_processes = T.Model(), {}, [bound]
         self.raw = None
         self.check()
+        self.session = self.call("open-reader-session", bound.open_session, str(uuid.uuid4()), str(uuid.uuid4()))
+        self.sessions = [self.session]
 
     def token(self):
         return self.b.state()["owner"]
@@ -215,7 +218,7 @@ class Checks:
         return self.call("publish-" + name + "-" + request, self.x.publish, *context, epoch, request, self.token())
 
     def capture(self, name, reader, kind="vector", source=None):
-        return self.call("capture-" + reader, self.x.capture, *self.context(name), reader, kind, source)
+        return self.call("capture-" + reader, self.x.capture, self.session, *self.context(name), reader, kind, source)
 
     def collect(self, table_uuid, unit, budget=None, start=True):
         budget = B.Budget() if budget is None else budget
@@ -260,7 +263,9 @@ def exercise(h, report):
         rejected="UNIT_BINDING_MISMATCH",
     )
     h.call("foreign-GC-rejected", h.x.plan_gc, bu, source_a, h.token(), B.Budget(), rejected="UNIT_BINDING_MISMATCH")
-    h.call("stale-schema-rejected", h.x.capture, "items", au, "00" * 32, "bad-schema", rejected="STALE_SCHEMA")
+    h.call(
+        "stale-schema-rejected", h.x.capture, h.session, "items", au, "00" * 32, "bad-schema", rejected="STALE_SCHEMA"
+    )
     with h.b.connect() as c:
         h.call(
             "foreign-table-id-FK-rejected",
@@ -360,7 +365,9 @@ def exercise(h, report):
         if mode == "before_forward":
             require((h.raw, h.typed) == before, "Unforwarded retirement changed state")
     h.call("retire-receipt-replay", h.m.retire, "items", au, h.token(), model=lambda: h.model.retire(au))
-    h.call("retired-capture-rejected", h.x.capture, *h.context("items"), "retired-view", rejected="STALE_TABLE")
+    h.call(
+        "retired-capture-rejected", h.x.capture, h.session, *h.context("items"), "retired-view", rejected="STALE_TABLE"
+    )
     h.call(
         "old-view-still-pinned",
         h.x.plan_gc,
@@ -370,16 +377,16 @@ def exercise(h, report):
         B.Budget(),
         rejected="REFERENCED",
     )
-    old_copy = deepcopy(h.call("materialize-old-view-after-retire", h.x.materialize, "old-view"))
-    new_copy = deepcopy(h.call("materialize-new-view-after-retire", h.x.materialize, "new-view"))
+    old_copy = deepcopy(h.call("materialize-old-view-after-retire", h.x.materialize, h.session, "old-view"))
+    new_copy = deepcopy(h.call("materialize-new-view-after-retire", h.x.materialize, h.session, "new-view"))
     require(
         len(old_copy["rows"]) == len(new_copy["rows"]) == 65
         and old_copy["rows"][0]["payload"] == "value"
         and new_copy["rows"][0]["payload"] == "changed",
         "Old/new payload snapshot was mixed",
     )
-    h.call("unpin-old-copy", h.x.release_copy_pin, "old-view")
-    h.call("unpin-new-copy", h.x.release_copy_pin, "new-view")
+    h.call("unpin-old-copy", h.x.release_copy_pin, h.session, "old-view")
+    h.call("unpin-new-copy", h.x.release_copy_pin, h.session, "new-view")
     h.collect(au, "generation:" + h.x.request_key(au, 1, "same"))
     h.collect(au, "generation:" + h.x.request_key(au, 2, "same"))
     h.call(
@@ -390,7 +397,7 @@ def exercise(h, report):
         h.token(),
         rejected="ORDINARY_TRANSACTION",
     )
-    h.call("end-unrelated-SQL-reader", h.x.close_view, "neighbor-sql")
+    h.call("end-unrelated-SQL-reader", h.x.close_view, h.session, "neighbor-sql")
     h.call("expire-retired-source", h.x.expire_native, au, source_a, h.token())
     # Delay an exact old-source DELETE across same-name recreation and publication.
     budget = B.Budget()
@@ -425,7 +432,7 @@ def exercise(h, report):
         "Canonical GC changed private view copies",
     )
     for label, fn, args in (
-        ("stale-UUID-capture", h.x.capture, ("items", au, a["schema_hash"], "bad-old")),
+        ("stale-UUID-capture", h.x.capture, (h.session, "items", au, a["schema_hash"], "bad-old")),
         ("stale-UUID-publication", h.x.publish, ("items", au, a["schema_hash"], 1, "same", h.token())),
         (
             "new-UUID-cannot-adopt-old-source",
@@ -483,6 +490,8 @@ def exercise(h, report):
         c.execute("DROP FUNCTION reject_bound_publish()")
     h.publish("neighbor", "rollback")
     h.ready("items", "restart", new_source)
+    neighbor_copy = deepcopy(h.call("neighbor-copy-before-server-crash", h.x.materialize, h.session, "neighbor-vector"))
+    old_session = h.session
     before = deepcopy((h.raw, h.typed))
     h.s.restart()
     h.check()
@@ -494,6 +503,8 @@ def exercise(h, report):
     h.b, h.m, h.x = writer, metadata, bound
     h.reader_processes.append(bound)
     h.call("owner-transfer-after-restart", writer.takeover, old_token)
+    h.session = h.call("new-reader-session-after-restart", bound.open_session, str(uuid.uuid4()), str(uuid.uuid4()))
+    h.sessions.append(h.session)
     h.call("old-owner-fenced", bound.adopt, *h.context("items"), 1, "restart", old_token, rejected="FENCED")
     h.call("explicit-adopt-original-binding", bound.adopt, *h.context("items"), 1, "restart", h.token())
     h.publish("items", "restart")
@@ -526,10 +537,16 @@ def exercise(h, report):
         receipt = h.publish("items", request)
         require(h.publish("items", request) == receipt, "Publication retry changed its original receipt")
     h.capture("items", "current-view")
-    h.call("current-view-still-readable", h.x.materialize, "current-view")
-    h.call("neighbor-old-view-still-readable", h.x.materialize, "neighbor-vector")
-    h.call("close-old-independent-copy", h.reader_processes[0].close_view, "old-view")
-    h.call("close-new-independent-copy", h.reader_processes[0].close_view, "new-view")
+    h.call("current-view-still-readable", h.x.materialize, h.session, "current-view")
+    require(h.copies()["neighbor-vector"] == neighbor_copy, "Server restart changed previously returned private bytes")
+    cleanup, budget = R.ReaderReclaimer(writer, metadata), B.Budget(objects=16)
+    h.call("fence-disconnected-old-session", cleanup.begin, old_session.id, 1, h.token(), budget)
+    for reader in ("old-view", "new-view", "neighbor-vector"):
+        h.call("reclaim-old-session-" + reader, cleanup.view, old_session.id, 1, reader, h.token(), budget)
+    h.call("finish-old-session-reclaim", cleanup.finish, old_session.id, 1, h.token(), budget)
+    old_session.disconnect()
+    h.call("close-current-view", h.x.close_view, h.session, "current-view")
+    h.call("close-current-session", h.x.close_session, h.session)
 
 
 def main():
@@ -546,7 +563,7 @@ def main():
     cpus = {int(v) for v in args.cpus.split(",")}
     require(cpus and cpus <= original, "Requested CPU set unavailable")
     threads = {n: os.environ.get(n) for n in THREADS}
-    sources = [Path(__file__), *[Path(m.__file__) for m in (B, M, X, O, T, BASE, S, P, HTTP)]]
+    sources = [Path(__file__), *[Path(m.__file__) for m in (B, M, R, X, O, T, BASE, S, P, HTTP)]]
     hashes = {str(p): B.sha(p.read_bytes()) for p in sources}
     report = {
         "status": "running",

@@ -114,9 +114,9 @@ def encoded_row(row):
 
 
 DDL = f"""
-CREATE TABLE typed_catalog(singleton boolean PRIMARY KEY CHECK(singleton),layout integer NOT NULL CHECK(layout=2),
+CREATE TABLE typed_catalog(singleton boolean PRIMARY KEY CHECK(singleton),layout integer NOT NULL CHECK(layout=3),
  snapshot bigint NOT NULL CHECK(snapshot>=0),next_table_id bigint NOT NULL,next_row_id bigint NOT NULL);
-INSERT INTO typed_catalog VALUES(true,2,0,1,1);
+INSERT INTO typed_catalog VALUES(true,3,0,1,1);
 CREATE TABLE typed_tables(table_uuid uuid PRIMARY KEY,table_id bigint NOT NULL UNIQUE,name bytea NOT NULL,
  dimension integer NOT NULL CHECK(dimension BETWEEN 1 AND 4096),schema_hash bytea NOT NULL CHECK(octet_length(schema_hash)=32),
  begin_snapshot bigint NOT NULL,end_snapshot bigint,request_epoch numeric(20,0),last_previous numeric(20,0),
@@ -161,6 +161,19 @@ CREATE TABLE bound_heads(table_uuid uuid PRIMARY KEY REFERENCES typed_tables(tab
  request text REFERENCES requests(id));
 CREATE TABLE bound_readers(reader text PRIMARY KEY REFERENCES readers(id),table_uuid uuid NOT NULL REFERENCES typed_tables(table_uuid),
  snapshot_id bigint NOT NULL,identity jsonb NOT NULL);
+CREATE TABLE reader_sessions(session_uuid uuid PRIMARY KEY,owner_uuid uuid NOT NULL,lock_key bigint NOT NULL UNIQUE,
+ backend_pid integer NOT NULL,backend_start timestamptz NOT NULL,fence bigint NOT NULL CHECK(fence>0),
+ state text NOT NULL CHECK(state IN ('active','closed','reclaiming','reclaimed')),intent jsonb,receipt jsonb,
+ CHECK((state='active' AND fence=1 AND intent IS NULL AND receipt IS NULL) OR
+       (state='closed' AND fence=2 AND intent IS NULL AND receipt IS NOT NULL) OR
+       (state='reclaiming' AND fence=2 AND intent IS NOT NULL AND receipt IS NULL) OR
+       (state='reclaimed' AND fence=2 AND intent IS NOT NULL AND receipt IS NOT NULL)));
+CREATE TABLE reader_session_views(reader text PRIMARY KEY REFERENCES bound_readers(reader),
+ session_uuid uuid NOT NULL REFERENCES reader_sessions(session_uuid),session_fence bigint NOT NULL CHECK(session_fence=1),
+ UNIQUE(reader,session_uuid,session_fence));
+CREATE TABLE reader_reclaims(reader text PRIMARY KEY,
+ session_uuid uuid NOT NULL REFERENCES reader_sessions(session_uuid),original_fence bigint NOT NULL CHECK(original_fence=1),
+ receipt jsonb NOT NULL,FOREIGN KEY(reader,session_uuid,original_fence) REFERENCES reader_session_views(reader,session_uuid,session_fence));
 """
 
 
@@ -175,7 +188,7 @@ class TypedMetadata:
     @staticmethod
     def catalog(c):
         state = c.execute("SELECT * FROM typed_catalog WHERE singleton").fetchone()
-        require(state and state["layout"] == 2, "UNSUPPORTED_TYPED_LAYOUT")
+        require(state and state["layout"] == 3, "UNSUPPORTED_TYPED_LAYOUT")
         return state
 
     @staticmethod
