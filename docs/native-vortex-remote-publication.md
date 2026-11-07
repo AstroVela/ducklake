@@ -4,6 +4,8 @@
 
 本地验证固定 CPU **6–11**，继承现有线程环境；既有原生测试的 DuckDB `threads=2` 设置保持。本模型不创建 DuckDB 或 ANN 线程。保留事务保护与预算，继续暂缓 R4 A/A、性能 A/B、长期稳态及依赖稳定负载的 R5 资格测试；耗时只记录为观察值。
 
+后续的 [PostgreSQL／S3 最小 backend](native-vortex-postgres-s3-backend.md)已把协议接到真实 PostgreSQL 与 MinIO API。它明确采用 broker 签发条件 SigV4 票据作为唯一 worker 授权方式，补充实际服务的原子发布、未知响应与 GC 验证；本文件继续保留 #91 的模型基线及历史结果。Vane 原生远程 SQL 与 ANN 仍未接入。
+
 ## 现有能力与待替换的本地假设
 
 | 当前实现证据 | 远程协议需要的能力 |
