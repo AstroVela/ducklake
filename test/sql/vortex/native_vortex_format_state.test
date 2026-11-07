@@ -1,0 +1,170 @@
+# name: test/sql/vortex/native_vortex_format_state.test
+# description: prepared writers and format options retain their physical and transaction identities
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_format_state.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_format_state', DATA_INLINING_ROW_LIMIT 0)
+
+# A prepared Parquet writer keeps its actual format after the table switches to Vortex.
+statement ok
+CREATE TABLE lake.prepared(id BIGINT, embedding FLOAT[])
+
+statement ok
+PREPARE write_parquet AS INSERT INTO lake.prepared VALUES (1, [1, 2, 3])
+
+statement ok
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'prepared')
+
+statement ok
+EXECUTE write_parquet
+
+statement ok
+INSERT INTO lake.prepared VALUES (2, [4, 5, 6])
+
+query II
+SELECT file_format, sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file JOIN __ducklake_metadata_lake.ducklake_table USING (table_id) WHERE table_name = 'prepared' GROUP BY file_format ORDER BY file_format
+----
+parquet	1
+vortex	1
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.prepared ORDER BY id
+----
+1	1	2	3
+2	4	5	6
+
+# Neither global nor schema scope is a valid interpretation of an empty table name.
+statement error
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => '')
+----
+requires table_name
+
+statement error
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'parquet', schema => 'main', table_name => '')
+----
+requires table_name
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata WHERE key = 'experimental_data_file_format' AND (scope IS NULL OR scope <> 'table')
+----
+0
+
+# Execution must recheck the transition even when the setter was bound earlier.
+statement ok
+CREATE TABLE lake.guarded(id BIGINT, embedding FLOAT[])
+
+statement ok
+PREPARE revert_format AS SELECT * FROM ducklake_set_option('lake', 'experimental_data_file_format', 'parquet', table_name => 'guarded')
+
+statement ok
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'guarded')
+
+statement ok
+INSERT INTO lake.guarded VALUES (1, [1, 2, 3]), (2, [2, 3, 4])
+
+statement error
+EXECUTE revert_format
+----
+cannot change their data file format
+
+statement ok
+CALL ducklake_set_option('lake', 'data_inlining_row_limit', 100, table_name => 'guarded')
+
+statement ok
+INSERT INTO lake.guarded VALUES (1000, [3, 4, 5])
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.guarded ORDER BY id
+----
+1	1	2	3
+2	2	3	4
+1000	3	4	5
+
+# A prepared enable operation must also validate the table's current schema.
+statement ok
+CREATE TABLE lake.late_schema(id BIGINT)
+
+statement ok
+PREPARE enable_vortex AS SELECT * FROM ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'late_schema')
+
+statement ok
+ALTER TABLE lake.late_schema ADD COLUMN payload BLOB
+
+statement error
+EXECUTE enable_vortex
+----
+do not support type BLOB
+
+# The option and writes inside a transaction are visible there, but both roll back.
+statement ok
+CREATE TABLE lake.rolled_back(id BIGINT, embedding FLOAT[])
+
+statement ok
+BEGIN
+
+statement ok
+CALL ducklake_set_option('lake', 'experimental_data_file_format', 'vortex', table_name => 'rolled_back')
+
+statement ok
+INSERT INTO lake.rolled_back VALUES (99, [9, 8, 7])
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.rolled_back
+----
+99	9	8	7
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM lake.rolled_back
+----
+0
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata JOIN __ducklake_metadata_lake.ducklake_table ON scope_id = table_id WHERE key = 'experimental_data_file_format' AND scope = 'table' AND table_name = 'rolled_back'
+----
+0
+
+statement ok
+INSERT INTO lake.rolled_back VALUES (1, [1, 2, 3]), (2, [2, 3, 4])
+
+query II
+SELECT file_format, sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file JOIN __ducklake_metadata_lake.ducklake_table USING (table_id) WHERE table_name = 'rolled_back' GROUP BY file_format
+----
+parquet	2
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_format_state.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vortex_format_state', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CALL ducklake_set_option('lake', 'data_inlining_row_limit', 100, table_name => 'rolled_back')
+
+statement ok
+INSERT INTO lake.rolled_back VALUES (1000, [3, 4, 5])
+
+# This must be correct with the optimizer enabled, including every vector component.
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.rolled_back ORDER BY id
+----
+1	1	2	3
+2	2	3	4
+1000	3	4	5
+
+query IIII
+SELECT id, embedding[1], embedding[2], embedding[3] FROM lake.prepared ORDER BY id
+----
+1	1	2	3
+2	4	5	6
+
+statement ok
+DETACH lake
