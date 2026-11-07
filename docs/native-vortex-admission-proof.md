@@ -143,16 +143,28 @@ Both producer counters and consumer reservations returned to zero on release.
 The two index builds are explicit: one for the original B files and one for
 the post-compaction layout.
 
-The ON native gate passed five Vortex SQL cases with 308 assertions, including
-the new 28-assertion acquisition case, plus Parquet/Vortex process-crash recovery.
+After integrating #30 at `8f72d23dcc1e2ebf299ff11e202345ec5f840ad5`, the ON
+native gate passed 14 Vortex SQL cases with 678 assertions, including the new
+28-assertion acquisition case and the inherited format/schema conflict,
+transaction and cleanup regressions. Parquet/Vortex process-crash recovery
+and the Vortex cleanup process proof also passed.
 Both ON and default-OFF base gates passed 86 SQL cases with 3,582 assertions,
 including the new 10-assertion metadata snapshot regression. Each reported 13
 skips for unavailable optional extensions. The OFF build also rejected Vortex
 format selection and exposed no acquisition function. The
 deletion-inlining suite passed 18 cases with 1,099 assertions; two HTTPFS cases
-were skipped because the optional extension was unavailable. Existing snapshot
-index, retained-view and mixed-query process proofs passed against the rebuilt
-native shell and the same Rust probe. Local builds reused qualified DuckDB
-v1.5.5 engine objects and pinned native dependencies; ON/default-OFF CMake
-configuration was checked separately. Hosted clean builds are tracked by the
-Draft PR's workflow.
+were skipped because the optional extension was unavailable. The snapshot-index
+proof passed 374 processes with 18 expected rejections and 15 nonempty recalls
+of 1.0. The retained-view proof passed 80 SQL/probe processes and 88 requests
+with 16 expected rejections. The mixed proof passed 61 SQL/probe processes and
+86 requests with 24 expected rejections; its seven main, three B-only and five
+Float32 regression recalls were all 1.0. It builds the original B generation
+once and reports the far sparse ANN probe independently.
+
+The stepwise Float32 oracle, existing distance tolerances, 0.8 fixture recall
+threshold, transaction protection and admission budgets are preserved. Local
+builds recompiled the affected native units and driver, reusing source- and
+artifact-verified DuckDB v1.5.5 engine objects and pinned dependencies.
+ON/default-OFF CMake configuration was checked separately. The parent
+integration does not change the Rust bridge source; every tracked probe source
+and the qualified executable hash were verified before reuse.

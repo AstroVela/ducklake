@@ -17,6 +17,14 @@ transaction and snapshot. Every returned T address must match the visibility
 set exactly. The source admission guard remains held through both reads and
 the complete source handoff.
 
+For each inline source, acquisition resolves its registered schema version
+through the native catalog and matches the query's business field IDs to that
+historical schema. It quotes the resulting physical column names before the
+metadata read. Column renames therefore preserve T values and category
+predicates even when several inline sources retain different historical names.
+The historical schema selects column names only; row visibility still uses the
+held query snapshot and transaction.
+
 The SQL path never constructs the full business-row oracle. The explicit
 `Acquire` proof interface still exports it for correctness comparisons and
 index-building fixtures. Both paths share snapshot selection, field validation,
@@ -51,6 +59,13 @@ writer commits a changed T payload and flushes T to F before the reader resumes
 its business read. The held query must return the earlier T version; a fresh
 prepared execution must see the committed F version. Another interruption at
 that boundary verifies transaction and guard release.
+
+A separate deterministic fixture swaps category/payload names, writes across
+three inline schema versions and renames payload through a quoted identifier.
+It checks full business values and category predicates against the native
+same-view oracle, including prepared execution and another rename committed
+after visibility selection. The held query retains the old field meanings and
+a fresh query sees the renamed meanings without rebuilding B.
 
 The existing gates continue to check updates/deletes before top-k, category
 filtering, nullable/Unicode business fields, prepared execution, source/index

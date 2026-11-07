@@ -1,6 +1,6 @@
 # Native DuckLake index publication and discovery
 
-This validation draft extends the [native read-view admission proof](native-vortex-admission-proof.md)
+This validation extends the [native read-view admission proof](native-vortex-admission-proof.md)
 in [DuckLake #31](https://github.com/AstroVela/ducklake/pull/31). A caller publishes
 an explicitly built, sealed SPFresh generation under an index name. A native
 read view discovers that generation and its source snapshot in the same
@@ -44,7 +44,16 @@ and checksums. Every referenced B file must still exist in the current source
 inventory with the same path, row count and content digest. Appended F files and
 committed T rows do not require rebuilding B. Candidate reference and artifact
 paths must be canonical local paths without symlinks, outside the managed data
-path so source orphan cleanup cannot delete the index.
+path so source orphan cleanup cannot delete the index. The managed `DATA_PATH`
+uses DuckLake's existing path semantics: publication resolves its physical root
+before checking directory containment, accepting relative paths, dot components
+and symlinked managed directories. Source verification reads the inventory's
+original paths without changing the sealed source identity. This does not relax
+the canonical-path requirement for references or index artifacts. Containment
+checks cover the actual generation directory, manifest and each artifact, so an
+external reference cannot admit a generation or artifact inside `DATA_PATH`.
+An index root may be an ancestor of the managed directory when its actual
+generation and artifacts remain outside that directory.
 
 The publisher takes an exclusive publication guard before choosing its source
 snapshot and holds it through metadata commit. Native source commits take the
@@ -54,6 +63,15 @@ source verification against physical cleanup. Concurrent publications with the
 same expected revision produce one ready successor and one explicit conflict.
 The guards cover the loaded extension instance, including all its catalogs;
 this proof does not establish publication between independent processes.
+
+Initialization and publication receive the original SQL caller's cancellation
+state even though their metadata work uses a separate owner connection. They
+check interruption before taking the publication guard, after obtaining it and
+before metadata commit. Publication also checks after generation/source
+validation and before writing the ready row. Cancellation observed before the
+commit attempt rolls back the owner's transaction and releases its guards; a
+ready row's revision and generation stay unchanged. Cancellation racing with a
+commit attempt retains the commit-outcome rules below.
 
 One metadata commit inserts or replaces the ready row. Publication changes the
 derived index revision without creating a new DuckLake source snapshot. A reader
@@ -119,27 +137,48 @@ Recovery must expose the previous and successor ready rows respectively, with
 sealed candidates still present. A separate injected lost acknowledgement
 checks that the committed row survives the reported failure.
 
+Cancellation regressions hold the publication guard while the SQL call creates
+its separate owner, then interrupt the original caller before releasing the
+guard. They verify cancelled initialization and publication without timing
+sleeps. Two further publication cases interrupt at `after_validation` and
+`before_commit`. All four must release transaction/guard state; the publication
+cases must preserve the existing ready revision and generation. Four separate
+fixtures publish and acquire 4,096-row views using canonical, dot-component,
+relative and symlinked managed paths. Each also publishes from a valid ancestor
+index root. Eleven negative controls retain physical directory containment and
+strict reference/artifact symlink rejection, including external references to
+managed generations and an external generation whose artifacts are managed.
+The generation-containment regression fails against the previous implementation,
+which incorrectly publishes the invalid candidate as a successor revision.
+
 The fixture starts with two B files and 4,096 vectors, then appends F and commits
 updates, deletes and T rows. It checks explicit initialization, invalid binding
 and corrupt-artifact rejection, stale revisions, retained old discovery,
 reference-file removal, compaction rejection, explicit rebuild, table UUID
 isolation, real source cleanup and unseen ranked B/F/T fetch after owner exit.
 
-The local catalog proof passed seven explicit builds, seven ready revisions,
-two SIGKILL boundaries, 41 native requests with 14 expected rejections, and
+The local catalog proof passed seven ready revisions, two SIGKILL boundaries,
+four cancellation cases and four managed-path fixtures. It performed eleven
+explicit builds: seven for the catalog lifecycle and four for the path fixtures.
+The lifecycle exercised 48 native requests with 14 expected rejections and
 35 consumer requests with three expected rejections. Eight fixture queries
 passed with recall 1.0 against the same-view oracle; the threshold is 0.8.
 Actual cleanup reclaimed three source files, and closing all consumer views
 returned reservations to zero. These fixture results do not establish workload
 performance or general ANN recall.
 
-The ON native gate passed six Vortex SQL cases with 323 assertions, including
-the new 15-assertion catalog case, plus Vortex/Parquet crash recovery. Both ON
+With the latest #31 implementation (`63d0162c`) integrated, the ON native gate
+passed fifteen Vortex SQL cases with 693 assertions, including the 15-assertion
+catalog case, plus Vortex/Parquet crash recovery and source cleanup. Both ON
 and default-OFF base gates passed the same 86 SQL cases with 3,582 assertions and
-13 optional-extension skips. The OFF gate also checks that all four native
-view/catalog functions are absent. Existing snapshot-index, retained-view,
+13 optional-extension skips. A separate ON deletion-inlining gate passed
+18 cases with 1,099 assertions and two optional-extension skips. The OFF gate
+also checks that all four native view/catalog functions are absent. Existing snapshot-index, retained-view,
 mixed-query and native-admission process proofs passed against the same shell
-and Rust probe. Rust Clippy passed with warnings denied.
+and Rust probe, including the inherited Float32 regressions. Score tolerances
+remain `rel_tol=1e-5` and `abs_tol=1e-4`, and the ANN recall threshold remains
+0.8. The unchanged Rust probe retains its qualified build and Clippy result with
+warnings denied.
 
 This remains a bounded validation interface: Linux/POSIX local unencrypted
 Vortex files, native DuckDB metadata, the existing four-column business
@@ -148,6 +187,6 @@ projection, and the source/row/artifact budgets documented in the
 Publication limits each reference/manifest to 1 MiB and its B source/artifact
 inventories to 64 MiB each. Local builds reused qualified DuckDB v1.5.5 engine
 objects and pinned dependencies; ON/default-OFF CMake configuration was checked
-separately. The Draft PR workflow performs clean hosted builds and runs all
-five process proofs. The next [native SQL search proof](native-vortex-sql-search-proof.md)
-connects named discovery to an experimental in-process search table function.
+separately. The validation workflow includes all five process proofs. The
+[native SQL search proof](native-vortex-sql-search-proof.md) connects named
+discovery to an experimental in-process search table function.

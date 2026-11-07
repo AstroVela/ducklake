@@ -3,9 +3,12 @@
 This DL3b validation draft connects DuckLake's native Vortex files to the
 existing `vortex-index` contracts and `vortex-index-spfresh` provider in
 [AstroVela/vortex, feat/vortex-index](https://github.com/AstroVela/vortex/tree/feat/vortex-index).
-The exact core revision is `145f816102d6024a12164e37737ff8864faf5033`, also
-used by the [DL3a file proof](native-vortex-files.md) in
-[DuckLake #27](https://github.com/AstroVela/ducklake/pull/27).
+The index and shared query library pin core revision
+`145f816102d6024a12164e37737ff8864faf5033`. The file-format wrapper used by the
+[DL3a file proof](native-vortex-files.md) in
+[DuckLake #27](https://github.com/AstroVela/ducklake/pull/27) remains at
+duckdb-vortex `b2253585db8fef4fa490e312841c6e8fa6479fd9`, which pins core
+`ee085f55a705cb9b2edab18d392dd822540774d7`.
 
 The implementation is a test-only Rust bridge and a Python process harness.
 It calls Vortex's `SpFreshIndexBuilder`, `LocalIndexStore`, `SpFreshProvider`,
@@ -60,6 +63,11 @@ fields, squared-L2 distances and result ordering. It evaluates its fixture's
 business predicates on captured DuckLake rows; it is not a general SQL predicate
 translator or an optimizer integration.
 
+The Python oracle restores FLOAT32 values after JSON decoding for captured rows,
+ranked fetches, Vortex hits and queries before vector equality, exact top-k and
+squared-L2 calculations. Different JSON decimals can represent the same FLOAT32
+value. Distance tolerances remain `rel_tol=1e-5` and `abs_tol=1e-4`.
+
 ## Build and run
 
 Use the ON shell with the repository's DuckDB v1.5.5 pin. This proof runs build
@@ -103,6 +111,9 @@ Vortex files. Independent build/search processes exercise:
   subsequent process reopen using the existing Vortex provider.
 - Stable catalog file IDs and original physical positions, ranked vector take,
   business-column fetch, selective predicates and an empty allow-list.
+- A separate 128-row fixture with vectors near 100,000,000: distinct JSON
+  representations of the same FLOAT32, distinct distances of 64 and 65, exact top-k and
+  recall, and a query decimal that rounds to a stored FLOAT32 value.
 - An updated nearest neighbor, a deleted neighbor and a new nearest neighbor.
   The old generation rejects the new snapshot; a rebuilt generation's mandatory
   visibility mask excludes the dead physical rows even when explicitly allowed.

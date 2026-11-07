@@ -90,7 +90,8 @@ static unique_ptr<FunctionData> DuckLakeSetOptionBind(ClientContext &context, Ta
 		value = StringUtil::Lower(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
 		DataFileFormatFromString(value);
 		auto table = input.named_parameters.find("table_name");
-		if (table == input.named_parameters.end() || table->second.IsNull()) {
+		if (table == input.named_parameters.end() || table->second.IsNull() ||
+		    StringValue::Get(table->second).empty()) {
 			throw BinderException("experimental_data_file_format requires table_name");
 		}
 		if (value == "vortex") {
@@ -197,7 +198,7 @@ static unique_ptr<FunctionData> DuckLakeSetOptionBind(ClientContext &context, Ta
 			DuckLakeVortex::ValidateTable(ducklake_table);
 		}
 		if (option == "experimental_data_file_format" && value != "vortex" &&
-		    DuckLakeVortex::GetFormat(ducklake_table) == DataFileFormat::VORTEX) {
+		    DuckLakeVortex::GetFormat(context, ducklake_table) == DataFileFormat::VORTEX) {
 			throw NotImplementedException("Experimental Vortex tables cannot change their data file format");
 		}
 		config_option.table_id = ducklake_table.GetTableId();

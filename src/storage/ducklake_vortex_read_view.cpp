@@ -140,9 +140,9 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		json.Add(admission, "sources", sources);
 		map<string, idx_t> by_path;
 		DuckLakeVortexReadView result;
-		result.managed_data_path = catalog.DataPath();
 		result.snapshot_id = snapshot.snapshot_id;
 		auto &fs = FileSystem::GetFileSystem(*reader.context);
+		result.managed_data_path = fs.ExpandPath(catalog.DataPath());
 		idx_t physical_rows = 0;
 		vector<DuckLakeVortexIndexFile> identities;
 		const auto row_limit = MinValue<idx_t>(options.max_rows, 64 * 1024 * 1024 / sizeof(float) / dimension);
@@ -300,9 +300,35 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			checkpoint("after_visibility");
 			idx_t inline_bytes = 0;
 			for (auto &source : inline_visible) {
-				// Native metadata applies the same snapshot predicates as its inlined reader.
-				auto inlined_rows = transaction.GetMetadataManager().ReadInlinedData(
-				    snapshot, source.first, {"id", "embedding", "category", "payload", "row_id"});
+				// Resolve physical names using the source schema, as the native inlined reader does.
+				auto &inlined_tables = table.GetInlinedDataTables();
+				auto source_table =
+				    std::find_if(inlined_tables.begin(), inlined_tables.end(),
+				                 [&](const DuckLakeInlinedTableInfo &info) { return info.table_name == source.first; });
+				if (source_table == inlined_tables.end()) {
+					throw InvalidInputException("Visible inline source is outside the native table inventory");
+				}
+				DuckLakeSnapshot source_snapshot(catalog.GetBeginSnapshotForSchemaVersion(
+				                                     table.GetTableId(), source_table->schema_version, transaction),
+				                                 source_table->schema_version, 0, 0);
+				auto source_entry = catalog.GetEntryById(transaction, source_snapshot, table.GetTableId());
+				if (!source_entry) {
+					throw InvalidInputException("Missing native inline source schema");
+				}
+				auto &source_schema = source_entry->Cast<DuckLakeTableEntry>();
+				vector<string> projections;
+				for (auto &name : {"id", "embedding", "category", "payload"}) {
+					auto &field = table.GetFieldId(vector<string> {name});
+					auto source_field = source_schema.GetFieldId(field.GetFieldIndex());
+					if (!source_field || source_field->Type() != field.Type()) {
+						throw InvalidInputException("Native inline source field mismatch: %s", name);
+					}
+					projections.push_back(KeywordHelper::WriteOptionallyQuoted(source_field->Name()));
+				}
+				projections.push_back("row_id");
+				// Business visibility still uses the query snapshot in the same metadata transaction.
+				auto inlined_rows =
+				    transaction.GetMetadataManager().ReadInlinedData(snapshot, source.first, projections);
 				if (inlined_rows->HasError()) {
 					inlined_rows->ThrowError();
 				}
