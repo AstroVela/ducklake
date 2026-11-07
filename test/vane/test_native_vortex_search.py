@@ -73,6 +73,11 @@ def exercise(proof, native, scratch, checks):
     native.call("publish", "knn", refs[0], 0)
     first_generation = CAT.generation(refs[0])
     refs[0].unlink()
+    binary = native.call("binary-rejections")
+    require(
+        binary["rejections"] == 7 and binary["reordered_open"], "native binary handoff rejection gate did not complete"
+    )
+    no_leases(scratch)
     initial = query(native, "EXECUTE reusable_search")
     recalls = [qualify(initial, native.rows("bootstrap"), vector)]
     core = native.call("core-search")
@@ -135,7 +140,15 @@ def exercise(proof, native, scratch, checks):
     native.sql("ROLLBACK;")
     failures = [
         ("cancel-search", stage, "Interrupted")
-        for stage in ("after_visibility", "after_open", "category_filter", "after_ann", "scan_batch", "before_fetch")
+        for stage in (
+            "after_visibility",
+            "source_pinned",
+            "after_open",
+            "category_filter",
+            "after_ann",
+            "scan_batch",
+            "before_fetch",
+        )
     ]
     failures += [("fail-search", stage, "Injected query lease failure") for stage in ("source_pinned", "after_open")]
     for op, stage, error in failures:
@@ -232,6 +245,7 @@ def exercise(proof, native, scratch, checks):
         "index_builds": 3,
         "reclaimed_source_files": len(old_files),
         "external_query_workers": 0,
+        "binary_rejections": 7,
     }
 
 
@@ -456,6 +470,18 @@ def exercise_data_paths(proof, scratch, checks):
             ]["admission"]
         )
         original_files = json.loads(capture.read_text())["capture"]["file_capture"]["files"]
+        source_uris = [file["uri"] for file in original_files]
+        require(source_uris, f"managed path fixture captured no source files for {mode}")
+        if mode == "relative":
+            require(
+                all(not Path(uri).is_absolute() and uri.startswith(represented + "/") for uri in source_uris),
+                "relative DATA_PATH fixture lost its relative source URI identity",
+            )
+        elif mode == "file-colon":
+            require(
+                all(uri.startswith(represented + "/") for uri in source_uris),
+                "file: DATA_PATH fixture lost its URI scheme before buffer admission",
+            )
         artifacts = case / "artifacts"
         artifacts.mkdir()
         reference = artifacts / "index.json"
@@ -491,7 +517,15 @@ def exercise_data_paths(proof, scratch, checks):
                 os.environ["TMPDIR"] = str(scratch)
             require(json.loads(sql(statement)) == result, "managed scratch rejection changed subsequent SQL results")
             no_leases(scratch)
-        cases.append({"data_path": mode, "visible_rows": 4096, "winner": 133, "source_identity_unchanged": True})
+        cases.append(
+            {
+                "data_path": mode,
+                "source_uris": source_uris,
+                "visible_rows": 4096,
+                "winner": 133,
+                "source_identity_unchanged": True,
+            }
+        )
     checks.append(
         "canonical/dot/relative/symlink/file: managed paths execute SQL search with unchanged source URI binding; physical managed scratch containment remains enforced"
     )
@@ -516,7 +550,7 @@ def main():
         "duckdb_sha256": BASE.digest(proof.duckdb),
         "probe_sha256": BASE.digest(proof.probe),
         "driver_sha256": BASE.digest(args.driver.resolve(strict=True)),
-        "vortex_revision": "145f816102d6024a12164e37737ff8864faf5033",
+        "vortex_revision": "703ed464a5e03bee45c8713c5a4286571349bce1",
     }
     try:
         native = CAT.Native(args.driver.resolve(strict=True), root / "native")

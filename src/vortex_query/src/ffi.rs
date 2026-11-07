@@ -8,19 +8,29 @@ use std::{cell::RefCell, collections::BTreeMap, time::Instant};
 
 use crate::{
     lease::ViewBudget,
-    mixed::{MixedHit, MixedView, ViewInput},
+    mixed::{MixedHit, MixedView},
 };
 use vortex::{
     VortexSessionDefault,
+    buffer::ByteBuffer,
     error::{VortexResult, vortex_bail, vortex_err},
     io::{runtime::single::block_on, session::RuntimeSessionExt},
     session::VortexSession,
 };
 
 #[repr(C)]
+pub struct Source {
+    file_id: u64,
+    data: *const u8,
+    size: u64,
+}
+
+#[repr(C)]
 pub struct Input {
     admission: *const u8,
     admission_len: u64,
+    sources: *const Source,
+    source_count: u64,
     data_path: *const u8,
     data_path_len: u64,
     index_name: *const u8,
@@ -66,11 +76,34 @@ impl Output {
     }
 }
 
-// The native caller keeps these read-only buffers and the callback alive until return.
+// Descriptor and data buffers are borrowed only while this bounded copy runs.
+unsafe fn copy_sources(input: &Input) -> VortexResult<BTreeMap<u64, ByteBuffer>> {
+    if input.sources.is_null() || !(1..=100_000).contains(&input.source_count) {
+        vortex_bail!("Invalid native binary source inventory");
+    }
+    let sources = unsafe { slice::from_raw_parts(input.sources, input.source_count as usize) };
+    let mut buffers = BTreeMap::new();
+    let mut remaining = 64 * 1024 * 1024;
+    for source in sources {
+        if source.data.is_null()
+            || source.size == 0
+            || source.size > remaining as u64
+            || buffers.contains_key(&source.file_id)
+        {
+            vortex_bail!("Invalid, duplicate or over-budget native source buffer");
+        }
+        let bytes = unsafe { slice::from_raw_parts(source.data, source.size as usize) };
+        buffers.insert(source.file_id, ByteBuffer::copy_from(bytes));
+        remaining -= bytes.len();
+    }
+    Ok(buffers)
+}
+
+// The caller keeps metadata/callbacks alive until return and source bytes until source_pinned.
 unsafe fn execute(input: &Input) -> VortexResult<Output> {
     if input.admission.is_null()
         || input.admission_len == 0
-        || input.admission_len > 160 * 1024 * 1024
+        || input.admission_len > 32 * 1024 * 1024
         || input.data_path.is_null()
         || !(1..=65536).contains(&input.data_path_len)
         || input.index_name.is_null()
@@ -106,7 +139,7 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
     let check = |stage: &str| {
         let phase = match stage {
             "before_open" => Some("setup_us"),
-            "sources_staged" => Some("decode_stage_us"),
+            "sources_staged" => Some("metadata_prepare_us"),
             "source_pinned" => Some("source_open_us"),
             "after_open" => Some("index_open_us"),
             "before_ann" => Some("filter_us"),
@@ -145,11 +178,13 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
         .tempdir_in(scratch_root)?;
     block_on(|handle| async {
         let session = VortexSession::default().with_handle(handle);
-        let view = MixedView::from_bytes(
+        let buffers = unsafe { copy_sources(input) }?;
+        let handoff_bytes = buffers.values().map(|bytes| bytes.len()).sum::<usize>();
+        let source_count = buffers.len();
+        let view = MixedView::from_binary(
             bytes,
-            ViewInput::Catalogued {
-                index_name: name.to_owned(),
-            },
+            name,
+            buffers,
             scratch.path(),
             ViewBudget {
                 source_bytes: 64 * 1024 * 1024,
@@ -168,7 +203,7 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
             "index_revision":view.catalog_revision,"generation":view.lease.index.metadata().generation,
             "snapshot_id":view.source.capture.snapshot_id, "cost":{"phases_us":phases.borrow().clone(),
             "projection_rows":view.source.projection_counts(),"source_bytes":view.source.pinned_bytes(),
-            "artifact_bytes":view.lease.artifact_bytes,"elapsed_us":started.elapsed().as_micros() as u64}}))
+            "artifact_bytes":view.lease.artifact_bytes,"binary_handoff_bytes":handoff_bytes,"source_buffer_count":source_count,"source_staging_bytes":0,"elapsed_us":started.elapsed().as_micros() as u64}}))
             .map_err(|e| vortex_err!("{e}"))?;
         Ok(Output {
             hits: result.hits,
@@ -179,7 +214,8 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
 }
 
 /// # Safety
-/// Input buffers and callback must be valid for the duration of this call.
+/// Metadata, descriptors and callbacks must remain valid until return. Source
+/// bytes must be readable until the source_pinned callback or an earlier return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ducklake_vortex_query(input: &Input) -> *mut Output {
     let result = catch_unwind(AssertUnwindSafe(|| unsafe { execute(input) }));

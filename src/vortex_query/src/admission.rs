@@ -47,6 +47,31 @@ struct CatalogAdmission {
     index: CatalogIndex,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BinaryAdmission {
+    format_version: u32,
+    capture: MixedCapture,
+    index: CatalogIndex,
+}
+
+pub fn prepare_binary(bytes: &[u8], name: &str) -> VortexResult<(MixedCapture, CatalogIndex)> {
+    if bytes.len() > 32 * 1024 * 1024 {
+        vortex_bail!("Binary admission metadata exceeds its byte budget");
+    }
+    let admission: BinaryAdmission =
+        serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
+    if admission.format_version != 1
+        || admission.index.name != name
+        || name.is_empty()
+        || admission.index.revision == 0
+        || !admission.index.root.is_absolute()
+    {
+        vortex_bail!("Binary admission version, name, revision or root mismatch");
+    }
+    Ok((admission.capture, admission.index))
+}
+
 pub struct Pins {
     pub files: BTreeMap<u64, String>,
     _scratch: TempDir,
