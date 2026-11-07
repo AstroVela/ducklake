@@ -121,7 +121,7 @@ void CheckInterrupted(Connection &owner, ClientContext &caller) {
 }
 
 string Read(FileSystem &fs, const string &path, idx_t limit, bool canonical) {
-	if (!fs.IsPathAbsolute(path)) {
+	if (canonical && !fs.IsPathAbsolute(path)) {
 		throw InvalidInputException("Vortex index paths must be absolute");
 	}
 	if (canonical) {
