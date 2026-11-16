@@ -283,6 +283,20 @@ def exercise_data_paths(driver, root, scratch):
                 SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1, category="A")) == result,
                 "managed reference rejection changed subsequent search",
             )
+            if mode == "canonical":
+                before = {path.relative_to(artifacts) for path in artifacts.rglob("*")}
+                native.call(
+                    "build",
+                    "knn",
+                    artifacts / "reserved.duckdb_extension",
+                    1,
+                    expected="reserved for DuckDB extensions",
+                )
+                require(
+                    {path.relative_to(artifacts) for path in artifacts.rglob("*")} == before,
+                    "reserved reference rejection wrote construction artifacts",
+                )
+                require(native.call("head", "knn")["reference"] == descriptor, "reserved output changed the ready head")
             SEARCH.no_leases(scratch)
             cases.append(
                 {
@@ -384,6 +398,65 @@ def exercise_historical_fields(driver, root, scratch):
             native.finish()
 
 
+def exercise_output_permissions(driver, root, scratch):
+    cases = []
+    for mode in ("denied", "exact-paths", "allowed-directory", "revoke-during-build"):
+        case = root / ("permissions-" + mode)
+        case.mkdir()
+        output = case / "output"
+        output.mkdir()
+        initial = case / "initial"
+        initial.mkdir()
+        reference = output / "build.json"
+        native = CAT.Native(driver, case / "native")
+        try:
+            native.call("init")
+            native.call("build", "knn", initial / "ready.json", 0)
+            previous = native.call("head", "knn")
+            directories = [native.root / "data"]
+            if mode == "allowed-directory":
+                directories.extend([output, initial, scratch])
+            policy = "SET allowed_directories=[" + ",".join(BASE.quote(path) for path in directories) + "];"
+            if mode == "exact-paths":
+                policy += "SET allowed_paths=[" + BASE.quote(output) + "," + BASE.quote(reference) + "];"
+            policy += "SET enable_external_access=false;"
+            if mode == "revoke-during-build":
+                mutation = case / "restrict.sql"
+                mutation.write_text(policy)
+                native.call("mutate-build", reference, 1, "build_started", mutation, expected="output directory")
+            else:
+                native.sql(policy)
+            if mode == "allowed-directory":
+                built = native.call("build", "knn", reference, 1)
+                require(built["revision"] == 2 and reference.exists(), "allowed output directory could not publish")
+                result = SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1))
+                require(
+                    len(result["rows"]) == 1 and result["rows"][0]["id"] == 133,
+                    "allowlisted native construction changed subsequent search",
+                )
+            else:
+                control = case / "copy.sql"
+                control.write_text("COPY (SELECT 1) TO " + BASE.quote(output / "ordinary-copy.csv") + ";")
+                native.call("sql", control, expected="file system operations are disabled")
+                if mode != "revoke-during-build":
+                    native.call("build", "knn", reference, 1, expected="output directory")
+                require(not list(output.iterdir()), "rejected construction wrote a reference, generation or scratch")
+                require(native.call("head", "knn") == previous, "denied output authorization changed the ready head")
+            SEARCH.no_leases(scratch)
+            cases.append(
+                {
+                    "policy": mode,
+                    "output_files": sum(path.is_file() for path in output.rglob("*")),
+                    "native_requests": native.requests,
+                    "native_rejections": native.errors,
+                }
+            )
+        finally:
+            if native.process.poll() is None:
+                native.finish()
+    return cases
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["driver", "output-dir"]:
@@ -409,13 +482,21 @@ def main():
         report["historical_field_regressions"] = exercise_historical_fields(
             args.driver.resolve(strict=True), root, scratch
         )
-        additional = [*report["data_path_regressions"], report["historical_field_regressions"]]
+        report["permission_regressions"] = exercise_output_permissions(args.driver.resolve(strict=True), root, scratch)
+        additional = [
+            *report["data_path_regressions"],
+            report["historical_field_regressions"],
+            *report["permission_regressions"],
+        ]
         report["total_native_requests"] = native.requests + sum(case["native_requests"] for case in additional)
         report["total_native_rejections"] = native.errors + sum(case["native_rejections"] for case in additional)
         checks.append(
             "native binary construction preserves opaque source URIs and rejects references inside managed data"
         )
         checks.append("native construction and concurrent column renames retain three historical inline field mappings")
+        checks.append(
+            "directory authorization precedes native writes; exact path grants and revoked access retain empty output trees and the ready head"
+        )
         require(list(scratch.iterdir()) == [], "build/search leaked private staging")
         report["status"] = "passed"
     except Exception as error:
