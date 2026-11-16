@@ -161,7 +161,7 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
             lambda value: value["sources"][0].update(
                 hex=("00" if value["sources"][0]["hex"][:2] != "00" else "ff") + value["sources"][0]["hex"][2:]
             ),
-            "file version mismatch",
+            "content version mismatch",
         ),
     ):
         value = json.loads(json.dumps(admitted))
@@ -287,7 +287,7 @@ def main() -> None:
         "duckdb_sha256": BASE.digest(proof.duckdb),
         "driver_sha256": BASE.digest(driver),
         "probe_sha256": BASE.digest(proof.probe),
-        "vortex_revision": "703ed464a5e03bee45c8713c5a4286571349bce1",
+        "vortex_revision": "307eaf56644845f45dfe6099d7148e6b6afb17a5",
     }
     started = time.monotonic()
     try:
