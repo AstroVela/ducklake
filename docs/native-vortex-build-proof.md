@@ -33,8 +33,8 @@ published revision and generation. Revision zero requires an absent name; replac
 ready revision. No implicit catalog initialization, retry or format probing is
 added. Default-OFF builds expose none of the six native Vortex functions.
 
-DuckDB file-access policy is checked before capture and at construction
-checkpoints. With `enable_external_access=false`, `allowed_directories` must
+DuckDB file-access policy is checked through the context filesystem before
+capture and at construction checkpoints. With `enable_external_access=false`, `allowed_directories` must
 authorize the output root and its generated descendants. The reference filename
 uses DuckDB's reserved-extension write guard.
 
@@ -287,3 +287,43 @@ inputs. Post-fix evidence is under
 the parent directory's `access-fix-build-identity.json`. The corrected driver
 SHA-256 is
 `85807d2740a9acdaeec4bb5b7a8f654e683cf0a88bed74f3f7d6cbbb9146ca16`.
+
+
+### Context filesystem dispatch correction (2026-11-16)
+
+A second fresh-context Astra/max review of `b2f765ee` reproduced a P1 when
+another connection disabled `LocalFileSystem` at `source_pinned` or
+`build_started`. The external-access-enabled fast path skipped engine filesystem
+dispatch, allowing ten output files before publication rejected access.
+
+Every directory authorization checkpoint now first uses the current context
+filesystem's read-only `DirectoryExists` operation. Its opener and virtual
+filesystem enforce access settings and disabled filesystem registration before
+the builder reaches native writes. Directory-wide authorization and the
+reserved-reference filename guard continue through their existing checks.
+
+Three additional regressions disable `LocalFileSystem` before the call, at
+`source_pinned` and at `build_started` while external access stays enabled.
+Each confirms ordinary COPY rejection, an empty output tree and the prior
+ready descriptor. The previous binary fails the new source-pinned regression
+with ten unauthorized files. The new context filesystem reports its standard
+"Cannot access directory" error for denied roots, and the policy tests now
+match the shared directory rejection while checking the same state assertions.
+
+The complete corrected native proof passes 181 requests with 41 expected
+rejections. All 25 recall checks remain 1.0. The five URI, four allowlist,
+three disabled-filesystem, 12 cancellation and three crash cases pass.
+All six earlier lifecycle proofs, 17 Vortex SQL cases / 725 assertions,
+ON/OFF base suites (86 / 3,582 each), deletion inlining (18 / 1,099),
+recovery/cleanup/OFF gates, 32 C ABI cases and four counter cases / 36 queries
+pass again. Workspace build/test, all-target/all-feature Clippy, formatting
+and source/build identity checks pass. The same recorded compile/link
+qualification applies to the updated catalog object and five ON programs.
+
+Current complete evidence is under
+`/tmp/ducklake-pr37-fix-validation-20261116/filesystem-fix`, including
+`native-build-final/report.json`, `executions.json`, `abi-final/report.json`,
+`validation-summary.json` and `complete.json`. The pre-fix reproduction and
+focused green cases are in the parent directory's `filesystem-fix-red` and
+`filesystem-fix-green`. The current catalog driver SHA-256 is
+`8b684c43531c3bbc79cb4dc43f8dd7aef95656c4582f37dfbc535f6cc38f1d6a`.
