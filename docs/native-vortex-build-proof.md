@@ -33,6 +33,11 @@ published revision and generation. Revision zero requires an absent name; replac
 ready revision. No implicit catalog initialization, retry or format probing is
 added. Default-OFF builds expose none of the six native Vortex functions.
 
+DuckDB file-access policy is checked before capture and at construction
+checkpoints. With `enable_external_access=false`, `allowed_directories` must
+authorize the output root and its generated descendants. The reference filename
+uses DuckDB's reserved-extension write guard.
+
 This is a synchronous explicit operation. Queries and writes on other
 connections can proceed during construction. The function does not enqueue a
 durable task or install a background scheduler. Its dedicated connections
@@ -164,7 +169,7 @@ The initial SQL fixture used a relative managed data path and hit the existing
 publisher's canonical-path restriction; the fixture now configures an absolute
 canonical path, with no alternate path handling added to the implementation.
 
-### Synchronized validation (2026-11-16)
+### Synchronized validation (2026-11-16, before permission correction)
 
 The source includes #36 at `7e9fc536` and uses Vortex
 `307eaf56644845f45dfe6099d7148e6b6afb17a5`. Native construction passes
@@ -226,3 +231,59 @@ C ABI results are `abi-final/report.json`, and source/build bindings are in
 `final-input-audit.json` and `verified-input-sha256.json`. The construction
 driver SHA-256 is
 `8c82fb16c5d9d972e4e4920d25e52914c2650b5be465d8a9570da9240b908fba`.
+
+
+### Output permission correction (2026-11-16)
+
+Fresh-context Astra/max review of `f073b677` reproduced a P1. With external
+access disabled and managed source reads authorized, native construction wrote
+a reference and nine generation files into an unauthorized directory before
+publication rejected its read. Exact `allowed_paths` entries for the output
+root and reference also left generated descendants unauthorized.
+
+Construction now checks the complete output namespace against DuckDB's
+normalized `allowed_directories` when external access is disabled. The check
+runs before source capture and after construction observers, including the
+boundary before SPFresh creates its scratch and generation. The reference
+filename uses the existing opener filesystem's reserved-extension write guard.
+The ordinary external-access-enabled path and explicitly allowed output roots
+pass the same construction and publication flow.
+
+Four deterministic policy cases cover denied output, exact root/reference
+paths, an allowed output directory and access revoked at `build_started`.
+All denied output trees stay empty and preserve the prior ready descriptor.
+The allowed-directory case publishes its successor and executes search. A
+reserved `.duckdb_extension` reference also rejects before construction writes.
+The original binary fails the new authorization regression and leaves the
+prohibited files, providing a recorded pre-fix reproduction.
+
+The first reserved-extension check was unconditional and rejected normal JSON
+reference paths. The existing `IsDuckDBExtensionName` predicate now guards that
+check, matching DuckDB's normal writer. A fresh normal SQL construction case
+and the complete corrected proof pass. A private runner's driver path was also
+corrected when its evidence moved into the post-fix subdirectory. Those initial
+failures and corrections are retained alongside the successful rerun.
+
+The complete post-fix proof passes 159 requests with 35 expected rejections,
+25 lifecycle/historical recall checks at 1.0, five URI cases, the four access
+policy cases, 12 cancellation boundaries, three SIGKILL/restart boundaries and
+actual collection of four captured sources. The six prior lifecycle proofs,
+17 Vortex SQL cases / 725 assertions, ON/OFF base suites (86 / 3,582 each),
+deletion inlining (18 / 1,099), recovery/cleanup/OFF gates, 32 C ABI cases and
+all four projection/counter cases / 36 queries pass again. Optional-extension
+skip counts, Float32 tolerances, recall threshold and budgets retain their
+recorded values. Rust workspace build/test and all-target/all-feature Clippy
+also pass again.
+
+The fix recompiles the catalog translation unit through its normal Ninja
+object rule and recreates the DuckLake archive and all five ON executables
+using the exact recorded CMake archive/link commands. The build rehashes
+13,224 unchanged inputs before reuse. Rust, SDK, codec and OFF binaries retain
+their previously qualified input bindings. The final source audit binds 13,226
+inputs. Post-fix evidence is under
+`/tmp/ducklake-pr37-fix-validation-20261116/access-fix`, including
+`native-build-final/report.json`, `executions.json`, `abi-final/report.json`,
+`validation-summary.json` and `complete.json`. The archive/link records are in
+the parent directory's `access-fix-build-identity.json`. The corrected driver
+SHA-256 is
+`85807d2740a9acdaeec4bb5b7a8f654e683cf0a88bed74f3f7d6cbbb9146ca16`.
