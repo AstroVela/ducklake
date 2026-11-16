@@ -127,6 +127,16 @@ def main() -> None:
                     "vortex",
                 ],
             )
+            run(
+                "vortex-cleanup",
+                [
+                    sys.executable,
+                    "-I",
+                    str(root / "test/vane/test_native_vortex_cleanup.py"),
+                    "--duckdb",
+                    str(duckdb),
+                ],
+            )
         selection = ",".join(
             "*test/sql/" + path
             for path in (

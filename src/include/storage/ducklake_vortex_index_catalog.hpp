@@ -9,6 +9,7 @@ class DuckLakeTransaction;
 class DuckLakeTableEntry;
 class ExtensionLoader;
 class StorageLock;
+class ClientContext;
 
 struct DuckLakeVortexIndexFile {
 	idx_t id;
@@ -30,11 +31,11 @@ struct DuckLakeVortexIndex {
 	string ToJSON() const;
 	void ValidateCoverage(const vector<DuckLakeVortexIndexFile> &current) const;
 	static StorageLock &PublicationLock();
-	static void Initialize(Connection &owner, const string &catalog);
+	static void Initialize(Connection &owner, const string &catalog, ClientContext &caller);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
 	                                   const string &table, const string &name, const string &reference,
-	                                   idx_t expected_revision,
+	                                   idx_t expected_revision, ClientContext &caller,
 	                                   const std::function<void(const string &)> &observe = nullptr);
 };
 
