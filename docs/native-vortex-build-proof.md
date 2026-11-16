@@ -163,3 +163,66 @@ Rust/C++/Python formatting, Python syntax, workflow YAML and diff checks passed.
 The initial SQL fixture used a relative managed data path and hit the existing
 publisher's canonical-path restriction; the fixture now configures an absolute
 canonical path, with no alternate path handling added to the implementation.
+
+### Synchronized validation (2026-11-16)
+
+The source includes #36 at `7e9fc536` and uses Vortex
+`307eaf56644845f45dfe6099d7148e6b6afb17a5`. Native construction passes
+131 requests with 28 expected rejections. Its 20 lifecycle recall checks and
+five historical-field recall checks return 1.0 at the existing 0.8 threshold.
+All five managed-path representations preserve exact source URI identities
+and return the expected nearest row. Each rejects an output reference inside
+the physical managed directory while retaining the ready reference and query
+results.
+
+Concurrent update/delete/flush and queries run at `build_started`, after source
+ownership transfer and before the SPFresh build call. The previous ready
+revision remains queryable, captured F becomes B after publication, and later
+F/T remains visible. Twelve cancellation boundaries, three SIGKILL/restart
+boundaries, competing builders, lost acknowledgement and actual reclamation
+of four captured source files pass. Three historical inline schemas survive
+native construction, cache eviction and a category/payload rename during a
+second construction.
+
+The first two runs exposed errors in the new test harness. A positional insert
+after swapping column names populated the wrong logical field. The corrected
+fixture names its columns and verifies their oracle values before building.
+The second run read the flat SQL generation shape from a core response. That
+assertion now reads `reference.generation.generation`. The complete corrected
+proof passes in fresh fixtures. The original failed reports are retained.
+
+The six prior lifecycle proofs pass. Native ON passes 17 Vortex SQL cases with
+725 assertions. ON and OFF each pass 86 base cases with 3,582 assertions and
+13 optional-extension skips. Deletion inlining passes 18 cases with 1,099
+assertions and two optional-extension skips. ON Vortex and ON/OFF Parquet
+restart recovery, cleanup, OFF format rejection and the absence of all six
+Vortex functions pass. The actual query C ABI passes 32 cases covering invalid
+inputs, source identity, cancellation, protected caller buffers and canonical
+source removal.
+
+Four projection/counter cases cover 4,096 and 32,768 B rows, 128 later F rows,
+two T rows, and ALL/category B queries. All 36 queries have fixture recall 1.0,
+zero retained native source buffers and zero source staging bytes. The
+unchanged Vortex dependency's 144 tests were re-executed using its qualified
+binary after matching its checksum and source revision. DuckLake workspace
+build/test, all-target/all-feature Clippy with warnings denied, Rust/Python
+formatting and diff checks pass.
+
+The local ON/OFF builds use two compiler jobs. They reuse 359/358 objects after
+matching compiler arguments, source bytes and every recorded compiler
+header dependency against the previous qualified build. The remaining units,
+query/probe, codec and native drivers were built and linked for this source.
+The unchanged SPFresh SDK and Roaring inputs retain their recorded checksums.
+The final audit binds 13,226 source/build inputs, including 441 ON and 431 OFF
+compile units. Float32 tolerances remain relative `1e-5` and absolute `1e-4`,
+with the existing row/source/vector/artifact and timeout budgets. CI validation
+is deferred under the requested scope. Timings in the counter evidence are
+informational under the current host-load constraint.
+
+Evidence is retained under
+`/tmp/ducklake-pr37-fix-validation-20261116`. The corrected construction report
+is `native-build-final/report.json`, full gate results are `executions.json`,
+C ABI results are `abi-final/report.json`, and source/build bindings are in
+`final-input-audit.json` and `verified-input-sha256.json`. The construction
+driver SHA-256 is
+`8c82fb16c5d9d972e4e4920d25e52914c2650b5be465d8a9570da9240b908fba`.
