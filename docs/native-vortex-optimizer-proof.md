@@ -84,7 +84,8 @@ and whether the local build connection is active. Metrics describe the latest
 probe and may lag a just-completed operation until the next check.
 
 Cancellation first persists disabled intent, then interrupts the worker's
-dedicated context. Cancellation is cooperative at the existing native
+dedicated context within the same policy I/O critical section used by resume.
+Cancellation is cooperative at the existing native
 checkpoints; an SPFresh native build call completes before its next check.
 Uncommitted failure disables the policy and preserves its reason. Explicit
 resume plans work from fresh committed table state. Failed/cancelled candidates

@@ -816,8 +816,8 @@ void DuckLakeVortexOptimizer::Cancel(ClientContext &context, const string &catal
 		p.enabled = false;
 		p.state = owner->runtime->IsActive(p.Id()) ? "cancelling" : "cancelled";
 		Save(meta, p, p.run);
+		owner->runtime->Cancel(p.Id());
 	}
-	owner->runtime->Cancel(p.Id());
 }
 
 vector<vector<Value>> DuckLakeVortexOptimizer::Status(ClientContext &context, const string &catalog) {
