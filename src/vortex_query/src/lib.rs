@@ -2,6 +2,7 @@
 pub mod admission;
 mod build;
 mod ffi;
+mod ffi_build;
 pub mod file_index;
 pub mod lease;
 pub mod mixed;

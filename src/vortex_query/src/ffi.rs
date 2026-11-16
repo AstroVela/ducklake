@@ -77,11 +77,14 @@ impl Output {
 }
 
 // Descriptor and data buffers are borrowed only while this bounded copy runs.
-unsafe fn copy_sources(input: &Input) -> VortexResult<BTreeMap<u64, ByteBuffer>> {
-    if input.sources.is_null() || !(1..=100_000).contains(&input.source_count) {
+pub(crate) unsafe fn copy_sources(
+    pointer: *const Source,
+    count: u64,
+) -> VortexResult<BTreeMap<u64, ByteBuffer>> {
+    if pointer.is_null() || !(1..=100_000).contains(&count) {
         vortex_bail!("Invalid native binary source inventory");
     }
-    let sources = unsafe { slice::from_raw_parts(input.sources, input.source_count as usize) };
+    let sources = unsafe { slice::from_raw_parts(pointer, count as usize) };
     let mut buffers = BTreeMap::new();
     let mut remaining = 64 * 1024 * 1024;
     for source in sources {
@@ -178,7 +181,7 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
         .tempdir_in(scratch_root)?;
     block_on(|handle| async {
         let session = VortexSession::default().with_handle(handle);
-        let buffers = unsafe { copy_sources(input) }?;
+        let buffers = unsafe { copy_sources(input.sources, input.source_count) }?;
         let handoff_bytes = buffers.values().map(|bytes| bytes.len()).sum::<usize>();
         let source_count = buffers.len();
         let view = MixedView::from_binary(

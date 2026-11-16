@@ -20,7 +20,7 @@ use vortex_index::SourceFile;
 use vortex_index::file::file_version;
 use vortex_index::store::LocalGeneration;
 
-use crate::build_generation;
+use crate::build::build_generation_checked;
 use crate::source::PhysicalSource;
 use crate::write_reference;
 
@@ -123,13 +123,22 @@ pub async fn build(
     reference: &Path,
     session: VortexSession,
 ) -> VortexResult<()> {
+    build_checked(source, reference, session, &|_| Ok(())).await
+}
+
+pub(crate) async fn build_checked(
+    source: Arc<PhysicalSource>,
+    reference: &Path,
+    session: VortexSession,
+    check: &dyn Fn(&str) -> VortexResult<()>,
+) -> VortexResult<()> {
     if reference.exists() {
         vortex_bail!("Index reference already exists");
     }
     let root = reference
         .parent()
         .ok_or_else(|| vortex_err!("Reference parent required"))?;
-    let (snapshot, generation) = build_generation(
+    let (snapshot, generation) = build_generation_checked(
         Arc::new(FileSource {
             snapshot: snapshot(&source, source.snapshot().files.clone())?,
             source: Arc::clone(&source),
@@ -138,6 +147,7 @@ pub async fn build(
         source.capture.dimension,
         root,
         session,
+        check,
     )
     .await?;
     let descriptor = Reference {
@@ -149,5 +159,7 @@ pub async fn build(
         snapshot,
         generation,
     };
-    write_reference(reference, &descriptor)
+    check("before_reference")?;
+    write_reference(reference, &descriptor)?;
+    check("reference_ready")
 }

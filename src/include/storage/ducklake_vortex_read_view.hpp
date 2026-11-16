@@ -44,6 +44,9 @@ struct DuckLakeVortexReadView {
 	static DuckLakeVortexReadView AcquireQuery(Connection &reader, const DuckLakeVortexViewOptions &options,
 	                                           const std::function<void(const string &)> &observe = nullptr,
 	                                           optional_ptr<ClientContext> owner = nullptr);
+	static DuckLakeVortexReadView AcquireBuild(Connection &reader, const DuckLakeVortexViewOptions &options,
+	                                           const std::function<void(const string &)> &observe = nullptr,
+	                                           optional_ptr<ClientContext> owner = nullptr);
 };
 
 } // namespace duckdb
