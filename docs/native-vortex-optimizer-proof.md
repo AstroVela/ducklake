@@ -37,6 +37,12 @@ The existing canonical absolute paths and outside-managed-data root restrictions
 apply. There is no migration, backend substitution or error-to-scan path.
 Enable prepares the managed data root if an empty/inline-only table has not
 created it yet, so the first threshold-triggered flush can write there.
+The output root must be an existing directory before the policy is persisted.
+An invalid root leaves the index available for a subsequent valid enable call.
+
+Inline aggregates resolve the physical names in each source schema using the
+current embedding, category and payload field IDs. Their row, byte and vector
+dimension checks use the existing committed query snapshot.
 
 ## Scheduling and publication
 
@@ -44,6 +50,9 @@ One worker per database serializes at most 16 registered policies, with at most
 one build in flight. It first flushes due committed T using DuckLake's existing
 transactional flush; if the resulting F meets a threshold, it invokes the shared
 native builder. A run may finish as `flushed` without building if F remains small.
+A successful flush can return zero rows when another connection has already
+flushed the scheduled T. The worker commits that operation and probes committed
+T/F again to apply the same F thresholds and continue automatic scheduling.
 Each build captures all current physical files and replaces the static SPFresh
 generation; it does not implement dynamic inserts into an existing ANN index.
 

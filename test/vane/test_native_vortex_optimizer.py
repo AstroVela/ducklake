@@ -354,6 +354,168 @@ def flush_recovery(driver, root, checks):
             native.process.wait(timeout=5)
 
 
+def concurrent_flush(driver, root, checks):
+    results = []
+    for index_rows in (128, 256):
+        native = CAT.Native(driver, root / f"concurrent-flush-{index_rows}")
+        try:
+            artifacts = root / f"concurrent-flush-{index_rows}-artifacts"
+            artifacts.mkdir()
+            native.sql(
+                "DROP TABLE lake.items;CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+                "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
+                "CALL ducklake_set_option('lake','data_inlining_row_limit',1000,table_name=>'items');"
+            )
+            initialize(native)
+            native.call(
+                "optimizer-enable",
+                artifacts,
+                128,
+                4194304,
+                index_rows,
+                67108864,
+                "optimizer_before_flush",
+                "pause",
+            )
+            insert(native, 0, 128)
+            native.call("optimizer-wait")
+            native.sql("CALL ducklake_flush_inlined_data('lake',schema_name=>'main',table_name=>'items');")
+            native.call("optimizer-release")
+            revision = 1 if index_rows == 128 else 0
+            first = wait(
+                native,
+                lambda s: not s["running"] and s["state"] == ("published" if revision else "flushed"),
+                "optimizer completion after a concurrent manual flush",
+            )
+            require(first["enabled"] and first["run_count"] == 1, "Concurrent flush disabled or repeated the task")
+            require(first["published_revision"] == revision, "Concurrent flush ignored the existing F threshold")
+            steady(native, first)
+            insert(native, 1000, 128)
+            second = wait(
+                native,
+                lambda s: s["state"] == "published" and s["published_revision"] == revision + 1 and not s["running"],
+                "automatic scheduling of later inserts after a concurrent flush",
+            )
+            require(second["enabled"] and second["run_count"] == 2, "Later writes required an explicit resume")
+            native.sql(
+                "SELECT CASE WHEN count(*)=256 THEN true ELSE error('Concurrent flush lost rows') END FROM lake.items;"
+            )
+            native.call("raw", "concurrent-flush")
+            rows = native.rows("concurrent-flush")
+            core = native.call("core-search")
+            sql = SEARCH.query(native, SEARCH.search_sql(BUILD.VECTOR))
+            recalls = [SEARCH.qualify(core, rows, BUILD.VECTOR), SEARCH.qualify(sql, rows, BUILD.VECTOR)]
+            require(core["rows"] == sql["rows"], "Concurrent flush changed SQL/core results")
+            native.finish()
+            require(native.process.returncode == 0, "Concurrent flush fixture failed to close")
+            results.append(
+                {
+                    "index_rows": index_rows,
+                    "first_revision": revision,
+                    "later_revision": revision + 1,
+                    "recalls": recalls,
+                }
+            )
+        finally:
+            if native.process.poll() is None:
+                native.process.kill()
+                native.process.wait(timeout=5)
+    checks.append("concurrent manual flush preserves automatic scheduling both above and below the F threshold")
+    return {"concurrent_flush": results}
+
+
+def renamed_inline(driver, root, checks):
+    native = CAT.Native(driver, root / "renamed-inline")
+    try:
+        artifacts = root / "renamed-inline-artifacts"
+        artifacts.mkdir()
+        native.sql(
+            'DROP TABLE lake.items;CREATE TABLE lake.items(id BIGINT,"old embedding" FLOAT[],"old category" VARCHAR,"old payload" VARCHAR);'
+            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',1000,table_name=>'items');"
+        )
+        insert(native, 0, 32)
+        native.sql(
+            'ALTER TABLE lake.items RENAME "old embedding" TO "intermediate embedding";'
+            'ALTER TABLE lake.items RENAME "old category" TO category;'
+        )
+        insert(native, 32, 32)
+        native.sql(
+            'ALTER TABLE lake.items RENAME "intermediate embedding" TO embedding;'
+            'ALTER TABLE lake.items RENAME "old payload" TO payload;'
+        )
+        insert(native, 64, 64)
+        initialize(native)
+        native.call("optimizer-enable", artifacts, 256, 4194304, 128, 67108864)
+        before = wait(native, lambda s: s["inline_rows"] == 128, "historical inline row and byte aggregation")
+        expected_bytes = 128 * (8 * 4 + 64 + 1 + len("optimizer-row"))
+        require(before["inline_bytes"] == expected_bytes, "Historical column names changed inline byte accounting")
+        require(
+            before["enabled"] and before["run_count"] == 0, "Historical inline aggregate changed scheduling thresholds"
+        )
+        steady(native, before)
+        insert(native, 128, 128)
+        published = wait(
+            native,
+            lambda s: s["state"] == "published" and s["published_revision"] == 1 and not s["running"],
+            "automatic flush and publication of renamed historical inline sources",
+        )
+        require(published["enabled"] and published["run_count"] == 1, "Renamed inline sources disabled the policy")
+        native.sql(
+            "SELECT CASE WHEN count(*)=256 THEN true ELSE error('Historical inline rows lost') END "
+            "FROM lake.items WHERE array_length(embedding)=8 AND category IN ('A','B') AND payload='optimizer-row';"
+        )
+        native.call("raw", "renamed-inline")
+        rows = native.rows("renamed-inline")
+        core = native.call("core-search")
+        sql = SEARCH.query(native, SEARCH.search_sql(BUILD.VECTOR))
+        recalls = [SEARCH.qualify(core, rows, BUILD.VECTOR), SEARCH.qualify(sql, rows, BUILD.VECTOR)]
+        require(core["rows"] == sql["rows"], "Historical schema resolution changed SQL/core results")
+        native.finish()
+        require(native.process.returncode == 0, "Historical inline fixture failed to close")
+        checks.append("field-ID aggregation resolves quoted vector/category/payload names across three inline schemas")
+        return {"renamed_inline": {"rows_before_flush": 128, "bytes_before_flush": expected_bytes, "recalls": recalls}}
+    finally:
+        if native.process.poll() is None:
+            native.process.kill()
+            native.process.wait(timeout=5)
+
+
+def output_root_validation(driver, root, checks):
+    native = CAT.Native(driver, root / "output-root")
+    try:
+        initialize(native)
+        root_file = root / "output-root-file"
+        root_file.write_text("optimizer directory validation\n")
+        native.call(
+            "optimizer-enable", root_file, 128, 4194304, 128, 67108864, expected="must be an existing directory"
+        )
+        require(native.call("optimizer-status") == [], "Invalid output root installed a durable policy")
+        native.call("optimizer-resume", expected="No Vortex optimizer policy")
+        artifacts = root / "output-root-artifacts"
+        artifacts.mkdir()
+        native.call("optimizer-enable", artifacts, 128, 4194304, 128, 67108864)
+        published = wait(
+            native,
+            lambda s: s["state"] == "published" and s["published_revision"] == 1 and not s["running"],
+            "valid output root after a rejected regular-file root",
+        )
+        require(
+            published["enabled"] and published["run_count"] == 1, "Rejected root prevented valid policy installation"
+        )
+        require(root_file.read_text() == "optimizer directory validation\n", "Directory validation changed the file")
+        native.finish()
+        require(native.process.returncode == 0, "Output root fixture failed to close")
+        checks.append(
+            "regular-file root fails before durable policy insertion; the same index accepts a valid directory"
+        )
+        return {"output_root_validation": "passed"}
+    finally:
+        if native.process.poll() is None:
+            native.process.kill()
+            native.process.wait(timeout=5)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--driver", required=True, type=Path)
@@ -377,6 +539,9 @@ def main():
         report.update(bytes_and_close(driver, root, checks))
         report.update(table_identity(driver, root, checks))
         report.update(flush_recovery(driver, root, checks))
+        report.update(concurrent_flush(driver, root, checks))
+        report.update(renamed_inline(driver, root, checks))
+        report.update(output_root_validation(driver, root, checks))
         require(list(scratch.iterdir()) == [], "Optimizer leaked private staging")
         report["status"] = "passed"
     except Exception as error:
