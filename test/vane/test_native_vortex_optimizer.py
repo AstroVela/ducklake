@@ -556,6 +556,59 @@ def stale_error_after_resume(driver, root, checks):
             native.process.wait(timeout=5)
 
 
+def initialize_preserves_transaction(driver, root, checks):
+    native = CAT.Native(driver, root / "initialization-transaction")
+    try:
+        native.call("init")
+        native.call("optimizer-init-active-transaction")
+        native.call("optimizer-init")
+        native.call("optimizer-init-active-transaction")
+        native.finish()
+        checks.append("public optimizer initialization preserves the caller's transaction and uncommitted row")
+        return {"initialize_preserves_transaction": "passed"}
+    finally:
+        if native.process.poll() is None:
+            native.process.kill()
+            native.process.wait(timeout=5)
+
+
+def completion_cancel(driver, root, checks):
+    native = CAT.Native(driver, root / "completion-cancel")
+    try:
+        artifacts = root / "completion-cancel-artifacts"
+        artifacts.mkdir()
+        native.sql(
+            "DROP TABLE lake.items;CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',1000,table_name=>'items');"
+        )
+        initialize(native)
+        native.call("optimizer-enable", artifacts, 128, 4194304, 128, 67108864, "optimizer_finished", "pause")
+        insert(native, 0, 128)
+        native.call("optimizer-wait")
+        finished = status(native)
+        require(
+            finished["state"] == "published" and finished["published_revision"] == 1,
+            "Task terminal state was not saved",
+        )
+        native.call("optimizer-cancel")
+        native.call("optimizer-release")
+        cancelled = wait(native, lambda s: not s["running"], "cancellation after terminal state persistence")
+        require(
+            cancelled["state"] == "cancelled" and not cancelled["enabled"],
+            "Completed task cancellation did not converge",
+        )
+        require(native.call("head", "knn")["revision"] == 1, "Cancelling a completed task changed its ready generation")
+        steady(native, cancelled)
+        native.finish()
+        checks.append("cancellation at the completed-task boundary reaches cancelled and retains the published head")
+        return {"completion_cancel": "passed"}
+    finally:
+        if native.process.poll() is None:
+            native.process.kill()
+            native.process.wait(timeout=5)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--driver", required=True, type=Path)
@@ -583,6 +636,8 @@ def main():
         report.update(renamed_inline(driver, root, checks))
         report.update(output_root_validation(driver, root, checks))
         report.update(stale_error_after_resume(driver, root, checks))
+        report.update(initialize_preserves_transaction(driver, root, checks))
+        report.update(completion_cancel(driver, root, checks))
         require(list(scratch.iterdir()) == [], "Optimizer leaked private staging")
         report["status"] = "passed"
     except Exception as error:

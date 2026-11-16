@@ -30,6 +30,8 @@ it does not pin or decode every B file just to decide whether work is due.
 
 Initialization and policy installation are explicit. Duplicate initialization,
 duplicate policy, unsupported configuration and invalid thresholds fail. The
+public C++ initializer requires an idle dedicated connection and preserves an
+existing caller transaction when rejecting that connection. The
 prototype requires native DuckDB metadata, the existing four business columns,
 unencrypted local Vortex output and `auto_compact=true`. It binds table UUID and
 embedding field ID, including the interval between scheduling and capture.
@@ -95,6 +97,8 @@ Each enable or resume installs a distinct in-memory policy registration.
 Scheduling, task completion and error handling apply results only while their
 originating registration is current. This also covers an older worker error
 that reaches final handling after a successful resume.
+Terminal-state persistence and release of local activity share the policy I/O
+critical section, so cancellation after task completion records `cancelled`.
 
 Before publication, the worker persists the sealed candidate generation and
 expected revision. Failure after commit and explicit resume after process restart
@@ -131,6 +135,9 @@ subsequent successful enable for the same index.
 An error-handling regression pauses an unavailable-catalog error, reattaches the
 catalog and resumes the policy, then releases the old error and checks automatic
 publication of subsequently committed rows.
+Direct-interface initialization checks retain an active caller transaction and
+its uncommitted row. A completed-task observer checks cancellation at the
+terminal-state boundary while retaining the published generation.
 
 It records task counts and generation IDs to distinguish reconciliation from
 duplicate publication, and checks recall against committed visible-row ground

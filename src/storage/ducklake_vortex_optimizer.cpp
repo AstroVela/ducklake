@@ -12,6 +12,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/storage/object_cache.hpp"
+#include "duckdb/transaction/transaction_context.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -467,6 +468,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	void Finish(DatabaseInstance &db, const std::shared_ptr<Pending> &pending, Policy &p, const string &state,
 	            const string &error, bool owns_task) {
 		std::lock_guard<std::mutex> guard(io);
+		Clear();
 		if (!IsCurrent(pending)) {
 			return;
 		}
@@ -591,20 +593,16 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				}
 			}
 			Finish(db, pending, p, build ? "published" : "flushed", "", true);
-			Clear();
+			if (pending->observe) {
+				pending->observe("optimizer_finished");
+			}
 		} catch (const std::exception &error) {
 			bool cancelled_job;
 			{
 				std::lock_guard<std::mutex> guard(lock);
 				cancelled_job = stopping || cancelled.count(p.Id());
 			}
-			try {
-				Finish(db, pending, p, cancelled_job ? "cancelled" : "failed", error.what(), owns_task);
-			} catch (...) {
-				Clear();
-				throw;
-			}
-			Clear();
+			Finish(db, pending, p, cancelled_job ? "cancelled" : "failed", error.what(), owns_task);
 		}
 	}
 	void Loop(weak_ptr<DatabaseInstance> weak) {
@@ -725,6 +723,9 @@ void Validate(const Policy &p) {
 } // namespace
 
 void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalog) {
+	if (owner.context->transaction.HasActiveTransaction()) {
+		throw InvalidInputException("Vortex optimizer catalog requires an idle dedicated connection");
+	}
 	try {
 		auto &transaction = VortexCatalog::Begin(owner, catalog);
 		VortexCatalog::Initialized(transaction);

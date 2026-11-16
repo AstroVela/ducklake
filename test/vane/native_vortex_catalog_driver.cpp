@@ -91,6 +91,28 @@ public:
 			SQL(writer, "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
 			return "{}";
 		}
+		if (op == "optimizer-init-active-transaction") {
+			Connection caller(database);
+			SQL(caller, "CREATE TEMP TABLE optimizer_transaction_guard(value INTEGER);"
+			            "BEGIN;INSERT INTO optimizer_transaction_guard VALUES(1);");
+			string failure;
+			try {
+				DuckLakeVortexOptimizer::Initialize(caller, "lake");
+			} catch (const std::exception &error) {
+				failure = error.what();
+			}
+			Require(!failure.empty(), "Optimizer initialization accepted an active transaction");
+			Require(caller.context->transaction.HasActiveTransaction(),
+			        "Optimizer initialization rolled back the caller's existing transaction");
+			Require(SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
+			            1,
+			        "Optimizer initialization lost the caller's uncommitted row");
+			caller.Rollback();
+			Require(SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
+			            0,
+			        "The caller could not roll back its own transaction");
+			return "{}";
+		}
 		if (op == "optimizer-enable") {
 			if (args.size() == 7) {
 				SQL(writer, "SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn'," +
