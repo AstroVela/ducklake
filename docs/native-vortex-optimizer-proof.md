@@ -115,6 +115,14 @@ terminal failure and explicit resume, lost publication ACK, SIGKILL on both side
 of commit, a mismatched vector field ID, table drop/recreate, invalid flush
 configuration after an earlier success, and active/idle database shutdown.
 
+Deterministic flush regressions pause the worker at `optimizer_before_flush`
+while another connection commits the manual flush. They check both F threshold
+outcomes, later automatic scheduling, visible row counts and ready-file coverage.
+Historical-column cases check quoted vector/category/payload names across three
+inline schemas, pre-flush business values, row/byte thresholds and published
+coverage. The output-root cases check rejection before policy insertion and a
+subsequent successful enable for the same index.
+
 It records task counts and generation IDs to distinguish reconciliation from
 duplicate publication, and checks recall against committed visible-row ground
 truth separately from visibility correctness. Minimal SQL tests cover explicit

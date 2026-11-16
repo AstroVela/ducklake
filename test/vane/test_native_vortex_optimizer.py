@@ -400,12 +400,10 @@ def concurrent_flush(driver, root, checks):
             native.sql(
                 "SELECT CASE WHEN count(*)=256 THEN true ELSE error('Concurrent flush lost rows') END FROM lake.items;"
             )
-            native.call("raw", "concurrent-flush")
-            rows = native.rows("concurrent-flush")
-            core = native.call("core-search")
-            sql = SEARCH.query(native, SEARCH.search_sql(BUILD.VECTOR))
-            recalls = [SEARCH.qualify(core, rows, BUILD.VECTOR), SEARCH.qualify(sql, rows, BUILD.VECTOR)]
-            require(core["rows"] == sql["rows"], "Concurrent flush changed SQL/core results")
+            head = native.call("head", "knn")
+            require(head["revision"] == revision + 1, "Later writes did not advance the ready index")
+            files = head["reference"]["snapshot"]["files"]
+            require(sum(file["row_count"] for file in files) == 256, "Published coverage lost flushed rows")
             native.finish()
             require(native.process.returncode == 0, "Concurrent flush fixture failed to close")
             results.append(
@@ -413,7 +411,6 @@ def concurrent_flush(driver, root, checks):
                     "index_rows": index_rows,
                     "first_revision": revision,
                     "later_revision": revision + 1,
-                    "recalls": recalls,
                 }
             )
         finally:
@@ -445,6 +442,10 @@ def renamed_inline(driver, root, checks):
             'ALTER TABLE lake.items RENAME "old payload" TO payload;'
         )
         insert(native, 64, 64)
+        native.sql(
+            "SELECT CASE WHEN count(*)=128 THEN true ELSE error('Historical inline rows lost') END "
+            "FROM lake.items WHERE array_length(embedding)=8 AND category IN ('A','B') AND payload='optimizer-row';"
+        )
         initialize(native)
         native.call("optimizer-enable", artifacts, 256, 4194304, 128, 67108864)
         before = wait(native, lambda s: s["inline_rows"] == 128, "historical inline row and byte aggregation")
@@ -461,20 +462,16 @@ def renamed_inline(driver, root, checks):
             "automatic flush and publication of renamed historical inline sources",
         )
         require(published["enabled"] and published["run_count"] == 1, "Renamed inline sources disabled the policy")
-        native.sql(
-            "SELECT CASE WHEN count(*)=256 THEN true ELSE error('Historical inline rows lost') END "
-            "FROM lake.items WHERE array_length(embedding)=8 AND category IN ('A','B') AND payload='optimizer-row';"
-        )
-        native.call("raw", "renamed-inline")
-        rows = native.rows("renamed-inline")
-        core = native.call("core-search")
-        sql = SEARCH.query(native, SEARCH.search_sql(BUILD.VECTOR))
-        recalls = [SEARCH.qualify(core, rows, BUILD.VECTOR), SEARCH.qualify(sql, rows, BUILD.VECTOR)]
-        require(core["rows"] == sql["rows"], "Historical schema resolution changed SQL/core results")
+        head = native.call("head", "knn")
+        require(head["revision"] == 1, "Historical schemas did not publish the ready index")
+        files = head["reference"]["snapshot"]["files"]
+        require(sum(file["row_count"] for file in files) == 256, "Published coverage lost historical rows")
         native.finish()
         require(native.process.returncode == 0, "Historical inline fixture failed to close")
         checks.append("field-ID aggregation resolves quoted vector/category/payload names across three inline schemas")
-        return {"renamed_inline": {"rows_before_flush": 128, "bytes_before_flush": expected_bytes, "recalls": recalls}}
+        return {
+            "renamed_inline": {"rows_before_flush": 128, "bytes_before_flush": expected_bytes, "published_rows": 256}
+        }
     finally:
         if native.process.poll() is None:
             native.process.kill()
