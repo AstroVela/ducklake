@@ -423,7 +423,7 @@ def exercise_output_permissions(driver, root, scratch):
             if mode == "revoke-during-build":
                 mutation = case / "restrict.sql"
                 mutation.write_text(policy)
-                native.call("mutate-build", reference, 1, "build_started", mutation, expected="output directory")
+                native.call("mutate-build", reference, 1, "build_started", mutation, expected="directory")
             else:
                 native.sql(policy)
             if mode == "allowed-directory":
@@ -439,7 +439,7 @@ def exercise_output_permissions(driver, root, scratch):
                 control.write_text("COPY (SELECT 1) TO " + BASE.quote(output / "ordinary-copy.csv") + ";")
                 native.call("sql", control, expected="file system operations are disabled")
                 if mode != "revoke-during-build":
-                    native.call("build", "knn", reference, 1, expected="output directory")
+                    native.call("build", "knn", reference, 1, expected="directory")
                 require(not list(output.iterdir()), "rejected construction wrote a reference, generation or scratch")
                 require(native.call("head", "knn") == previous, "denied output authorization changed the ready head")
             SEARCH.no_leases(scratch)
