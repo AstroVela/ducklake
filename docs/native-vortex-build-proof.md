@@ -1,6 +1,6 @@
 # Native SPFresh construction and publication
 
-This validation draft follows [DuckLake #36](https://github.com/AstroVela/ducklake/pull/36).
+This validation follows [DuckLake #36](https://github.com/AstroVela/ducklake/pull/36).
 It connects the existing SPFresh builder to native SQL, using the same owned
 binary sources as native search. A caller can build and publish a ready index
 without exporting a source envelope or launching the validation probe.
@@ -26,9 +26,10 @@ SELECT revision, generation FROM ducklake_build_vortex_index(
 Arguments are catalog, schema, table, index name, destination reference path,
 dimension and expected ready revision. The destination parent must already
 exist at a canonical local path outside DuckLake's managed data path; the
-reference must not exist. The existing publisher also requires a canonical
-absolute managed data path. The function returns one published revision and
-generation. Revision zero requires an absent name; replacement uses the exact
+reference must not exist. The managed data path is expanded and resolved for
+artifact containment. Physical source URI identities retain their captured
+representation, including relative and `file:` forms. The function returns one
+published revision and generation. Revision zero requires an absent name; replacement uses the exact
 ready revision. No implicit catalog initialization, retry or format probing is
 added. Default-OFF builds expose none of the six native Vortex functions.
 
@@ -96,6 +97,10 @@ a fresh connection before retrying; no automatic retry is attempted.
 
 ## Validation
 
+The current source includes #36 at `7e9fc536` and pins Vortex to
+`307eaf56644845f45dfe6099d7148e6b6afb17a5`. Native construction uses the
+same opaque URI and verified-reader contracts as binary SQL search.
+
 The native proof uses only the linked C++ driver for SQL build/search. It checks
 initial publication, removal of the reference output, F-to-B promotion while
 another connection updates/deletes/flushes and queries, revision-CAS competition,
@@ -104,6 +109,14 @@ catalog commit, and a lost acknowledgement. It removes canonical source files
 after Rust ownership but before native building, requires construction to
 finish from owned bytes, and rejects publication of that stale layout. Explicit
 native rebuilding restores search against the rewritten files.
+
+The native build proof also covers canonical, dot, relative, symlink and `file:`
+managed paths. It verifies exact source URI binding, ranked query results and
+managed-reference containment. Three historical inline schemas, swapped
+category/payload names, quoted historical columns, cache eviction and a
+concurrent rename during construction exercise stable field-ID resolution.
+The cancellation matrix includes the caller checks before building, at ABI
+input, after publication validation and immediately before commit.
 
 ```sh
 python3 -I test/vane/test_native_vortex_build.py \
@@ -114,8 +127,9 @@ python3 -I test/vane/test_native_vortex_build.py \
 The native ON suite adds a minimal SQL build/search/rebuild case. OFF checks
 include the new function's absence. CI runs this proof alongside the existing
 six lifecycle proofs and cost/projection gates and uploads raw evidence. Local
-builds reuse qualified DuckDB v1.5.5 engine objects and the unchanged pinned
-SPFresh SDK, rebuilding affected DuckLake C++ sources and the Rust library.
+builds reuse DuckDB v1.5.5 objects qualified against compiler arguments, source
+bytes and every recorded compiler dependency. They rebuild affected DuckLake
+C++ sources and the Rust library using the unchanged pinned SPFresh SDK.
 Clean hosted builds remain an independent gate.
 
 ### Local result (2026-10-29)
