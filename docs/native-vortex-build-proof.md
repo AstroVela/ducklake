@@ -77,6 +77,16 @@ atomically publishes the complete ready row. Compaction that removes a captured
 file, corrupt artifacts or a competing revision produce explicit failure.
 There is no index-to-scan error path or automatic rebuild.
 
+The pinned SPFresh bridge serializes native build, open and search entrypoints
+with a process-wide mutex. An ANN request reaching that core during a native
+build waits for the call to release the mutex. DuckLake's publication and
+metadata locks are released during heavy construction, permitting ordinary
+commits and exact SQL work on other connections. The concurrent lifecycle
+proof pauses at `build_started`, after source transfer and before acquiring
+the native mutex. Continuous ANN throughput during the native core call
+requires separate validation. The current proof establishes lifecycle progress
+at that pre-call boundary.
+
 Queries before publication keep the previous B/F/T plan. A fresh query after
 publication treats covered F files as B and uses ANN for them. Files appended
 after capture remain F; committed inline data remains T. Current visibility and
