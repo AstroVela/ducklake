@@ -88,6 +88,12 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		auto entry = catalog.GetEntry(*reader.context, CatalogType::TABLE_ENTRY, options.schema, options.table,
 		                              OnEntryNotFound::THROW_EXCEPTION);
 		auto &table = entry->Cast<DuckLakeTableEntry>();
+		if ((!options.expected_table_uuid.empty() && options.expected_table_uuid != table.GetTableUUID()) ||
+		    (options.expected_field_id.IsValid() &&
+		     options.expected_field_id.GetIndex() !=
+		         table.GetFieldId(vector<string> {"embedding"}).GetFieldIndex().index)) {
+			throw InvalidInputException("Vortex optimizer table or vector field identity changed");
+		}
 		unique_ptr<DuckLakeVortexIndex> index;
 		auto dimension = options.dimension;
 		if (!options.index_name.empty()) {
