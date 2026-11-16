@@ -457,6 +457,53 @@ def exercise_output_permissions(driver, root, scratch):
     return cases
 
 
+def exercise_disabled_filesystems(driver, root, scratch):
+    cases = []
+    for stage in ("before-call", "source_pinned", "build_started"):
+        case = root / ("disabled-filesystem-" + stage)
+        case.mkdir()
+        output = case / "output"
+        output.mkdir()
+        initial = case / "initial"
+        initial.mkdir()
+        reference = output / "build.json"
+        native = CAT.Native(driver, case / "native")
+        try:
+            native.call("init")
+            native.call("build", "knn", initial / "ready.json", 0)
+            previous = native.call("head", "knn")
+            policy = "SET disabled_filesystems='LocalFileSystem';"
+            if stage == "before-call":
+                native.sql(policy)
+                native.call("build", "knn", reference, 1, expected="disabled by configuration")
+            else:
+                mutation = case / "disable.sql"
+                mutation.write_text(policy)
+                native.call("mutate-build", reference, 1, stage, mutation, expected="disabled by configuration")
+            native.sql(
+                "SELECT CASE WHEN current_setting('enable_external_access') THEN true "
+                "ELSE error('Disabled filesystem fixture changed external access') END;"
+            )
+            control = case / "copy.sql"
+            control.write_text("COPY (SELECT 1) TO " + BASE.quote(output / "ordinary-copy.csv") + ";")
+            native.call("sql", control, expected="disabled by configuration")
+            require(not list(output.iterdir()), "disabled filesystem construction wrote output artifacts")
+            require(native.call("head", "knn") == previous, "disabled filesystem changed the ready head")
+            SEARCH.no_leases(scratch)
+            cases.append(
+                {
+                    "stage": stage,
+                    "output_files": 0,
+                    "native_requests": native.requests,
+                    "native_rejections": native.errors,
+                }
+            )
+        finally:
+            if native.process.poll() is None:
+                native.finish()
+    return cases
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["driver", "output-dir"]:
@@ -483,10 +530,14 @@ def main():
             args.driver.resolve(strict=True), root, scratch
         )
         report["permission_regressions"] = exercise_output_permissions(args.driver.resolve(strict=True), root, scratch)
+        report["disabled_filesystem_regressions"] = exercise_disabled_filesystems(
+            args.driver.resolve(strict=True), root, scratch
+        )
         additional = [
             *report["data_path_regressions"],
             report["historical_field_regressions"],
             *report["permission_regressions"],
+            *report["disabled_filesystem_regressions"],
         ]
         report["total_native_requests"] = native.requests + sum(case["native_requests"] for case in additional)
         report["total_native_rejections"] = native.errors + sum(case["native_rejections"] for case in additional)
@@ -496,6 +547,9 @@ def main():
         checks.append("native construction and concurrent column renames retain three historical inline field mappings")
         checks.append(
             "directory authorization precedes native writes; exact path grants and revoked access retain empty output trees and the ready head"
+        )
+        checks.append(
+            "context filesystem dispatch rejects disabled LocalFileSystem before native writes, including source_pinned and build_started revocation"
         )
         require(list(scratch.iterdir()) == [], "build/search leaked private staging")
         report["status"] = "passed"

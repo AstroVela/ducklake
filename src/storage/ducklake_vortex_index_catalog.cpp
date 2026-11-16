@@ -127,6 +127,10 @@ void CheckInterrupted(Connection &owner, ClientContext &caller) {
 }
 
 void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (!fs.DirectoryExists(root)) {
+		throw IOException("Vortex index output directory does not exist: %s", root);
+	}
 	auto &config = DBConfig::GetConfig(context);
 	if (Settings::Get<EnableExternalAccessSetting>(config)) {
 		return;
