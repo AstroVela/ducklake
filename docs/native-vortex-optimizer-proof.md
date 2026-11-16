@@ -91,6 +91,11 @@ Uncommitted failure disables the policy and preserves its reason. Explicit
 resume plans work from fresh committed table state. Failed/cancelled candidates
 can remain outside managed data; generation collection is not introduced here.
 
+Each enable or resume installs a distinct in-memory policy registration.
+Scheduling, task completion and error handling apply results only while their
+originating registration is current. This also covers an older worker error
+that reaches final handling after a successful resume.
+
 Before publication, the worker persists the sealed candidate generation and
 expected revision. Failure after commit and explicit resume after process restart
 check the ready catalog for that exact successor generation. A committed task is
@@ -123,6 +128,9 @@ Historical-column cases check quoted vector/category/payload names across three
 inline schemas, pre-flush business values, row/byte thresholds and published
 coverage. The output-root cases check rejection before policy insertion and a
 subsequent successful enable for the same index.
+An error-handling regression pauses an unavailable-catalog error, reattaches the
+catalog and resumes the policy, then releases the old error and checks automatic
+publication of subsequently committed rows.
 
 It records task counts and generation IDs to distinguish reconciliation from
 duplicate publication, and checks recall against committed visible-row ground

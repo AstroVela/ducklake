@@ -366,7 +366,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	std::condition_variable changed, finished;
 	bool started = false, stopping = false, done = false;
 	std::thread::id worker_id;
-	std::map<Key, Pending> policies;
+	std::map<Key, std::shared_ptr<Pending>> policies;
 	std::set<Key> cancelled;
 	std::map<Key, string> errors;
 	Key active;
@@ -398,10 +398,14 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		if (policies.size() >= 16 && !policies.count(p.Id())) {
 			throw InvalidInputException("Optimizer policy limit exceeded");
 		}
-		policies[p.Id()] = {p, observe};
+		policies[p.Id()] = std::make_shared<Pending>(Pending {p, observe});
 		cancelled.erase(p.Id());
 		errors.erase(p.Id());
 		changed.notify_all();
+	}
+	bool IsCurrent(const std::shared_ptr<Pending> &pending) {
+		std::lock_guard<std::mutex> guard(lock);
+		return policies.at(pending->policy.Id()) == pending;
 	}
 	void Capacity(const Policy &p) {
 		std::lock_guard<std::mutex> guard(lock);
@@ -460,8 +464,12 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		}
 		Check(p.Id());
 	}
-	void Finish(DatabaseInstance &db, Policy &p, const string &state, const string &error, bool owns_task) {
+	void Finish(DatabaseInstance &db, const std::shared_ptr<Pending> &pending, Policy &p, const string &state,
+	            const string &error, bool owns_task) {
 		std::lock_guard<std::mutex> guard(io);
+		if (!IsCurrent(pending)) {
+			return;
+		}
 		Metadata meta(db, p.config.catalog);
 		auto current = Load(meta, p);
 		if (current.run != p.run) {
@@ -477,12 +485,15 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		}
 		Save(meta, current, p.run);
 	}
-	void Run(DatabaseInstance &db, const Pending &pending) {
+	void Run(DatabaseInstance &db, const std::shared_ptr<Pending> &pending) {
 		Policy p;
 		{
 			std::lock_guard<std::mutex> guard(io);
-			Metadata meta(db, pending.policy.config.catalog);
-			p = Load(meta, pending.policy);
+			if (!IsCurrent(pending)) {
+				return;
+			}
+			Metadata meta(db, pending->policy.config.catalog);
+			p = Load(meta, pending->policy);
 			meta.Commit();
 		}
 		if (!p.enabled) {
@@ -498,7 +509,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				std::lock_guard<std::mutex> guard(io);
 				Metadata meta(db, p.config.catalog);
 				auto current = Load(meta, p);
-				if (!current.enabled || current.run != p.run) {
+				if (!IsCurrent(pending) || !current.enabled || current.run != p.run) {
 					meta.Commit();
 					return;
 				}
@@ -536,7 +547,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				Connection job(db);
 				Use(job, p.Id());
 				if (flush) {
-					Stage(db, pending, p, "optimizer_before_flush");
+					Stage(db, *pending, p, "optimizer_before_flush");
 					job.BeginTransaction();
 					auto &catalog = Catalog::GetCatalog(*job.context, p.config.catalog).Cast<DuckLakeCatalog>();
 					auto entry = catalog.GetEntry(*job.context, CatalogType::TABLE_ENTRY, p.config.schema,
@@ -557,7 +568,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					}
 					// Another connection may have flushed T already. Plan from committed T/F below.
 					job.Commit();
-					Stage(db, pending, p, "optimizer_flushed");
+					Stage(db, *pending, p, "optimizer_flushed");
 					metrics = p;
 					Probe(db, metrics);
 					build = IndexDue(metrics);
@@ -572,14 +583,14 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 						Save(meta, current, p.run);
 						p.expected = current.expected;
 					}
-					Stage(db, pending, p, "optimizer_before_build");
+					Stage(db, *pending, p, "optimizer_before_build");
 					VortexCatalog::BuildAndPublish(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.reference,
-					    p.config.dimension, p.expected, [&](const string &stage) { Stage(db, pending, p, stage); },
+					    p.config.dimension, p.expected, [&](const string &stage) { Stage(db, *pending, p, stage); },
 					    p.uuid, optional_idx(p.field_id));
 				}
 			}
-			Finish(db, p, build ? "published" : "flushed", "", true);
+			Finish(db, pending, p, build ? "published" : "flushed", "", true);
 			Clear();
 		} catch (const std::exception &error) {
 			bool cancelled_job;
@@ -588,7 +599,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				cancelled_job = stopping || cancelled.count(p.Id());
 			}
 			try {
-				Finish(db, p, cancelled_job ? "cancelled" : "failed", error.what(), owns_task);
+				Finish(db, pending, p, cancelled_job ? "cancelled" : "failed", error.what(), owns_task);
 			} catch (...) {
 				Clear();
 				throw;
@@ -602,7 +613,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			worker_id = std::this_thread::get_id();
 		}
 		while (true) {
-			vector<Pending> work;
+			vector<std::shared_ptr<Pending>> work;
 			{
 				std::lock_guard<std::mutex> guard(lock);
 				if (stopping) {
@@ -620,12 +631,21 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					break;
 				}
 				try {
-					Run(*db, pending);
+					try {
+						Run(*db, pending);
+					} catch (...) {
+						if (pending->observe) {
+							pending->observe("optimizer_before_error");
+						}
+						throw;
+					}
 				} catch (const std::exception &error) {
 					Clear();
 					std::lock_guard<std::mutex> guard(lock);
-					cancelled.insert(pending.policy.Id());
-					errors[pending.policy.Id()] = error.what();
+					if (policies.at(pending->policy.Id()) == pending) {
+						cancelled.insert(pending->policy.Id());
+						errors[pending->policy.Id()] = error.what();
+					}
 				}
 			}
 			std::unique_lock<std::mutex> guard(lock);

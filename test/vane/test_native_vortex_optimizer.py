@@ -513,6 +513,49 @@ def output_root_validation(driver, root, checks):
             native.process.wait(timeout=5)
 
 
+def stale_error_after_resume(driver, root, checks):
+    native = CAT.Native(driver, root / "stale-error")
+    try:
+        artifacts = root / "stale-error-artifacts"
+        artifacts.mkdir()
+        native.sql(
+            "DROP TABLE lake.items;CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',1000,table_name=>'items');"
+        )
+        initialize(native)
+        native.call("optimizer-enable", artifacts, 128, 4194304, 128, 67108864, "optimizer_before_error", "pause")
+        native.sql("DETACH lake;")
+        native.call("optimizer-wait")
+        native.sql(
+            "ATTACH "
+            + BASE.quote("ducklake:" + str(native.root / "metadata.ducklake"))
+            + " AS lake(DATA_PATH "
+            + BASE.quote(native.root / "data")
+            + ",DATA_INLINING_ROW_LIMIT 1000);"
+        )
+        native.call("optimizer-resume")
+        native.call("optimizer-release")
+        insert(native, 0, 128)
+        published = wait(
+            native,
+            lambda s: s["published_revision"] == 1 or bool(s["error"]),
+            "resumed scheduling after a late error from the previous policy registration",
+        )
+        require(
+            published["enabled"] and not published["error"] and published["published_revision"] == 1,
+            "A stale optimizer error stopped a successfully resumed policy",
+        )
+        native.finish()
+        require(native.process.returncode == 0, "Stale optimizer error fixture failed to close")
+        checks.append("late planning errors from a replaced registration cannot cancel a successfully resumed policy")
+        return {"stale_error_after_resume": "passed"}
+    finally:
+        if native.process.poll() is None:
+            native.process.kill()
+            native.process.wait(timeout=5)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--driver", required=True, type=Path)
@@ -539,6 +582,7 @@ def main():
         report.update(concurrent_flush(driver, root, checks))
         report.update(renamed_inline(driver, root, checks))
         report.update(output_root_validation(driver, root, checks))
+        report.update(stale_error_after_resume(driver, root, checks))
         require(list(scratch.iterdir()) == [], "Optimizer leaked private staging")
         report["status"] = "passed"
     except Exception as error:
