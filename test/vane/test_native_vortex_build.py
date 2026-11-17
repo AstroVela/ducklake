@@ -93,7 +93,7 @@ def exercise(native, root, checks):
         "INSERT INTO lake.items VALUES(300000,[133.0625,4,2,0,1,8,7,16],'A','T-after-capture');"
     )
     promoted = reference("promotion")
-    overlap = native.call("split-build", promoted, 1, "reference_ready", mutation)
+    overlap = native.call("split-build", promoted, 1, "build_started", mutation)
     qualify(overlap["before"], before_rows)
     rows = oracle("after-build")
     qualify(overlap["during"], rows)
@@ -120,7 +120,9 @@ def exercise(native, root, checks):
     )
 
     checkpoints = [
+        "before_build",
         "after_pin",
+        "build_input",
         "source_pinned",
         "build_started",
         "build_complete",
@@ -128,6 +130,7 @@ def exercise(native, root, checks):
         "before_reference",
         "reference_ready",
         "before_build_publish",
+        "after_validation",
         "before_commit",
     ]
     for stage in checkpoints:
@@ -222,6 +225,292 @@ def exercise(native, root, checks):
     }
 
 
+def exercise_data_paths(driver, root, scratch):
+    cases = []
+    for mode in ("canonical", "dot", "relative", "symlink", "file-colon"):
+        case = root / ("data-path-" + mode)
+        case.mkdir()
+        data = case / "managed"
+        data.mkdir()
+        represented = str(data)
+        if mode == "dot":
+            represented = str(case) + "/./managed"
+        elif mode == "relative":
+            represented = os.path.relpath(data, Path.cwd())
+        elif mode == "symlink":
+            (case / "data-link").symlink_to(data, target_is_directory=True)
+            represented = str(case / "data-link")
+        elif mode == "file-colon":
+            represented = "file:" + str(data)
+        artifacts = case / "artifacts"
+        artifacts.mkdir()
+        native = CAT.Native(driver, case / "native")
+        try:
+            native.sql(
+                "DETACH lake;ATTACH "
+                + BASE.quote("ducklake:" + str(case / "metadata.ducklake"))
+                + " AS lake(DATA_PATH "
+                + BASE.quote(represented)
+                + ",DATA_INLINING_ROW_LIMIT 0);"
+                "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+                "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
+                "INSERT INTO lake.items SELECT i,[i::FLOAT,4,2,0,1,8,7,16],'A','row-'||i FROM range(4096)t(i);"
+            )
+            native.call("raw", "before-build")
+            original = json.loads(native.mixed("before-build").read_text())["file_capture"]["files"]
+            require(original, "native URI fixture captured no files")
+            if mode == "relative":
+                require(all(not Path(file["uri"]).is_absolute() for file in original), "relative URI was rewritten")
+            elif mode == "file-colon":
+                require(all(file["uri"].startswith(represented + "/") for file in original), "file: URI was rewritten")
+            native.call("init")
+            reference = artifacts / "native.json"
+            built = native.call("build", "knn", reference, 0)
+            descriptor = CAT.descriptor(reference)
+            require(
+                descriptor["snapshot"]["files"] == original and built["revision"] == 1,
+                "native construction changed its captured source identities",
+            )
+            result = SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1, category="A"))
+            require(
+                len(result["rows"]) == 1 and result["rows"][0]["id"] == 133 and result["rows"][0]["distance"] == 0,
+                "native URI construction/search returned the wrong winner",
+            )
+            native.call("build", "knn", data / "forbidden.json", 1, expected="outside the managed data path")
+            require(not (data / "forbidden.json").exists(), "managed reference rejection wrote an output")
+            require(
+                CAT.single_reference(native.call("head", "knn")) == descriptor,
+                "rejected reference changed the ready head",
+            )
+            require(
+                SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1, category="A")) == result,
+                "managed reference rejection changed subsequent search",
+            )
+            if mode == "canonical":
+                before = {path.relative_to(artifacts) for path in artifacts.rglob("*")}
+                native.call(
+                    "build",
+                    "knn",
+                    artifacts / "reserved.duckdb_extension",
+                    1,
+                    expected="reserved for DuckDB extensions",
+                )
+                require(
+                    {path.relative_to(artifacts) for path in artifacts.rglob("*")} == before,
+                    "reserved reference rejection wrote construction artifacts",
+                )
+                require(
+                    CAT.single_reference(native.call("head", "knn")) == descriptor,
+                    "reserved output changed the ready head",
+                )
+            SEARCH.no_leases(scratch)
+            cases.append(
+                {
+                    "data_path": mode,
+                    "source_uris": [file["uri"] for file in original],
+                    "winner": 133,
+                    "native_requests": native.requests,
+                    "native_rejections": native.errors,
+                }
+            )
+        finally:
+            if native.process.poll() is None:
+                native.finish()
+    return cases
+
+
+def exercise_historical_fields(driver, root, scratch):
+    case = root / "historical-fields"
+    case.mkdir()
+    native = CAT.Native(driver, case / "native")
+    recalls = []
+    swap = (
+        "ALTER TABLE lake.items RENAME category TO temporary_name;"
+        "ALTER TABLE lake.items RENAME payload TO category;"
+        "ALTER TABLE lake.items RENAME temporary_name TO payload;"
+    )
+    try:
+        native.sql(
+            "INSERT INTO lake.items VALUES(9000,[133.5,4,2,0,1,8,7,16],'old-file-category','new-file-category');"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items');"
+            "INSERT INTO lake.items VALUES(9001,[133,4,2,0,1,8,7,16],'old-category','new-category');"
+            + swap
+            + "INSERT INTO lake.items(id,embedding,category,payload) "
+            "VALUES(9002,[133.0625,4,2,0,1,8,7,16],'second-category','second-payload');"
+            'ALTER TABLE lake.items RENAME payload TO "body ""value""";'
+            'INSERT INTO lake.items(id,embedding,category,"body ""value""") '
+            "VALUES(9003,[133.125,4,2,0,1,8,7,16],'quoted-category','quoted-value');"
+            'ALTER TABLE lake.items RENAME "body ""value""" TO payload;'
+        )
+        native.call("raw", "historical")
+        rows = native.rows("historical")
+        inline = [row for row in rows if row["id"] in (9001, 9002, 9003)]
+        require(
+            len({row["filename"] for row in inline}) == 3
+            and all(row["filename"].startswith("ducklake_inlined_data_") for row in inline),
+            "native build fixture did not retain three historical inline schemas",
+        )
+        selected = {row["id"]: row for row in inline}
+        require(
+            selected[9001]["category"] == "new-category"
+            and selected[9002]["category"] == "second-category"
+            and selected[9002]["payload"] == "second-payload"
+            and selected[9003]["category"] == "quoted-category"
+            and selected[9003]["payload"] == "quoted-value",
+            "historical field fixture did not preserve the intended named-column values",
+        )
+        native.call("init")
+        built = native.call("build", "knn", case / "first.json", 0)
+        for category, identifier in (
+            ("new-file-category", 9000),
+            ("new-category", 9001),
+            ("second-category", 9002),
+            ("quoted-category", 9003),
+        ):
+            result = SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1, category=category))
+            recalls.append(SEARCH.qualify(result, rows, VECTOR, category=category, k=1))
+            require(
+                [row["id"] for row in result["rows"]] == [identifier], "native build lost a historical field mapping"
+            )
+        baseline = SEARCH.query(native, SEARCH.search_sql(VECTOR))
+        require(native.call("cache-search")["rows"] == baseline["rows"], "native build cache eviction changed T values")
+        rename = case / "during-build.sql"
+        rename.write_text(swap)
+        rebuilt = native.call("mutate-build", case / "second.json", 1, "build_complete", rename)
+        require(
+            rebuilt["revision"] == 2
+            and CAT.single_reference(rebuilt)["generation"]["generation"] != built["generation"],
+            "native rebuild did not publish",
+        )
+        native.call("raw", "renamed")
+        rows = native.rows("renamed")
+        result = SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1, category="old-category"))
+        recalls.append(SEARCH.qualify(result, rows, VECTOR, category="old-category", k=1))
+        require([row["id"] for row in result["rows"]] == [9001], "concurrent build rename lost historical T")
+        diagnostics = native.call("core-search")["diagnostics"]
+        require(
+            diagnostics["routes"]["inline_rows"] == 3 and not diagnostics["routes"]["scan_files"],
+            "native construction copied T or omitted a materialized source",
+        )
+        SEARCH.no_leases(scratch)
+        return {
+            "fixture_recalls": recalls,
+            "inline_sources": 3,
+            "native_builds": 2,
+            "native_requests": native.requests,
+            "native_rejections": native.errors,
+        }
+    finally:
+        if native.process.poll() is None:
+            native.finish()
+
+
+def exercise_output_permissions(driver, root, scratch):
+    cases = []
+    for mode in ("denied", "exact-paths", "allowed-directory", "revoke-during-build"):
+        case = root / ("permissions-" + mode)
+        case.mkdir()
+        output = case / "output"
+        output.mkdir()
+        initial = case / "initial"
+        initial.mkdir()
+        reference = output / "build.json"
+        native = CAT.Native(driver, case / "native")
+        try:
+            native.call("init")
+            native.call("build", "knn", initial / "ready.json", 0)
+            previous = native.call("head", "knn")
+            directories = [native.root / "data"]
+            if mode == "allowed-directory":
+                directories.extend([output, initial, scratch])
+            policy = "SET allowed_directories=[" + ",".join(BASE.quote(path) for path in directories) + "];"
+            if mode == "exact-paths":
+                policy += "SET allowed_paths=[" + BASE.quote(output) + "," + BASE.quote(reference) + "];"
+            policy += "SET enable_external_access=false;"
+            if mode == "revoke-during-build":
+                mutation = case / "restrict.sql"
+                mutation.write_text(policy)
+                native.call("mutate-build", reference, 1, "build_started", mutation, expected="directory")
+            else:
+                native.sql(policy)
+            if mode == "allowed-directory":
+                built = native.call("build", "knn", reference, 1)
+                require(built["revision"] == 2 and reference.exists(), "allowed output directory could not publish")
+                result = SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1))
+                require(
+                    len(result["rows"]) == 1 and result["rows"][0]["id"] == 133,
+                    "allowlisted native construction changed subsequent search",
+                )
+            else:
+                control = case / "copy.sql"
+                control.write_text("COPY (SELECT 1) TO " + BASE.quote(output / "ordinary-copy.csv") + ";")
+                native.call("sql", control, expected="file system operations are disabled")
+                if mode != "revoke-during-build":
+                    native.call("build", "knn", reference, 1, expected="directory")
+                require(not list(output.iterdir()), "rejected construction wrote a reference, generation or scratch")
+                require(native.call("head", "knn") == previous, "denied output authorization changed the ready head")
+            SEARCH.no_leases(scratch)
+            cases.append(
+                {
+                    "policy": mode,
+                    "output_files": sum(path.is_file() for path in output.rglob("*")),
+                    "native_requests": native.requests,
+                    "native_rejections": native.errors,
+                }
+            )
+        finally:
+            if native.process.poll() is None:
+                native.finish()
+    return cases
+
+
+def exercise_disabled_filesystems(driver, root, scratch):
+    cases = []
+    for stage in ("before-call", "source_pinned", "build_started"):
+        case = root / ("disabled-filesystem-" + stage)
+        case.mkdir()
+        output = case / "output"
+        output.mkdir()
+        initial = case / "initial"
+        initial.mkdir()
+        reference = output / "build.json"
+        native = CAT.Native(driver, case / "native")
+        try:
+            native.call("init")
+            native.call("build", "knn", initial / "ready.json", 0)
+            previous = native.call("head", "knn")
+            policy = "SET disabled_filesystems='LocalFileSystem';"
+            if stage == "before-call":
+                native.sql(policy)
+                native.call("build", "knn", reference, 1, expected="disabled by configuration")
+            else:
+                mutation = case / "disable.sql"
+                mutation.write_text(policy)
+                native.call("mutate-build", reference, 1, stage, mutation, expected="disabled by configuration")
+            native.sql(
+                "SELECT CASE WHEN current_setting('enable_external_access') THEN true "
+                "ELSE error('Disabled filesystem fixture changed external access') END;"
+            )
+            control = case / "copy.sql"
+            control.write_text("COPY (SELECT 1) TO " + BASE.quote(output / "ordinary-copy.csv") + ";")
+            native.call("sql", control, expected="disabled by configuration")
+            require(not list(output.iterdir()), "disabled filesystem construction wrote output artifacts")
+            require(native.call("head", "knn") == previous, "disabled filesystem changed the ready head")
+            SEARCH.no_leases(scratch)
+            cases.append(
+                {
+                    "stage": stage,
+                    "output_files": 0,
+                    "native_requests": native.requests,
+                    "native_rejections": native.errors,
+                }
+            )
+        finally:
+            if native.process.poll() is None:
+                native.finish()
+    return cases
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["driver", "output-dir"]:
@@ -243,6 +532,32 @@ def main():
     try:
         native = CAT.Native(args.driver.resolve(strict=True), root / "native")
         report.update(exercise(native, root, checks))
+        report["data_path_regressions"] = exercise_data_paths(args.driver.resolve(strict=True), root, scratch)
+        report["historical_field_regressions"] = exercise_historical_fields(
+            args.driver.resolve(strict=True), root, scratch
+        )
+        report["permission_regressions"] = exercise_output_permissions(args.driver.resolve(strict=True), root, scratch)
+        report["disabled_filesystem_regressions"] = exercise_disabled_filesystems(
+            args.driver.resolve(strict=True), root, scratch
+        )
+        additional = [
+            *report["data_path_regressions"],
+            report["historical_field_regressions"],
+            *report["permission_regressions"],
+            *report["disabled_filesystem_regressions"],
+        ]
+        report["total_native_requests"] = native.requests + sum(case["native_requests"] for case in additional)
+        report["total_native_rejections"] = native.errors + sum(case["native_rejections"] for case in additional)
+        checks.append(
+            "native binary construction preserves opaque source URIs and rejects references inside managed data"
+        )
+        checks.append("native construction and concurrent column renames retain three historical inline field mappings")
+        checks.append(
+            "directory authorization precedes native writes; exact path grants and revoked access retain empty output trees and the ready head"
+        )
+        checks.append(
+            "context filesystem dispatch rejects disabled LocalFileSystem before native writes, including source_pinned and build_started revocation"
+        )
         require(list(scratch.iterdir()) == [], "build/search leaked private staging")
         report["status"] = "passed"
     except Exception as error:

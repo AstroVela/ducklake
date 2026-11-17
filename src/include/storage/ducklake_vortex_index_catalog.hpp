@@ -52,7 +52,7 @@ struct DuckLakeVortexIndex {
 	static void Rollback(Connection &owner);
 	static void Initialized(DuckLakeTransaction &transaction);
 	static unique_ptr<QueryResult> Query(DuckLakeTransaction &transaction, const string &sql);
-	static void Initialize(Connection &owner, const string &catalog);
+	static void Initialize(Connection &owner, const string &catalog, ClientContext &caller);
 	static DuckLakeVortexGCResult Collect(ClientContext &context, const string &catalog, idx_t max_generations,
 	                                      idx_t max_artifact_bytes,
 	                                      const std::function<void(const string &)> &observe = nullptr);
@@ -61,7 +61,7 @@ struct DuckLakeVortexIndex {
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
 	                                   const string &table, const string &name, const string &reference,
-	                                   idx_t expected_revision,
+	                                   idx_t expected_revision, ClientContext &caller,
 	                                   const std::function<void(const string &)> &observe = nullptr,
 	                                   DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
 	                                   const vector<string> &merge_generations = {});
