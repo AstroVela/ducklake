@@ -79,9 +79,12 @@ lease materialization, releasing it before the `after_open` observer once the
 private copies and native handles exist. Errors and cancellation release the
 guard through ownership cleanup. Selected native builds retain their guard
 through publication. The collector takes the exclusive guard before the
-publication lock and its first metadata snapshot. Both exclusive acquisitions
-respond to caller cancellation while another operation holds the lock; an
-interrupted collector releases any acquired guard and its database owner.
+publication lock and its first metadata snapshot. Both collection readers and collectors respond to caller cancellation while
+another operation holds the guard. Waiting query/append/merge capture checks
+both its dedicated reader and original caller before beginning a metadata
+transaction. The guard retains writer preference and releases every acquired
+key and database owner on interruption. Publication-lock acquisition is also
+interruptible for collectors.
 Publication can proceed while
 an old reader finishes admission; collection waits for the old generation copies.
 
@@ -116,23 +119,34 @@ This adds no background sweeper, orphan-directory scan, abandoned-candidate
 cleanup, source-file rewriting or SPFresh online updates. Failed candidates
 remain outside ownership until a later explicitly designed registration path.
 
-Local Linux qualification on 2026-11-17 used functional source `a18585e4`
+Local Linux qualification on 2026-11-17 used functional source `38a4e9a0`
 with reviewed #42 `eb90fc7d` merged in. DuckDB v1.5.5 (`d8cdaa33`), Vortex
 `b20e34c2`, codec `84cef204`, and SPFresh `5893eb61` with Vortex's pinned
 static-only patch were preserved. The final catalog driver SHA-256 was
-`0463a74c951060155502e4eb41377e187e992861d08eba92b5c98c9d06a03552`.
+`0e71bddec63556cdc4234587f3b669139c07fb9dc561324f5b77d9731d098b29`.
 
-The final GC process proof passed 33 checks and 144 fixture queries at recall
-1.0 in 64.6 seconds under the existing 180-second outer budget. It includes
+The final GC process proof passed 34 checks and 148 fixture queries at recall
+1.0 in 64.8 seconds under the existing 180-second outer budget. It includes
 ten external-access/disabled-filesystem rejection and revocation cases, two
 directory-allowlisted collection/resumption controls, and cancellation while
-each collection/publication lock remains held. Waiting cancellation releases
-its owner and guards. The original permission bypass and both uninterruptible
-lock waits reproduced against an unchanged pre-fix native archive.
+each collection/publication lock remains held. It also cancels valid search,
+append capture and selected-merge capture while GC stays paused with its guard.
+Each returns before GC unlock, releases its dedicated reader, preserves the
+ready head and artifact signatures, and survives reopen.
+
+The original permission bypass and uninterruptible collector waits reproduced
+against an unchanged pre-fix native archive. A first independent Astra max
+review of `b135dedd` found the reverse shared-admission cancellation problem
+and reproduced query/selected-build blocking against that version's unchanged
+archive. The pinned engine has no cancellable shared StorageLock acquisition.
+The collection guard therefore keeps its own reader count and mutex with the
+same exclusion and writer preference, checks reader/caller interruption while
+waiting, and preserves Collection-to-Publication order and lease lifetime.
+No engine pin, thread setting or timeout was changed.
 
 ON passed 23 Vortex SQL cases / 907 assertions, including shared named-index
-references surviving GC until their last owner is replaced. ON and OFF each
-passed 86 base cases / 3,582 assertions with 13 optional-dependency skips.
+references surviving actual GC until their last owner is replaced. ON and OFF
+each passed 86 base cases / 3,582 assertions with 13 optional-dependency skips.
 Deletion inlining passed 18 cases / 1,099 assertions with two optional-dependency
 skips; audit passed 122 assertions. Search/catalog/admission, retained and mixed
 views, Vortex/Parquet recovery, cleanup, native build, optimizer, lifecycle,
@@ -148,8 +162,6 @@ in 11.7 seconds with four cases / 36 queries at recall 1.0. Native RPC and
 cleanup limits remain 60 and 30 seconds. Source, header, object, link and SDK
 identities qualify reused build inputs; changed C++ was compiled and products
 relinked normally. These checks make no stable-load throughput or latency
-claim. CI was deferred.
-
-The prior #42 large nonadjacent merge timeout remains separately tracked in
-[its qualification](native-vortex-segment-merge-proof.md). This GC change does
-not establish a cause or fix for that anomaly.
+claim. CI was deferred. The earlier #42 large nonadjacent merge timeout remains
+separately tracked in [its qualification](native-vortex-segment-merge-proof.md);
+this GC change does not establish its cause or a fix.
