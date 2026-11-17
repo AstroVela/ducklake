@@ -377,7 +377,8 @@ public:
 			pause.Release();
 			auto result = gc.get();
 			auto error = publish.get();
-			Require(error.find("canonical") != string::npos, "Publisher revived a collected generation");
+			Require(error.find("Cannot resolve local Vortex index path") != string::npos,
+			        "Publisher did not reject the collected generation: " + error);
 			return GCJSON(result);
 		}
 		if (op == "gc-build-race") {
