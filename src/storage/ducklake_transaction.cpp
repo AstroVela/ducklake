@@ -89,6 +89,18 @@ void LocalTableChanges::CleanupFiles(DatabaseInstance &db) {
 				fs.TryRemoveFile(del_file.file_name);
 			}
 		}
+		for (auto &compaction : table_changes.compactions) {
+			auto &file = compaction.written_file;
+			if (file.file_name.empty()) {
+				continue;
+			}
+			if (file.created_by_ducklake) {
+				fs.TryRemoveFile(file.file_name);
+			}
+			for (auto &delete_file : file.delete_files) {
+				fs.TryRemoveFile(delete_file.file_name);
+			}
+		}
 		for (auto &file : table_changes.new_delete_files) {
 			for (auto &delete_files : file.second) {
 				fs.TryRemoveFile(delete_files.file_name);
@@ -105,6 +117,7 @@ void LocalTableChanges::CleanupFiles(DatabaseInstance &db) {
 #endif
 		table_changes.new_data_files.clear();
 		table_changes.new_delete_files.clear();
+		table_changes.compactions.clear();
 	}
 }
 
@@ -631,6 +644,18 @@ void LocalTableChanges::CleanupFiles(ClientContext &context, TableIndex table_id
 				fs.TryRemoveFile(del_file.file_name);
 			}
 		}
+		for (auto &compaction : table_changes.compactions) {
+			auto &file = compaction.written_file;
+			if (file.file_name.empty()) {
+				continue;
+			}
+			if (file.created_by_ducklake) {
+				fs.TryRemoveFile(file.file_name);
+			}
+			for (auto &delete_file : file.delete_files) {
+				fs.TryRemoveFile(delete_file.file_name);
+			}
+		}
 		for (auto &file : table_changes.new_delete_files) {
 			for (auto &delete_files : file.second) {
 				fs.TryRemoveFile(delete_files.file_name);
@@ -773,8 +798,8 @@ void DuckLakeTransaction::Commit() {
 	try {
 		if (ChangesMade()) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
-			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock());
-			auto publication_guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			unique_ptr<StorageLockKey> publication_guard;
+			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock(), publication_guard);
 #endif
 			FlushChanges();
 		} else if (connection) {

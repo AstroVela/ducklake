@@ -265,6 +265,130 @@ def history(native, root, checks):
     )
 
 
+def data_files(native):
+    return {str(path): BASE.digest(path) for path in (native.root / "data").rglob("*.vortex")}
+
+
+def publication(native, root, checks):
+    setup(native, root, empty=True)
+    native.call("optimizer-cancel")
+    sql(native, "CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items')")
+    sql(native, insert(0, 2048))
+    sql(native, insert(2048, 2048))
+    budget(native, 100000, 4194304, 100000)
+    before = data_files(native)
+    merge = root / "merge.sql"
+    merge.write_text("CALL ducklake_merge_adjacent_files('lake','items')")
+    result = native.call("budget-compaction-publication", "knn", root / "published.json", 0, merge)
+    require(result["revision"] == 1, "Publication did not commit its new index")
+    require(
+        "cannot replace an indexed source" in result["commit_error"], "Compaction used the pre-publication coverage"
+    )
+    require(data_files(native) == before, "Rejected concurrent compaction retained or changed physical sources")
+    native.call("capture", "published-view", "knn")
+    count(native, 4096)
+    sql(native, insert(90000, 1))
+    count(native, 4097)
+    owners(native)
+    checks.append(
+        "publication coverage stays protected through write projection/commit; a stale F compaction aborts and cleans its output"
+    )
+    return {"revision": result["revision"], "compaction_error": result["commit_error"], "source_files": len(before)}
+
+
+def rejected_compaction(native, root, checks):
+    setup(native, root)
+    native.call("optimizer-cancel")
+    budget(native, 100000, 4194304, 100000)
+    before = data_files(native)
+    require(len(before) == 2, "Compaction regression requires two indexed source files")
+    for _ in range(3):
+        sql(native, "CALL ducklake_merge_adjacent_files('lake','items')", "cannot replace an indexed source")
+        require(data_files(native) == before, "Rejected compaction left output artifacts")
+    sql(native, "BEGIN;CALL ducklake_merge_adjacent_files('lake','items');ROLLBACK")
+    require(data_files(native) == before, "Explicit rollback retained compaction output")
+    count(native, 4096)
+    native.call("capture", "after-rejections", "knn")
+    native.call("reopen")
+    require(data_files(native) == before, "Reopen exposed rejected compaction artifacts")
+    count(native, 4096)
+    owners(native)
+    checks.append("three rejected B-source compactions and explicit rollback preserve exact source files across reopen")
+    return {"source_files": len(before), "rejections": 3}
+
+
+def empty_compaction(native, root, checks):
+    setup(native, root, empty=True)
+    native.call("optimizer-cancel")
+    budget(native, 100000, 4194304, 20)
+    sql(native, insert(0, 20))
+    sql(native, "DELETE FROM lake.items;CALL ducklake_flush_inlined_data('lake')")
+    count(native, 0)
+    sql(
+        native,
+        "SELECT CASE WHEN count(*)=1 AND sum(record_count)=20 THEN true ELSE error('Missing retained physical history') END "
+        "FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    sql(native, "CALL ducklake_rewrite_data_files('lake','items',delete_threshold=>0)")
+    sql(
+        native,
+        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Empty rewrite retained an active source') END "
+        "FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    sql(native, "CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items')")
+    sql(native, insert(1000, 1))
+    count(native, 1)
+    native.call("reopen")
+    count(native, 1)
+    owners(native)
+    checks.append("zero-output delete rewrite releases physical F capacity held by flushed inline history")
+
+
+def rename_table(native, root, checks):
+    setup(native, root, empty=True)
+    native.call("optimizer-cancel")
+    budget(native, 2, 1048576, 100000)
+    sql(native, insert(0, 1))
+    sql(native, "ALTER TABLE lake.items RENAME TO renamed")
+    sql(native, insert(1000, 1).replace("lake.items", "lake.renamed"))
+    sql(
+        native,
+        "SELECT * FROM ducklake_set_vortex_write_budget('lake','main','renamed','knn',2,1048576,100000,67108864)",
+    )
+    sql(native, insert(2000, 1).replace("lake.items", "lake.renamed"), "inline rows")
+    native.call("reopen")
+    sql(native, insert(3000, 1).replace("lake.items", "lake.renamed"), "inline rows")
+    sql(native, "SELECT CASE WHEN count(*)=2 THEN true ELSE error('Rename lost committed rows') END FROM lake.renamed")
+    owners(native)
+    checks.append("table UUID keeps its persistent budget after rename/reconfiguration and same-process reopen")
+
+
+def renamed_inline_sources(native, root, checks):
+    setup(native, root, empty=True)
+    native.call("optimizer-cancel")
+    sql(
+        native,
+        "ALTER TABLE lake.items RENAME embedding TO old_embedding;"
+        "ALTER TABLE lake.items RENAME category TO old_category;"
+        "ALTER TABLE lake.items RENAME payload TO old_payload;"
+        "INSERT INTO lake.items VALUES(1,[1,4,2,0,1,8,7,16],'A','historical');"
+        "UPDATE lake.items SET old_payload='ended-version';"
+        "ALTER TABLE lake.items RENAME old_embedding TO embedding;"
+        "ALTER TABLE lake.items RENAME old_category TO category;"
+        "ALTER TABLE lake.items RENAME old_payload TO payload",
+    )
+    budget(native, 2, 1048576, 100000)
+    sql(native, insert(1000, 1))
+    sql(native, insert(2000, 1), "inline rows")
+    sql(native, "CALL ducklake_flush_inlined_data('lake')")
+    sql(native, insert(3000, 1))
+    count(native, 3)
+    owners(native)
+    checks.append(
+        "visible and retained inline budgets map historical renamed business/vector fields by stable field ID"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--driver", required=True, type=Path)
@@ -292,6 +416,11 @@ def main():
             ("bytes", bytes_and_vectors),
             ("wide", wide),
             ("history", history),
+            ("publication", publication),
+            ("rejected-compaction", rejected_compaction),
+            ("empty-compaction", empty_compaction),
+            ("rename-table", rename_table),
+            ("renamed-inline-sources", renamed_inline_sources),
         ]:
             case_root = root / name
             case_root.mkdir()

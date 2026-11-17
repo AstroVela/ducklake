@@ -147,13 +147,15 @@ public:
 			Require(!failure.empty(), "Optimizer initialization accepted an active transaction");
 			Require(caller.context->transaction.HasActiveTransaction(),
 			        "Optimizer initialization rolled back the caller's existing transaction");
-			Require(SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
-			            1,
-			        "Optimizer initialization lost the caller's uncommitted row");
+			Require(
+			    SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
+			        1,
+			    "Optimizer initialization lost the caller's uncommitted row");
 			caller.Rollback();
-			Require(SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
-			            0,
-			        "The caller could not roll back its own transaction");
+			Require(
+			    SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
+			        0,
+			    "The caller could not roll back its own transaction");
 			return "{}";
 		}
 		if (op == "optimizer-enable") {
@@ -629,6 +631,45 @@ public:
 			auto winners = idx_t(a.get()) + idx_t(b.get());
 			Require(winners == 1, "Concurrent publication did not produce exactly one winner");
 			return Head(args.at(2)).ToJSON();
+		}
+		if (op == "budget-compaction-publication") {
+			SQL(writer, "BEGIN;" + ReadText(args.at(5)));
+			Connection owner(database);
+			Pause pause;
+			auto publish = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::BuildAndPublish(*owner.context, "lake", "main", "items", args.at(2),
+				                                            args.at(3), 8, std::stoull(args.at(4)),
+				                                            [&](const string &stage) {
+					                                            if (stage == "after_validation") {
+						                                            pause.Stop();
+					                                            }
+				                                            });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			std::promise<void> started;
+			auto ready = started.get_future();
+			auto commit = std::async(std::launch::async, [&] {
+				started.set_value();
+				try {
+					SQL(writer, "COMMIT");
+					return string();
+				} catch (const std::exception &error) {
+					return string(error.what());
+				}
+			});
+			ReleasePause release_commit {pause};
+			ready.wait();
+			Require(commit.wait_for(std::chrono::milliseconds(500)) == std::future_status::timeout,
+			        "Compaction committed inside publication validation");
+			pause.Release();
+			auto record = publish.get();
+			auto failure = commit.get();
+			ViewJSON json;
+			auto value = json.Object();
+			json.Number(value, "revision", record.revision);
+			json.Text(value, "commit_error", failure);
+			return json.Finish(value);
 		}
 		if (op == "commit-race") {
 			SQL(writer,

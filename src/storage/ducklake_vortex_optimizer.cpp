@@ -204,10 +204,27 @@ void Save(Metadata &meta, const Policy &p, const string &previous_run) {
 	meta.Commit();
 }
 
-DuckLakeTableEntry &Table(Metadata &meta, const Policy &p) {
+DuckLakeTableEntry &Table(Metadata &meta, Policy &p) {
 	auto &catalog = meta.transaction.GetCatalog();
-	auto entry = catalog.GetEntry(*meta.connection.context, CatalogType::TABLE_ENTRY, p.config.schema, p.config.table,
-	                              OnEntryNotFound::THROW_EXCEPTION);
+	optional_ptr<CatalogEntry> entry;
+	if (p.uuid.empty()) {
+		entry = catalog.GetEntry(*meta.connection.context, CatalogType::TABLE_ENTRY, p.config.schema, p.config.table,
+		                         OnEntryNotFound::THROW_EXCEPTION);
+	} else {
+		auto identity =
+		    meta.Query("SELECT table_id FROM {METADATA_CATALOG}.ducklake_table WHERE table_uuid=" + Quote(p.uuid) +
+		               " AND begin_snapshot<={SNAPSHOT_ID} AND "
+		               "(end_snapshot IS NULL OR end_snapshot>{SNAPSHOT_ID})");
+		auto row = identity->Fetch();
+		if (!row || row->size() != 1) {
+			throw InvalidInputException("Missing optimizer table identity");
+		}
+		entry = catalog.GetEntryById(meta.transaction, meta.transaction.GetSnapshot(),
+		                             TableIndex(row->GetValue(0, 0).GetValue<idx_t>()));
+		if (!entry) {
+			throw InvalidInputException("Missing optimizer table identity");
+		}
+	}
 	auto &table = entry->Cast<DuckLakeTableEntry>();
 	if ((!p.uuid.empty() && p.uuid != table.GetTableUUID()) ||
 	    (p.field_id && p.field_id != table.GetFieldId(vector<string> {"embedding"}).GetFieldIndex().index)) {
@@ -221,6 +238,8 @@ DuckLakeTableEntry &Table(Metadata &meta, const Policy &p) {
 			throw InvalidInputException("Optimizer business/vector field type changed");
 		}
 	}
+	p.config.schema = table.schema.name;
+	p.config.table = table.name;
 	return table;
 }
 
@@ -291,12 +310,13 @@ void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> 
 		}
 		auto &embedding = columns[0];
 		auto sql = DuckLakeMetadataManager::ReadInlinedDataAggregatesSql(
-		    source.table_name, "count(*) FILTER(WHERE " + eligible +
-		                           "),coalesce(sum(coalesce(array_length(" + embedding + "),0)*4+64+"
-		                           "coalesce(octet_length(encode(" + columns[1] + ")),0)+coalesce(octet_length(encode(" +
-		                           columns[2] + ")),0)) FILTER(WHERE " + eligible +
-		                           "),0),count(*) FILTER(WHERE (" + eligible + ") AND (" + embedding +
-		                           " IS NULL OR array_length(" + embedding + ")<>" + to_string(p.config.dimension) + "))");
+		    source.table_name,
+		    "count(*) FILTER(WHERE " + eligible + "),coalesce(sum(coalesce(array_length(" + embedding +
+		        "),0)*4+64+"
+		        "coalesce(octet_length(encode(" +
+		        columns[1] + ")),0)+coalesce(octet_length(encode(" + columns[2] + ")),0)) FILTER(WHERE " + eligible +
+		        "),0),count(*) FILTER(WHERE (" + eligible + ") AND (" + embedding + " IS NULL OR array_length(" +
+		        embedding + ")<>" + to_string(p.config.dimension) + "))");
 		auto result = meta.transaction.Query(snapshot, sql);
 		if (result->HasError()) {
 			result->ThrowError();
@@ -829,11 +849,13 @@ void PendingInline(Metadata &meta, Policy &p, const vector<FlushedInlinedTableIn
 			}
 		}
 		// Flush materializes ended versions too; visible T alone underestimates build capacity.
-		auto result = meta.transaction.Query(
-		    snapshot, "SELECT count(*),coalesce(sum(coalesce(array_length(" + columns[0] + "),0)*4+64+"
-		              "coalesce(octet_length(encode(" + columns[1] + ")),0)+coalesce(octet_length(encode(" +
-		                  columns[2] + ")),0)),0) FROM {METADATA_CATALOG}." + source.table_name +
-		                  " WHERE begin_snapshot<={SNAPSHOT_ID}" + filter);
+		auto result =
+		    meta.transaction.Query(snapshot, "SELECT count(*),coalesce(sum(coalesce(array_length(" + columns[0] +
+		                                         "),0)*4+64+"
+		                                         "coalesce(octet_length(encode(" +
+		                                         columns[1] + ")),0)+coalesce(octet_length(encode(" + columns[2] +
+		                                         ")),0)),0) FROM {METADATA_CATALOG}." + source.table_name +
+		                                         " WHERE begin_snapshot<={SNAPSHOT_ID}" + filter);
 		if (result->HasError()) {
 			result->ThrowError();
 		}
@@ -857,7 +879,9 @@ void AddWrite(Policy &p, DuckLakeTableEntry &table, const LocalTableDataChanges 
 		file(data);
 	}
 	for (auto &compaction : changes.compactions) {
-		file(compaction.written_file);
+		if (!compaction.written_file.file_name.empty()) {
+			file(compaction.written_file);
+		}
 	}
 	if (!changes.new_inlined_data) {
 		return;
@@ -902,20 +926,24 @@ bool Grows(const LocalTableDataChanges &changes) {
 
 } // namespace
 
-unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction,
-                                                               ClientContext &context) {
+unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
+                                                               unique_ptr<StorageLockKey> &publication_guard) {
 	bool grows = false;
 	for (auto &entry : transaction.GetLocalChanges().Changes()) {
 		grows |= Grows(entry.GetTableChanges());
 	}
 	auto &catalog = transaction.GetCatalog();
-	if (!grows || (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb")) {
-		return nullptr;
+	unique_ptr<StorageLockKey> admission;
+	if (grows && (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb")) {
+		admission = GetOwner(*context.db)->write_admission.GetExclusiveLock();
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 	}
-	// Hold the reservation until metadata commit; every following writer probes fresh committed state.
-	auto admission = GetOwner(*context.db)->write_admission.GetExclusiveLock();
-	if (context.IsInterrupted()) {
-		throw InterruptException();
+	// Use the same admission/publication order as configuration, and keep coverage stable through commit.
+	publication_guard = VortexCatalog::PublicationLock().GetSharedLock();
+	if (!admission) {
+		return nullptr;
 	}
 	Metadata meta(*context.db, catalog.GetName(), false);
 	try {
