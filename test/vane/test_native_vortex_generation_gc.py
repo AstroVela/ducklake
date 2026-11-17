@@ -40,6 +40,104 @@ def setup(native, root):
     return M.setup(native, root)
 
 
+def permission(driver, root, policy, stage, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, merged, _, _, parts = setup(native, root)
+        chosen = M.selection(parts)
+        candidate = seal(native, merged, chosen)
+        publish(native, candidate, chosen)
+        before = status(native)
+        head = native.call("head", "knn")
+        pending = retired(native)
+        signatures = {row["generation"]: SEG.signature(directory(row)) for row in pending}
+        policy_file = root / "policy.sql"
+        policy_file.write_text(
+            "SET enable_external_access=false;"
+            if policy == "external-access"
+            else "SET disabled_filesystems='LocalFileSystem';"
+        )
+        if stage == "initial":
+            native.call("sql", policy_file)
+            native.call("gc", 1, LIMIT, expected="disabled by configuration")
+        else:
+            native.call("gc-policy", stage, 1, LIMIT, policy_file, expected="disabled by configuration")
+        removed = 0
+        for row in pending:
+            signature = SEG.signature(directory(row))
+            original = signatures[row["generation"]]
+            missing = set(original) - set(signature)
+            require(not set(signature) - set(original), "Denied GC created unexpected files")
+            require(all(signature[name] == original[name] for name in signature), "Denied GC changed artifact bytes")
+            removed += len(missing)
+        require(removed == (1 if stage == "gc_file_deleted" else 0), "GC kept unlinking after access was revoked")
+        expected = [dict(row) for row in before]
+        if stage in ["gc_deleting", "gc_before_unlink", "gc_file_deleted"]:
+            next(row for row in expected if row["generation"] == pending[0]["generation"])["state"] = "deleting"
+        require(status(native) == expected, "Denied GC changed unrelated retirement metadata")
+        require(native.call("head", "knn") == head, "Denied GC changed the active index")
+        native.call("reopen")
+        require(status(native) == expected, "Reopen lost the denied GC checkpoint")
+        require(native.call("gc", 16, LIMIT)["collected_generations"] == 2, "Authorized resume did not finish GC")
+        require(not retired(native), "Authorized resume retained retirement rows")
+        recalls = []
+        M.qualify(native, "authorized-resume", recalls, 2)
+        native.finish()
+        checks.append(f"{policy} at {stage} stops native GC before further unlinks and preserves recoverable state")
+        return {"policy": policy, "stage": stage, "files_removed_before_rejection": removed, "fixture_recalls": recalls}
+    finally:
+        M.stop(native)
+
+
+def allowlisted(driver, root, missing, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, merged, _, _, parts = setup(native, root)
+        chosen = M.selection(parts)
+        candidate = seal(native, merged, chosen)
+        publish(native, candidate, chosen)
+        pending = retired(native)
+        if missing:
+            native.call("gc-cancel", "gc_files_deleted", 1, LIMIT, expected="Interrupted")
+            require(not directory(pending[0]).exists(), "Resume fixture retained the deleted directory")
+        allowed = str(directory(pending[0]).parent).replace("'", "''")
+        native.sql(f"SET allowed_directories=['{allowed}'];SET enable_external_access=false;")
+        result = native.call("gc", 16, LIMIT)
+        require(result["collected_generations"] == 2 and not result["remaining_generations"], "Allowlisted GC failed")
+        require(all(not directory(row).exists() for row in pending), "Allowlisted GC retained retired artifacts")
+        native.call("reopen")
+        require(not retired(native), "Allowlisted GC completion was not durable")
+        native.finish()
+        checks.append(
+            f"directory-wide allowlisting permits bounded GC{' with an already absent deleting generation' if missing else ''}"
+        )
+        return {"missing_generation": missing, "collected_generations": result["collected_generations"]}
+    finally:
+        M.stop(native)
+
+
+def cancel_waiting(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        native.call("init")
+        for lock in ["admissions", "publication"]:
+            result = native.call("gc-cancel-wait", lock)
+            require(result["interrupted_before_unlock"], "GC cancellation depended on releasing another operation")
+            require(not status(native), "Waiting cancellation changed generation ownership")
+            owner = native.call("owners")
+            require(
+                owner["database_references"] == 2 and len(owner["connections"]) == 1, "Waiting GC retained its owner"
+            )
+        require(native.call("gc", 1, LIMIT)["collected_generations"] == 0, "Waiting cancellation leaked a lock")
+        native.finish()
+        checks.append(
+            "GC cancellation exits while admission/publication blockers remain held and releases both locks and its owner"
+        )
+        return {"locks": ["admissions", "publication"], "interrupted_before_unlock": True}
+    finally:
+        M.stop(native)
+
+
 def publish(native, candidate, chosen):
     result = native.call("publish-merge", candidate, 3, *chosen)
     require(result["revision"] == 4 and len(segments(result)) == 2, "Merge publication was incomplete")
@@ -413,6 +511,20 @@ def main():
     try:
         report["main"] = exercise(proof, native, directory, report["checks"], workers)
         native.finish()
+        report["permissions"] = []
+        for policy in ["external-access", "disabled-filesystem"]:
+            for stage in ["initial", "gc_validated", "gc_deleting", "gc_before_unlink", "gc_file_deleted"]:
+                directory = root / f"permission-{policy}-{stage}"
+                directory.mkdir()
+                report["permissions"].append(permission(driver, directory, policy, stage, report["checks"]))
+        report["allowlisted"] = []
+        for missing in [False, True]:
+            directory = root / ("allowlisted-missing" if missing else "allowlisted")
+            directory.mkdir()
+            report["allowlisted"].append(allowlisted(driver, directory, missing, report["checks"]))
+        directory = root / "cancel-waiting"
+        directory.mkdir()
+        report["cancel_waiting"] = cancel_waiting(driver, directory, report["checks"])
         report["admissions"] = []
         for stage, cancel in [
             ("after_snapshot", False),
