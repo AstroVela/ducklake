@@ -1,6 +1,6 @@
 # Independent native Vortex B segments
 
-This validation draft follows [DuckLake #40](https://github.com/AstroVela/ducklake/pull/40)
+This proof follows [DuckLake #40](https://github.com/AstroVela/ducklake/pull/40)
 and the [original design](https://chatgpt.com/space/page_5ee0f8c698d08191a17198d45d152362).
 After bootstrap creates B1, the next F promotion builds B2 independently. B1's
 generation, descriptor, artifact contents and modification times stay unchanged.
@@ -39,8 +39,8 @@ Old catalog reference values are rejected; no migration or alternate decoder
 is added. Explicit full build/publication remains an operator-requested
 replacement that consolidates to one segment.
 
-The background optimizer bootstraps once, then uses the append path. This draft
-allows at most two B segments. A third promotion returns `RESOURCE_EXHAUSTED`
+The background optimizer bootstraps once, then uses the append path. This
+validation allows at most two B segments. A third promotion returns `RESOURCE_EXHAUSTED`
 and stops the policy; it never rebuilds existing B automatically. Acknowledged
 B/F/T stays queryable, and durable write quotas remain active. Explicit full
 consolidation restores a free segment slot. Automatic compaction and production
@@ -52,6 +52,11 @@ One ReadView owns both generation leases, the same visibility and business
 predicate snapshot, remaining F, and committed T. Each B segment applies its
 own row-ordinal visibility/predicate filter before ANN top-k. Its candidates are
 reranked and merged into the same bounded global top-k with F/T scan results.
+ANN and rerank timing closes at each segment boundary and accumulates repeated
+phases. Existing query-wide cancellation checkpoints remain in place. Controlled
+observer delays check that each phase includes both segments' work using measured
+duration lower bounds, without requiring stable-load speed measurements.
+
 Typed fetches use the same retained view. Segment sources are disjoint, so a
 captured row cannot enter both B paths or B and F.
 
@@ -92,16 +97,37 @@ quotas and operator consolidation have separate assertions. Strict database
 shutdown and empty private lease directories are required. Minimal SQL cases,
 the existing process proofs and ON/OFF SQL/recovery suites run in CI.
 
-Local qualification used DuckDB v1.5.5 (`d8cdaa33`), Vortex `65dab44f` and the
-native wrapper `b819cc03`, with the dependency pins unchanged from #40. The
-segment proof passed all ten checks, including 22 fixture queries with recall
-1.0. The final catalog driver SHA-256 was
-`4a29d5e28c3d7d7596feba6177c61780d8ab213854a91b680eaefa414c817d22`.
-ON passed 12 Vortex SQL cases (460 assertions) and Vortex crash recovery.
-ON/OFF each passed 86 base cases (3,582 assertions; 13 optional-dependency
-skips) and Parquet crash recovery; the audit case passed 122 assertions.
-Existing native index, read-view, mixed, admission, catalog, search, build,
-optimizer, lifecycle and write-budget proofs passed. The isolated cost proof
-passed four cases with nine queries each; timings remain informational.
-`make format-fix`, Rust formatting and workspace Clippy with warnings denied
-completed successfully.
+Local Linux qualification on 2026-11-17 used functional source `53a7db01`,
+DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`, codec `84cef204`, and SPFresh
+`5893eb61` with the pinned Vortex static-only patch. The final catalog driver
+SHA-256 is `6967e52295f0091f0c5a3287039a198cc96fa9a72b1e8b56110e4a249a6acf52`.
+
+The segment proof passed all eleven checks in 11.3 seconds under the unchanged
+180-second proof budget, including 24 fixture recall checks at 1.0. It retained
+B1's descriptor, generation, artifact checksums and modification times. Both
+controlled phase checks included the measured delays of both segments. Single
+segment test consumers continue comparing complete descriptors, and concurrent
+flush checks require the expected one/two segments and exactly 256 covered rows.
+
+ON passed 21 Vortex SQL cases / 833 assertions. ON and OFF each passed 86 base
+cases / 3,582 assertions with 13 optional-dependency skips. ON deletion inlining
+passed 18 cases / 1,099 assertions with two optional-dependency skips; audit
+passed 122 assertions. Vortex/Parquet recovery, cleanup and all existing native
+index/read-view/mixed/admission/catalog/search/build/optimizer/lifecycle and
+13-case write-budget proofs passed. The 32-case FFI ABI matrix passed. Lifecycle
+covered 20 query cycles and 18 same-process reopens. All measured fixture
+recalls were 1.0, preserving the 0.8 threshold and existing Float32 tolerances.
+
+Seventeen ordinary functional gates retained 180-second budgets. The separate
+counter/recall gate retained its existing 600-second outer budget and completed
+in 11.7 seconds with four cases / 36 queries; timings remain informational.
+Scoped pinned C++/Python formatting, query/probe Rust formatting, Clippy with
+warnings denied and builds passed. The Rust workspace has no unit tests; the
+native and ABI proofs provide behavioral coverage. Unchanged Vortex inputs
+reuse the hash-qualified #40/#39 results: 310 I/O/file tests, 164 index/SPFresh
+tests and three index doctests, with one pre-existing ignored I/O doctest.
+
+The initial phase-attribution failure and its original products were retained
+as controls. Existing transaction guards, threads, source/artifact capacities
+and operation deadlines were preserved. CI, Windows and stable-load performance
+measurements were outside this local qualification.
