@@ -98,6 +98,14 @@ def descriptor(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def single_reference(record):
+    manifest = record["reference"]
+    require(
+        manifest["format_version"] == 2 and len(manifest["segments"]) == 1, "Expected a single-segment catalog manifest"
+    )
+    return manifest["segments"][0]["reference"]
+
+
 def generation(path: Path) -> str:
     return descriptor(path)["generation"]["generation"]
 
@@ -133,14 +141,14 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
     native.call("cancel-publish", "knn", refs["b"], 1)
     cancelled = native.call("head", "knn")
     require(
-        cancelled["revision"] == 1 and cancelled["reference"] == descriptors["a"],
+        cancelled["revision"] == 1 and single_reference(cancelled) == descriptors["a"],
         "publication cancelled before its metadata transaction changed the ready index",
     )
     for stage in ("after_validation", "before_commit"):
         native.call("cancel-stage", "knn", refs["b"], 1, stage)
         cancelled = native.call("head", "knn")
         require(
-            cancelled["revision"] == 1 and cancelled["reference"] == descriptors["a"],
+            cancelled["revision"] == 1 and single_reference(cancelled) == descriptors["a"],
             f"publication cancelled at {stage} changed the ready index",
         )
     checks.append(
@@ -194,7 +202,7 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
     raced = native.call("race", "knn", refs["b"], refs["c"], 1)
     require(
         raced["revision"] == 2
-        and raced["reference"]["generation"]["generation"] in (generations["b"], generations["c"]),
+        and single_reference(raced)["generation"]["generation"] in (generations["b"], generations["c"]),
         "two concurrent publishers did not resolve to one atomic revision",
     )
     native.call("capture", "raced", "knn")
@@ -258,7 +266,7 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
         "named discovery composes B/F/T; publication fences source commits; lost acknowledgement preserves the committed head and all generations"
     )
 
-    loser = "c" if raced["reference"]["generation"]["generation"] == generations["b"] else "b"
+    loser = "c" if single_reference(raced)["generation"]["generation"] == generations["b"] else "b"
     native.crash("crash-before", refs[loser], 5)
     require(native.call("head", "knn")["revision"] == 5, "SIGKILL before metadata commit published an uncommitted head")
     require(
@@ -268,7 +276,7 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
     native.crash("crash-after", refs[loser], 5)
     recovered = native.call("head", "knn")
     require(
-        recovered["revision"] == 6 and recovered["reference"] == descriptors[loser],
+        recovered["revision"] == 6 and single_reference(recovered) == descriptors[loser],
         "SIGKILL after commit lost the durable publication",
     )
     refs[loser].unlink()
@@ -305,7 +313,12 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
     )
     worker.close_view("recovered")
     held = worker.stats()
-    worker.open("wrong-name", native.capture("latest"), index_name="other", expected="name, revision or root mismatch")
+    worker.open(
+        "wrong-name",
+        native.capture("latest"),
+        index_name="other",
+        expected="name, revision, version, roots or count mismatch",
+    )
     ADMIT.Worker.open(worker, "wrong-mode", native.capture("latest"), fresh, expected="unknown field")
     broken = artifact(fresh)
     saved = broken.read_bytes()
@@ -368,7 +381,7 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
         "reclaimed_source_files": len(old_files),
         "fixture_recalls": recalls,
         "recall_threshold": 0.8,
-        "winner_generation": recovered["reference"]["generation"]["generation"],
+        "winner_generation": single_reference(recovered)["generation"]["generation"],
     }
 
 
@@ -481,7 +494,7 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
         require(
             named_before["revision"] == 1
             and named_before["root"] == str(index)
-            and named_before["reference"] == json.loads(reference.read_text()),
+            and single_reference(named_before) == json.loads(reference.read_text()),
             f"path rejections changed the ready identity for {mode}",
         )
 
@@ -501,7 +514,7 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
             int(acquired["visible_rows"]) == 4096
             and named["revision"] == 2
             and named["root"] == str(data.parent)
-            and named["reference"]["generation"]["generation"] == generation(reference),
+            and single_reference(named)["generation"]["generation"] == generation(reference),
             f"path validation changed the ready index for {mode}",
         )
         cases.append(

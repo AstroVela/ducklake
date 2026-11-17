@@ -35,7 +35,47 @@ pub struct CatalogIndex {
     pub name: String,
     pub revision: u64,
     pub root: PathBuf,
+    pub reference: SegmentManifest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogSegment {
+    pub root: PathBuf,
     pub reference: Reference,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentManifest {
+    pub format_version: u32,
+    pub segments: Vec<CatalogSegment>,
+}
+
+impl CatalogIndex {
+    fn validate(&self, name: &str) -> VortexResult<()> {
+        if self.name != name
+            || name.is_empty()
+            || self.revision == 0
+            || self.reference.format_version != 2
+            || !(1..=2).contains(&self.reference.segments.len())
+            || self
+                .reference
+                .segments
+                .iter()
+                .any(|segment| !segment.root.is_absolute())
+            || self
+                .reference
+                .segments
+                .last()
+                .is_none_or(|segment| segment.root != self.root)
+        {
+            vortex_bail!(
+                "Catalogued segment manifest name, revision, version, roots or count mismatch"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -61,14 +101,10 @@ pub fn prepare_binary(bytes: &[u8], name: &str) -> VortexResult<(MixedCapture, C
     }
     let admission: BinaryAdmission =
         serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
-    if admission.format_version != 1
-        || admission.index.name != name
-        || name.is_empty()
-        || admission.index.revision == 0
-        || !admission.index.root.is_absolute()
-    {
-        vortex_bail!("Binary admission version, name, revision or root mismatch");
+    if admission.format_version != 1 {
+        vortex_bail!("Binary admission version mismatch");
     }
+    admission.index.validate(name)?;
     Ok((admission.capture, admission.index))
 }
 
@@ -102,13 +138,7 @@ pub fn prepare_catalogued(
     }
     let admission: CatalogAdmission =
         serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
-    if admission.index.name != name
-        || name.is_empty()
-        || admission.index.revision == 0
-        || !admission.index.root.is_absolute()
-    {
-        vortex_bail!("Catalogued index name, revision or root mismatch");
-    }
+    admission.index.validate(name)?;
     let prepared = materialize(
         Admission {
             format_version: admission.format_version,

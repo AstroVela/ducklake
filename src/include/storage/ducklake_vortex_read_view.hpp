@@ -21,6 +21,7 @@ struct DuckLakeVortexViewOptions {
 	string index_name;
 	string expected_table_uuid;
 	optional_idx expected_field_id;
+	bool unindexed_only;
 };
 
 struct DuckLakeVortexSourceBuffer {

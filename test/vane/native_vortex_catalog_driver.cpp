@@ -224,8 +224,9 @@ public:
 			}
 			return json.Finish(rows);
 		}
-		if (op == "build") {
-			auto result = SQL(writer, "SELECT * FROM ducklake_build_vortex_index('lake','main','items'," +
+		if (op == "build" || op == "append") {
+			auto function = op == "append" ? "ducklake_append_vortex_index_segment" : "ducklake_build_vortex_index";
+			auto result = SQL(writer, "SELECT * FROM " + string(function) + "('lake','main','items'," +
 			                              Value(args.at(2)).ToSQLString() + "," + Value(args.at(3)).ToSQLString() +
 			                              ",8," + args.at(4) + ")");
 			ViewJSON json;
@@ -234,7 +235,8 @@ public:
 			json.Text(value, "generation", StringValue::Get(result->GetValue(1, 0)));
 			return json.Finish(value);
 		}
-		if (op == "cancel-build" || op == "fail-build" || op == "crash-build") {
+		if (op == "cancel-build" || op == "fail-build" || op == "crash-build" || op == "cancel-append" ||
+		    op == "fail-append" || op == "crash-append") {
 			Connection builder(database);
 			return DuckLakeVortexIndex::BuildAndPublish(
 			           *builder.context, "lake", "main", "items", "knn", args.at(3), 8, std::stoull(args.at(4)),
@@ -242,9 +244,9 @@ public:
 				           if (stage != args.at(2)) {
 					           return;
 				           }
-				           if (op == "cancel-build") {
+				           if (op == "cancel-build" || op == "cancel-append") {
 					           builder.Interrupt();
-				           } else if (op == "fail-build") {
+				           } else if (op == "fail-build" || op == "fail-append") {
 					           throw InvalidInputException("Injected native build failure");
 				           } else {
 					           Write(root + "/build-" + stage + ".ready", "ready");
@@ -252,20 +254,22 @@ public:
 					           std::getline(std::cin, line);
 					           throw InvalidInputException("Build crash fixture resumed without SIGKILL");
 				           }
-			           })
+			           },
+			           "", optional_idx(), op.find("append") != string::npos)
 			    .ToJSON();
 		}
-		if (op == "split-build" || op == "mutate-build") {
+		if (op == "split-build" || op == "mutate-build" || op == "split-append") {
 			Connection builder(database);
 			Pause pause;
 			auto pending = std::async(std::launch::async, [&] {
-				return DuckLakeVortexIndex::BuildAndPublish(*builder.context, "lake", "main", "items", "knn",
-				                                            args.at(2), 8, std::stoull(args.at(3)),
-				                                            [&](const string &stage) {
-					                                            if (stage == args.at(4)) {
-						                                            pause.Stop();
-					                                            }
-				                                            });
+				return DuckLakeVortexIndex::BuildAndPublish(
+				    *builder.context, "lake", "main", "items", "knn", args.at(2), 8, std::stoull(args.at(3)),
+				    [&](const string &stage) {
+					    if (stage == args.at(4)) {
+						    pause.Stop();
+					    }
+				    },
+				    "", optional_idx(), op == "split-append");
 			});
 			ReleasePause release {pause};
 			pause.Wait();
@@ -273,13 +277,13 @@ public:
 			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
 			request.k = 10;
 			string before;
-			if (op == "split-build") {
+			if (op == "split-build" || op == "split-append") {
 				auto rows = DuckLakeVortexSearch::Execute(*writer.context, Options("knn"), request);
 				before = SearchJSON(rows.rows, rows.diagnostics);
 			}
 			SQL(writer, ReadText(args.at(5)));
 			string during;
-			if (op == "split-build") {
+			if (op == "split-build" || op == "split-append") {
 				auto rows = DuckLakeVortexSearch::Execute(*writer.context, Options("knn"), request);
 				during = SearchJSON(rows.rows, rows.diagnostics);
 			}
@@ -368,8 +372,8 @@ public:
 			}
 			return SearchJSON(rows, "{}");
 		}
-		if (op == "core-search" || op == "cache-search" || op == "cancel-search" || op == "fail-search" ||
-		    op == "held-search" || op == "split-search") {
+		if (op == "timed-core-search" || op == "core-search" || op == "cache-search" || op == "cancel-search" ||
+		    op == "fail-search" || op == "held-search" || op == "split-search") {
 			Connection query(database);
 			DuckLakeVortexSearchRequest request;
 			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
@@ -388,6 +392,32 @@ public:
 				    });
 				Require(evicted, "Cache query missed the visibility boundary");
 				return SearchJSON(result.rows, result.diagnostics);
+			}
+			if (op == "timed-core-search") {
+				auto phase = args.at(2);
+				Require(phase == "ann_us" || phase == "rerank_us", "Unknown timing fixture phase");
+				idx_t ann_calls = 0, rerank_calls = 0, observed_delay_us = 0;
+				auto result =
+				    DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request, [&](const string &stage) {
+					    ann_calls += stage == "before_ann";
+					    rerank_calls += stage == "segment_searched";
+					    if ((phase == "ann_us" && stage == "before_ann") ||
+					        (phase == "rerank_us" && stage == "segment_searched")) {
+						    auto started = std::chrono::steady_clock::now();
+						    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+						    observed_delay_us += std::chrono::duration_cast<std::chrono::microseconds>(
+						                             std::chrono::steady_clock::now() - started)
+						                             .count();
+					    }
+				    });
+				Require(ann_calls == 2 && rerank_calls == 2, "Timing fixture requires exactly two ANN segments");
+				ViewJSON json;
+				auto value = json.Object();
+				json.Text(value, "phase", phase);
+				json.Number(value, "ann_calls", ann_calls);
+				json.Number(value, "observed_delay_us", observed_delay_us);
+				json.Text(value, "query_json", SearchJSON(result.rows, result.diagnostics));
+				return json.Finish(value);
 			}
 			if (op == "core-search") {
 				auto result = DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request);
@@ -535,8 +565,10 @@ public:
 			SQL(writer, "SELECT * FROM ducklake_initialize_vortex_indexes('lake')");
 			return "{}";
 		}
-		if (op == "publish") {
-			auto result = SQL(writer, "SELECT * FROM ducklake_publish_vortex_index('lake','main','items'," +
+		if (op == "publish" || op == "publish-segment") {
+			auto function =
+			    op == "publish-segment" ? "ducklake_publish_vortex_index_segment" : "ducklake_publish_vortex_index";
+			auto result = SQL(writer, "SELECT * FROM " + string(function) + "('lake','main','items'," +
 			                              Value(args.at(2)).ToSQLString() + "," + Value(args.at(3)).ToSQLString() +
 			                              "," + args.at(4) + ")");
 			ViewJSON json;
@@ -632,7 +664,7 @@ public:
 			Save(args.at(5), pending.get());
 			return published.ToJSON();
 		}
-		if (op == "race" || op == "race-build") {
+		if (op == "race" || op == "race-build" || op == "race-append") {
 			std::promise<void> release;
 			auto start = release.get_future().share();
 			auto publish = [&](const string &path) {
@@ -644,7 +676,8 @@ public:
 						                                     8, std::stoull(args.at(5)));
 					} else {
 						DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), path,
-						                             std::stoull(args.at(5)), *owner.context);
+						                             std::stoull(args.at(5)), *owner.context, nullptr,
+						                             op == "race-append");
 					}
 					return true;
 				} catch (const TransactionException &error) {
