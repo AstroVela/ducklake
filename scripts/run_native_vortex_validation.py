@@ -39,9 +39,7 @@ def main() -> None:
         expected_error: str | None = None,
     ) -> None:
         started = time.monotonic()
-        result = subprocess.run(
-            command, cwd=root, capture_output=True, text=True, timeout=1200
-        )
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=1200)
         text = result.stdout + result.stderr
         (output / f"{name}.log").write_text(text)
         check = {
@@ -52,19 +50,13 @@ def main() -> None:
         report["checks"].append(check)
         if expected_error is not None:
             if result.returncode == 0 or expected_error not in text:
-                raise AssertionError(
-                    f"{name}: expected explicit rejection, see {output / (name + '.log')}"
-                )
+                raise AssertionError(f"{name}: expected explicit rejection, see {output / (name + '.log')}")
         elif result.returncode:
-            raise AssertionError(
-                f"{name}: exit {result.returncode}, see {output / (name + '.log')}"
-            )
+            raise AssertionError(f"{name}: exit {result.returncode}, see {output / (name + '.log')}")
         if sql_tests:
             counts = re.search(r"(\d+) assertions in (\d+) test cases?", text)
             if "All tests passed" not in text or counts is None or int(counts[2]) == 0:
-                raise AssertionError(
-                    f"{name}: native SQL tests did not complete, see {output / (name + '.log')}"
-                )
+                raise AssertionError(f"{name}: native SQL tests did not complete, see {output / (name + '.log')}")
             check.update(assertions=int(counts[1]), test_cases=int(counts[2]))
             skipped = re.search(r"(\d+) skipped tests?", text)
             check["skipped_tests"] = int(skipped[1]) if skipped else 0
@@ -72,9 +64,7 @@ def main() -> None:
 
     try:
         if args.mode == "OFF":
-            with tempfile.TemporaryDirectory(
-                prefix="ducklake-vortex-disabled-"
-            ) as directory:
+            with tempfile.TemporaryDirectory(prefix="ducklake-vortex-disabled-") as directory:
                 sql = (
                     "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; LOAD ducklake;"
                     f"ATTACH 'ducklake:{directory}/metadata.ducklake' AS lake (DATA_PATH '{directory}/data');"
@@ -130,6 +120,16 @@ def main() -> None:
                     str(duckdb),
                     "--file-format",
                     "vortex",
+                ],
+            )
+            run(
+                "vortex-cleanup",
+                [
+                    sys.executable,
+                    "-I",
+                    str(root / "test/vane/test_native_vortex_cleanup.py"),
+                    "--duckdb",
+                    str(duckdb),
                 ],
             )
         selection = ",".join(

@@ -1820,7 +1820,14 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 
 			// retry the transaction (with a new snapshot id)
 			// clear the inlined table caches - the rollback undid any table creation from the previous attempt
-			context.prepare_retry();
+			try {
+				context.prepare_retry();
+			} catch (...) {
+				// A retry can fail while restoring transaction-local options. The
+				// existing outcome guard retains files if a commit was uncertain.
+				CleanupFiles();
+				throw;
+			}
 		}
 	}
 	// If we got here, this snapshot was successful
