@@ -39,6 +39,24 @@ def ownership_baseline(native):
     return connections[0]["references"]
 
 
+def owner_probe_publication(native):
+    before = native.call("owners")
+    context_references = ownership_baseline(native)
+    published = native.call("owners-published-context")
+    connections = published["connections"]
+    require(published["database_references"] == before["database_references"] + 1, "Published control lost its database owner")
+    require(len(connections) == 2, "Published control was missing from the connection snapshot")
+    foreign = [row for row in connections if row["active"] is None]
+    writer = [row for row in connections if row["active"] is False]
+    require(len(foreign) == 1 and len(writer) == 1, "Probe inspected a foreign transaction or lost its idle writer")
+    require(all("connection_id" not in row for row in connections), "Probe inspected connection IDs before construction completed")
+    require(foreign[0]["references"] == 2, "Published control did not retain exactly its local and snapshot owners")
+    require(writer[0]["references"] == context_references, "Published control changed writer ownership")
+    after = native.call("owners")
+    require(after == before, "Published control did not unregister and release its context/database owners")
+    return {"before": before, "published": published, "after": after}
+
+
 def settled(native, context_references):
     deadline = time.monotonic() + 5
     while True:
@@ -234,6 +252,8 @@ def main():
                 "same strict driver with the old native archive reproduces retained database owners and fails shutdown"
             )
         native = CAT.Native(driver, root / "native")
+        report["owner_probe_publication"] = owner_probe_publication(native)
+        checks.append("published-but-unassigned foreign contexts expose only safe shared-owner counts")
         report.update(exercise(native, root, args.cycles, args.reopens, checks))
         native.finish()
         require(not list(scratch.iterdir()), "Native database close retained private leases")

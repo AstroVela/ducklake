@@ -30,6 +30,24 @@ string ReadText(const string &path) {
 	return string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
 }
 
+class PublishedContext {
+public:
+	explicit PublishedContext(DuckDB &database)
+	    : manager(database.instance->GetConnectionManager()),
+	      context(make_shared_ptr<ClientContext>(database.instance)) {
+		manager.AddConnection(*context);
+	}
+	~PublishedContext() {
+		manager.RemoveConnection(*context);
+	}
+	PublishedContext(const PublishedContext &) = delete;
+	PublishedContext &operator=(const PublishedContext &) = delete;
+
+private:
+	ConnectionManager &manager;
+	shared_ptr<ClientContext> context;
+};
+
 class Fixture {
 public:
 	Fixture(string root_p, bool create) : root(std::move(root_p)), database(nullptr), writer(database) {
@@ -77,26 +95,35 @@ public:
 		return json.Finish(value);
 	}
 
+	string Owners() {
+		ViewJSON json;
+		auto value = json.Object();
+		json.Number(value, "database_references", database.instance.use_count());
+		auto entries = json.Array();
+		// Foreign contexts are published before ID assignment; inspect shared ownership only.
+		for (auto &context : database.instance->GetConnectionManager().GetConnectionList()) {
+			auto item = json.Object();
+			json.Number(item, "references", context.use_count());
+			// Only this command's writer context is idle and exclusively owned here.
+			auto active = context == writer.context
+			                  ? yyjson_mut_bool(json.doc.get(), context->transaction.HasActiveTransaction())
+			                  : yyjson_mut_null(json.doc.get());
+			json.Add(item, "active", active);
+			yyjson_mut_arr_append(entries, item);
+		}
+		json.Add(value, "connections", entries);
+		return json.Finish(value);
+	}
+
 	string Execute(const vector<string> &args) {
 		const auto &op = args.at(1);
 		if (op == "owners") {
-			ViewJSON json;
-			auto value = json.Object();
-			json.Number(value, "database_references", database.instance.use_count());
-			auto entries = json.Array();
-			for (auto &context : database.instance->GetConnectionManager().GetConnectionList()) {
-				auto item = json.Object();
-				json.Number(item, "connection_id", context->GetConnectionId());
-				json.Number(item, "references", context.use_count());
-				// Only this command's writer context is idle and exclusively owned here.
-				auto active = context == writer.context
-				                  ? yyjson_mut_bool(json.doc.get(), context->transaction.HasActiveTransaction())
-				                  : yyjson_mut_null(json.doc.get());
-				json.Add(item, "active", active);
-				yyjson_mut_arr_append(entries, item);
-			}
-			json.Add(value, "connections", entries);
-			return json.Finish(value);
+			return Owners();
+		}
+		if (op == "owners-published-context") {
+			// Hold construction at its published-but-unassigned prefix.
+			PublishedContext pending(database);
+			return Owners();
 		}
 		if (op == "build-wrong-field") {
 			return DuckLakeVortexIndex::BuildAndPublish(*writer.context, "lake", "main", "items", "knn", args.at(2), 8,
