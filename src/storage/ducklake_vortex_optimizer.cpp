@@ -725,8 +725,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				}
 			}
 			Finish(db, pending, p, build ? "published" : "flushed", "", true);
-			if (p.kind == "merge") {
-				Stage(db, *pending, p, "optimizer_merged");
+			if (p.kind == "merge" && pending->observe) {
+				pending->observe("optimizer_merged");
 			}
 			if (pending->observe) {
 				pending->observe("optimizer_finished");

@@ -309,6 +309,75 @@ def background(driver, root, checks):
         stop(native)
 
 
+def completion_cancel(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, _, first, frozen, _ = setup(native, root)
+        native.call("optimizer-init")
+        native.call("optimizer-enable", artifacts, 100000, 4194304, 128, 67108864, "optimizer_merged", "pause")
+        SEG.add_f(native, 7000)
+        native.call("optimizer-wait")
+        finished = OPT.status(native)
+        require(
+            finished["state"] == "published"
+            and finished["task_kind"] == "merge"
+            and finished["published_revision"] == 4
+            and not finished["running"],
+            "Merge completion callback preceded terminal state persistence",
+        )
+        published = native.call("head", "knn")
+        require(
+            native.call("owners")["database_references"] == 3,
+            "Completed merge callback is not holding its worker database pin",
+        )
+        native.call("optimizer-cancel")
+        cancelled = OPT.status(native)
+        require(
+            cancelled["state"] == "cancelled" and not cancelled["enabled"] and not cancelled["error"],
+            "Cancellation did not persist its terminal state",
+        )
+        native.call("optimizer-release")
+        deadline = time.monotonic() + 5
+        while True:
+            owner = native.call("owners")
+            if owner["database_references"] == 2 and len(owner["connections"]) == 1:
+                break
+            require(time.monotonic() < deadline, f"Completed merge retained its worker pin: {owner}")
+            time.sleep(0.01)
+        after = OPT.status(native)
+        require(
+            after["state"] == "cancelled"
+            and not after["enabled"]
+            and not after["error"]
+            and not after["running"]
+            and after["run_count"] == finished["run_count"],
+            "Completed merge callback overwrote the caller's cancelled state",
+        )
+        require(native.call("head", "knn") == published, "Completed cancellation changed the committed merge")
+        SEG.unchanged(native, first, frozen)
+        native.call("reopen")
+        durable = OPT.status(native)
+        require(
+            durable["state"] == "cancelled" and not durable["enabled"] and not durable["error"],
+            "Reopen lost completed merge cancellation",
+        )
+        require(native.call("head", "knn") == published, "Reopen replaced the committed merge")
+        recalls = []
+        qualify(native, "completed-cancel", recalls, 2)
+        native.finish()
+        checks.append(
+            "completed merge cancellation survives callback return, worker-pin release and reopen without rewriting the committed head"
+        )
+        return {
+            "state_after_worker_release": after["state"],
+            "revision": published["revision"],
+            "worker_database_references": [3, 2],
+            "fixture_recalls": recalls,
+        }
+    finally:
+        stop(native)
+
+
 def crash(driver, root, stage, checks):
     native = CAT.Native(driver, root / "native")
     try:
@@ -472,6 +541,7 @@ def main():
             ("background", background),
             ("failure", failure),
             ("global-rows", global_rows),
+            ("completion-cancel", completion_cancel),
         ]:
             directory = root / name
             directory.mkdir()
