@@ -5,7 +5,7 @@ if(DUCKLAKE_ENABLE_VORTEX)
     duckdb_extension_load(parquet)
     duckdb_extension_load(vortex
         GIT_URL https://github.com/AstroVela/duckdb-vortex
-        GIT_TAG a4403c8fab0e8c697adbe8252d4fe6fbb1a312e4
+        GIT_TAG d2ee7fae92655b87c8934b74d5931e294f7cba8b
     )
 endif()
 
