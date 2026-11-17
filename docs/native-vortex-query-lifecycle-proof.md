@@ -6,9 +6,9 @@ the Vortex fixes through the native DuckDB-Vortex reader and shared query/probe
 dependencies. It adds no compatibility path or backend substitution.
 
 The dependency changes are [Vortex #28](https://github.com/AstroVela/vortex/pull/28)
-at `c44eba3096f01a5b7d556a549cd3b2462b6f43ba` and
+at `65346aaf1632f37ab889b821135cf669b56110fa` and
 [DuckDB-Vortex #37](https://github.com/AstroVela/duckdb-vortex/pull/37) at
-`a4403c8fab0e8c697adbe8252d4fe6fbb1a312e4`.
+`d2ee7fae92655b87c8934b74d5931e294f7cba8b`.
 
 ## Retained ownership
 
@@ -31,6 +31,8 @@ Two asynchronous ownership boundaries needed correction:
   handle requests cancellation without joining its current poll. Cleanup consumes
   a stored background panic; normal `next()` still propagates the original panic.
   Unrelated self-waking tasks do not prevent owned cleanup from finishing.
+  Once a queued join finishes, its completed receipt is removed from the live
+  parent. Pending descendant receipts remain available to acknowledge teardown.
 - `FileSegmentSource`'s idle request driver also owned its reader. It could keep
   the DuckDB filesystem handle and database alive after a scan completed. The
   source and live request futures now own reader leases; the idle driver holds a
@@ -100,8 +102,8 @@ Neither the owner probe nor the close wait drives another Vortex operation.
 
 | Binary | SHA-256 |
 | --- | --- |
-| Old native reader with final fixture and query archive | `d5b35bcb90a7d1d76f5df36407e3815244d9f55f41654ddf22750aec1fbb86fb` |
-| Fixed reader with the same fixture and query archive | `be3e49e6a9401cbaca46cf12b37a89ada957f91dc6089f476a7cd7db84ab4754` |
+| Old native reader with final fixture and query archive | `9c851da3326ac847c290574c52636edf0ed4d3f87d799c0ed4cb233cb96823a5` |
+| Fixed reader with the same fixture and query archive | `69d0ac392b5fabd93a35bf6cdd2407ca9cb1ee3330c65448f0f9564add123545` |
 
 Both ON and OFF builds passed 86 base SQL cases (3,582 assertions and 13 skips
 each) and Parquet crash recovery. ON also passed 19 Vortex SQL cases (773
@@ -116,7 +118,7 @@ Vortex functions checked by the proof.
 The shared query/probe workspace passed formatting, build and all-target,
 all-feature Clippy with warnings denied. It currently has no Rust unit cases;
 its query behavior is exercised by the native and probe-driven proofs above.
-The pinned Vortex revision passed 307 I/O/file tests, including 13 runtime and
+The pinned Vortex revision passed 308 I/O/file tests, including 14 runtime and
 four real-file lifecycle regressions, plus 164 index/SPFresh native tests and
 three index doctests. One existing file doctest is ignored. Both modified Vortex
 crates passed nightly formatting and all-target/all-feature Clippy with warnings
@@ -126,6 +128,13 @@ formatting in four unchanged DuckDB/FFI files whose blobs match the parent.
 The isolated counters run passed four cases with nine queries each at
 4,096/32,768 base rows, with and without a category prefilter. Projection, binary
 handoff and private-lease gates passed. Timings remain informational.
+
+An isolated allocation-counter regression keeps one parent alive across
+100,000 completed child cancellations and bounds live allocation growth after
+warm-up. The unfixed receipt bookkeeping retains about 13.4 MB; the fixed public
+counter probe stays around 73 KB after warm-up. The two-worker successful-await
+probe stays around 92 KB. These requested-allocation counters use no RSS or
+elapsed-time threshold. Native production-scale memory remains unmeasured.
 
 The existing local Vortex/native DuckDB-metadata scope, transaction protection,
 source/vector/artifact budgets, thread settings, distance tolerances and recall
