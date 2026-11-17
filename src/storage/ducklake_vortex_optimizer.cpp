@@ -211,16 +211,19 @@ DuckLakeTableEntry &Table(Metadata &meta, Policy &p) {
 		entry = catalog.GetEntry(*meta.connection.context, CatalogType::TABLE_ENTRY, p.config.schema, p.config.table,
 		                         OnEntryNotFound::THROW_EXCEPTION);
 	} else {
-		auto identity =
-		    meta.Query("SELECT table_id FROM {METADATA_CATALOG}.ducklake_table WHERE table_uuid=" + Quote(p.uuid) +
-		               " AND begin_snapshot<={SNAPSHOT_ID} AND "
-		               "(end_snapshot IS NULL OR end_snapshot>{SNAPSHOT_ID})");
+		auto snapshot = meta.transaction.GetSnapshot();
+		auto identity = meta.transaction.Query(
+		    snapshot, "SELECT table_id FROM {METADATA_CATALOG}.ducklake_table WHERE table_uuid=" + Quote(p.uuid) +
+		                  " AND begin_snapshot<={SNAPSHOT_ID} AND "
+		                  "(end_snapshot IS NULL OR end_snapshot>{SNAPSHOT_ID})");
+		if (identity->HasError()) {
+			identity->ThrowError();
+		}
 		auto row = identity->Fetch();
 		if (!row || row->size() != 1) {
 			throw InvalidInputException("Missing optimizer table identity");
 		}
-		entry = catalog.GetEntryById(meta.transaction, meta.transaction.GetSnapshot(),
-		                             TableIndex(row->GetValue(0, 0).GetValue<idx_t>()));
+		entry = catalog.GetEntryById(meta.transaction, snapshot, TableIndex(row->GetValue(0, 0).GetValue<idx_t>()));
 		if (!entry) {
 			throw InvalidInputException("Missing optimizer table identity");
 		}
