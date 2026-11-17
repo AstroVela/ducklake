@@ -49,6 +49,11 @@ of completed generations, including already removed files on explicit resume;
 they are not a measurement of that call's physical disk delta. Source/vector
 budgets, the three-B limit and write quotas remain unchanged.
 
+The managed DATA_PATH is expanded and resolved with the existing publication
+resolver, so supported relative and symlink data directories remain valid
+exclusion boundaries. Canonical and no-follow rules apply to index artifacts;
+resolving the data directory does not relax those artifact checks.
+
 The collector authenticates the cached manifest, checks the registered tree and
 remaining file checksums, then durably marks that generation `deleting` before
 the first unlink. POSIX directory descriptors and relative `openat`/`unlinkat`
@@ -119,30 +124,35 @@ This adds no background sweeper, orphan-directory scan, abandoned-candidate
 cleanup, source-file rewriting or SPFresh online updates. Failed candidates
 remain outside ownership until a later explicitly designed registration path.
 
-Local Linux qualification on 2026-11-17 used functional source `38a4e9a0`
+Local Linux qualification on 2026-11-17 used functional source `8b6be9bb`
 with reviewed #42 `eb90fc7d` merged in. DuckDB v1.5.5 (`d8cdaa33`), Vortex
 `b20e34c2`, codec `84cef204`, and SPFresh `5893eb61` with Vortex's pinned
 static-only patch were preserved. The final catalog driver SHA-256 was
-`0e71bddec63556cdc4234587f3b669139c07fb9dc561324f5b77d9731d098b29`.
+`aad678cb9f05dbce539e909200675452fcb9e61f1e63b9fbe3ccde2f279e0ccb`.
 
-The final GC process proof passed 34 checks and 148 fixture queries at recall
-1.0 in 64.8 seconds under the existing 180-second outer budget. It includes
+The final GC process proof passed 37 checks and 148 fixture recall checks
+at 1.0 in 68.5 seconds under the existing 180-second outer budget. It includes
 ten external-access/disabled-filesystem rejection and revocation cases, two
-directory-allowlisted collection/resumption controls, and cancellation while
-each collection/publication lock remains held. It also cancels valid search,
-append capture and selected-merge capture while GC stays paused with its guard.
-Each returns before GC unlock, releases its dedicated reader, preserves the
-ready head and artifact signatures, and survives reopen.
+directory-allowlisted collection/resumption controls, collector cancellation
+while admission/publication locks remain held, and valid search/append/merge
+capture cancellation while GC stays paused with its guard. Dedicated readers
+are released before GC unlock; head, artifact signatures and reopen stay valid.
+Canonical, relative and symlink DATA_PATH each build/publish twice, retire
+and actually collect the old generation, query before/after GC and preserve
+128 source rows and the current generation/reference. These add six exact SQL
+query-result checks to the fixture recall checks above.
 
 The original permission bypass and uninterruptible collector waits reproduced
-against an unchanged pre-fix native archive. A first independent Astra max
-review of `b135dedd` found the reverse shared-admission cancellation problem
-and reproduced query/selected-build blocking against that version's unchanged
-archive. The pinned engine has no cancellable shared StorageLock acquisition.
-The collection guard therefore keeps its own reader count and mutex with the
-same exclusion and writer preference, checks reader/caller interruption while
-waiting, and preserves Collection-to-Publication order and lease lifetime.
-No engine pin, thread setting or timeout was changed.
+against unchanged pre-fix native archives. A first independent Astra max review
+of `b135dedd` reproduced reverse shared-admission cancellation blocking. The
+pinned engine has no cancellable shared StorageLock acquisition; collection
+therefore keeps its own reader count and mutex with the same exclusion and
+writer preference. It checks reader/caller interruption and preserves
+Collection-to-Publication order and lease lifetime. A second independent review
+of `fc4bcf4e` reproduced GC rejecting valid relative/symlink DATA_PATH values.
+The collector now uses the existing publication resolver for that managed-data
+boundary. Artifact canonical/no-follow checks remain in place. All red/control
+results and successful regressions are retained.
 
 ON passed 23 Vortex SQL cases / 907 assertions, including shared named-index
 references surviving actual GC until their last owner is replaced. ON and OFF
@@ -159,9 +169,10 @@ scoped pinned C++/Python formatting passed. Existing Float32 tolerances
 Seventeen ordinary functional gates kept 180-second budgets. The separate
 counter/recall gate retained its existing 600-second outer limit and completed
 in 11.7 seconds with four cases / 36 queries at recall 1.0. Native RPC and
-cleanup limits remain 60 and 30 seconds. Source, header, object, link and SDK
-identities qualify reused build inputs; changed C++ was compiled and products
-relinked normally. These checks make no stable-load throughput or latency
-claim. CI was deferred. The earlier #42 large nonadjacent merge timeout remains
+cleanup limits remain 60 and 30 seconds. No engine pin, thread setting,
+transaction protection or timeout changed. Source/header/object/link/SDK
+identities qualify reused inputs; changed C++ was compiled and products
+relinked normally. These checks make no stable-load performance claim.
+CI was deferred. The earlier #42 large nonadjacent merge timeout remains
 separately tracked in [its qualification](native-vortex-segment-merge-proof.md);
-this GC change does not establish its cause or a fix.
+this GC change does not establish that anomaly's cause or a fix.
