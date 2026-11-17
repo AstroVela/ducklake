@@ -159,7 +159,81 @@ static void ExecuteIndexView(ClientContext &context, TableFunctionInput &input, 
 	state.finished = true;
 }
 
+struct GenerationBind : public TableFunctionData {
+	bool status;
+	vector<Value> args;
+};
+
+struct GenerationState : public GlobalTableFunctionState {
+	bool loaded = false;
+	idx_t offset = 0;
+	vector<vector<Value>> rows;
+};
+
+static unique_ptr<GlobalTableFunctionState> InitGeneration(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<GenerationState>();
+}
+
+template <bool STATUS>
+static unique_ptr<FunctionData> BindGeneration(ClientContext &, TableFunctionBindInput &input,
+                                               vector<LogicalType> &types, vector<string> &names) {
+	for (auto &arg : input.inputs) {
+		if (arg.IsNull()) {
+			throw InvalidInputException("Vortex generation arguments cannot be NULL");
+		}
+	}
+	if (!STATUS &&
+	    (input.inputs[1].GetValue<int64_t>() < 1 || input.inputs[1].GetValue<int64_t>() > 16 ||
+	     input.inputs[2].GetValue<int64_t>() < 1 || input.inputs[2].GetValue<int64_t>() > 64 * 1024 * 1024)) {
+		throw InvalidInputException("Invalid Vortex collection count or artifact byte budget");
+	}
+	auto bind = make_uniq<GenerationBind>();
+	bind->status = STATUS;
+	bind->args = input.inputs;
+	if (STATUS) {
+		names = {"index_root", "generation", "state", "artifact_bytes", "reference_count"};
+		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
+		         LogicalType::UBIGINT};
+	} else {
+		names = {"collected_generations", "collected_artifact_bytes", "remaining_generations"};
+		types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT};
+	}
+	return std::move(bind);
+}
+
+static void ExecuteGeneration(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &bind = input.bind_data->Cast<GenerationBind>();
+	auto &state = input.global_state->Cast<GenerationState>();
+	if (!state.loaded) {
+		auto catalog = StringValue::Get(bind.args[0]);
+		if (bind.status) {
+			Connection owner(*context.db);
+			state.rows = DuckLakeVortexIndex::GenerationStatus(owner, catalog);
+		} else {
+			auto result = DuckLakeVortexIndex::Collect(context, catalog, bind.args[1].GetValue<idx_t>(),
+			                                           bind.args[2].GetValue<idx_t>());
+			state.rows.push_back({Value::UBIGINT(result.generations), Value::UBIGINT(result.artifact_bytes),
+			                      Value::UBIGINT(result.remaining)});
+		}
+		state.loaded = true;
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && state.offset < state.rows.size()) {
+		auto &row = state.rows[state.offset++];
+		for (idx_t i = 0; i < row.size(); i++) {
+			output.SetValue(i, count, row[i]);
+		}
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader) {
+	loader.RegisterFunction(TableFunction("ducklake_collect_vortex_generations",
+	                                      {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                                      ExecuteGeneration, BindGeneration<false>, InitGeneration));
+	loader.RegisterFunction(TableFunction("ducklake_vortex_generation_status", {LogicalType::VARCHAR},
+	                                      ExecuteGeneration, BindGeneration<true>, InitGeneration));
 	for (auto &name : {"ducklake_merge_vortex_index_segments", "ducklake_publish_vortex_index_merge"}) {
 		loader.RegisterFunction(
 		    TableFunction(name,

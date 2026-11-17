@@ -17,15 +17,78 @@
 #include "mbedtls_wrapper.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <set>
+#include <thread>
+#ifndef _WIN32
+#include <cerrno>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace duckdb {
 using namespace duckdb_yyjson;
 using namespace vortex_detail;
 
+struct DuckLakeVortexCollectionLock::State {
+	std::mutex lock;
+	std::atomic<idx_t> readers {0};
+};
+
+DuckLakeVortexCollectionLock::DuckLakeVortexCollectionLock() : state(make_shared_ptr<State>()) {
+}
+
+DuckLakeVortexCollectionLock::Key::Key(shared_ptr<State> state_p, bool exclusive_p)
+    : state(std::move(state_p)), exclusive(exclusive_p) {
+}
+
+DuckLakeVortexCollectionLock::Key::~Key() {
+	if (exclusive) {
+		state->lock.unlock();
+	} else {
+		state->readers--;
+	}
+}
+
+unique_ptr<DuckLakeVortexCollectionLock::Key>
+DuckLakeVortexCollectionLock::GetSharedLock(const std::function<void()> &check) {
+	std::unique_lock<std::mutex> pending(state->lock, std::defer_lock);
+	while (!pending.try_lock()) {
+		check();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	check();
+	auto key = make_uniq<Key>(state, false);
+	state->readers++;
+	return key;
+}
+
+unique_ptr<DuckLakeVortexCollectionLock::Key>
+DuckLakeVortexCollectionLock::GetExclusiveLock(const std::function<void()> &check) {
+	std::unique_lock<std::mutex> pending(state->lock, std::defer_lock);
+	while (!pending.try_lock()) {
+		check();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	while (state->readers != 0) {
+		check();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	check();
+	auto key = make_uniq<Key>(state, true);
+	pending.release();
+	return key;
+}
+
 namespace {
 const char *CATALOG_TABLE = "ducklake_vortex_indexes_v1";
+const char *GENERATIONS = "ducklake_vortex_generations_v1";
+const char *GENERATION_REFS = "ducklake_vortex_generation_refs_v1";
 const idx_t MAX_MANIFEST = 1024 * 1024;
 const idx_t MAX_ARTIFACTS = 64 * 1024 * 1024;
 
@@ -126,24 +189,42 @@ void CheckInterrupted(Connection &owner, ClientContext &caller) {
 	}
 }
 
-void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
+bool CheckDirectoryAccess(ClientContext &context, const string &root) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	if (!fs.DirectoryExists(root)) {
-		throw IOException("Vortex index output directory does not exist: %s", root);
-	}
+	const bool exists = fs.DirectoryExists(root);
 	auto &config = DBConfig::GetConfig(context);
 	if (Settings::Get<EnableExternalAccessSetting>(config)) {
-		return;
+		return exists;
 	}
 	auto directory = config.SanitizeAllowedPath(root);
 	if (!StringUtil::EndsWith(directory, "/")) {
 		directory += "/";
 	}
-	// Construction creates generated descendants, which require directory-wide authorization.
+	// Native construction and collection access descendants through the qualified directory.
 	auto allowed = std::any_of(config.options.allowed_directories.begin(), config.options.allowed_directories.end(),
 	                           [&](const string &prefix) { return StringUtil::StartsWith(directory, prefix); });
 	if (!allowed) {
-		throw PermissionException("Vortex index construction cannot access output directory \"%s\"", root);
+		throw PermissionException("Vortex index cannot access directory \"%s\"", root);
+	}
+	return exists;
+}
+
+void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
+	if (!CheckDirectoryAccess(context, root)) {
+		throw IOException("Vortex index output directory does not exist: %s", root);
+	}
+}
+
+unique_ptr<StorageLockKey> AcquirePublicationLock(ClientContext &context) {
+	while (true) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto key = DuckLakeVortexIndex::PublicationLock().TryGetExclusiveLock();
+		if (key) {
+			return key;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 }
 
@@ -328,7 +409,7 @@ DuckLakeVortexIndex ParseCatalogReference(const string &bytes, const string &uui
 	return result;
 }
 
-void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index, const string &data_path, idx_t &remaining) {
+string VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index, const string &data_path, idx_t &remaining) {
 	Parsed reference(index.reference);
 	auto descriptor = Member(reference.Root(), "generation");
 	auto directory = fs.JoinPath(index.root, index.generation);
@@ -384,7 +465,269 @@ void VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index, const st
 		auto data = Verify(fs, fs.JoinPath(directory, "artifacts", path), artifact, remaining, data_path);
 		remaining -= data.size();
 	}
+	return bytes;
 }
+
+string GenerationWhere(const string &root, const string &generation) {
+	return " WHERE index_root=" + Value(root).ToSQLString() + " AND generation=" + Value(generation).ToSQLString();
+}
+
+void RegisterGeneration(DuckLakeTransaction &transaction, const DuckLakeVortexIndex &index, const string &manifest,
+                        idx_t artifact_bytes) {
+	auto where = GenerationWhere(index.root, index.generation);
+	auto result = DuckLakeVortexIndex::Query(
+	    transaction, "SELECT manifest,artifact_bytes,state FROM {METADATA_CATALOG}." + string(GENERATIONS) + where);
+	auto row = result->Fetch();
+	if (row && row->size()) {
+		if (StringValue::Get(row->GetValue(2, 0)) == "deleting") {
+			throw InvalidInputException("Vortex generation collection has already started");
+		}
+		if (StringValue::Get(row->GetValue(0, 0)) != manifest ||
+		    row->GetValue(1, 0).GetValue<idx_t>() != artifact_bytes) {
+			throw InvalidInputException("Registered Vortex generation identity changed");
+		}
+		DuckLakeVortexIndex::Query(transaction,
+		                           "UPDATE {METADATA_CATALOG}." + string(GENERATIONS) + " SET state='active'" + where);
+	} else {
+		DuckLakeVortexIndex::Query(transaction,
+		                           "INSERT INTO {METADATA_CATALOG}." + string(GENERATIONS) + " VALUES(" +
+		                               Value(index.root).ToSQLString() + "," + Value(index.generation).ToSQLString() +
+		                               "," + Value(index.reference).ToSQLString() + "," +
+		                               Value(manifest).ToSQLString() + "," + to_string(artifact_bytes) + ",'active')");
+	}
+}
+
+void UpdateGenerationRefs(DuckLakeTransaction &transaction, const string &uuid, const DuckLakeVortexIndex &index) {
+	auto owner =
+	    " WHERE table_uuid=" + Value(uuid).ToSQLString() + " AND index_name=" + Value(index.name).ToSQLString();
+	auto previous = DuckLakeVortexIndex::Query(transaction, "SELECT index_root,generation FROM {METADATA_CATALOG}." +
+	                                                            string(GENERATION_REFS) + owner);
+	vector<std::pair<string, string>> old;
+	while (auto chunk = previous->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			old.emplace_back(StringValue::Get(chunk->GetValue(0, row)), StringValue::Get(chunk->GetValue(1, row)));
+		}
+	}
+	DuckLakeVortexIndex::Query(transaction, "DELETE FROM {METADATA_CATALOG}." + string(GENERATION_REFS) + owner);
+	for (auto &segment : index.segments) {
+		DuckLakeVortexIndex::Query(
+		    transaction, "INSERT INTO {METADATA_CATALOG}." + string(GENERATION_REFS) + " VALUES(" +
+		                     Value(uuid).ToSQLString() + "," + Value(index.name).ToSQLString() + "," +
+		                     Value(segment.root).ToSQLString() + "," + Value(segment.generation).ToSQLString() + ")");
+	}
+	for (auto &entry : old) {
+		auto where = GenerationWhere(entry.first, entry.second);
+		auto result = DuckLakeVortexIndex::Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." +
+		                                                          string(GENERATION_REFS) + where);
+		if (!result->Fetch()->GetValue(0, 0).GetValue<idx_t>()) {
+			DuckLakeVortexIndex::Query(transaction, "UPDATE {METADATA_CATALOG}." + string(GENERATIONS) +
+			                                            " SET state='retired'" + where);
+		}
+	}
+}
+
+#ifndef _WIN32
+struct Descriptor {
+	explicit Descriptor(int32_t fd_p) : fd(fd_p) {
+	}
+	~Descriptor() {
+		close(fd);
+	}
+	int32_t fd;
+};
+
+unique_ptr<Descriptor> OpenDirectory(int32_t parent, const string &name, bool missing) {
+	auto fd = openat(parent, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0) {
+		if (missing && errno == ENOENT) {
+			return nullptr;
+		}
+		throw IOException("Cannot open registered Vortex directory without following links: %s", name);
+	}
+	return make_uniq<Descriptor>(fd);
+}
+
+unique_ptr<Descriptor> OpenRoot(const string &path, bool missing) {
+	if (path.empty() || path[0] != '/' || path.find('\0') != string::npos) {
+		throw InvalidInputException("Invalid registered Vortex root");
+	}
+	auto result = OpenDirectory(AT_FDCWD, "/", false);
+	for (auto &part : StringUtil::Split(path, '/')) {
+		if (!part.empty()) {
+			Relative(part, true);
+			result = OpenDirectory(result->fd, part, missing);
+			if (!result) {
+				return nullptr;
+			}
+		}
+	}
+	return result;
+}
+
+struct Parent {
+	unique_ptr<Descriptor> directory;
+	string name;
+};
+
+Parent OpenParent(int32_t root, const string &path, bool missing) {
+	Relative(path, false);
+	auto parts = StringUtil::Split(path, '/');
+	auto fd = dup(root);
+	if (fd < 0) {
+		throw IOException("Cannot retain registered Vortex directory");
+	}
+	auto directory = make_uniq<Descriptor>(fd);
+	for (idx_t i = 0; i + 1 < parts.size(); i++) {
+		directory = OpenDirectory(directory->fd, parts[i], missing);
+		if (!directory) {
+			break;
+		}
+	}
+	return {std::move(directory), parts.back()};
+}
+
+void SyncDirectory(int32_t fd) {
+	if (fsync(fd)) {
+		throw IOException("Cannot sync Vortex generation collection");
+	}
+}
+
+struct CollectedFile {
+	string path, checksum;
+	idx_t size;
+};
+
+struct CollectionPlan {
+	vector<CollectedFile> files;
+	std::set<string> directories;
+	std::set<string> paths;
+};
+
+CollectionPlan Plan(const string &reference, const string &manifest, idx_t artifact_bytes) {
+	if (reference.size() > MAX_MANIFEST || manifest.size() > MAX_MANIFEST || artifact_bytes > MAX_ARTIFACTS) {
+		throw InvalidInputException("Registered Vortex generation exceeds its byte budget");
+	}
+	Parsed parsed_reference(reference);
+	auto descriptor = Member(Member(parsed_reference.Root(), "generation"), "manifest");
+	if (Number(descriptor, "size") != manifest.size() || Text(descriptor, "checksum") != Hash(manifest)) {
+		throw InvalidInputException("Registered Vortex manifest identity changed");
+	}
+	Parsed parsed(manifest);
+	auto artifacts = Member(parsed.Root(), "artifacts");
+	Array(artifacts);
+	CollectionPlan plan;
+	idx_t remaining = artifact_bytes;
+	for (idx_t i = 0; i < yyjson_arr_size(artifacts); i++) {
+		auto artifact = yyjson_arr_get(artifacts, i);
+		Object(artifact, 3);
+		auto path = Text(artifact, "path");
+		Relative(path, false);
+		auto size = Number(artifact, "size");
+		if (size > remaining || !plan.paths.insert("artifacts/" + path).second) {
+			throw InvalidInputException("Invalid registered Vortex artifact inventory");
+		}
+		remaining -= size;
+		plan.files.push_back({"artifacts/" + path, Text(artifact, "checksum"), size});
+	}
+	if (remaining || plan.files.empty()) {
+		throw InvalidInputException("Registered Vortex artifact byte count mismatch");
+	}
+	plan.files.push_back({"manifest.json", Hash(manifest), manifest.size()});
+	plan.paths.insert("manifest.json");
+	for (auto &file : plan.files) {
+		for (auto pos = file.path.find('/'); pos != string::npos; pos = file.path.find('/', pos + 1)) {
+			plan.directories.insert(file.path.substr(0, pos));
+		}
+	}
+	return plan;
+}
+
+void InspectDirectory(int32_t fd, const string &prefix, const CollectionPlan &plan) {
+	auto copy = dup(fd);
+	if (copy < 0) {
+		throw IOException("Cannot inspect registered Vortex generation");
+	}
+	auto raw = fdopendir(copy);
+	if (!raw) {
+		close(copy);
+		throw IOException("Cannot enumerate registered Vortex generation");
+	}
+	std::unique_ptr<DIR, decltype(&closedir)> directory(raw, closedir);
+	while (true) {
+		errno = 0;
+		auto entry = readdir(directory.get());
+		if (!entry) {
+			if (errno) {
+				throw IOException("Cannot enumerate registered Vortex generation");
+			}
+			break;
+		}
+		auto name = string(entry->d_name);
+		if (name == "." || name == "..") {
+			continue;
+		}
+		auto path = prefix.empty() ? name : prefix + "/" + name;
+		struct stat info;
+		if (fstatat(fd, name.c_str(), &info, AT_SYMLINK_NOFOLLOW)) {
+			throw IOException("Cannot inspect registered Vortex path: %s", path);
+		}
+		if (plan.paths.count(path) && S_ISREG(info.st_mode)) {
+			continue;
+		}
+		if (plan.directories.count(path) && S_ISDIR(info.st_mode)) {
+			auto child = OpenDirectory(fd, name, false);
+			InspectDirectory(child->fd, path, plan);
+			continue;
+		}
+		throw InvalidInputException("Unexpected path in registered Vortex generation: %s", path);
+	}
+}
+
+void VerifyCollectedFile(int32_t root, const CollectedFile &file, bool missing) {
+	auto parent = OpenParent(root, file.path, missing);
+	if (!parent.directory) {
+		return;
+	}
+	auto raw = openat(parent.directory->fd, parent.name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+	if (raw < 0) {
+		if (missing && errno == ENOENT) {
+			return;
+		}
+		throw IOException("Cannot open registered Vortex artifact: %s", file.path);
+	}
+	Descriptor descriptor(raw);
+	struct stat info;
+	if (fstat(raw, &info) || !S_ISREG(info.st_mode) || info.st_size < 0 || idx_t(info.st_size) != file.size) {
+		throw InvalidInputException("Registered Vortex artifact size/type changed: %s", file.path);
+	}
+	string bytes(file.size, '\0');
+	idx_t offset = 0;
+	while (offset < bytes.size()) {
+		auto count = pread(raw, &bytes[offset], bytes.size() - offset, offset);
+		if (count < 0 && errno == EINTR) {
+			continue;
+		}
+		if (count <= 0) {
+			throw IOException("Cannot read registered Vortex artifact: %s", file.path);
+		}
+		offset += idx_t(count);
+	}
+	if (Hash(bytes) != file.checksum) {
+		throw InvalidInputException("Registered Vortex artifact checksum changed: %s", file.path);
+	}
+}
+
+void Unlink(int32_t root, const string &path, bool directory) {
+	auto parent = OpenParent(root, path, true);
+	if (!parent.directory) {
+		return;
+	}
+	if (unlinkat(parent.directory->fd, parent.name.c_str(), directory ? AT_REMOVEDIR : 0) && errno != ENOENT) {
+		throw IOException("Cannot remove registered Vortex path: %s", path);
+	}
+	SyncDirectory(parent.directory->fd);
+}
+#endif
 
 } // namespace
 
@@ -407,9 +750,11 @@ void DuckLakeVortexIndex::Rollback(Connection &owner) {
 
 void DuckLakeVortexIndex::Initialized(DuckLakeTransaction &transaction) {
 	auto &catalog = transaction.GetCatalog();
-	if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
-	                                           CATALOG_TABLE)) {
-		throw InvalidInputException("Vortex index catalog is not initialized");
+	for (auto &name : {CATALOG_TABLE, GENERATIONS, GENERATION_REFS}) {
+		if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+		                                           name)) {
+			throw InvalidInputException("Vortex index catalog is not initialized");
+		}
 	}
 }
 
@@ -426,6 +771,11 @@ StorageLock &DuckLakeVortexIndex::PublicationLock() {
 	return lock;
 }
 
+DuckLakeVortexCollectionLock &DuckLakeVortexIndex::CollectionLock() {
+	static DuckLakeVortexCollectionLock lock;
+	return lock;
+}
+
 void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog, ClientContext &caller) {
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex index catalog requires an idle dedicated connection");
@@ -439,12 +789,192 @@ void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog, C
 		      "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_indexes_v1("
 		      "table_uuid VARCHAR NOT NULL,index_name VARCHAR NOT NULL,revision BIGINT NOT NULL CHECK(revision>0),"
 		      "index_root VARCHAR NOT NULL,reference VARCHAR NOT NULL,PRIMARY KEY(table_uuid,index_name))");
+		Query(transaction, "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_generations_v1("
+		                   "index_root VARCHAR NOT NULL,generation VARCHAR NOT NULL,reference VARCHAR NOT "
+		                   "NULL,manifest VARCHAR NOT NULL,"
+		                   "artifact_bytes BIGINT NOT NULL CHECK(artifact_bytes>=0),state VARCHAR NOT NULL "
+		                   "CHECK(state IN ('active','retired','deleting')),PRIMARY KEY(index_root,generation))");
+		Query(transaction, "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_generation_refs_v1("
+		                   "table_uuid VARCHAR NOT NULL,index_name VARCHAR NOT NULL,index_root VARCHAR NOT "
+		                   "NULL,generation VARCHAR NOT NULL,"
+		                   "PRIMARY KEY(table_uuid,index_name,index_root,generation))");
 		CheckInterrupted(owner, caller);
 		owner.Commit();
 	} catch (...) {
 		Rollback(owner);
 		throw;
 	}
+}
+
+vector<vector<Value>> DuckLakeVortexIndex::GenerationStatus(Connection &owner, const string &catalog) {
+	try {
+		auto &transaction = Begin(owner, catalog);
+		Initialized(transaction);
+		auto result = Query(
+		    transaction,
+		    "SELECT g.index_root,g.generation,g.state,g.artifact_bytes,count(r.generation) FROM {METADATA_CATALOG}." +
+		        string(GENERATIONS) + " g LEFT JOIN {METADATA_CATALOG}." + GENERATION_REFS +
+		        " r ON g.index_root=r.index_root AND g.generation=r.generation "
+		        "GROUP BY g.index_root,g.generation,g.state,g.artifact_bytes ORDER BY g.index_root,g.generation");
+		vector<vector<Value>> rows;
+		while (auto chunk = result->Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				rows.push_back({chunk->GetValue(0, row), chunk->GetValue(1, row), chunk->GetValue(2, row),
+				                Value::UBIGINT(chunk->GetValue(3, row).GetValue<idx_t>()),
+				                Value::UBIGINT(chunk->GetValue(4, row).GetValue<idx_t>())});
+			}
+		}
+		owner.Commit();
+		return rows;
+	} catch (...) {
+		Rollback(owner);
+		throw;
+	}
+}
+
+DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, const string &catalog,
+                                                    idx_t max_generations, idx_t max_artifact_bytes,
+                                                    const std::function<void(const string &)> &observe) {
+	if (!max_generations || max_generations > 16 || !max_artifact_bytes || max_artifact_bytes > MAX_ARTIFACTS) {
+		throw InvalidInputException("Invalid Vortex collection count or artifact byte budget");
+	}
+#ifdef _WIN32
+	throw NotImplementedException("Native Vortex generation collection is qualified on POSIX paths");
+#else
+	string generation_path;
+	auto check = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		if (!generation_path.empty()) {
+			CheckDirectoryAccess(context, generation_path);
+		}
+	};
+	check("gc_waiting");
+	auto admissions = CollectionLock().GetExclusiveLock([&] {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
+	auto publication = AcquirePublicationLock(context);
+	check("gc_acquired");
+	Connection owner(*context.db);
+	DuckLakeVortexGCResult collected;
+	try {
+		auto &transaction = Begin(owner, catalog);
+		Initialized(transaction);
+		auto result =
+		    Query(transaction,
+		          "SELECT index_root,generation,reference,manifest,artifact_bytes,state FROM {METADATA_CATALOG}." +
+		              string(GENERATIONS) +
+		              " g WHERE state IN ('retired','deleting') AND NOT EXISTS "
+		              "(SELECT 1 FROM {METADATA_CATALOG}." +
+		              GENERATION_REFS +
+		              " r WHERE r.index_root=g.index_root AND r.generation=g.generation) "
+		              "ORDER BY index_root,generation LIMIT " +
+		              to_string(max_generations));
+		vector<vector<Value>> entries;
+		while (auto chunk = result->Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				vector<Value> entry;
+				for (idx_t col = 0; col < 6; col++) {
+					entry.push_back(chunk->GetValue(col, row));
+				}
+				entries.push_back(std::move(entry));
+			}
+		}
+		auto managed = transaction.GetCatalog().DataPath();
+		owner.Commit();
+		if (!entries.empty()) {
+			managed = FileSystem::GetFileSystem(context).ExpandPath(managed);
+			while (managed.size() > 1 && managed.back() == '/') {
+				managed.pop_back();
+			}
+			managed = ResolveLocalPath(managed);
+		}
+		for (auto &entry : entries) {
+			auto bytes = entry[4].GetValue<idx_t>();
+			if (bytes > max_artifact_bytes - collected.artifact_bytes) {
+				break;
+			}
+			auto root = StringValue::Get(entry[0]);
+			if (root == managed || StringUtil::StartsWith(root, managed == "/" ? managed : managed + "/")) {
+				throw InvalidInputException("Vortex collection root must be outside managed data");
+			}
+			auto generation = StringValue::Get(entry[1]);
+			auto reference = StringValue::Get(entry[2]);
+			auto manifest = StringValue::Get(entry[3]);
+			const bool resume = StringValue::Get(entry[5]) == "deleting";
+			Relative(generation, true);
+			generation_path = FileSystem::GetFileSystem(context).JoinPath(root, generation);
+			CheckDirectoryAccess(context, generation_path);
+			Parsed parsed(reference);
+			auto index =
+			    ParseReference(reference, Text(parsed.Root(), "table_uuid"), Number(parsed.Root(), "field_id"));
+			if (index.generation != generation) {
+				throw InvalidInputException("Registered Vortex generation identity changed");
+			}
+			auto plan = Plan(reference, manifest, bytes);
+			auto directory = OpenRoot(root, resume);
+			auto stored = directory ? OpenDirectory(directory->fd, generation, resume) : nullptr;
+			struct stat identity;
+			if (stored) {
+				if (fstat(stored->fd, &identity)) {
+					throw IOException("Cannot identify registered Vortex generation");
+				}
+				InspectDirectory(stored->fd, "", plan);
+				for (auto &file : plan.files) {
+					check("gc_verifying");
+					VerifyCollectedFile(stored->fd, file, resume);
+				}
+			}
+			check("gc_validated");
+			auto where = GenerationWhere(root, generation);
+			auto &mark = Begin(owner, catalog);
+			Query(mark, "UPDATE {METADATA_CATALOG}." + string(GENERATIONS) + " SET state='deleting'" + where);
+			owner.Commit();
+			check("gc_deleting");
+			if (stored) {
+				for (auto &file : plan.files) {
+					check("gc_before_unlink");
+					Unlink(stored->fd, file.path, false);
+					check("gc_file_deleted");
+				}
+				for (auto path = plan.directories.rbegin(); path != plan.directories.rend(); ++path) {
+					check("gc_before_unlink");
+					Unlink(stored->fd, *path, true);
+				}
+				struct stat current;
+				if (fstatat(directory->fd, generation.c_str(), &current, AT_SYMLINK_NOFOLLOW) ||
+				    current.st_dev != identity.st_dev || current.st_ino != identity.st_ino) {
+					throw IOException("Registered Vortex directory identity changed during collection");
+				}
+				check("gc_before_unlink");
+				Unlink(directory->fd, generation, true);
+			}
+			check("gc_files_deleted");
+			auto &finish = Begin(owner, catalog);
+			Query(finish, "DELETE FROM {METADATA_CATALOG}." + string(GENERATIONS) + where);
+			check("gc_before_finish");
+			owner.Commit();
+			collected.generations++;
+			collected.artifact_bytes += bytes;
+			check("gc_after_finish");
+		}
+		auto &remaining = Begin(owner, catalog);
+		auto count = Query(remaining, "SELECT count(*) FROM {METADATA_CATALOG}." + string(GENERATIONS) +
+		                                  " WHERE state IN ('retired','deleting')");
+		collected.remaining = count->Fetch()->GetValue(0, 0).GetValue<idx_t>();
+		owner.Commit();
+		return collected;
+	} catch (...) {
+		Rollback(owner);
+		throw;
+	}
+#endif
 }
 
 DuckLakeVortexIndex DuckLakeVortexIndex::ParseSegments(const string &reference, const string &uuid, idx_t field_id) {
@@ -731,7 +1261,9 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 			auto part = ParseReference(segment.reference, table.GetTableUUID(), field.GetFieldIndex().index);
 			part.root = segment.root;
 			CheckInterrupted(owner, caller);
-			VerifyGeneration(fs, part, data_path, artifact_budget);
+			auto before = artifact_budget;
+			auto manifest = VerifyGeneration(fs, part, data_path, artifact_budget);
+			RegisterGeneration(transaction, part, manifest, before - artifact_budget);
 		}
 		CheckInterrupted(owner, caller);
 		auto source_guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
@@ -756,6 +1288,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 		candidate.ValidateCoverage(files);
 		candidate.name = name;
 		candidate.revision = revision + 1;
+		UpdateGenerationRefs(transaction, table.GetTableUUID(), candidate);
 		if (observe) {
 			observe("after_validation");
 		}
