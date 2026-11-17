@@ -12,5 +12,5 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-vortex = { git = "https://github.com/AstroVela/vortex.git", rev = "9066434c8b649e25c5d88e0a1bf74753fbf5ff1f" }
-vortex-index = { git = "https://github.com/AstroVela/vortex.git", rev = "9066434c8b649e25c5d88e0a1bf74753fbf5ff1f", features = ["file", "local-store"] }
+vortex = { git = "https://github.com/AstroVela/vortex.git", rev = "b20e34c2abe63dd8f1b886b370d060b0b1ce499b" }
+vortex-index = { git = "https://github.com/AstroVela/vortex.git", rev = "b20e34c2abe63dd8f1b886b370d060b0b1ce499b", features = ["file", "local-store"] }
