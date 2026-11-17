@@ -77,7 +77,10 @@ An active native operation may finish while owning its connection; teardown
 checks wait for those owners without issuing another Vortex operation. The
 probe reads transaction state only for its command-exclusive writer connection.
 Other registered contexts prevent the settled condition without reading their
-concurrently changing transaction state.
+concurrently changing transaction state or connection IDs. Connection IDs are
+assigned after context publication, so they are omitted from this diagnostic.
+A fixed published-but-unassigned context control checks the safe owner snapshot
+and its return to the original ownership baseline after unregistering.
 
 The optional `--baseline-driver` runs the identical minimal scenario with the
 old native reader archive. Qualification requires observing the extra owners
@@ -109,8 +112,8 @@ Neither the owner probe nor the close wait drives another Vortex operation.
 
 | Binary | SHA-256 |
 | --- | --- |
-| Old native reader with final fixture and query archive | `9dfee519541f6207e01812fbe8f8f0af7dc4bf8361ef8512bf4e48ccc969b845` |
-| Fixed reader with the same fixture and query archive | `40691d699c597fb8b6dc6be8dde1eaaee4668bb7625fc810cacdcbb518587f9e` |
+| Old native reader with final fixture and query archive | `d84ee1d35c446754bb5b8e45954e26b934c71a116047a43c28fff6eac4952089` |
+| Fixed reader with the same fixture and query archive | `bd667568e4bb73b8e8014f2e786db6115794064d5c6a533810c9c567737fab9d` |
 
 Both ON and OFF builds passed 86 base SQL cases (3,582 assertions and 13 skips
 each) and Parquet crash recovery. ON also passed 19 Vortex SQL cases (773
@@ -163,3 +166,10 @@ source/vector/artifact budgets, thread settings, distance tolerances and recall
 requirement still apply. Started blocking I/O keeps its real handle until it
 finishes. This qualifies ownership for these cases; writer backpressure,
 distributed optimizer ownership and production capacity remain separate work.
+
+One local qualification attempt timed out while building the `file:` data-path
+case (the existing 60-second command limit), and its shutdown did not finish
+within 30 seconds. Two unchanged-binary, unchanged-configuration repeats passed
+within the same 180-second proof budget without monitored stalls. The cause of
+the initial timeout remains unconfirmed. The failed run and both successful
+repeats are retained; no timeout or ownership gate was relaxed.
