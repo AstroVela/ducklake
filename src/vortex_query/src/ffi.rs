@@ -146,7 +146,8 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
             "source_pinned" => Some("source_open_us"),
             "after_open" => Some("index_open_us"),
             "before_ann" => Some("filter_us"),
-            "after_ann" => Some("ann_us"),
+            "segment_searched" | "after_ann" => Some("ann_us"),
+            "segment_reranked" => Some("rerank_us"),
             "before_scan" => Some("rerank_us"),
             "inline_top_k" => Some("file_scan_us"),
             "before_fetch" => Some("inline_merge_us"),
@@ -155,9 +156,8 @@ unsafe fn execute(input: &Input) -> VortexResult<Output> {
         };
         if let Some(phase) = phase {
             let now = Instant::now();
-            phases
-                .borrow_mut()
-                .insert(phase, now.duration_since(*last.borrow()).as_micros() as u64);
+            *phases.borrow_mut().entry(phase).or_default() +=
+                now.duration_since(*last.borrow()).as_micros() as u64;
             *last.borrow_mut() = now;
         }
 

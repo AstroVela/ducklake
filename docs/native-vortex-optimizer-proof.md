@@ -30,6 +30,8 @@ it does not pin or decode every B file just to decide whether work is due.
 
 Initialization and policy installation are explicit. Duplicate initialization,
 duplicate policy, unsupported configuration and invalid thresholds fail. The
+public C++ initializer requires an idle dedicated connection and preserves an
+existing caller transaction when rejecting that connection. The
 prototype requires native DuckDB metadata, the existing four business columns,
 unencrypted local Vortex output and `auto_compact=true`. It binds table UUID and
 embedding field ID, including the interval between scheduling and capture.
@@ -37,6 +39,12 @@ The existing canonical absolute paths and outside-managed-data root restrictions
 apply. There is no migration, backend substitution or error-to-scan path.
 Enable prepares the managed data root if an empty/inline-only table has not
 created it yet, so the first threshold-triggered flush can write there.
+The output root must be an existing directory before the policy is persisted.
+An invalid root leaves the index available for a subsequent valid enable call.
+
+Inline aggregates resolve the physical names in each source schema using the
+current embedding, category and payload field IDs. Their row, byte and vector
+dimension checks use the existing committed query snapshot.
 
 ## Scheduling and publication
 
@@ -44,6 +52,9 @@ One worker per database serializes at most 16 registered policies, with at most
 one build in flight. It first flushes due committed T using DuckLake's existing
 transactional flush; if the resulting F meets a threshold, it invokes the shared
 native builder. A run may finish as `flushed` without building if F remains small.
+A successful flush can return zero rows when another connection has already
+flushed the scheduled T. The worker commits that operation and probes committed
+T/F again to apply the same F thresholds and continue automatic scheduling.
 Bootstrap captures all current physical files. The
 [two-segment follow-up](native-vortex-segments-proof.md) then builds only new F
 into an independent static SPFresh generation, preserving existing B. The
@@ -85,11 +96,19 @@ and the exact selected merge generations. Metrics describe the latest
 probe and may lag a just-completed operation until the next check.
 
 Cancellation first persists disabled intent, then interrupts the worker's
-dedicated context. Cancellation is cooperative at the existing native
+dedicated context within the same policy I/O critical section used by resume.
+Cancellation is cooperative at the existing native
 checkpoints; an SPFresh native build call completes before its next check.
 Uncommitted failure disables the policy and preserves its reason. Explicit
 resume plans work from fresh committed table state. Failed/cancelled candidates
 can remain outside managed data; generation collection is not introduced here.
+
+Each enable or resume installs a distinct in-memory policy registration.
+Scheduling, task completion and error handling apply results only while their
+originating registration is current. This also covers an older worker error
+that reaches final handling after a successful resume.
+Terminal-state persistence and release of local activity share the policy I/O
+critical section, so cancellation after task completion records `cancelled`.
 
 Before publication, the worker persists the sealed candidate generation and
 expected revision. Failure after commit and explicit resume after process restart
@@ -115,6 +134,20 @@ concurrent business writes and exact/ANN queries, post-capture F/T, cancellation
 terminal failure and explicit resume, lost publication ACK, SIGKILL on both sides
 of commit, a mismatched vector field ID, table drop/recreate, invalid flush
 configuration after an earlier success, and active/idle database shutdown.
+
+Deterministic flush regressions pause the worker at `optimizer_before_flush`
+while another connection commits the manual flush. They check both F threshold
+outcomes, later automatic scheduling, visible row counts and ready-file coverage.
+Historical-column cases check quoted vector/category/payload names across three
+inline schemas, pre-flush business values, row/byte thresholds and published
+coverage. The output-root cases check rejection before policy insertion and a
+subsequent successful enable for the same index.
+An error-handling regression pauses an unavailable-catalog error, reattaches the
+catalog and resumes the policy, then releases the old error and checks automatic
+publication of subsequently committed rows.
+Direct-interface initialization checks retain an active caller transaction and
+its uncommitted row. A completed-task observer checks cancellation at the
+terminal-state boundary while retaining the published generation.
 
 It records task counts and generation IDs to distinguish reconciliation from
 duplicate publication, and checks recall against committed visible-row ground

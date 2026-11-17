@@ -81,6 +81,22 @@ def exercise(proof, native, root, checks, workers):
     )
     core, rows = qualify(native, "three-B", recalls, 3)
     require(core["diagnostics"]["routes"]["scan_files"] and core["diagnostics"]["routes"]["inline_rows"], "Missing F/T")
+    phase_checks = []
+    for phase in ["ann_us", "rerank_us"]:
+        observed = native.call("timed-core-search", phase, 3)
+        timed = json.loads(observed["query_json"])
+        measured = timed["diagnostics"]["cost"]["phases_us"][phase]
+        require(
+            observed["ann_calls"] == 3 and observed["observed_delay_us"] > 0,
+            "Timing fixture did not visit three ANN segments",
+        )
+        require(measured >= observed["observed_delay_us"], f"{phase} omitted work from a ready segment")
+        require(timed["rows"] == core["rows"], "Three-segment timing changed query results")
+        recalls.append(SEARCH.qualify(timed, rows, VECTOR))
+        phase_checks.append(
+            {"phase": phase, "observed_delay_us": observed["observed_delay_us"], "reported_us": measured}
+        )
+    checks.append("three-segment ANN/rerank timing accumulates observed delays without stable-load speed assertions")
     native.call("append", "knn", merged / "fourth.json", 3, expected="segment count budget exceeded")
     native.call("merge", merged / "missing.json", 3, "missing", chosen[0], expected="no longer ready")
     native.call("merge", merged / "duplicate.json", 3, chosen[0], chosen[0], expected="two distinct ready generations")
@@ -178,6 +194,7 @@ def exercise(proof, native, root, checks, workers):
         "fixture_recalls": recalls,
         "final_revision": 7,
         "selected_rows": 256,
+        "phase_checks": phase_checks,
         "unchanged_generation": generation(first),
     }
 
