@@ -58,7 +58,7 @@ impl CatalogIndex {
             || name.is_empty()
             || self.revision == 0
             || self.reference.format_version != 2
-            || !(1..=2).contains(&self.reference.segments.len())
+            || !(1..=3).contains(&self.reference.segments.len())
             || self
                 .reference
                 .segments

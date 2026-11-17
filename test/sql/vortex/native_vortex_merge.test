@@ -1,0 +1,125 @@
+# name: test/sql/vortex/native_vortex_merge.test
+# description: merge only selected B generations and preserve the other B, F and T
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_merge.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_merge_data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','B1' FROM range(128)t(i)
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/merge-B1.json',2,0)
+----
+1
+
+statement ok
+INSERT INTO lake.items SELECT 1000+i,[0.125+i,0],'B','B2' FROM range(128)t(i)
+
+query I
+SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/merge-B2.json',2,1)
+----
+2
+
+statement ok
+INSERT INTO lake.items SELECT 2000+i,[0.0625+i,0],'C','B3' FROM range(128)t(i)
+
+query I
+SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/merge-B3.json',2,2)
+----
+3
+
+statement ok
+SET VARIABLE ready_generations = (SELECT regexp_extract_all(admission,'"generation":"([^"]+)"',1) FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000))
+
+statement error
+SELECT * FROM ducklake_merge_vortex_index_segments('lake','main','items','knn','unused',getvariable('ready_generations')[2:2],3)
+----
+two distinct ready generations
+
+statement error
+SELECT * FROM ducklake_merge_vortex_index_segments('lake','main','items','knn','unused',['missing',getvariable('ready_generations')[2]],3)
+----
+selected generation is no longer ready
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')
+
+statement ok
+INSERT INTO lake.items SELECT 3000+i,[0.03125+i,0],'D','F' FROM range(128)t(i)
+
+statement ok
+INSERT INTO lake.items VALUES(4000,[0.015625,0],'E','实时-T')
+
+statement error
+SELECT * FROM ducklake_publish_vortex_index_merge('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/merge-B2.json',getvariable('ready_generations')[2:3],3)
+----
+exactly the selected segments
+
+query I
+SELECT revision FROM ducklake_merge_vortex_index_segments('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/merge-B23.json',getvariable('ready_generations')[2:3],3)
+----
+4
+
+query II
+SELECT array_length(regexp_extract_all(admission,'"generation":"[^"]+"')),regexp_extract(admission,'"generation":"([^"]+)"',1)=getvariable('ready_generations')[1] FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+----
+2	true
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'A')
+----
+0
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'B')
+----
+1000
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'C')
+----
+2000
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'D')
+----
+3000
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1,category=>'E')
+----
+4000
+
+statement error
+SELECT * FROM ducklake_publish_vortex_index_merge('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/merge-B23.json',getvariable('ready_generations')[2:3],3)
+----
+revision conflict
+
+query I
+SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/merge-B4.json',2,4)
+----
+5
+
+query I
+SELECT array_length(regexp_extract_all(admission,'"generation":"[^"]+"')) FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
+----
+3
+
+statement ok
+DETACH lake

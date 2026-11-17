@@ -39,12 +39,13 @@ Old catalog reference values are rejected; no migration or alternate decoder
 is added. Explicit full build/publication remains an operator-requested
 replacement that consolidates to one segment.
 
-The background optimizer bootstraps once, then uses the append path. This
-validation allows at most two B segments. A third promotion returns `RESOURCE_EXHAUSTED`
-and stops the policy; it never rebuilds existing B automatically. Acknowledged
+The background optimizer bootstraps once, then uses the append path. The #41
+qualification bounded the catalog to two B segments. The
+[selective merge follow-up](native-vortex-segment-merge-proof.md) extends that
+bound to three and schedules a separate two-smallest-B merge when full and F
+is due. Direct append at the limit returns `RESOURCE_EXHAUSTED`. Acknowledged
 B/F/T stays queryable, and durable write quotas remain active. Explicit full
-consolidation restores a free segment slot. Automatic compaction and production
-segment-count policy remain later work.
+consolidation remains an operator-requested replacement.
 
 ## One retained view and aggregate budgets
 
@@ -92,12 +93,12 @@ is not rebuilt, and an uncommitted candidate is never silently replayed.
 The proof also holds a native SQL query and an independent retained view across
 replacement, real source GC and removal of both original generations, then
 queries and fetches from those old views. Aggregate artifact and physical-row
-limits, background B2 promotion, explicit two-slot exhaustion, persistent write
+limits, background B2/B3 promotion, explicit segment-count exhaustion, persistent write
 quotas and operator consolidation have separate assertions. Strict database
 shutdown and empty private lease directories are required. Minimal SQL cases,
 the existing process proofs and ON/OFF SQL/recovery suites run in CI.
 
-Local Linux qualification on 2026-11-17 used functional source `53a7db01`,
+The #41 local Linux qualification on 2026-11-17 used functional source `53a7db01`,
 DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`, codec `84cef204`, and SPFresh
 `5893eb61` with the pinned Vortex static-only patch. The final catalog driver
 SHA-256 is `6967e52295f0091f0c5a3287039a198cc96fa9a72b1e8b56110e4a249a6acf52`.
