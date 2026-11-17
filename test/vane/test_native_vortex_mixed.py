@@ -510,7 +510,7 @@ def main() -> None:
     report = {
         "duckdb_sha256": BASE.digest(proof.duckdb),
         "probe_sha256": BASE.digest(proof.probe),
-        "vortex_revision": "307eaf56644845f45dfe6099d7148e6b6afb17a5",
+        "vortex_revision": BASE.VORTEX_REVISION,
     }
     started = time.monotonic()
     try:

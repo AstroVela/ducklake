@@ -34,7 +34,7 @@ jobs:
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg,readwrite
       VCPKG_MAX_CONCURRENCY: '2'
       DISABLE_EXTENSIONS_FOR_TEST: '1'
-      VORTEX_REVISION: 307eaf56644845f45dfe6099d7148e6b6afb17a5
+      VORTEX_REVISION: b20e34c2abe63dd8f1b886b370d060b0b1ce499b
       VORTEX_SPFRESH_NATIVE: ${{ github.workspace }}/build/spfresh/build
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -149,7 +149,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_TARGET_DIR: ${{ github.workspace }}/build/index-cargo
       VORTEX_SPFRESH_NATIVE: ${{ github.workspace }}/build/spfresh/build
-      VORTEX_REVISION: 307eaf56644845f45dfe6099d7148e6b6afb17a5
+      VORTEX_REVISION: b20e34c2abe63dd8f1b886b370d060b0b1ce499b
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -236,6 +236,11 @@ jobs:
           python3 -I test/vane/test_native_vortex_build.py \
             --driver build/index-shell/ducklake_vortex_catalog_driver \
             --output-dir build/index-logs/native-build
+      - name: Validate query ownership and same-process database shutdown
+        run: |
+          python3 -I test/vane/test_native_vortex_lifecycle.py \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --output-dir build/index-logs/query-lifecycle
       - name: Validate background T-to-F-to-B optimization and task recovery
         run: |
           python3 -I test/vane/test_native_vortex_optimizer.py \
