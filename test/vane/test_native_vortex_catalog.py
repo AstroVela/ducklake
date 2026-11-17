@@ -141,14 +141,14 @@ def exercise(proof, native: Native, workers: list[Worker], checks: list[str]) ->
     native.call("cancel-publish", "knn", refs["b"], 1)
     cancelled = native.call("head", "knn")
     require(
-        cancelled["revision"] == 1 and cancelled["reference"] == descriptors["a"],
+        cancelled["revision"] == 1 and single_reference(cancelled) == descriptors["a"],
         "publication cancelled before its metadata transaction changed the ready index",
     )
     for stage in ("after_validation", "before_commit"):
         native.call("cancel-stage", "knn", refs["b"], 1, stage)
         cancelled = native.call("head", "knn")
         require(
-            cancelled["revision"] == 1 and cancelled["reference"] == descriptors["a"],
+            cancelled["revision"] == 1 and single_reference(cancelled) == descriptors["a"],
             f"publication cancelled at {stage} changed the ready index",
         )
     checks.append(
@@ -494,7 +494,7 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
         require(
             named_before["revision"] == 1
             and named_before["root"] == str(index)
-            and named_before["reference"] == json.loads(reference.read_text()),
+            and single_reference(named_before) == json.loads(reference.read_text()),
             f"path rejections changed the ready identity for {mode}",
         )
 
@@ -514,7 +514,7 @@ def exercise_data_paths(proof, root: Path, checks: list[str]) -> list[dict]:
             int(acquired["visible_rows"]) == 4096
             and named["revision"] == 2
             and named["root"] == str(data.parent)
-            and named["reference"]["generation"]["generation"] == generation(reference),
+            and single_reference(named)["generation"]["generation"] == generation(reference),
             f"path validation changed the ready index for {mode}",
         )
         cases.append(

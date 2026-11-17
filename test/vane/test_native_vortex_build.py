@@ -278,7 +278,10 @@ def exercise_data_paths(driver, root, scratch):
             )
             native.call("build", "knn", data / "forbidden.json", 1, expected="outside the managed data path")
             require(not (data / "forbidden.json").exists(), "managed reference rejection wrote an output")
-            require(native.call("head", "knn")["reference"] == descriptor, "rejected reference changed the ready head")
+            require(
+                CAT.single_reference(native.call("head", "knn")) == descriptor,
+                "rejected reference changed the ready head",
+            )
             require(
                 SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1, category="A")) == result,
                 "managed reference rejection changed subsequent search",
@@ -296,7 +299,10 @@ def exercise_data_paths(driver, root, scratch):
                     {path.relative_to(artifacts) for path in artifacts.rglob("*")} == before,
                     "reserved reference rejection wrote construction artifacts",
                 )
-                require(native.call("head", "knn")["reference"] == descriptor, "reserved output changed the ready head")
+                require(
+                    CAT.single_reference(native.call("head", "knn")) == descriptor,
+                    "reserved output changed the ready head",
+                )
             SEARCH.no_leases(scratch)
             cases.append(
                 {
@@ -372,7 +378,8 @@ def exercise_historical_fields(driver, root, scratch):
         rename.write_text(swap)
         rebuilt = native.call("mutate-build", case / "second.json", 1, "build_complete", rename)
         require(
-            rebuilt["revision"] == 2 and rebuilt["reference"]["generation"]["generation"] != built["generation"],
+            rebuilt["revision"] == 2
+            and CAT.single_reference(rebuilt)["generation"]["generation"] != built["generation"],
             "native rebuild did not publish",
         )
         native.call("raw", "renamed")

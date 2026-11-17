@@ -439,7 +439,9 @@ def concurrent_flush(driver, root, checks):
             )
             head = native.call("head", "knn")
             require(head["revision"] == revision + 1, "Later writes did not advance the ready index")
-            files = head["reference"]["snapshot"]["files"]
+            parts = head["reference"]["segments"]
+            require(len(parts) == (2 if index_rows == 128 else 1), "Concurrent flush changed segment coverage")
+            files = [file for segment in parts for file in segment["reference"]["snapshot"]["files"]]
             require(sum(file["row_count"] for file in files) == 256, "Published coverage lost flushed rows")
             native.finish()
             require(native.process.returncode == 0, "Concurrent flush fixture failed to close")
@@ -501,7 +503,7 @@ def renamed_inline(driver, root, checks):
         require(published["enabled"] and published["run_count"] == 1, "Renamed inline sources disabled the policy")
         head = native.call("head", "knn")
         require(head["revision"] == 1, "Historical schemas did not publish the ready index")
-        files = head["reference"]["snapshot"]["files"]
+        files = CAT.single_reference(head)["snapshot"]["files"]
         require(sum(file["row_count"] for file in files) == 256, "Published coverage lost historical rows")
         native.finish()
         require(native.process.returncode == 0, "Historical inline fixture failed to close")
