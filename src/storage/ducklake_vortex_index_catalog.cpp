@@ -17,8 +17,10 @@
 #include "mbedtls_wrapper.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <set>
+#include <thread>
 #ifndef _WIN32
 #include <cerrno>
 #include <dirent.h>
@@ -135,24 +137,42 @@ void CheckInterrupted(Connection &owner, ClientContext &caller) {
 	}
 }
 
-void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
+bool CheckDirectoryAccess(ClientContext &context, const string &root) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	if (!fs.DirectoryExists(root)) {
-		throw IOException("Vortex index output directory does not exist: %s", root);
-	}
+	const bool exists = fs.DirectoryExists(root);
 	auto &config = DBConfig::GetConfig(context);
 	if (Settings::Get<EnableExternalAccessSetting>(config)) {
-		return;
+		return exists;
 	}
 	auto directory = config.SanitizeAllowedPath(root);
 	if (!StringUtil::EndsWith(directory, "/")) {
 		directory += "/";
 	}
-	// Construction creates generated descendants, which require directory-wide authorization.
+	// Native construction and collection access descendants through the qualified directory.
 	auto allowed = std::any_of(config.options.allowed_directories.begin(), config.options.allowed_directories.end(),
 	                           [&](const string &prefix) { return StringUtil::StartsWith(directory, prefix); });
 	if (!allowed) {
-		throw PermissionException("Vortex index construction cannot access output directory \"%s\"", root);
+		throw PermissionException("Vortex index cannot access directory \"%s\"", root);
+	}
+	return exists;
+}
+
+void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
+	if (!CheckDirectoryAccess(context, root)) {
+		throw IOException("Vortex index output directory does not exist: %s", root);
+	}
+}
+
+unique_ptr<StorageLockKey> AcquireCollectionLock(StorageLock &lock, ClientContext &context) {
+	while (true) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto key = lock.TryGetExclusiveLock();
+		if (key) {
+			return key;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 }
 
@@ -769,6 +789,7 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 #ifdef _WIN32
 	throw NotImplementedException("Native Vortex generation collection is qualified on POSIX paths");
 #else
+	string generation_path;
 	auto check = [&](const string &stage) {
 		if (observe) {
 			observe(stage);
@@ -776,10 +797,13 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
+		if (!generation_path.empty()) {
+			CheckDirectoryAccess(context, generation_path);
+		}
 	};
 	check("gc_waiting");
-	auto admissions = CollectionLock().GetExclusiveLock();
-	auto publication = PublicationLock().GetExclusiveLock();
+	auto admissions = AcquireCollectionLock(CollectionLock(), context);
+	auto publication = AcquireCollectionLock(PublicationLock(), context);
 	check("gc_acquired");
 	Connection owner(*context.db);
 	DuckLakeVortexGCResult collected;
@@ -829,6 +853,8 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 			auto manifest = StringValue::Get(entry[3]);
 			const bool resume = StringValue::Get(entry[5]) == "deleting";
 			Relative(generation, true);
+			generation_path = FileSystem::GetFileSystem(context).JoinPath(root, generation);
+			CheckDirectoryAccess(context, generation_path);
 			Parsed parsed(reference);
 			auto index =
 			    ParseReference(reference, Text(parsed.Root(), "table_uuid"), Number(parsed.Root(), "field_id"));
@@ -862,6 +888,7 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 					check("gc_file_deleted");
 				}
 				for (auto path = plan.directories.rbegin(); path != plan.directories.rend(); ++path) {
+					check("gc_before_unlink");
 					Unlink(stored->fd, *path, true);
 				}
 				struct stat current;
@@ -869,6 +896,7 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 				    current.st_dev != identity.st_dev || current.st_ino != identity.st_ino) {
 					throw IOException("Registered Vortex directory identity changed during collection");
 				}
+				check("gc_before_unlink");
 				Unlink(directory->fd, generation, true);
 			}
 			check("gc_files_deleted");
