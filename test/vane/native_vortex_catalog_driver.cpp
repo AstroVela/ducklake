@@ -372,8 +372,8 @@ public:
 			}
 			return SearchJSON(rows, "{}");
 		}
-		if (op == "core-search" || op == "cache-search" || op == "cancel-search" || op == "fail-search" ||
-		    op == "held-search" || op == "split-search") {
+		if (op == "timed-core-search" || op == "core-search" || op == "cache-search" || op == "cancel-search" ||
+		    op == "fail-search" || op == "held-search" || op == "split-search") {
 			Connection query(database);
 			DuckLakeVortexSearchRequest request;
 			request.query = {133, 4, 2, 0, 1, 8, 7, 16};
@@ -392,6 +392,32 @@ public:
 				    });
 				Require(evicted, "Cache query missed the visibility boundary");
 				return SearchJSON(result.rows, result.diagnostics);
+			}
+			if (op == "timed-core-search") {
+				auto phase = args.at(2);
+				Require(phase == "ann_us" || phase == "rerank_us", "Unknown timing fixture phase");
+				idx_t ann_calls = 0, rerank_calls = 0, observed_delay_us = 0;
+				auto result =
+				    DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request, [&](const string &stage) {
+					    ann_calls += stage == "before_ann";
+					    rerank_calls += stage == "segment_searched";
+					    if ((phase == "ann_us" && stage == "before_ann") ||
+					        (phase == "rerank_us" && stage == "segment_searched")) {
+						    auto started = std::chrono::steady_clock::now();
+						    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+						    observed_delay_us += std::chrono::duration_cast<std::chrono::microseconds>(
+						                             std::chrono::steady_clock::now() - started)
+						                             .count();
+					    }
+				    });
+				Require(ann_calls == 2 && rerank_calls == 2, "Timing fixture requires exactly two ANN segments");
+				ViewJSON json;
+				auto value = json.Object();
+				json.Text(value, "phase", phase);
+				json.Number(value, "ann_calls", ann_calls);
+				json.Number(value, "observed_delay_us", observed_delay_us);
+				json.Text(value, "query_json", SearchJSON(result.rows, result.diagnostics));
+				return json.Finish(value);
 			}
 			if (op == "core-search") {
 				auto result = DuckLakeVortexSearch::Execute(*query.context, Options("knn"), request);

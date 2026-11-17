@@ -144,6 +144,25 @@ def exercise(proof, native, root, checks, workers):
     core, rows = qualify(native, "two-B", recalls, two=True)
     routes = core["diagnostics"]["routes"]
     require(routes["scan_files"] and routes["inline_rows"], "Two-B query omitted remaining F or T")
+    phase_checks = []
+    for phase in ["ann_us", "rerank_us"]:
+        observation = native.call("timed-core-search", phase)
+        timed = json.loads(observation["query_json"])
+        measured = timed["diagnostics"]["cost"]["phases_us"][phase]
+        require(
+            observation["ann_calls"] == 2 and observation["observed_delay_us"] > 0,
+            "Timing fixture did not observe both segments",
+        )
+        require(
+            measured >= observation["observed_delay_us"],
+            f"{phase} omitted a segment or charged its controlled delay to another phase",
+        )
+        require(timed["rows"] == core["rows"], "Phase instrumentation changed the two-segment result")
+        recalls.append(SEARCH.qualify(timed, rows, VECTOR))
+        phase_checks.append(
+            {"phase": phase, "observed_delay_us": observation["observed_delay_us"], "reported_us": measured}
+        )
+    checks.append("per-segment ANN/rerank phases accumulate both observed delays without a stable-load speed assertion")
     native.call("append", "knn", reference("third"), 2, expected="segment count budget exceeded")
     require(native.call("head", "knn")["revision"] == 2, "Segment budget changed the ready head")
     checks.append(
@@ -224,6 +243,7 @@ def exercise(proof, native, root, checks, workers):
     )
     return {
         "fixture_recalls": recalls,
+        "phase_checks": phase_checks,
         "first_generation": generation(first),
         "second_generation": second["generation"]["generation"],
         "first_artifact_signature": frozen,
