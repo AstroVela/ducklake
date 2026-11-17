@@ -25,14 +25,20 @@ Transaction &DuckLakeTransactionManager::StartTransaction(ClientContext &context
 
 ErrorData DuckLakeTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
 	auto &ducklake_transaction = transaction.Cast<DuckLakeTransaction>();
+	ErrorData error;
 	try {
 		ducklake_transaction.Commit();
 	} catch (std::exception &ex) {
-		return ErrorData(ex);
+		error = ErrorData(ex);
+		try {
+			ducklake_transaction.Rollback();
+		} catch (std::exception &rollback_error) {
+			error.Merge(ErrorData(rollback_error));
+		}
 	}
 	lock_guard<mutex> l(transaction_lock);
 	transactions.erase(transaction);
-	return ErrorData();
+	return error;
 }
 
 void DuckLakeTransactionManager::RollbackTransaction(Transaction &transaction) {

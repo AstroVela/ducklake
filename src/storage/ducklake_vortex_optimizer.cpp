@@ -12,9 +12,11 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/storage/object_cache.hpp"
+#include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <map>
@@ -30,6 +32,8 @@ using namespace duckdb_yyjson;
 using namespace vortex_detail;
 using Key = std::pair<string, string>;
 const char *POLICIES = "ducklake_vortex_optimizer_v1";
+const char *WRITE_BUDGETS = "ducklake_vortex_write_budgets_v1";
+const char *BUDGET_COLUMNS = "max_inline_rows,max_inline_bytes,max_unindexed_rows,max_unindexed_bytes";
 const idx_t SOURCE_LIMIT = 64 * 1024 * 1024;
 const idx_t INLINE_LIMIT = 4 * 1024 * 1024;
 
@@ -40,6 +44,8 @@ struct Policy {
 	bool enabled = false;
 	string state = "idle", run, generation, reference, error;
 	idx_t expected = 0, published = 0, t_rows = 0, t_bytes = 0, f_rows = 0, f_bytes = 0, runs = 0;
+	idx_t source_rows = 0, source_bytes = 0;
+	idx_t pending_rows = 0, pending_bytes = 0;
 	Key Id() const {
 		return {uuid, config.index};
 	}
@@ -50,9 +56,20 @@ void Validate(const Policy &p);
 struct Metadata {
 	Connection connection;
 	DuckLakeTransaction &transaction;
-	Metadata(DatabaseInstance &db, const string &catalog)
-	    : connection(db), transaction(VortexCatalog::Begin(connection, catalog)) {
-		VortexCatalog::Initialized(transaction);
+	static DuckLakeTransaction &Begin(Connection &connection, const string &catalog, bool require_index) {
+		try {
+			auto &transaction = VortexCatalog::Begin(connection, catalog);
+			if (require_index) {
+				VortexCatalog::Initialized(transaction);
+			}
+			return transaction;
+		} catch (...) {
+			VortexCatalog::Rollback(connection);
+			throw;
+		}
+	}
+	Metadata(DatabaseInstance &db, const string &catalog, bool require_index = true)
+	    : connection(db), transaction(Begin(connection, catalog, require_index)) {
 	}
 	unique_ptr<QueryResult> Query(const string &sql) {
 		return VortexCatalog::Query(transaction, sql);
@@ -187,10 +204,30 @@ void Save(Metadata &meta, const Policy &p, const string &previous_run) {
 	meta.Commit();
 }
 
-DuckLakeTableEntry &Table(Metadata &meta, const Policy &p) {
+DuckLakeTableEntry &Table(Metadata &meta, Policy &p) {
 	auto &catalog = meta.transaction.GetCatalog();
-	auto entry = catalog.GetEntry(*meta.connection.context, CatalogType::TABLE_ENTRY, p.config.schema, p.config.table,
-	                              OnEntryNotFound::THROW_EXCEPTION);
+	optional_ptr<CatalogEntry> entry;
+	if (p.uuid.empty()) {
+		entry = catalog.GetEntry(*meta.connection.context, CatalogType::TABLE_ENTRY, p.config.schema, p.config.table,
+		                         OnEntryNotFound::THROW_EXCEPTION);
+	} else {
+		auto snapshot = meta.transaction.GetSnapshot();
+		auto identity = meta.transaction.Query(
+		    snapshot, "SELECT table_id FROM {METADATA_CATALOG}.ducklake_table WHERE table_uuid=" + Quote(p.uuid) +
+		                  " AND begin_snapshot<={SNAPSHOT_ID} AND "
+		                  "(end_snapshot IS NULL OR end_snapshot>{SNAPSHOT_ID})");
+		if (identity->HasError()) {
+			identity->ThrowError();
+		}
+		auto row = identity->Fetch();
+		if (!row || row->size() != 1) {
+			throw InvalidInputException("Missing optimizer table identity");
+		}
+		entry = catalog.GetEntryById(meta.transaction, snapshot, TableIndex(row->GetValue(0, 0).GetValue<idx_t>()));
+		if (!entry) {
+			throw InvalidInputException("Missing optimizer table identity");
+		}
+	}
 	auto &table = entry->Cast<DuckLakeTableEntry>();
 	if ((!p.uuid.empty() && p.uuid != table.GetTableUUID()) ||
 	    (p.field_id && p.field_id != table.GetFieldId(vector<string> {"embedding"}).GetFieldIndex().index)) {
@@ -204,6 +241,8 @@ DuckLakeTableEntry &Table(Metadata &meta, const Policy &p) {
 			throw InvalidInputException("Optimizer business/vector field type changed");
 		}
 	}
+	p.config.schema = table.schema.name;
+	p.config.table = table.name;
 	return table;
 }
 
@@ -222,38 +261,66 @@ idx_t ReadyRevision(Metadata &meta, const Policy &p) {
 	return chunk && chunk->size() ? chunk->GetValue(0, 0).GetValue<idx_t>() : 0;
 }
 
-void Probe(DatabaseInstance &db, Policy &p) {
-	Metadata meta(db, p.config.catalog);
+vector<string> InlineSourceColumns(Metadata &meta, DuckLakeTableEntry &table, const DuckLakeInlinedTableInfo &source) {
+	auto &catalog = meta.transaction.GetCatalog();
+	DuckLakeSnapshot source_snapshot(
+	    catalog.GetBeginSnapshotForSchemaVersion(table.GetTableId(), source.schema_version, meta.transaction),
+	    source.schema_version, 0, 0);
+	auto source_entry = catalog.GetEntryById(meta.transaction, source_snapshot, table.GetTableId());
+	if (!source_entry) {
+		throw InvalidInputException("Missing optimizer inline source schema");
+	}
+	auto &source_schema = source_entry->Cast<DuckLakeTableEntry>();
+	vector<string> columns;
+	for (auto &name : {"embedding", "category", "payload"}) {
+		auto &field = table.GetFieldId(vector<string> {name});
+		auto source_field = source_schema.GetFieldId(field.GetFieldIndex());
+		if (!source_field || source_field->Type() != field.Type()) {
+			throw InvalidInputException("Optimizer inline source field mismatch: %llu", field.GetFieldIndex().index);
+		}
+		columns.push_back(KeywordHelper::WriteOptionallyQuoted(source_field->Name()));
+	}
+	return columns;
+}
+
+void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> changes = nullptr,
+           optional_ptr<const vector<FlushedInlinedTableInfo>> flushed = nullptr,
+           optional_ptr<const unordered_map<string, DataFileIndex>> dropped = nullptr) {
 	auto &table = Table(meta, p);
 	FlushConfiguration(*meta.connection.context, table);
 	auto snapshot = meta.transaction.GetSnapshot();
 	auto &manager = meta.transaction.GetMetadataManager();
 	p.t_rows = p.t_bytes = p.f_rows = p.f_bytes = 0;
-	auto &catalog = meta.transaction.GetCatalog();
+	p.source_rows = p.source_bytes = 0;
 	for (auto &source : table.GetInlinedDataTables()) {
-		DuckLakeSnapshot source_snapshot(
-		    catalog.GetBeginSnapshotForSchemaVersion(table.GetTableId(), source.schema_version, meta.transaction),
-		    source.schema_version, 0, 0);
-		auto source_entry = catalog.GetEntryById(meta.transaction, source_snapshot, table.GetTableId());
-		if (!source_entry) {
-			throw InvalidInputException("Missing optimizer inline source schema");
-		}
-		auto &source_schema = source_entry->Cast<DuckLakeTableEntry>();
-		vector<string> columns;
-		for (auto &name : {"embedding", "category", "payload"}) {
-			auto &field = table.GetFieldId(vector<string> {name});
-			auto source_field = source_schema.GetFieldId(field.GetFieldIndex());
-			if (!source_field || source_field->Type() != field.Type()) {
-				throw InvalidInputException("Optimizer inline source field mismatch: %llu", field.GetFieldIndex().index);
+		auto columns = InlineSourceColumns(meta, table, source);
+		string eligible = "true";
+		if (changes) {
+			auto deleted = changes->new_inlined_data_deletes.find(source.table_name);
+			if (deleted != changes->new_inlined_data_deletes.end() && !deleted->second->rows.empty()) {
+				vector<string> ids;
+				for (auto id : deleted->second->rows) {
+					ids.push_back(to_string(id));
+				}
+				eligible += " AND row_id NOT IN (" + StringUtil::Join(ids, ",") + ")";
 			}
-			columns.push_back(KeywordHelper::WriteOptionallyQuoted(source_field->Name()));
+		}
+		if (flushed) {
+			for (auto &entry : *flushed) {
+				if (entry.inlined_table.table_name == source.table_name) {
+					eligible += " AND begin_snapshot>" + to_string(entry.flush_snapshot_id);
+				}
+			}
 		}
 		auto &embedding = columns[0];
 		auto sql = DuckLakeMetadataManager::ReadInlinedDataAggregatesSql(
-		    source.table_name, "count(*),coalesce(sum(coalesce(array_length(" + embedding + "),0)*4+64+"
-		                       "coalesce(octet_length(encode(" + columns[1] + ")),0)+coalesce(octet_length(encode(" +
-		                           columns[2] + ")),0)),0),count(*) FILTER(WHERE " + embedding +
-		                           " IS NULL OR array_length(" + embedding + ")<>" + to_string(p.config.dimension) + ")");
+		    source.table_name,
+		    "count(*) FILTER(WHERE " + eligible + "),coalesce(sum(coalesce(array_length(" + embedding +
+		        "),0)*4+64+"
+		        "coalesce(octet_length(encode(" +
+		        columns[1] + ")),0)+coalesce(octet_length(encode(" + columns[2] + ")),0)) FILTER(WHERE " + eligible +
+		        "),0),count(*) FILTER(WHERE (" + eligible + ") AND (" + embedding + " IS NULL OR array_length(" +
+		        embedding + ")<>" + to_string(p.config.dimension) + "))");
 		auto result = meta.transaction.Query(snapshot, sql);
 		if (result->HasError()) {
 			result->ThrowError();
@@ -279,6 +346,19 @@ void Probe(DatabaseInstance &db, Policy &p) {
 			covered.insert(file.id);
 		}
 	}
+	std::set<idx_t> replaced;
+	if (changes) {
+		for (auto &compaction : changes->compactions) {
+			for (auto &source : compaction.source_files) {
+				replaced.insert(source.file.id.index);
+			}
+		}
+	}
+	if (dropped) {
+		for (auto &file : *dropped) {
+			replaced.insert(file.second.index);
+		}
+	}
 	auto files = manager.GetExtendedFilesForTable(table, snapshot);
 	for (auto &file : files) {
 		if (file.data_type != DuckLakeDataType::DATA_FILE) {
@@ -287,6 +367,14 @@ void Probe(DatabaseInstance &db, Policy &p) {
 		if (file.file.data_format != DataFileFormat::VORTEX || !file.file.encryption_key.empty()) {
 			throw InvalidInputException("Optimizer requires unencrypted Vortex files");
 		}
+		if (replaced.count(file.file_id.index)) {
+			if (covered.count(file.file_id.index)) {
+				throw InvalidInputException("Vortex write budget cannot replace an indexed source");
+			}
+			continue;
+		}
+		p.source_rows += file.row_count;
+		p.source_bytes += file.file.file_size_bytes;
 		if (!covered.count(file.file_id.index)) {
 			p.f_rows += file.row_count;
 			p.f_bytes += file.file.file_size_bytes;
@@ -303,6 +391,11 @@ void Probe(DatabaseInstance &db, Policy &p) {
 		throw InvalidInputException("Optimizer indexed source was replaced; explicit rebuild required");
 	}
 	p.expected = revision;
+}
+
+void Probe(DatabaseInstance &db, Policy &p) {
+	Metadata meta(db, p.config.catalog);
+	Probe(meta, p);
 	meta.Commit();
 }
 
@@ -664,6 +757,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 
 struct Owner : public ObjectCacheEntry {
 	std::shared_ptr<Runtime> runtime = std::make_shared<Runtime>();
+	StorageLock write_admission;
 	~Owner() override {
 		runtime->Stop();
 	}
@@ -720,12 +814,235 @@ void Validate(const Policy &p) {
 	}
 }
 
+bool HasWriteBudgetTable(Metadata &meta) {
+	auto &catalog = meta.transaction.GetCatalog();
+	return bool(meta.transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+	                                                       WRITE_BUDGETS));
+}
+
+DuckLakeVortexWriteBudget ReadBudget(DataChunk &chunk, idx_t row, idx_t offset = 0) {
+	return {chunk.GetValue(offset, row).GetValue<idx_t>(), chunk.GetValue(offset + 1, row).GetValue<idx_t>(),
+	        chunk.GetValue(offset + 2, row).GetValue<idx_t>(), chunk.GetValue(offset + 3, row).GetValue<idx_t>()};
+}
+
+void CheckLimit(const char *name, idx_t used, idx_t limit) {
+	if (used > limit) {
+		throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex write %s budget exceeded (%llu > %llu)", name, used,
+		                            limit);
+	}
+}
+
+void CheckWriteBudget(const Policy &p, const DuckLakeVortexWriteBudget &budget) {
+	CheckLimit("inline rows", p.t_rows, budget.inline_rows);
+	CheckLimit("inline bytes", p.t_bytes, budget.inline_bytes);
+	CheckLimit("unindexed rows", p.f_rows, budget.unindexed_rows);
+	CheckLimit("unindexed bytes", p.f_bytes, budget.unindexed_bytes);
+	CheckLimit("physical and inline rows", p.source_rows + p.pending_rows,
+	           MinValue<idx_t>(100000, SOURCE_LIMIT / sizeof(float) / p.config.dimension));
+	CheckLimit("physical source bytes", p.source_bytes, SOURCE_LIMIT);
+	CheckLimit("pending inline bytes", p.pending_bytes, SOURCE_LIMIT);
+}
+
+void PendingInline(Metadata &meta, Policy &p, const vector<FlushedInlinedTableInfo> &flushed) {
+	auto &table = Table(meta, p);
+	auto snapshot = meta.transaction.GetSnapshot();
+	p.pending_rows = p.pending_bytes = 0;
+	for (auto &source : table.GetInlinedDataTables()) {
+		auto columns = InlineSourceColumns(meta, table, source);
+		string filter;
+		for (auto &entry : flushed) {
+			if (entry.inlined_table.table_name == source.table_name) {
+				filter += " AND begin_snapshot>" + to_string(entry.flush_snapshot_id);
+			}
+		}
+		// Flush materializes ended versions too; visible T alone underestimates build capacity.
+		auto result =
+		    meta.transaction.Query(snapshot, "SELECT count(*),coalesce(sum(coalesce(array_length(" + columns[0] +
+		                                         "),0)*4+64+"
+		                                         "coalesce(octet_length(encode(" +
+		                                         columns[1] + ")),0)+coalesce(octet_length(encode(" + columns[2] +
+		                                         ")),0)),0) FROM {METADATA_CATALOG}." + source.table_name +
+		                                         " WHERE begin_snapshot<={SNAPSHOT_ID}" + filter);
+		if (result->HasError()) {
+			result->ThrowError();
+		}
+		auto values = result->Fetch();
+		p.pending_rows += values->GetValue(0, 0).GetValue<idx_t>();
+		p.pending_bytes += values->GetValue(1, 0).GetValue<idx_t>();
+	}
+}
+
+void AddWrite(Policy &p, DuckLakeTableEntry &table, const LocalTableDataChanges &changes) {
+	auto file = [&](const DuckLakeDataFile &data) {
+		if (data.format != DataFileFormat::VORTEX || !data.encryption_key.empty()) {
+			throw InvalidInputException("Vortex write budgets require unencrypted Vortex output");
+		}
+		p.source_rows += data.row_count;
+		p.source_bytes += data.file_size_bytes;
+		p.f_rows += data.row_count;
+		p.f_bytes += data.file_size_bytes;
+	};
+	for (auto &data : changes.new_data_files) {
+		file(data);
+	}
+	for (auto &compaction : changes.compactions) {
+		if (!compaction.written_file.file_name.empty()) {
+			file(compaction.written_file);
+		}
+	}
+	if (!changes.new_inlined_data) {
+		return;
+	}
+	auto &data = *changes.new_inlined_data;
+	if (!data.data || table.GetColumns().PhysicalColumnCount() != 4 || data.data->ColumnCount() != 4) {
+		throw InvalidInputException("Vortex write budgets require native four-column inline data");
+	}
+	auto column = [&](string name) {
+		return table.GetColumns().LogicalToPhysical(table.GetColumns().GetColumnIndex(name)).index;
+	};
+	auto embedding = column("embedding"), category = column("category"), payload = column("payload");
+	p.t_rows += data.Count();
+	p.pending_rows += data.Count();
+	for (auto &chunk : data.data->Chunks()) {
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			auto vector = chunk.GetValue(embedding, row);
+			if (vector.IsNull() || ListValue::GetChildren(vector).size() != p.config.dimension) {
+				throw InvalidInputException("Invalid write budget inline vector dimension");
+			}
+			for (auto &value : ListValue::GetChildren(vector)) {
+				if (value.IsNull() || !std::isfinite(value.GetValue<float>())) {
+					throw InvalidInputException("Write budget vectors require finite non-NULL components");
+				}
+			}
+			idx_t bytes = p.config.dimension * sizeof(float) + 64;
+			for (auto col : {category, payload}) {
+				auto value = chunk.GetValue(col, row);
+				if (!value.IsNull()) {
+					bytes += StringValue::Get(value).size();
+				}
+			}
+			p.t_bytes += bytes;
+			p.pending_bytes += bytes;
+		}
+	}
+}
+
+bool Grows(const LocalTableDataChanges &changes) {
+	return changes.new_inlined_data || !changes.new_data_files.empty() || !changes.compactions.empty();
+}
+
 } // namespace
+
+unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
+                                                               unique_ptr<StorageLockKey> &publication_guard) {
+	bool grows = false;
+	for (auto &entry : transaction.GetLocalChanges().Changes()) {
+		grows |= Grows(entry.GetTableChanges());
+	}
+	auto &catalog = transaction.GetCatalog();
+	unique_ptr<StorageLockKey> admission;
+	if (grows && (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb")) {
+		admission = GetOwner(*context.db)->write_admission.GetExclusiveLock();
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	}
+	// Use the same admission/publication order as configuration, and keep coverage stable through commit.
+	publication_guard = VortexCatalog::PublicationLock().GetSharedLock();
+	if (!admission) {
+		return nullptr;
+	}
+	Metadata meta(*context.db, catalog.GetName(), false);
+	try {
+		if (HasWriteBudgetTable(meta)) {
+			for (auto &entry : transaction.GetLocalChanges().Changes()) {
+				auto &changes = entry.GetTableChanges();
+				if (!Grows(changes) || entry.GetTableIndex().IsTransactionLocal() ||
+				    transaction.GetDroppedTables().count(entry.GetTableIndex())) {
+					continue;
+				}
+				auto rows =
+				    meta.Query("SELECT table_uuid,index_name," + string(BUDGET_COLUMNS) + " FROM {METADATA_CATALOG}." +
+				               WRITE_BUDGETS + " WHERE table_id=" + to_string(entry.GetTableIndex().index));
+				auto row = rows->Fetch();
+				if (!row || !row->size()) {
+					continue;
+				}
+				Policy key;
+				key.uuid = StringValue::Get(row->GetValue(0, 0));
+				key.config.index = StringValue::Get(row->GetValue(1, 0));
+				key.config.catalog = catalog.GetName();
+				auto p = Load(meta, key);
+				auto &table = Table(meta, p);
+				if (table.GetTableId() != entry.GetTableIndex()) {
+					throw InvalidInputException("Vortex write budget table identity changed");
+				}
+				Probe(meta, p, &changes, &transaction.GetFlushedInlinedTables(), &transaction.GetDroppedFiles());
+				PendingInline(meta, p, transaction.GetFlushedInlinedTables());
+				AddWrite(p, table, changes);
+				CheckWriteBudget(p, ReadBudget(*row, 0, 2));
+			}
+		}
+		meta.Commit();
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		return admission;
+	} catch (...) {
+		VortexCatalog::Rollback(meta.connection);
+		throw;
+	}
+}
+
+void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const string &catalog, const string &schema,
+                                             const string &table, const string &index,
+                                             const DuckLakeVortexWriteBudget &budget) {
+	if (!budget.inline_rows || budget.inline_rows > 100000 || !budget.inline_bytes ||
+	    budget.inline_bytes > INLINE_LIMIT || !budget.unindexed_rows || budget.unindexed_rows > 100000 ||
+	    !budget.unindexed_bytes || budget.unindexed_bytes > SOURCE_LIMIT) {
+		throw InvalidInputException("Invalid Vortex write budget limits");
+	}
+	auto owner = GetOwner(*context.db);
+	auto admission = owner->write_admission.GetExclusiveLock();
+	auto publication = VortexCatalog::PublicationLock().GetSharedLock();
+	std::lock_guard<std::mutex> guard(owner->runtime->io);
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
+	Metadata meta(*context.db, catalog);
+	try {
+		Initialized(meta);
+		auto p = Load(meta, Identify(meta, catalog, schema, table, index));
+		auto &entry = Table(meta, p);
+		if (entry.GetColumns().PhysicalColumnCount() != 4 || entry.GetColumns().LogicalColumnCount() != 4) {
+			throw InvalidInputException("Vortex write budgets require the four business columns");
+		}
+		Probe(meta, p);
+		PendingInline(meta, p, {});
+		CheckWriteBudget(p, budget);
+		meta.Query("INSERT INTO {METADATA_CATALOG}." + string(WRITE_BUDGETS) + " VALUES(" + Quote(p.uuid) + "," +
+		           to_string(entry.GetTableId().index) + "," + Quote(index) + "," + to_string(budget.inline_rows) +
+		           "," + to_string(budget.inline_bytes) + "," + to_string(budget.unindexed_rows) + "," +
+		           to_string(budget.unindexed_bytes) +
+		           ") ON CONFLICT(table_uuid) DO UPDATE SET "
+		           "index_name=excluded.index_name,max_inline_rows=excluded.max_inline_rows,"
+		           "max_inline_bytes=excluded.max_inline_bytes,max_unindexed_rows=excluded.max_unindexed_rows,"
+		           "max_unindexed_bytes=excluded.max_unindexed_bytes");
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		meta.Commit();
+	} catch (...) {
+		VortexCatalog::Rollback(meta.connection);
+		throw;
+	}
+}
 
 void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalog) {
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex optimizer catalog requires an idle dedicated connection");
 	}
+	auto admission = GetOwner(*owner.context->db)->write_admission.GetExclusiveLock();
 	try {
 		auto &transaction = VortexCatalog::Begin(owner, catalog);
 		VortexCatalog::Initialized(transaction);
@@ -739,6 +1056,11 @@ void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalo
 		    "inline_rows BIGINT NOT NULL,inline_bytes BIGINT NOT NULL,unindexed_rows BIGINT NOT NULL,unindexed_bytes "
 		    "BIGINT NOT NULL,"
 		    "run_count BIGINT NOT NULL,PRIMARY KEY(table_uuid,index_name))");
+		VortexCatalog::Query(transaction,
+		                     "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_write_budgets_v1("
+		                     "table_uuid VARCHAR PRIMARY KEY,table_id BIGINT NOT NULL,index_name VARCHAR NOT NULL,"
+		                     "max_inline_rows BIGINT NOT NULL,max_inline_bytes BIGINT NOT NULL,"
+		                     "max_unindexed_rows BIGINT NOT NULL,max_unindexed_bytes BIGINT NOT NULL)");
 		owner.Commit();
 	} catch (...) {
 		VortexCatalog::Rollback(owner);
@@ -859,6 +1181,13 @@ vector<vector<Value>> DuckLakeVortexOptimizer::Status(ClientContext &context, co
 			                Value::UBIGINT(p.t_bytes), Value::UBIGINT(p.f_rows), Value::UBIGINT(p.f_bytes),
 			                Value(local_error.empty() ? p.error : local_error), Value::UBIGINT(p.runs),
 			                Value::BOOLEAN(owner->runtime->IsActive(p.Id()))});
+			auto budget =
+			    meta.Query("SELECT " + string(BUDGET_COLUMNS) + " FROM {METADATA_CATALOG}." + WRITE_BUDGETS + Where(p));
+			auto limits = budget->Fetch();
+			for (idx_t col = 0; col < 4; col++) {
+				rows.back().push_back(limits && limits->size() ? limits->GetValue(col, 0)
+				                                               : Value(LogicalType::UBIGINT));
+			}
 		}
 	}
 	meta.Commit();

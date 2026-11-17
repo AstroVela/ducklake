@@ -147,13 +147,15 @@ public:
 			Require(!failure.empty(), "Optimizer initialization accepted an active transaction");
 			Require(caller.context->transaction.HasActiveTransaction(),
 			        "Optimizer initialization rolled back the caller's existing transaction");
-			Require(SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
-			            1,
-			        "Optimizer initialization lost the caller's uncommitted row");
+			Require(
+			    SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
+			        1,
+			    "Optimizer initialization lost the caller's uncommitted row");
 			caller.Rollback();
-			Require(SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
-			            0,
-			        "The caller could not roll back its own transaction");
+			Require(
+			    SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
+			        0,
+			    "The caller could not roll back its own transaction");
 			return "{}";
 		}
 		if (op == "optimizer-enable") {
@@ -207,7 +209,9 @@ public:
 				auto value = json.Object();
 				for (idx_t col = 0; col < result->ColumnCount(); col++) {
 					auto item = result->GetValue(col, row);
-					if (item.type().id() == LogicalTypeId::BOOLEAN) {
+					if (item.IsNull()) {
+						json.Add(value, result->names[col].c_str(), yyjson_mut_null(json.doc.get()));
+					} else if (item.type().id() == LogicalTypeId::BOOLEAN) {
 						json.Add(value, result->names[col].c_str(),
 						         yyjson_mut_bool(json.doc.get(), item.GetValue<bool>()));
 					} else if (item.type().id() == LogicalTypeId::UBIGINT) {
@@ -436,6 +440,93 @@ public:
 		if (op == "capture") {
 			return Capture(args.at(2), args.at(3));
 		}
+		if (op == "budget-race") {
+			auto count = std::stoull(args.at(2));
+			Require(count >= 2 && count <= 16, "Budget race requires two to sixteen writers");
+			auto sql = ReadText(args.at(3));
+			std::mutex lock;
+			std::condition_variable changed;
+			idx_t ready = 0;
+			bool release = false;
+			vector<std::future<string>> writers;
+			for (idx_t i = 0; i < count; i++) {
+				writers.push_back(std::async(std::launch::async, [&, i] {
+					Connection connection(database);
+					string error;
+					try {
+						connection.BeginTransaction();
+						SQL(connection, StringUtil::Replace(sql, "{WRITER}", to_string(i)));
+					} catch (const std::exception &ex) {
+						error = ex.what();
+					}
+					{
+						std::unique_lock<std::mutex> guard(lock);
+						ready++;
+						changed.notify_all();
+						changed.wait(guard, [&] { return release; });
+					}
+					if (error.empty()) {
+						try {
+							connection.Commit();
+						} catch (const std::exception &ex) {
+							error = ex.what();
+						}
+					}
+					return error;
+				}));
+			}
+			{
+				std::unique_lock<std::mutex> guard(lock);
+				changed.wait(guard, [&] { return ready == count; });
+				release = true;
+				changed.notify_all();
+			}
+			ViewJSON json;
+			auto rows = json.Array();
+			for (auto &task : writers) {
+				auto item = json.Object();
+				json.Text(item, "error", task.get());
+				yyjson_mut_arr_append(rows, item);
+			}
+			return json.Finish(rows);
+		}
+		if (op == "budget-config-interrupt") {
+			Connection caller(database);
+			auto statement = ReadText(args.at(2));
+			auto publication = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock();
+			std::promise<void> started;
+			auto ready = started.get_future();
+			auto configuring = std::async(std::launch::async, [&] {
+				started.set_value();
+				auto result = caller.Query(statement);
+				return result->HasError() ? result->GetError() : string();
+			});
+			ready.wait();
+			auto waited = configuring.wait_for(std::chrono::milliseconds(500)) == std::future_status::timeout;
+			if (!waited) {
+				publication.reset();
+				throw InvalidInputException("Configuration did not wait for the publication guard");
+			}
+			caller.context->Interrupt();
+			auto interrupted = caller.context->IsInterrupted();
+			publication.reset();
+			auto error = configuring.get();
+			ViewJSON json;
+			auto value = json.Object();
+			json.Text(value, "query_error", error);
+			json.Add(value, "waited_for_publication", yyjson_mut_bool(json.doc.get(), waited));
+			json.Add(value, "interrupted_before_release", yyjson_mut_bool(json.doc.get(), interrupted));
+			return json.Finish(value);
+		}
+		if (op == "budget-interrupt") {
+			Connection connection(database);
+			connection.BeginTransaction();
+			SQL(connection, ReadText(args.at(2)));
+			auto &catalog = Catalog::GetCatalog(*connection.context, "lake");
+			connection.context->Interrupt();
+			DuckLakeTransaction::Get(*connection.context, catalog).Commit();
+			throw InvalidInputException("Interrupted budget admission unexpectedly committed");
+		}
 		if (op == "sql") {
 			SQL(writer, ReadText(args.at(2)));
 			return "{}";
@@ -568,6 +659,45 @@ public:
 			auto winners = idx_t(a.get()) + idx_t(b.get());
 			Require(winners == 1, "Concurrent publication did not produce exactly one winner");
 			return Head(args.at(2)).ToJSON();
+		}
+		if (op == "budget-compaction-publication") {
+			SQL(writer, "BEGIN;" + ReadText(args.at(5)));
+			Connection owner(database);
+			Pause pause;
+			auto publish = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::BuildAndPublish(*owner.context, "lake", "main", "items", args.at(2),
+				                                            args.at(3), 8, std::stoull(args.at(4)),
+				                                            [&](const string &stage) {
+					                                            if (stage == "after_validation") {
+						                                            pause.Stop();
+					                                            }
+				                                            });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			std::promise<void> started;
+			auto ready = started.get_future();
+			auto commit = std::async(std::launch::async, [&] {
+				started.set_value();
+				try {
+					SQL(writer, "COMMIT");
+					return string();
+				} catch (const std::exception &error) {
+					return string(error.what());
+				}
+			});
+			ReleasePause release_commit {pause};
+			ready.wait();
+			Require(commit.wait_for(std::chrono::milliseconds(500)) == std::future_status::timeout,
+			        "Compaction committed inside publication validation");
+			pause.Release();
+			auto record = publish.get();
+			auto failure = commit.get();
+			ViewJSON json;
+			auto value = json.Object();
+			json.Number(value, "revision", record.revision);
+			json.Text(value, "commit_error", failure);
+			return json.Finish(value);
 		}
 		if (op == "commit-race") {
 			SQL(writer,
