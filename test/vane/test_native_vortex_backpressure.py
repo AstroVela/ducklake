@@ -389,6 +389,85 @@ def renamed_inline_sources(native, root, checks):
     )
 
 
+def file_replacement(native, root, checks):
+    setup(native, root, empty=True)
+    native.call("optimizer-cancel")
+    sql(native, "CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items')")
+    budget(native, 10, 1048576, 4)
+    sql(native, insert(0, 4))
+    sql(native, "BEGIN;DELETE FROM lake.items;" + insert(1000, 4) + ";COMMIT")
+    count(native, 4)
+    sql(native, "UPDATE lake.items SET payload='updated-file'")
+    sql(
+        native,
+        "SELECT CASE WHEN count(*)=4 AND bool_and(payload='updated-file') THEN true "
+        "ELSE error('File replacement lost rows') END FROM lake.items",
+    )
+    sql(
+        native,
+        "SELECT CASE WHEN count(*)=1 AND sum(record_count)=4 THEN true "
+        "ELSE error('Wrong active physical occupancy') END "
+        "FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    sql(native, insert(2000, 1), "unindexed rows")
+    native.call("reopen")
+    count(native, 4)
+    sql(native, insert(3000, 1), "unindexed rows")
+    owners(native)
+    checks.append(
+        "whole-file delete/append and full-file update use net F occupancy; actual growth still rejects across reopen"
+    )
+
+
+def dropped_table(native, root, checks):
+    setup(native, root, empty=True)
+    native.call("optimizer-cancel")
+    budget(native, 2, 1048576, 100000)
+    sql(native, insert(0, 1))
+    sql(native, "BEGIN;" + insert(1000, 2) + ";DROP TABLE lake.items;COMMIT")
+    sql(
+        native,
+        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Dropped table remained visible') END "
+        "FROM duckdb_tables() WHERE database_name='lake' AND table_name='items'",
+    )
+    native.call("reopen")
+    sql(
+        native,
+        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Reopen restored dropped table') END "
+        "FROM duckdb_tables() WHERE database_name='lake' AND table_name='items'",
+    )
+    owners(native)
+    checks.append("a transaction that finally drops its protected table does not charge discarded pending rows")
+
+
+def cancelled_configuration(native, root, checks):
+    setup(native, root, empty=True)
+    native.call("optimizer-cancel")
+    budget(native, 2, 1048576, 100000)
+    statement = root / "configure.sql"
+    statement.write_text(
+        "SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn'," "3,1048576,100000,67108864)"
+    )
+    result = native.call("budget-config-interrupt", statement)
+    require(
+        result["waited_for_publication"] and result["interrupted_before_release"],
+        "Configuration did not reach the controlled cancellation boundary",
+    )
+    require("Interrupted" in result["query_error"], "Cancelled configuration did not report interruption")
+    require(OPT.status(native)["max_inline_rows"] == 2, "Cancelled configuration changed the durable budget")
+    sql(native, insert(0, 2))
+    sql(native, insert(1000, 1), "inline rows")
+    native.call("reopen")
+    require(OPT.status(native)["max_inline_rows"] == 2, "Reopen exposed cancelled configuration")
+    sql(native, insert(2000, 1), "inline rows")
+    count(native, 2)
+    owners(native)
+    checks.append(
+        "SQL cancellation while configuration waits for publication preserves the old durable quota across reopen"
+    )
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--driver", required=True, type=Path)
@@ -421,6 +500,9 @@ def main():
             ("empty-compaction", empty_compaction),
             ("rename-table", rename_table),
             ("renamed-inline-sources", renamed_inline_sources),
+            ("file-replacement", file_replacement),
+            ("dropped-table", dropped_table),
+            ("cancelled-configuration", cancelled_configuration),
         ]:
             case_root = root / name
             case_root.mkdir()

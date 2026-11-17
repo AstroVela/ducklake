@@ -490,6 +490,34 @@ public:
 			}
 			return json.Finish(rows);
 		}
+		if (op == "budget-config-interrupt") {
+			Connection caller(database);
+			auto statement = ReadText(args.at(2));
+			auto publication = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock();
+			std::promise<void> started;
+			auto ready = started.get_future();
+			auto configuring = std::async(std::launch::async, [&] {
+				started.set_value();
+				auto result = caller.Query(statement);
+				return result->HasError() ? result->GetError() : string();
+			});
+			ready.wait();
+			auto waited = configuring.wait_for(std::chrono::milliseconds(500)) == std::future_status::timeout;
+			if (!waited) {
+				publication.reset();
+				throw InvalidInputException("Configuration did not wait for the publication guard");
+			}
+			caller.context->Interrupt();
+			auto interrupted = caller.context->IsInterrupted();
+			publication.reset();
+			auto error = configuring.get();
+			ViewJSON json;
+			auto value = json.Object();
+			json.Text(value, "query_error", error);
+			json.Add(value, "waited_for_publication", yyjson_mut_bool(json.doc.get(), waited));
+			json.Add(value, "interrupted_before_release", yyjson_mut_bool(json.doc.get(), interrupted));
+			return json.Finish(value);
+		}
 		if (op == "budget-interrupt") {
 			Connection connection(database);
 			connection.BeginTransaction();

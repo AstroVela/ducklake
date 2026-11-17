@@ -284,7 +284,8 @@ vector<string> InlineSourceColumns(Metadata &meta, DuckLakeTableEntry &table, co
 }
 
 void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> changes = nullptr,
-           optional_ptr<const vector<FlushedInlinedTableInfo>> flushed = nullptr) {
+           optional_ptr<const vector<FlushedInlinedTableInfo>> flushed = nullptr,
+           optional_ptr<const unordered_map<string, DataFileIndex>> dropped = nullptr) {
 	auto &table = Table(meta, p);
 	FlushConfiguration(*meta.connection.context, table);
 	auto snapshot = meta.transaction.GetSnapshot();
@@ -345,6 +346,19 @@ void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> 
 			covered.insert(file.id);
 		}
 	}
+	std::set<idx_t> replaced;
+	if (changes) {
+		for (auto &compaction : changes->compactions) {
+			for (auto &source : compaction.source_files) {
+				replaced.insert(source.file.id.index);
+			}
+		}
+	}
+	if (dropped) {
+		for (auto &file : *dropped) {
+			replaced.insert(file.second.index);
+		}
+	}
 	auto files = manager.GetExtendedFilesForTable(table, snapshot);
 	for (auto &file : files) {
 		if (file.data_type != DuckLakeDataType::DATA_FILE) {
@@ -353,20 +367,10 @@ void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> 
 		if (file.file.data_format != DataFileFormat::VORTEX || !file.file.encryption_key.empty()) {
 			throw InvalidInputException("Optimizer requires unencrypted Vortex files");
 		}
-		bool replaced = false;
-		if (changes) {
-			for (auto &compaction : changes->compactions) {
-				for (auto &source : compaction.source_files) {
-					if (source.file.id == file.file_id) {
-						if (covered.count(file.file_id.index)) {
-							throw InvalidInputException("Vortex write budget cannot replace an indexed source");
-						}
-						replaced = true;
-					}
-				}
+		if (replaced.count(file.file_id.index)) {
+			if (covered.count(file.file_id.index)) {
+				throw InvalidInputException("Vortex write budget cannot replace an indexed source");
 			}
-		}
-		if (replaced) {
 			continue;
 		}
 		p.source_rows += file.row_count;
@@ -953,7 +957,8 @@ unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransacti
 		if (HasWriteBudgetTable(meta)) {
 			for (auto &entry : transaction.GetLocalChanges().Changes()) {
 				auto &changes = entry.GetTableChanges();
-				if (!Grows(changes) || entry.GetTableIndex().IsTransactionLocal()) {
+				if (!Grows(changes) || entry.GetTableIndex().IsTransactionLocal() ||
+				    transaction.GetDroppedTables().count(entry.GetTableIndex())) {
 					continue;
 				}
 				auto rows =
@@ -972,7 +977,7 @@ unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransacti
 				if (table.GetTableId() != entry.GetTableIndex()) {
 					throw InvalidInputException("Vortex write budget table identity changed");
 				}
-				Probe(meta, p, &changes, &transaction.GetFlushedInlinedTables());
+				Probe(meta, p, &changes, &transaction.GetFlushedInlinedTables(), &transaction.GetDroppedFiles());
 				PendingInline(meta, p, transaction.GetFlushedInlinedTables());
 				AddWrite(p, table, changes);
 				CheckWriteBudget(p, ReadBudget(*row, 0, 2));
@@ -1001,6 +1006,9 @@ void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const strin
 	auto admission = owner->write_admission.GetExclusiveLock();
 	auto publication = VortexCatalog::PublicationLock().GetSharedLock();
 	std::lock_guard<std::mutex> guard(owner->runtime->io);
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
 	Metadata meta(*context.db, catalog);
 	try {
 		Initialized(meta);
@@ -1020,6 +1028,9 @@ void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const strin
 		           "index_name=excluded.index_name,max_inline_rows=excluded.max_inline_rows,"
 		           "max_inline_bytes=excluded.max_inline_bytes,max_unindexed_rows=excluded.max_unindexed_rows,"
 		           "max_unindexed_bytes=excluded.max_unindexed_bytes");
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 		meta.Commit();
 	} catch (...) {
 		VortexCatalog::Rollback(meta.connection);
