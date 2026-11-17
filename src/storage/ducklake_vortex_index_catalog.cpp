@@ -893,7 +893,7 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 			while (managed.size() > 1 && managed.back() == '/') {
 				managed.pop_back();
 			}
-			managed = Canonical(managed);
+			managed = ResolveLocalPath(managed);
 		}
 		for (auto &entry : entries) {
 			auto bytes = entry[4].GetValue<idx_t>();

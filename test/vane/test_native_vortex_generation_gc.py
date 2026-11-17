@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
 
 SPEC = importlib.util.spec_from_file_location("merge", Path(__file__).with_name("test_native_vortex_merge.py"))
@@ -172,6 +173,91 @@ def cancel_admission(driver, root, checks):
         return {"cases": results, "fixture_recalls": recalls}
     finally:
         M.stop(native)
+
+
+def data_path(shell, root, kind, checks):
+    real = root / "data"
+    real.mkdir()
+    if kind == "relative":
+        supplied = "data"
+    elif kind == "symlink":
+        alias = root / "data-link"
+        alias.symlink_to(real, target_is_directory=True)
+        supplied = str(alias)
+    else:
+        supplied = str(real)
+    artifacts = root / "artifacts"
+    artifacts.mkdir()
+    first, second = artifacts / "first.json", artifacts / "second.json"
+    sql = (
+        "SET autoinstall_known_extensions=false;SET autoload_known_extensions=false;"
+        "LOAD parquet;LOAD ducklake;LOAD vortex;SET threads=2;"
+        f"ATTACH {BASE.quote('ducklake:' + str(root / 'catalog.ducklake'))} AS lake "
+        f"(DATA_PATH {BASE.quote(supplied)},DATA_INLINING_ROW_LIMIT 0);"
+        "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+        "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
+        "SELECT * FROM ducklake_initialize_vortex_indexes('lake');"
+        "INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','data-path' FROM range(128)t(i);"
+        "SELECT revision::BIGINT AS first_revision FROM ducklake_build_vortex_index("
+        f"'lake','main','items','knn',{BASE.quote(first)},2,0);"
+        "SELECT revision::BIGINT AS second_revision FROM ducklake_build_vortex_index("
+        f"'lake','main','items','knn',{BASE.quote(second)},2,1);"
+        "SELECT id AS before_id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1);"
+        "SELECT count(*) AS retired_before FROM ducklake_vortex_generation_status('lake') WHERE state='retired';"
+        "SELECT collected_generations::BIGINT AS collected_generations,"
+        "collected_artifact_bytes::BIGINT AS collected_artifact_bytes,"
+        "remaining_generations::BIGINT AS remaining_generations "
+        "FROM ducklake_collect_vortex_generations('lake',16,67108864);"
+        "SELECT id AS after_id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1);"
+        "SELECT count(*) AS source_rows_after FROM lake.items;"
+        "SELECT count(*) AS registered_after,min(state) AS state_after,"
+        "min(reference_count)::BIGINT AS references_after "
+        "FROM ducklake_vortex_generation_status('lake');"
+    )
+    (root / "test.sql").write_text(sql)
+    command = [str(shell), "-batch", "-bail", "-json"]
+    started = time.monotonic()
+    result = subprocess.run(command, input=sql, cwd=root, capture_output=True, text=True, timeout=180)
+    (root / "stdout.log").write_text(result.stdout)
+    (root / "stderr.log").write_text(result.stderr)
+    (root / "execution.json").write_text(
+        json.dumps(
+            {
+                "command": command,
+                "cwd": str(root),
+                "returncode": result.returncode,
+                "seconds": time.monotonic() - started,
+                "budget_seconds": 180,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    require(result.returncode == 0, f"GC rejected {kind} DATA_PATH: {result.stderr}")
+    decoder = json.JSONDecoder()
+    remaining, rows = result.stdout.strip(), []
+    while remaining:
+        values, end = decoder.raw_decode(remaining)
+        rows.extend(values)
+        remaining = remaining[end:].lstrip()
+    values = {key: value for row in rows for key, value in row.items()}
+    require(values["first_revision"] == 1 and values["second_revision"] == 2, "DATA_PATH publication changed")
+    require(values["before_id"] == values["after_id"] == 0, "DATA_PATH GC changed query results")
+    require(
+        values["retired_before"] == 1 and values["collected_generations"] == 1 and values["remaining_generations"] == 0,
+        "DATA_PATH GC did not finish the retirement",
+    )
+    require(
+        values["registered_after"] == 1
+        and values["state_after"] == "active"
+        and values["references_after"] == 1
+        and values["source_rows_after"] == 128,
+        "DATA_PATH GC changed current references or source rows",
+    )
+    require(not (artifacts / CAT.generation(first)).exists(), "DATA_PATH GC retained the old generation")
+    require((artifacts / CAT.generation(second)).is_dir(), "DATA_PATH GC removed the active generation")
+    checks.append(f"{kind} DATA_PATH resolves the managed boundary and collects only the retired canonical generation")
+    return {"kind": kind, "supplied_data_path": supplied, "resolved_data_path": str(real), "result": values}
 
 
 def publish(native, candidate, chosen):
@@ -564,6 +650,11 @@ def main():
         directory = root / "cancel-admission"
         directory.mkdir()
         report["cancel_admission"] = cancel_admission(driver, directory, report["checks"])
+        report["data_paths"] = []
+        for kind in ["canonical", "relative", "symlink"]:
+            directory = root / ("data-path-" + kind)
+            directory.mkdir()
+            report["data_paths"].append(data_path(args.duckdb.resolve(strict=True), directory, kind, report["checks"]))
         report["admissions"] = []
         for stage, cancel in [
             ("after_snapshot", False),
