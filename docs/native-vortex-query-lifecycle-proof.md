@@ -6,9 +6,9 @@ the Vortex fixes through the native DuckDB-Vortex reader and shared query/probe
 dependencies. It adds no compatibility path or backend substitution.
 
 The dependency changes are [Vortex #28](https://github.com/AstroVela/vortex/pull/28)
-at `65346aaf1632f37ab889b821135cf669b56110fa` and
+at `b20e34c2abe63dd8f1b886b370d060b0b1ce499b` and
 [DuckDB-Vortex #37](https://github.com/AstroVela/duckdb-vortex/pull/37) at
-`d2ee7fae92655b87c8934b74d5931e294f7cba8b`.
+`84cef20459d15a2e950dee3e6b91e2804d729ec9`.
 
 ## Retained ownership
 
@@ -27,8 +27,15 @@ Two asynchronous ownership boundaries needed correction:
   and joins that task when its last iterator closes, including concurrent clone
   drops. Cancellation completion includes the tasks released by the driver and
   their descendants, even across executor scheduling batches or worker threads.
-  A cleanup queue flattens nested cancellation. Dropping an active task's own
-  handle requests cancellation without joining its current poll. Cleanup consumes
+  Nested cancellation registers an acknowledgment and lets the active poll finish.
+  Pending dependency checks prevent wait cycles between tasks on different
+  workers or runtimes. Dropping an active task's own handle requests cancellation
+  without joining its current poll. Acknowledgments drive idle peer runtimes,
+  including peers with no background workers. Cleanup borrows each executor
+  only during a poll, so queued cleanup does not keep the executor alive.
+  Blocking entrypoints scope both root future polls and destruction, then join
+  after the Runner returns its prefetched local tasks. This also applies during
+  panic unwinding and to borrowed-stream `next()` calls. Cleanup consumes
   a stored background panic; normal `next()` still propagates the original panic.
   Unrelated self-waking tasks do not prevent owned cleanup from finishing.
   Once a queued join finishes, its completed receipt is removed from the live
@@ -102,8 +109,8 @@ Neither the owner probe nor the close wait drives another Vortex operation.
 
 | Binary | SHA-256 |
 | --- | --- |
-| Old native reader with final fixture and query archive | `9c851da3326ac847c290574c52636edf0ed4d3f87d799c0ed4cb233cb96823a5` |
-| Fixed reader with the same fixture and query archive | `69d0ac392b5fabd93a35bf6cdd2407ca9cb1ee3330c65448f0f9564add123545` |
+| Old native reader with final fixture and query archive | `9dfee519541f6207e01812fbe8f8f0af7dc4bf8361ef8512bf4e48ccc969b845` |
+| Fixed reader with the same fixture and query archive | `40691d699c597fb8b6dc6be8dde1eaaee4668bb7625fc810cacdcbb518587f9e` |
 
 Both ON and OFF builds passed 86 base SQL cases (3,582 assertions and 13 skips
 each) and Parquet crash recovery. ON also passed 19 Vortex SQL cases (773
@@ -118,12 +125,16 @@ Vortex functions checked by the proof.
 The shared query/probe workspace passed formatting, build and all-target,
 all-feature Clippy with warnings denied. It currently has no Rust unit cases;
 its query behavior is exercised by the native and probe-driven proofs above.
-The pinned Vortex revision passed 308 I/O/file tests, including 14 runtime and
+The pinned Vortex revision passed 310 I/O/file tests, including 16 runtime and
 four real-file lifecycle regressions, plus 164 index/SPFresh native tests and
 three index doctests. One existing file doctest is ignored. Both modified Vortex
 crates passed nightly formatting and all-target/all-feature Clippy with warnings
 denied. The whole-workspace formatting check reported pre-existing macro
 formatting in four unchanged DuckDB/FFI files whose blobs match the parent.
+
+The file-stats tests use independent sessions for each configured runtime. Their
+previous shared session let concurrent tests replace each other's weak runtime
+handle. The production file-stats implementation is unchanged.
 
 The isolated counters run passed four cases with nine queries each at
 4,096/32,768 base rows, with and without a category prefilter. Projection, binary
@@ -134,7 +145,18 @@ An isolated allocation-counter regression keeps one parent alive across
 warm-up. The unfixed receipt bookkeeping retains about 13.4 MB; the fixed public
 counter probe stays around 73 KB after warm-up. The two-worker successful-await
 probe stays around 92 KB. These requested-allocation counters use no RSS or
-elapsed-time threshold. Native production-scale memory remains unmeasured.
+elapsed-time threshold. A separate long-lived blocking-root probe stays flat at 74,545 live requested
+bytes from 20,000 through 100,000 peer cancellations. Native production-scale
+memory remains unmeasured.
+
+Isolated cancellation regressions cover parent/child and transitive cycles, a
+parent doing a normal blocking child join, and peers on separate runtimes. The
+zero-worker cases require cleanup at normal parent completion, while a parent
+is still alive, at unpolled/started last-iterator close, across 32 nested peer
+runtimes and at idle runtime teardown. A prefetched-queue regression covers
+root future polling, normal destruction, panic unwinding and borrowed-stream
+`next()`. Their watchdogs detect missing progress;
+none assert timing or throughput.
 
 The existing local Vortex/native DuckDB-metadata scope, transaction protection,
 source/vector/artifact budgets, thread settings, distance tolerances and recall
