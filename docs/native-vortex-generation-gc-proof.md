@@ -1,6 +1,6 @@
 # Registered native Vortex generation collection
 
-This validation draft follows [DuckLake #42](https://github.com/AstroVela/ducklake/pull/42).
+This proof follows [DuckLake #42](https://github.com/AstroVela/ducklake/pull/42).
 It adds explicit collection of published generations retired by replacement or
 selective merging. It reuses the existing static SPFresh generations and private
 query leases. Source data and unpublished candidates are outside collection.
@@ -56,6 +56,14 @@ operations reject symlink traversal. It deletes only registered files and empty
 registered directories, never recursively clears a root, and syncs directory
 changes. Unexpected children, changed bytes and links fail explicitly.
 
+The collector uses the caller-context filesystem for directory access checks
+and requires directory-wide authorization before native descendant access.
+Disabled LocalFileSystem and external-access settings remain effective. Checks
+repeat at collection checkpoints and before each unlink, including when access
+is revoked after validation or after partial deletion. Permission rejection
+preserves the active head and the last durable retirement/deleting checkpoint.
+Authorized explicit resumption still handles missing registered directories.
+
 After deleting files, the collector removes the completed registry row. A crash
 or cancellation leaves a durable `deleting` record; explicit resumption permits
 missing registered files/directories in that state. A `retired` record with
@@ -71,7 +79,10 @@ lease materialization, releasing it before the `after_open` observer once the
 private copies and native handles exist. Errors and cancellation release the
 guard through ownership cleanup. Selected native builds retain their guard
 through publication. The collector takes the exclusive guard before the
-publication lock and its first metadata snapshot. Publication can proceed while
+publication lock and its first metadata snapshot. Both exclusive acquisitions
+respond to caller cancellation while another operation holds the lock; an
+interrupted collector releases any acquired guard and its database owner.
+Publication can proceed while
 an old reader finishes admission; collection waits for the old generation copies.
 
 Fully opened views continue searching and fetching from their private sources
@@ -105,16 +116,40 @@ This adds no background sweeper, orphan-directory scan, abandoned-candidate
 cleanup, source-file rewriting or SPFresh online updates. Failed candidates
 remain outside ownership until a later explicitly designed registration path.
 
-Local qualification kept DuckDB v1.5.5 (`d8cdaa33`), Vortex `65dab44f`, the native
-wrapper `b819cc03` and the qualified static SPFresh SDK unchanged from #42.
-The final catalog driver SHA-256 was
-`6ed37b3ce73a2d452726483f9638b4cec5df3e02ef8900e71da7fbb251c990cc`.
-The process proof passed 20 checks and 104 fixture queries with recall 1.0,
-including four append/merge/GC rounds. ON passed 14 Vortex SQL cases (534
-assertions) and Vortex recovery. ON/OFF each passed 86 base cases (3,582
-assertions; 13 optional-dependency skips) and Parquet recovery; audit passed 122
-assertions. All existing native index, read-view, mixed, admission, catalog,
-search, build, optimizer, lifecycle, write-budget, segment and merge proofs
-passed. The isolated cost proof passed four cases with nine queries each and
-recall 1.0; timings remain informational. `make format-fix`, Rust formatting
-and workspace Clippy with all targets/features and warnings denied passed.
+Local Linux qualification on 2026-11-17 used functional source `a18585e4`
+with reviewed #42 `eb90fc7d` merged in. DuckDB v1.5.5 (`d8cdaa33`), Vortex
+`b20e34c2`, codec `84cef204`, and SPFresh `5893eb61` with Vortex's pinned
+static-only patch were preserved. The final catalog driver SHA-256 was
+`0463a74c951060155502e4eb41377e187e992861d08eba92b5c98c9d06a03552`.
+
+The final GC process proof passed 33 checks and 144 fixture queries at recall
+1.0 in 64.6 seconds under the existing 180-second outer budget. It includes
+ten external-access/disabled-filesystem rejection and revocation cases, two
+directory-allowlisted collection/resumption controls, and cancellation while
+each collection/publication lock remains held. Waiting cancellation releases
+its owner and guards. The original permission bypass and both uninterruptible
+lock waits reproduced against an unchanged pre-fix native archive.
+
+ON passed 23 Vortex SQL cases / 907 assertions, including shared named-index
+references surviving GC until their last owner is replaced. ON and OFF each
+passed 86 base cases / 3,582 assertions with 13 optional-dependency skips.
+Deletion inlining passed 18 cases / 1,099 assertions with two optional-dependency
+skips; audit passed 122 assertions. Search/catalog/admission, retained and mixed
+views, Vortex/Parquet recovery, cleanup, native build, optimizer, lifecycle,
+all 13 write-budget cases, independent segments and selective merge proofs
+passed. The 32-case ABI matrix passed. Query/probe Rust formatting, workspace
+Clippy with all targets/features and warnings denied, workspace tests, and
+scoped pinned C++/Python formatting passed. Existing Float32 tolerances
+(`rel=1e-5`, `abs=1e-4`) and recall threshold 0.8 were retained.
+
+Seventeen ordinary functional gates kept 180-second budgets. The separate
+counter/recall gate retained its existing 600-second outer limit and completed
+in 11.7 seconds with four cases / 36 queries at recall 1.0. Native RPC and
+cleanup limits remain 60 and 30 seconds. Source, header, object, link and SDK
+identities qualify reused build inputs; changed C++ was compiled and products
+relinked normally. These checks make no stable-load throughput or latency
+claim. CI was deferred.
+
+The prior #42 large nonadjacent merge timeout remains separately tracked in
+[its qualification](native-vortex-segment-merge-proof.md). This GC change does
+not establish a cause or fix for that anomaly.
