@@ -272,7 +272,8 @@ public:
 			ReleasePause release {pause};
 			pause.Wait();
 			DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "knn", args.at(3), std::stoull(args.at(4)),
-			                             nullptr, DuckLakeVortexIndexOperation::MERGE, {args.at(5), args.at(6)});
+			                             *publisher.context, nullptr, DuckLakeVortexIndexOperation::MERGE,
+			                             {args.at(5), args.at(6)});
 			std::promise<void> waiting;
 			auto started = waiting.get_future();
 			auto gc = std::async(std::launch::async, [&] {
@@ -329,7 +330,8 @@ public:
 			auto publish = std::async(std::launch::async, [&] {
 				Connection publisher(database);
 				try {
-					DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "gc-alias", args.at(2), 0);
+					DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "gc-alias", args.at(2), 0,
+					                             *publisher.context);
 					return string();
 				} catch (const std::exception &error) {
 					return string(error.what());
