@@ -76,9 +76,13 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			throw InterruptException();
 		}
 	};
-	unique_ptr<StorageLockKey> generation_guard;
+	unique_ptr<DuckLakeVortexCollectionLock::Key> generation_guard;
 	if (!options.index_name.empty()) {
-		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock();
+		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock([&] {
+			if (reader.context->IsInterrupted() || (owner && owner->IsInterrupted())) {
+				throw InterruptException();
+			}
+		});
 	}
 	reader.BeginTransaction();
 	try {

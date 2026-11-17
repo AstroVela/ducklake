@@ -260,9 +260,13 @@ public:
 		}
 		if (op == "gc-cancel-wait") {
 			Require(args.at(2) == "admissions" || args.at(2) == "publication", "Unknown GC wait lock");
-			auto &lock = args.at(2) == "admissions" ? DuckLakeVortexIndex::CollectionLock()
-			                                        : DuckLakeVortexIndex::PublicationLock();
-			auto blocker = lock.GetSharedLock();
+			unique_ptr<DuckLakeVortexCollectionLock::Key> admission_blocker;
+			unique_ptr<StorageLockKey> publication_blocker;
+			if (args.at(2) == "admissions") {
+				admission_blocker = DuckLakeVortexIndex::CollectionLock().GetSharedLock([] {});
+			} else {
+				publication_blocker = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			}
 			Connection collector(database);
 			std::promise<void> waiting;
 			auto started = waiting.get_future();
@@ -278,7 +282,8 @@ public:
 			const bool blocked = pending.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
 			collector.Interrupt();
 			const bool cancelled = pending.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
-			blocker.reset();
+			admission_blocker.reset();
+			publication_blocker.reset();
 			string error;
 			try {
 				pending.get();
@@ -289,6 +294,64 @@ public:
 			Require(cancelled && error.find("Interrupt") != string::npos,
 			        "GC ignored cancellation while its lock remained held");
 			return "{\"interrupted_before_unlock\":true}";
+		}
+		if (op == "gc-cancel-admission") {
+			Require(args.at(2) == "search" || args.at(2) == "append" || args.at(2) == "merge",
+			        "Unknown waiting admission kind");
+			auto head = Head("knn");
+			Pause pause;
+			auto gc = std::async(std::launch::async, [&] {
+				Connection collector(database);
+				return DuckLakeVortexIndex::Collect(*collector.context, "lake", 1, 64 * 1024 * 1024,
+				                                    [&](const string &stage) {
+					                                    if (stage == "gc_acquired") {
+						                                    pause.Stop();
+					                                    }
+				                                    });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			Connection caller(database);
+			std::promise<void> entered;
+			auto started = entered.get_future();
+			auto pending = std::async(std::launch::async, [&] {
+				if (args.at(2) == "search") {
+					DuckLakeVortexSearchRequest request;
+					request.query = {133, 4, 2, 0, 1, 8, 7, 16};
+					request.k = 10;
+					entered.set_value();
+					DuckLakeVortexSearch::Execute(*caller.context, Options("knn"), request);
+				} else {
+					Connection owner(database);
+					auto options = Options("knn");
+					options.unindexed_only = args.at(2) == "append";
+					if (!options.unindexed_only) {
+						options.merge_generations = {head.segments[0].generation, head.segments[1].generation};
+					}
+					entered.set_value();
+					DuckLakeVortexReadView::AcquireBuild(owner, options, nullptr, caller.context.get());
+				}
+			});
+			const bool reached = started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+			const bool blocked = pending.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+			caller.Interrupt();
+			const bool cancelled = pending.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+			auto references = database.instance.use_count();
+			auto connections = database.instance->GetConnectionManager().GetConnectionList().size();
+			pause.Release();
+			string error;
+			try {
+				pending.get();
+			} catch (const std::exception &failure) {
+				error = failure.what();
+			}
+			auto collected = gc.get();
+			Require(reached && blocked && cancelled && error.find("Interrupt") != string::npos,
+			        "Admission ignored caller cancellation while GC remained paused: " + error);
+			Require(references == 4 && connections == 3, "Cancelled admission retained its dedicated owner");
+			Require(collected.generations == 0, "Waiting cancellation changed active generation ownership");
+			return "{\"interrupted_before_gc_unlock\":true,\"database_references_before_unlock\":4,"
+			       "\"connections_before_unlock\":3}";
 		}
 		if (op == "gc-lease-race") {
 			Connection query(database), publisher(database);

@@ -17,8 +17,10 @@
 #include "mbedtls_wrapper.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <set>
 #include <thread>
 #ifndef _WIN32
@@ -32,6 +34,56 @@
 namespace duckdb {
 using namespace duckdb_yyjson;
 using namespace vortex_detail;
+
+struct DuckLakeVortexCollectionLock::State {
+	std::mutex lock;
+	std::atomic<idx_t> readers {0};
+};
+
+DuckLakeVortexCollectionLock::DuckLakeVortexCollectionLock() : state(make_shared_ptr<State>()) {
+}
+
+DuckLakeVortexCollectionLock::Key::Key(shared_ptr<State> state_p, bool exclusive_p)
+    : state(std::move(state_p)), exclusive(exclusive_p) {
+}
+
+DuckLakeVortexCollectionLock::Key::~Key() {
+	if (exclusive) {
+		state->lock.unlock();
+	} else {
+		state->readers--;
+	}
+}
+
+unique_ptr<DuckLakeVortexCollectionLock::Key>
+DuckLakeVortexCollectionLock::GetSharedLock(const std::function<void()> &check) {
+	std::unique_lock<std::mutex> pending(state->lock, std::defer_lock);
+	while (!pending.try_lock()) {
+		check();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	check();
+	auto key = make_uniq<Key>(state, false);
+	state->readers++;
+	return key;
+}
+
+unique_ptr<DuckLakeVortexCollectionLock::Key>
+DuckLakeVortexCollectionLock::GetExclusiveLock(const std::function<void()> &check) {
+	std::unique_lock<std::mutex> pending(state->lock, std::defer_lock);
+	while (!pending.try_lock()) {
+		check();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	while (state->readers != 0) {
+		check();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	check();
+	auto key = make_uniq<Key>(state, true);
+	pending.release();
+	return key;
+}
 
 namespace {
 const char *CATALOG_TABLE = "ducklake_vortex_indexes_v1";
@@ -163,12 +215,12 @@ void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
 	}
 }
 
-unique_ptr<StorageLockKey> AcquireCollectionLock(StorageLock &lock, ClientContext &context) {
+unique_ptr<StorageLockKey> AcquirePublicationLock(ClientContext &context) {
 	while (true) {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-		auto key = lock.TryGetExclusiveLock();
+		auto key = DuckLakeVortexIndex::PublicationLock().TryGetExclusiveLock();
 		if (key) {
 			return key;
 		}
@@ -719,8 +771,8 @@ StorageLock &DuckLakeVortexIndex::PublicationLock() {
 	return lock;
 }
 
-StorageLock &DuckLakeVortexIndex::CollectionLock() {
-	static StorageLock lock;
+DuckLakeVortexCollectionLock &DuckLakeVortexIndex::CollectionLock() {
+	static DuckLakeVortexCollectionLock lock;
 	return lock;
 }
 
@@ -802,8 +854,12 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 		}
 	};
 	check("gc_waiting");
-	auto admissions = AcquireCollectionLock(CollectionLock(), context);
-	auto publication = AcquireCollectionLock(PublicationLock(), context);
+	auto admissions = CollectionLock().GetExclusiveLock([&] {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
+	auto publication = AcquirePublicationLock(context);
 	check("gc_acquired");
 	Connection owner(*context.db);
 	DuckLakeVortexGCResult collected;

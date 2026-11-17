@@ -138,6 +138,42 @@ def cancel_waiting(driver, root, checks):
         M.stop(native)
 
 
+def cancel_admission(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts = root / "artifacts"
+        artifacts.mkdir()
+        native.call("init")
+        native.call("build", "knn", artifacts / "B1.json", 0)
+        SEG.add_f(native, 5000)
+        native.call("append", "knn", artifacts / "B2.json", 1)
+        SEG.add_f(native, 6000)
+        head = native.call("head", "knn")
+        rows = status(native)
+        signatures = {row["generation"]: SEG.signature(directory(row)) for row in rows}
+        results = []
+        for kind in ["search", "append", "merge"]:
+            result = native.call("gc-cancel-admission", kind)
+            require(result["interrupted_before_gc_unlock"], "Admission cancellation waited for GC release")
+            require(native.call("head", "knn") == head and status(native) == rows, "Cancellation changed ownership")
+            owner = native.call("owners")
+            require(owner["database_references"] == 2 and len(owner["connections"]) == 1, "Admission retained owners")
+            require(
+                all(SEG.signature(directory(row)) == signatures[row["generation"]] for row in rows),
+                "Waiting admission changed active generation bytes",
+            )
+            results.append({"kind": kind, **result})
+        recalls = []
+        M.qualify(native, "after-waiting-cancellation", recalls, 2)
+        native.call("reopen")
+        require(native.call("head", "knn") == head and status(native) == rows, "Reopen lost the untouched ready set")
+        native.finish()
+        checks.append("query, append and merge capture cancel before GC unlock and release their dedicated owners")
+        return {"cases": results, "fixture_recalls": recalls}
+    finally:
+        M.stop(native)
+
+
 def publish(native, candidate, chosen):
     result = native.call("publish-merge", candidate, 3, *chosen)
     require(result["revision"] == 4 and len(segments(result)) == 2, "Merge publication was incomplete")
@@ -525,6 +561,9 @@ def main():
         directory = root / "cancel-waiting"
         directory.mkdir()
         report["cancel_waiting"] = cancel_waiting(driver, directory, report["checks"])
+        directory = root / "cancel-admission"
+        directory.mkdir()
+        report["cancel_admission"] = cancel_admission(driver, directory, report["checks"])
         report["admissions"] = []
         for stage, cancel in [
             ("after_snapshot", False),

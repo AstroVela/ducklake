@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection.hpp"
 #include <functional>
@@ -11,6 +12,30 @@ class DuckLakeTableEntry;
 class ExtensionLoader;
 class StorageLock;
 class ClientContext;
+
+class DuckLakeVortexCollectionLock {
+	struct State;
+
+public:
+	class Key {
+	public:
+		Key(shared_ptr<State> state, bool exclusive);
+		~Key();
+		Key(const Key &) = delete;
+		Key &operator=(const Key &) = delete;
+
+	private:
+		shared_ptr<State> state;
+		bool exclusive;
+	};
+
+	DuckLakeVortexCollectionLock();
+	unique_ptr<Key> GetSharedLock(const std::function<void()> &check);
+	unique_ptr<Key> GetExclusiveLock(const std::function<void()> &check);
+
+private:
+	shared_ptr<State> state;
+};
 
 enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
 
@@ -47,7 +72,7 @@ struct DuckLakeVortexIndex {
 	vector<DuckLakeVortexIndexFile> SelectedFiles(const vector<string> &generations) const;
 	vector<string> SmallestSegments() const;
 	static StorageLock &PublicationLock();
-	static StorageLock &CollectionLock();
+	static DuckLakeVortexCollectionLock &CollectionLock();
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog);
 	static void Rollback(Connection &owner);
 	static void Initialized(DuckLakeTransaction &transaction);
