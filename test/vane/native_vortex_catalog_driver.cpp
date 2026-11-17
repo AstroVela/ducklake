@@ -88,7 +88,11 @@ public:
 				auto item = json.Object();
 				json.Number(item, "connection_id", context->GetConnectionId());
 				json.Number(item, "references", context.use_count());
-				json.Add(item, "active", yyjson_mut_bool(json.doc.get(), context->transaction.HasActiveTransaction()));
+				// Only this command's writer context is idle and exclusively owned here.
+				auto active = context == writer.context
+				                  ? yyjson_mut_bool(json.doc.get(), context->transaction.HasActiveTransaction())
+				                  : yyjson_mut_null(json.doc.get());
+				json.Add(item, "active", active);
 				yyjson_mut_arr_append(entries, item);
 			}
 			json.Add(value, "connections", entries);

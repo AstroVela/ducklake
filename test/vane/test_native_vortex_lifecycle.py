@@ -29,12 +29,27 @@ def delta(native):
     )
 
 
-def settled(native):
+def ownership_baseline(native):
+    counters = native.call("owners")
+    connections = counters["connections"]
+    require(
+        counters["database_references"] == 2 and len(connections) == 1 and connections[0]["active"] is False,
+        f"Unexpected ownership baseline: {counters}",
+    )
+    return connections[0]["references"]
+
+
+def settled(native, context_references):
     deadline = time.monotonic() + 5
     while True:
         counters = native.call("owners")
         connections = counters["connections"]
-        if counters["database_references"] == 2 and len(connections) == 1 and not connections[0]["active"]:
+        if (
+            counters["database_references"] == 2
+            and len(connections) == 1
+            and connections[0]["active"] is False
+            and connections[0]["references"] == context_references
+        ):
             return counters
         require(time.monotonic() < deadline, f"Query retained database/context/transaction owners: {counters}")
         time.sleep(0.01)
@@ -91,20 +106,47 @@ def exercise(native, root, cycles, reopens, checks):
     observations = []
     recalls = []
     rss_samples = []
+    context_before_prepare = ownership_baseline(native)
     native.sql("PREPARE lifecycle_search AS " + SEARCH.search_sql(VECTOR))
+    context_references = ownership_baseline(native)
+
+    def released(label):
+        observations.append({"operation": label, **settled(native, context_references)})
+        require(not list((root / "private").iterdir()), f"{label} retained private leases")
+
     for i in range(cycles):
         native.sql("SET threads=" + str(1 + i % 2) + ";")
         result = SEARCH.query(native, "EXECUTE lifecycle_search")
         recalls.append(SEARCH.qualify(result, rows, VECTOR))
+        released("prepared-search")
         limited = SEARCH.query(native, SEARCH.search_sql(VECTOR) + " LIMIT 1")
         require(limited["rows"] == result["rows"][:1], "Early LIMIT changed ranked output")
+        released("search-limit")
         native.sql("SELECT id,payload FROM lake.items LIMIT 1;")
-        observations.append(settled(native))
-        require(not list((root / "private").iterdir()), "Successful/LIMIT query retained private leases")
+        released("scan-limit")
         rss_samples.append(rss(native))
     checks.append(
         "successful mixed queries, prepared execution and early LIMIT release owners with one/two DuckDB threads"
     )
+
+    reopen_pid = native.process.pid
+    direct_reopens = []
+
+    def reopen_after(label):
+        native.call("reopen")
+        require(native.process.pid == reopen_pid, "Reopen changed the native process")
+        direct_reopens.append(label)
+        return ownership_baseline(native)
+
+    SEARCH.query(native, "EXECUTE lifecycle_search")
+    released("prepared-before-reopen")
+    context_references = reopen_after("prepared-search")
+    SEARCH.query(native, SEARCH.search_sql(VECTOR) + " LIMIT 1")
+    released("search-limit-before-reopen")
+    context_references = reopen_after("search-limit")
+    native.sql("SELECT id,payload FROM lake.items LIMIT 1;")
+    released("scan-limit-before-reopen")
+    context_references = reopen_after("scan-limit")
 
     for operation, stage, expected in [
         ("cancel-search", "after_visibility", "Interrupted"),
@@ -116,29 +158,29 @@ def exercise(native, root, cycles, reopens, checks):
         ("fail-search", "after_open", "Injected query lease failure"),
     ]:
         native.call(operation, stage, expected=expected)
-        observations.append(settled(native))
-        require(not list((root / "private").iterdir()), "Failed/cancelled query retained private leases")
+        released(operation + "-" + stage)
+        context_references = reopen_after(operation + "-" + stage)
     SEARCH.query(native, SEARCH.search_sql([1, 2]), expected="Query dimension")
-    observations.append(settled(native))
+    released("dimension-error")
+    context_references = reopen_after("dimension-error")
     checks.append(
         "interruption, callback failure and dimension rejection release owners before any subsequent Vortex operation"
     )
 
-    native.sql("DEALLOCATE lifecycle_search;")
-    reopen_pid = native.process.pid
     for _ in range(reopens):
         native.call("reopen")
         require(native.process.pid == reopen_pid, "Reopen changed the native process")
+        context_references = ownership_baseline(native)
         result = native.call("core-search")
         recalls.append(SEARCH.qualify(result, rows, VECTOR))
-        observations.append(settled(native))
+        released("core-search-after-reopen")
     checks.append("strict database weak-reference checks pass before reopening another database in the same process")
 
     native.call("optimizer-init")
     native.call("optimizer-enable", artifacts, 100000, 4194304, 100000, 67108864)
     for _ in range(4):
         native.call("core-search")
-        observations.append(settled(native))
+        released("optimizer-core-search")
     native.call("optimizer-cancel")
     deadline = time.monotonic() + 10
     while True:
@@ -147,16 +189,19 @@ def exercise(native, root, cycles, reopens, checks):
             break
         require(time.monotonic() < deadline, "Optimizer cancellation did not settle")
         time.sleep(0.02)
-    observations.append(settled(native))
+    released("optimizer-cancel")
     native.call("reopen")
+    context_references = ownership_baseline(native)
     result = native.call("core-search")
     recalls.append(SEARCH.qualify(result, rows, VECTOR))
-    observations.append(settled(native))
+    released("core-search-after-optimizer-reopen")
     checks.append("the same ownership and close checks pass with an optimizer installed and after its cancellation")
     return {
         "fixture_recalls": recalls,
         "owner_observations": observations,
-        "same_process_reopens": reopens + 1,
+        "same_process_reopens": reopens + 1 + len(direct_reopens),
+        "direct_reopen_endings": direct_reopens,
+        "context_references_before_prepare": context_before_prepare,
         "query_cycles": cycles,
         "rss_samples_kib": rss_samples,
         "rss_conditions": "allocator/cache observations; ownership is the hard gate",
