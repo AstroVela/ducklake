@@ -239,6 +239,65 @@ public:
 			auto result = SQL(writer, "SELECT * FROM ducklake_recover_vortex_builds('lake'," + args.at(2) + ")");
 			return to_string(result->GetValue(0, 0).GetValue<idx_t>());
 		}
+		if (op == "build-status-transaction") {
+			Connection caller(database);
+			SQL(caller, "CREATE TEMP TABLE status_marker(i INTEGER)");
+			caller.BeginTransaction();
+			SQL(caller, "INSERT INTO status_marker VALUES (1)");
+			bool rejected = false;
+			try {
+				DuckLakeVortexIndex::BuildStatus(caller, "lake");
+			} catch (const InvalidInputException &error) {
+				rejected = string(error.what()).find("idle dedicated connection") != string::npos;
+			}
+			Require(rejected && caller.context->transaction.HasActiveTransaction(),
+			        "Build status did not preserve its caller transaction");
+			Require(SQL(caller, "SELECT count(*) FROM status_marker")->GetValue(0, 0).GetValue<idx_t>() == 1,
+			        "Build status discarded pending work");
+			caller.Rollback();
+			Require(SQL(caller, "SELECT count(*) FROM status_marker")->GetValue(0, 0).GetValue<idx_t>() == 0,
+			        "Build status committed pending work");
+			return "{\"caller_rollback\":true}";
+		}
+		if (op == "build-cancel-source-wait") {
+			const auto &stage = args.at(2);
+			Require(stage == "before_source_admission" || stage == "before_publish_source_admission",
+			        "Unknown source admission stage");
+			Connection builder(database);
+			Pause pause;
+			auto pending = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::BuildAndPublish(*builder.context, "lake", "main", "items", "knn",
+				                                            args.at(3), 8, std::stoull(args.at(4)),
+				                                            [&](const string &observed) {
+					                                            if (observed == stage) {
+						                                            pause.Stop();
+					                                            }
+				                                            });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			auto source_cleanup = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock([] {});
+			pause.Release();
+			const bool blocked = pending.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+			builder.Interrupt();
+			const bool cancelled = pending.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+			auto maintenance = std::async(std::launch::async, [&] {
+				Connection collector(database);
+				return DuckLakeVortexIndex::CollectBuilds(*collector.context, "lake", 1, 64 * 1024 * 1024);
+			});
+			const bool collected = maintenance.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+			source_cleanup.reset();
+			bool interrupted = false;
+			try {
+				pending.get();
+			} catch (const InterruptException &) {
+				interrupted = true;
+			}
+			auto result = maintenance.get();
+			Require(blocked && cancelled && interrupted, "Build cancellation waited for source cleanup");
+			Require(collected && result.builds == 1, "Cancelled build retained its maintenance guard");
+			return "{\"collected_before_source_unlock\":true}";
+		}
 		if (op == "build-gc" || op == "build-gc-cancel" || op == "build-gc-fail" || op == "build-gc-crash" ||
 		    op == "build-gc-policy") {
 			Connection collector(database);

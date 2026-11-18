@@ -24,6 +24,9 @@ against paths claimed by other builds and registered generations. Two builds
 can share an artifact root or use sibling directories. A claim that coincides
 with, contains or lies inside another owner's path is rejected. The same check
 protects published generations after their workspace registration is collected.
+The builder opens the root with the collector's POSIX path rules before it
+commits a task. Source capture checks the table UUID recorded by that task.
+Replacing a table between registration and capture abandons the old build.
 
 Build state advances through `allocated`, `building` and `sealed`. Publication
 sets `published` and `keep_generation=true` in the same transaction as the
@@ -38,6 +41,8 @@ and error reconciliation, including bootstrap and full replacement builds.
 Recovery and both collectors take the exclusive guard before the publication
 lock. A caller can cancel while waiting for either lock. A stopped waiter
 releases its locks and connection while the other operation still holds its lock.
+Capture and publication also observe cancellation while physical source cleanup
+holds its exclusive admission lock.
 
 ## Explicit recovery and bounded collection
 

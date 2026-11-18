@@ -86,6 +86,16 @@ DuckLakeVortexCollectionLock::GetExclusiveLock(const std::function<void()> &chec
 	return key;
 }
 
+unique_ptr<DuckLakeVortexCollectionLock::Key> DuckLakeVortexCollectionLock::TryGetExclusiveLock() {
+	std::unique_lock<std::mutex> pending(state->lock, std::try_to_lock);
+	if (!pending.owns_lock() || state->readers != 0) {
+		return nullptr;
+	}
+	auto key = make_uniq<Key>(state, true);
+	pending.release();
+	return key;
+}
+
 namespace {
 const char *CATALOG_TABLE = "ducklake_vortex_indexes_v1";
 const char *GENERATIONS = "ducklake_vortex_generations_v1";
@@ -1176,6 +1186,9 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 }
 
 vector<vector<Value>> DuckLakeVortexIndex::BuildStatus(Connection &owner, const string &catalog) {
+	if (owner.context->transaction.HasActiveTransaction()) {
+		throw InvalidInputException("Vortex build status requires an idle dedicated connection");
+	}
 	try {
 		auto &transaction = Begin(owner, catalog);
 		Initialized(transaction);
@@ -1529,7 +1542,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		auto entry = catalog.GetEntry(*owner.context, CatalogType::TABLE_ENTRY, schema, table_name,
 		                              OnEntryNotFound::THROW_EXCEPTION);
 		auto &table = entry->Cast<DuckLakeTableEntry>();
-		if ((!expected_table_uuid.empty() && table.GetTableUUID() != expected_table_uuid) ||
+		auto table_uuid = table.GetTableUUID();
+		if ((!expected_table_uuid.empty() && table_uuid != expected_table_uuid) ||
 		    (expected_field_id.IsValid() &&
 		     table.GetFieldId(vector<string> {"embedding"}).GetFieldIndex().index != expected_field_id.GetIndex())) {
 			throw InvalidInputException("Vortex optimizer table or vector field identity changed");
@@ -1576,8 +1590,13 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		    fs.FileExists(generation_path) || fs.DirectoryExists(reference_path)) {
 			throw InvalidInputException("Planned Vortex build namespace already exists");
 		}
+#ifndef _WIN32
+		auto directory = OpenRoot(root, false);
+#else
+		throw NotImplementedException("Native Vortex builds are qualified on POSIX paths");
+#endif
 		Query(transaction, "INSERT INTO {METADATA_CATALOG}." + string(BUILDS) + " VALUES(" + Value(id).ToSQLString() +
-		                       "," + Value(table.GetTableUUID()).ToSQLString() + "," + Value(name).ToSQLString() + "," +
+		                       "," + Value(table_uuid).ToSQLString() + "," + Value(name).ToSQLString() + "," +
 		                       to_string(expected_revision) + "," + Value(root).ToSQLString() + "," +
 		                       Value(generation).ToSQLString() + "," + Value(workspace).ToSQLString() + "," +
 		                       Value(reference_path).ToSQLString() + ",'allocated',false)");
@@ -1587,13 +1606,11 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		registration.reset();
 		check("build_allocated");
 #ifndef _WIN32
-		auto directory = OpenRoot(root, false);
 		if (mkdirat(directory->fd, (".build-" + id).c_str(), 0700)) {
 			throw IOException("Cannot create exclusive native Vortex build workspace");
 		}
 		SyncDirectory(directory->fd);
-#else
-		throw NotImplementedException("Native Vortex builds are qualified on POSIX paths");
+		directory.reset();
 #endif
 		check("build_workspace_created");
 		BuildState(owner, catalog_name, id, "building");
@@ -1606,7 +1623,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		                                   select_index ? name : ""};
 		options.unindexed_only = operation == DuckLakeVortexIndexOperation::APPEND;
 		options.merge_generations = merge_generations;
-		options.expected_table_uuid = expected_table_uuid;
+		options.expected_table_uuid = table_uuid;
 		options.expected_field_id = expected_field_id;
 		auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, check, &context);
 		vector<DuckLakeVortexQuerySource> sources;
@@ -1746,7 +1763,11 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 			RegisterGeneration(transaction, part, manifest, before - artifact_budget);
 		}
 		CheckInterrupted(owner, caller);
-		auto source_guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
+		if (observe) {
+			observe("before_publish_source_admission");
+		}
+		auto source_guard =
+		    DuckLakeVortexReadView::AdmissionLock().GetSharedLock([&] { CheckInterrupted(owner, caller); });
 		CheckInterrupted(owner, caller);
 		auto current = transaction.GetMetadataManager().GetExtendedFilesForTable(table, transaction.GetSnapshot());
 		vector<DuckLakeVortexIndexFile> files;

@@ -5,7 +5,6 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
-#include "duckdb/storage/storage_lock.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -50,8 +49,8 @@ yyjson_mut_val *Business(ViewJSON &json, const vector<Value> &values, uint32_t d
 
 } // namespace
 
-StorageLock &DuckLakeVortexReadView::AdmissionLock() {
-	static StorageLock lock;
+DuckLakeVortexCollectionLock &DuckLakeVortexReadView::AdmissionLock() {
+	static DuckLakeVortexCollectionLock lock;
 	return lock;
 }
 
@@ -68,21 +67,20 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 	if (reader.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Read view acquisition requires an idle dedicated connection");
 	}
-	auto checkpoint = [&](const string &stage) {
-		if (observe) {
-			observe(stage);
-		}
+	auto interrupt = [&] {
 		if (reader.context->IsInterrupted() || (owner && owner->IsInterrupted())) {
 			throw InterruptException();
 		}
 	};
+	auto checkpoint = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		interrupt();
+	};
 	unique_ptr<DuckLakeVortexCollectionLock::Key> generation_guard;
 	if (!options.index_name.empty() && !build_files) {
-		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock([&] {
-			if (reader.context->IsInterrupted() || (owner && owner->IsInterrupted())) {
-				throw InterruptException();
-			}
-		});
+		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock(interrupt);
 	}
 	reader.BeginTransaction();
 	try {
@@ -90,7 +88,8 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 			throw InvalidInputException("Native Vortex read views require DuckDB metadata");
 		}
-		auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
+		checkpoint("before_source_admission");
+		auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
 		auto &transaction = DuckLakeTransaction::Get(*reader.context, catalog);
 		auto snapshot = transaction.GetSnapshot();
 		checkpoint("after_snapshot");

@@ -32,6 +32,7 @@ public:
 	DuckLakeVortexCollectionLock();
 	unique_ptr<Key> GetSharedLock(const std::function<void()> &check);
 	unique_ptr<Key> GetExclusiveLock(const std::function<void()> &check);
+	unique_ptr<Key> TryGetExclusiveLock();
 
 private:
 	shared_ptr<State> state;

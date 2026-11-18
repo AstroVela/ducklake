@@ -426,6 +426,14 @@ def namespace_ownership(driver, root, checks):
         workspace = Path(owner["workspace"])
         generation = GC.directory(owner)
         reference_bytes = reference.read_bytes()
+        unqualified = artifacts / "12:30"
+        unqualified.mkdir()
+        native.call("build", "second", unqualified / "next.json", 0, expected="Invalid local index artifact path")
+        require(
+            status(native) == [owner] and not list(unqualified.iterdir()),
+            "A root the collector cannot open acquired a durable claim",
+        )
+        checks.append("root component validation precedes registration and leaves existing tasks collectible")
         for directory in [workspace, generation]:
             output = directory / "next.json"
             native.call("build", "second", output, 0, expected="overlaps another registered owner")
@@ -481,10 +489,54 @@ def stored_ownership(driver, root, checks):
         M.stop(native)
 
 
+def table_replacement(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts = root / "artifacts"
+        artifacts.mkdir()
+        native.call("init")
+        native.call("raw", "original-table")
+        original = CAT.descriptor(native.capture("original-table"))["capture"]["file_capture"]["table_uuid"]
+        ddl = root / "replace.sql"
+        ddl.write_text(
+            "ALTER TABLE lake.items RENAME TO previous_items;"
+            "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items');"
+            "INSERT INTO lake.items SELECT id,embedding,category,payload FROM lake.previous_items;"
+        )
+        reference = artifacts / "registered.json"
+        native.call("mutate-build", reference, 0, "build_allocated", ddl, expected="identity changed")
+        stopped = candidate(native)
+        native.call("raw", "replacement-table")
+        replacement = CAT.descriptor(native.capture("replacement-table"))["capture"]["file_capture"]["table_uuid"]
+        require(
+            stopped["table_uuid"] == original != replacement and stopped["state"] == "abandoned",
+            "Replacing the table changed the registered task's identity",
+        )
+        native.call("head", "knn", expected="No published Vortex index")
+        require(
+            not reference.exists() and collect(native, 1)["collected_builds"] == 1,
+            "Stale capture produced output or could not be collected",
+        )
+        gone(stopped)
+        native.call("build", "knn", artifacts / "replacement.json", 0)
+        require(candidate(native)["table_uuid"] == replacement, "Fresh build did not bind the replacement table")
+        recalls = []
+        qualify(native, "current-table", recalls)
+        native.finish()
+        checks.append("replacing a table after registration cancels stale capture and a fresh build binds its new UUID")
+        return {"stale_task_collected": True, "fixture_recalls": recalls}
+    finally:
+        M.stop(native)
+
+
 def cancel_maintenance(driver, root, checks):
     native = CAT.Native(driver, root / "native")
     try:
         native.call("init")
+        require(native.call("build-status-transaction")["caller_rollback"], "Build status lost caller transaction work")
+        checks.append("rejecting build status on a busy connection keeps the caller's pending write and rollback")
         cases = []
         for operation in ["build-recovery", "build-gc"]:
             for lock in ["admissions", "publication"]:
@@ -504,6 +556,32 @@ def cancel_maintenance(driver, root, checks):
         native.finish()
         checks.append("recovery and workspace GC cancel at either lock before its holder releases it")
         return {"interrupted_before_unlock": cases}
+    finally:
+        M.stop(native)
+
+
+def cancel_source_wait(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, first, frozen = SEG.setup(native, root)
+        collect(native)
+        head = native.call("head", "knn")
+        stages = ["before_source_admission", "before_publish_source_admission"]
+        for stage in stages:
+            result = native.call("build-cancel-source-wait", stage, artifacts / (stage + ".json"), 1)
+            require(
+                result["collected_before_source_unlock"] and not status(native),
+                "Source cleanup blocked cancelled build collection",
+            )
+            require(native.call("head", "knn") == head, "A cancelled source admission published a revision")
+            SEG.unchanged(native, first, frozen)
+        recalls = []
+        qualify(native, "after-source-waits", recalls)
+        native.finish()
+        checks.append(
+            "build capture and publication cancel and release maintenance while source cleanup holds its lock"
+        )
+        return {"stages": stages, "fixture_recalls": recalls}
     finally:
         M.stop(native)
 
@@ -610,7 +688,9 @@ def main():
             ("retired-scratch", retired_scratch),
             ("namespace-ownership", namespace_ownership),
             ("stored-ownership", stored_ownership),
+            ("table-replacement", table_replacement),
             ("cancel-maintenance", cancel_maintenance),
+            ("cancel-source-wait", cancel_source_wait),
             ("allowed-workspace", allowed_workspace),
         ]:
             directory = root / name
