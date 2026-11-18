@@ -13,6 +13,8 @@ and return only visible rows while retirement is pending. When an existing
 external mask is completed, the prior descriptor ends at the actual DELETE
 commit and remains available to historical snapshots. Change feeds compare
 the new mask with its predecessor to report the newly deleted positions.
+Expiry retains the predecessor while the successor still serves a retained
+snapshot or remains active.
 Unindexed files continue to use native full-file deletion. Final metadata
 commit rejects a file drop if a concurrent index publication has covered it.
 
@@ -34,8 +36,8 @@ transaction. The snapshot journal records physical compaction so a staged
 append can commit after retirement. Other B descriptors and artifact bytes
 are retained.
 The commit marks the retired source IDs so change feeds keep the original
-logical delete events. Snapshot expiry removes the markers and inlined masks
-when it removes the corresponding source metadata.
+logical delete events. Flush keeps their inlined masks in metadata. Snapshot
+expiry removes the markers and inlined masks with the source metadata.
 
 The existing explicit data-compaction policy also selects an entirely empty B.
 It journals a `retire` task in `retiring` and then `publishing` before the native

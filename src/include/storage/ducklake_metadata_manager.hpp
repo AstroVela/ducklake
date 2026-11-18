@@ -302,6 +302,8 @@ public:
 	static const char *VortexRetiredSourceTable() {
 		return "ducklake_vortex_retired_sources_v1";
 	}
+	//! SQL predicate for the retirement status of source rows aliased as data.
+	string VortexRetiredSourcePredicate();
 	//! Caller supplies one resolved path per overwritten file, in the same order.
 	static string DeleteOverwrittenDeleteFiles(const vector<DuckLakeOverwrittenDeleteFile> &overwritten_files,
 	                                           const vector<DuckLakePath> &resolved_paths);

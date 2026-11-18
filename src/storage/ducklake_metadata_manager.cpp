@@ -1869,7 +1869,7 @@ WHERE data.table_id=%d AND data.begin_snapshot <= {SNAPSHOT_ID} AND (
 	return files;
 }
 
-static string VortexRetiredSourcePredicate(DuckLakeTransaction &transaction) {
+string DuckLakeMetadataManager::VortexRetiredSourcePredicate() {
 	auto &catalog = transaction.GetCatalog();
 	auto table = DuckLakeMetadataManager::VortexRetiredSourceTable();
 	if ((!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") ||
@@ -1891,7 +1891,7 @@ vector<DuckLakeDeleteScanEntry> DuckLakeMetadataManager::GetTableDeletions(DuckL
 	// Check if we have an inlined deletion table for this table (usually cached, no DB hit)
 	auto inlined_table_name = GetInlinedDeletionTableName(table_id, end_snapshot);
 	bool has_inlined_table = !inlined_table_name.empty();
-	auto physical_retirement = VortexRetiredSourcePredicate(transaction);
+	auto physical_retirement = VortexRetiredSourcePredicate();
 
 	// Build the query with optional CTE for inlined deletions
 	// Deletes come in three flavors:
@@ -4976,7 +4976,7 @@ AND NOT EXISTS (
 		table_id_filter = StringUtil::Format("table_id IN (%s) OR", deleted_table_ids);
 	}
 
-	auto physical_retirement = VortexRetiredSourcePredicate(transaction);
+	auto physical_retirement = VortexRetiredSourcePredicate();
 	result = transaction.Query(StringUtil::Format(R"(
 SELECT data_file_id, table_id, path, path_is_relative%s
 FROM {METADATA_CATALOG}.ducklake_data_file data
@@ -5061,7 +5061,7 @@ VALUES %s;
 		}
 	}
 
-	// get a list of delete files that are no longer required after these deletions
+	// A retained mask version still needs its predecessor for the change feed.
 	string file_id_filter;
 	if (!deleted_file_ids.empty()) {
 		file_id_filter = StringUtil::Format("data_file_id IN (%s) OR", deleted_file_ids);
@@ -5069,11 +5069,20 @@ VALUES %s;
 
 	result = transaction.Query(StringUtil::Format(R"(
 SELECT delete_file_id, table_id, path, path_is_relative
-FROM {METADATA_CATALOG}.ducklake_delete_file
-WHERE %s %s (end_snapshot IS NOT NULL AND NOT EXISTS(
+FROM {METADATA_CATALOG}.ducklake_delete_file previous
+WHERE %s %s (previous.end_snapshot IS NOT NULL AND NOT EXISTS(
     SELECT snapshot_id
     FROM {METADATA_CATALOG}.ducklake_snapshot
-    WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot
+    WHERE snapshot_id >= previous.begin_snapshot AND snapshot_id < previous.end_snapshot
+) AND NOT EXISTS (
+    SELECT 1
+    FROM {METADATA_CATALOG}.ducklake_delete_file successor
+    WHERE successor.data_file_id = previous.data_file_id
+      AND successor.begin_snapshot = previous.end_snapshot
+      AND (successor.end_snapshot IS NULL OR EXISTS (
+          SELECT 1 FROM {METADATA_CATALOG}.ducklake_snapshot retained
+          WHERE retained.snapshot_id >= successor.begin_snapshot AND retained.snapshot_id < successor.end_snapshot
+      ))
 ));)",
 	                                              table_id_filter, file_id_filter));
 	vector<DuckLakeFileForCleanup> cleanup_deletes;
