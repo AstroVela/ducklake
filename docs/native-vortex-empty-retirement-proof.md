@@ -106,17 +106,17 @@ after a vector column rename.
 
 ## Local verification against #48
 
-The native ON and OFF builds were verified on DuckLake `f50300c6`, which
+The native ON and OFF builds were verified on DuckLake `a900abb7`, which
 incorporates #48 at `9563536f`. The dependency pins are DuckDB
 `d8cdaa33`, Vortex `b20e34c2`, and the DuckDB Vortex
 wrapper `84cef204`.
 
-Empty-segment retirement passed 27 checks and
+Empty-segment retirement passed 28 checks and
 88 query comparisons with minimum recall
-1.0 in 43.57 seconds. Background
+1.0 in 43.88 seconds. Background
 rewrite passed 30 checks and 124
 comparisons with minimum recall 1.0 in
-86.87 seconds. Both used the existing 180-second budget.
+87.47 seconds. Both used the existing 180-second budget.
 The retirement SQL case passed 64 assertions.
 
 All 19 native process proofs passed. ON passed
@@ -136,4 +136,4 @@ and 156 assertions. The table change suite passed
 11 cases and 684 assertions.
 
 The qualified catalog driver SHA-256 is
-`9bc9fafedca133132de4948ce59abf9a60ba05777134e2bf952737638271c000`.
+`a5828055c9916bf6fba796f7dd518dad443c1e27056e8634d06e47da90af4595`.
