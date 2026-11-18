@@ -9,10 +9,13 @@
 #include "storage/ducklake_vortex.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/storage/object_cache.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <chrono>
@@ -59,9 +62,10 @@ void Validate(const Policy &p);
 struct Metadata {
 	Connection connection;
 	DuckLakeTransaction &transaction;
-	static DuckLakeTransaction &Begin(Connection &connection, const string &catalog, bool require_index) {
+	static DuckLakeTransaction &Begin(Connection &connection, const string &catalog, bool require_index,
+	                                  optional_ptr<const DuckLakeVortexCatalogIdentity> identity) {
 		try {
-			auto &transaction = VortexCatalog::Begin(connection, catalog);
+			auto &transaction = VortexCatalog::Begin(connection, catalog, identity);
 			if (require_index) {
 				VortexCatalog::Initialized(transaction);
 			}
@@ -71,8 +75,9 @@ struct Metadata {
 			throw;
 		}
 	}
-	Metadata(DatabaseInstance &db, const string &catalog, bool require_index = true)
-	    : connection(db), transaction(Begin(connection, catalog, require_index)) {
+	Metadata(DatabaseInstance &db, const string &catalog, bool require_index = true,
+	         optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr)
+	    : connection(db), transaction(Begin(connection, catalog, require_index, identity)) {
 	}
 	unique_ptr<QueryResult> Query(const string &sql) {
 		return VortexCatalog::Query(transaction, sql);
@@ -91,16 +96,48 @@ string Where(const Policy &p) {
 
 void Initialized(Metadata &meta) {
 	auto &catalog = meta.transaction.GetCatalog();
-	for (auto &name : {POLICIES, MAINTENANCE}) {
-		if (!meta.transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
-		                                                name)) {
-			throw InvalidInputException("Vortex optimizer catalog is not initialized");
-		}
+	if (!meta.transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+	                                                POLICIES)) {
+		throw InvalidInputException("Vortex optimizer catalog is not initialized");
 	}
 }
 
+using MaintenanceId = std::pair<idx_t, idx_t>;
+
+struct MaintenanceCatalog {
+	string name;
+	DuckLakeVortexCatalogIdentity identity;
+	MaintenanceId Id() const {
+		return {identity.lake_oid, identity.metadata_oid};
+	}
+};
+
+MaintenanceCatalog ResolveMaintenanceCatalog(ClientContext &context, const string &name, bool write) {
+	if (write && (!context.transaction.IsAutoCommit() || (context.transaction.HasActiveTransaction() &&
+	                                                      context.transaction.ActiveTransaction().IsReadOnly()))) {
+		throw TransactionException("Vortex maintenance controls require autocommit");
+	}
+	auto &manager = DatabaseManager::Get(context);
+	auto lake = manager.GetDatabase(name);
+	if (!lake || lake->GetCatalog().GetCatalogType() != "ducklake") {
+		throw InvalidInputException("Vortex maintenance requires an attached DuckLake catalog");
+	}
+	auto &catalog = lake->GetCatalog().Cast<DuckLakeCatalog>();
+	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
+		throw InvalidInputException("Vortex maintenance requires native DuckDB metadata");
+	}
+	auto metadata = manager.GetDatabase(catalog.MetadataDatabaseName());
+	if (!metadata || manager.GetDatabase(name) != lake) {
+		throw TransactionException("Vortex maintenance catalog attachment changed");
+	}
+	if (write && (lake->IsReadOnly() || metadata->IsReadOnly())) {
+		throw TransactionException("Vortex maintenance controls require a writable DuckLake attachment");
+	}
+	return {name, {lake->oid, metadata->oid}};
+}
+
 struct Maintenance {
-	string catalog, state = "idle", run, error;
+	string state = "idle", run, error;
 	bool enabled = true;
 	idx_t max_objects = 0, max_bytes = 0, runs = 0, recovered = 0, builds = 0, generations = 0, bytes = 0;
 	idx_t remaining_builds = 0, remaining_generations = 0;
@@ -110,9 +147,8 @@ const char *MAINTENANCE_COLUMNS =
     "enabled,state,run_id,max_objects,max_bytes,run_count,reconciled_builds,collected_builds,"
     "collected_generations,collected_bytes,remaining_builds,remaining_generations,error";
 
-Maintenance ReadMaintenance(DataChunk &chunk, const string &catalog) {
+Maintenance ReadMaintenance(DataChunk &chunk) {
 	Maintenance m;
-	m.catalog = catalog;
 	m.enabled = chunk.GetValue(0, 0).GetValue<bool>();
 	m.state = StringValue::Get(chunk.GetValue(1, 0));
 	m.run = StringValue::Get(chunk.GetValue(2, 0));
@@ -129,14 +165,14 @@ Maintenance ReadMaintenance(DataChunk &chunk, const string &catalog) {
 	return m;
 }
 
-Maintenance LoadMaintenance(Metadata &meta, const string &catalog) {
+Maintenance LoadMaintenance(Metadata &meta) {
 	Initialized(meta);
 	auto result = meta.Query("SELECT " + string(MAINTENANCE_COLUMNS) + " FROM {METADATA_CATALOG}." + MAINTENANCE);
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() != 1) {
 		throw InvalidInputException("No Vortex maintenance policy in this catalog");
 	}
-	return ReadMaintenance(*chunk, catalog);
+	return ReadMaintenance(*chunk);
 }
 
 void SaveMaintenance(Metadata &meta, const Maintenance &m, const string &previous_run) {
@@ -155,13 +191,25 @@ void SaveMaintenance(Metadata &meta, const Maintenance &m, const string &previou
 	meta.Commit();
 }
 
-void MaintenanceBacklog(Metadata &meta, Maintenance &m) {
-	auto result = meta.Query("SELECT (SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_builds_v1),"
-	                         "(SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_generations_v1 WHERE state IN "
-	                         "('retired','deleting'))");
+bool MaintenanceBacklog(Metadata &meta, Maintenance &m) {
+	auto result = meta.Query("SELECT (SELECT count(*) FROM "
+	                         "{METADATA_CATALOG}.ducklake_vortex_builds_v1),"
+	                         "count(*),count(*) FILTER (WHERE " +
+	                         VortexCatalog::CollectibleGenerationPredicate(m.max_bytes) +
+	                         ") FROM {METADATA_CATALOG}.ducklake_vortex_generations_v1 g"
+	                         " WHERE g.state IN ('retired','deleting')");
 	auto chunk = result->Fetch();
 	m.remaining_builds = chunk->GetValue(0, 0).GetValue<idx_t>();
 	m.remaining_generations = chunk->GetValue(1, 0).GetValue<idx_t>();
+	return m.remaining_builds || chunk->GetValue(2, 0).GetValue<idx_t>() != 0;
+}
+
+void SetMaintenanceReadyState(Maintenance &m, bool actionable) {
+	const bool blocked = !actionable && m.remaining_generations;
+	m.state = blocked ? "blocked" : "idle";
+	m.error = blocked ? "Retired Vortex generations are referenced or exceed the "
+	                    "maintenance byte budget"
+	                  : "";
 }
 
 string Encode(const Policy &p) {
@@ -555,7 +603,7 @@ struct Pending {
 };
 
 struct PendingMaintenance {
-	string catalog;
+	MaintenanceCatalog catalog;
 	std::function<void(const string &)> observe;
 };
 
@@ -567,10 +615,10 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	std::map<Key, std::shared_ptr<Pending>> policies;
 	std::set<Key> cancelled;
 	std::map<Key, string> errors;
-	std::map<string, PendingMaintenance> maintenance;
-	std::set<string> maintenance_cancelled;
-	std::map<string, string> maintenance_errors;
-	string active_maintenance;
+	std::map<MaintenanceId, std::shared_ptr<PendingMaintenance>> maintenance;
+	std::set<MaintenanceId> maintenance_cancelled;
+	std::map<MaintenanceId, string> maintenance_errors;
+	std::shared_ptr<PendingMaintenance> active_maintenance;
 	Key active;
 	shared_ptr<ClientContext> context;
 
@@ -615,36 +663,58 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			throw InvalidInputException("Optimizer policy limit exceeded");
 		}
 	}
-	void AddMaintenance(const string &catalog, const std::function<void(const string &)> &observe) {
+	void AddMaintenance(const MaintenanceCatalog &catalog, const std::function<void(const string &)> &observe) {
 		std::lock_guard<std::mutex> guard(lock);
-		if (maintenance.size() >= 16 && !maintenance.count(catalog)) {
-			throw InvalidInputException("Vortex maintenance catalog limit exceeded");
-		}
-		maintenance[catalog] = {catalog, observe};
-		maintenance_cancelled.erase(catalog);
-		maintenance_errors.erase(catalog);
+		maintenance[catalog.Id()] = std::make_shared<PendingMaintenance>(PendingMaintenance {catalog, observe});
+		maintenance_cancelled.erase(catalog.Id());
+		maintenance_errors.erase(catalog.Id());
 		changed.notify_all();
 	}
-	void MaintenanceCapacity(const string &catalog) {
+	void MaintenanceCapacity(DatabaseInstance &db, const MaintenanceCatalog &catalog) {
 		std::lock_guard<std::mutex> guard(lock);
-		if (maintenance.size() >= 16 && !maintenance.count(catalog)) {
+		auto &manager = DatabaseManager::Get(db);
+		for (auto entry = maintenance.begin(); entry != maintenance.end();) {
+			auto lake = manager.GetDatabase(entry->second->catalog.name);
+			if (lake && lake->oid == entry->first.first) {
+				auto &attached = lake->GetCatalog().Cast<DuckLakeCatalog>();
+				auto metadata = manager.GetDatabase(attached.MetadataDatabaseName());
+				if (metadata && metadata->oid == entry->first.second) {
+					++entry;
+					continue;
+				}
+			}
+			maintenance_cancelled.erase(entry->first);
+			maintenance_errors.erase(entry->first);
+			entry = maintenance.erase(entry);
+		}
+		if (maintenance.size() >= 16 && !maintenance.count(catalog.Id())) {
 			throw InvalidInputException("Vortex maintenance catalog limit exceeded");
 		}
 	}
-	bool IsMaintenanceActive(const string &catalog) {
+	bool IsCurrentMaintenance(const std::shared_ptr<PendingMaintenance> &pending) {
 		std::lock_guard<std::mutex> guard(lock);
-		return active_maintenance == catalog;
+		auto entry = maintenance.find(pending->catalog.Id());
+		return entry != maintenance.end() && entry->second == pending;
 	}
-	void CheckMaintenance(const string &catalog) {
+	bool IsMaintenanceActive(const MaintenanceId &id) {
 		std::lock_guard<std::mutex> guard(lock);
-		if (stopping || maintenance_cancelled.count(catalog)) {
+		return active_maintenance && active_maintenance->catalog.Id() == id;
+	}
+	bool MaintenanceCancelled(const MaintenanceId &id) {
+		std::lock_guard<std::mutex> guard(lock);
+		return stopping || maintenance_cancelled.count(id);
+	}
+	void CheckMaintenance(const MaintenanceId &id) {
+		if (MaintenanceCancelled(id)) {
 			throw InterruptException();
 		}
 	}
-	void CancelMaintenance(const string &catalog) {
+	void CancelMaintenance(const MaintenanceId &id) {
 		std::lock_guard<std::mutex> guard(lock);
-		maintenance_cancelled.insert(catalog);
-		if (active_maintenance == catalog && context) {
+		if (maintenance.count(id)) {
+			maintenance_cancelled.insert(id);
+		}
+		if (active_maintenance && active_maintenance->catalog.Id() == id) {
 			context->Interrupt();
 		}
 		changed.notify_all();
@@ -681,41 +751,87 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		std::lock_guard<std::mutex> guard(lock);
 		context.reset();
 		active = Key();
-		active_maintenance.clear();
 	}
-	void StoreMaintenance(DatabaseInstance &db, Maintenance &m, const string &state) {
+	void ClearMaintenance(const std::shared_ptr<PendingMaintenance> &pending) {
+		std::lock_guard<std::mutex> guard(lock);
+		if (active_maintenance == pending) {
+			context.reset();
+			active_maintenance.reset();
+		}
+	}
+	void StoreMaintenance(DatabaseInstance &db, const MaintenanceCatalog &catalog, Maintenance &m,
+	                      const string &state) {
 		std::lock_guard<std::mutex> guard(io);
-		Metadata meta(db, m.catalog);
-		auto current = LoadMaintenance(meta, m.catalog);
+		CheckMaintenance(catalog.Id());
+		Metadata meta(db, catalog.name, true, &catalog.identity);
+		auto current = LoadMaintenance(meta);
 		if (current.run != m.run) {
 			throw TransactionException("Vortex maintenance ownership changed");
 		}
-		m.enabled = current.enabled;
+		if (!current.enabled) {
+			throw InterruptException();
+		}
 		m.state = state;
 		SaveMaintenance(meta, m, m.run);
 	}
-	void RunMaintenance(DatabaseInstance &db, PendingMaintenance pending) {
+	bool FinishMaintenance(DatabaseInstance &db, const std::shared_ptr<PendingMaintenance> &pending, Maintenance &m,
+	                       const string &error) {
+		std::lock_guard<std::mutex> guard(io);
+		// Controls and status use io too, so completion and the active marker
+		// change together.
+		ClearMaintenance(pending);
+		if (!IsCurrentMaintenance(pending)) {
+			return false;
+		}
+		auto &catalog = pending->catalog;
+		Metadata meta(db, catalog.name, true, &catalog.identity);
+		auto current = LoadMaintenance(meta);
+		if (current.run != m.run) {
+			throw TransactionException("Vortex maintenance ownership changed");
+		}
+		const bool cancelled_job = !current.enabled || MaintenanceCancelled(catalog.Id());
+		m.enabled = !cancelled_job && error.empty();
+		if (m.enabled) {
+			SetMaintenanceReadyState(m, MaintenanceBacklog(meta, m));
+		} else {
+			m.state = cancelled_job ? "cancelled" : "failed";
+			m.error = error;
+		}
+		SaveMaintenance(meta, m, m.run);
+		if (!m.enabled) {
+			CancelMaintenance(catalog.Id());
+		}
+		return m.enabled;
+	}
+	void RunMaintenance(DatabaseInstance &db, const std::shared_ptr<PendingMaintenance> &pending) {
+		auto &catalog = pending->catalog;
 		Maintenance m;
+		unique_ptr<Connection> job;
 		{
 			std::lock_guard<std::mutex> guard(io);
-			Metadata meta(db, pending.catalog);
-			m = LoadMaintenance(meta, pending.catalog);
+			if (!IsCurrentMaintenance(pending) || MaintenanceCancelled(catalog.Id())) {
+				return;
+			}
+			Metadata meta(db, catalog.name, true, &catalog.identity);
+			m = LoadMaintenance(meta);
 			if (!m.enabled) {
 				meta.Commit();
 				return;
 			}
-			auto had_backlog = m.remaining_builds || m.remaining_generations;
-			MaintenanceBacklog(meta, m);
-			if (!m.remaining_builds && !m.remaining_generations) {
-				if (had_backlog) {
-					m.state = "idle";
+			auto builds = m.remaining_builds;
+			auto generations = m.remaining_generations;
+			auto state = m.state;
+			if (!MaintenanceBacklog(meta, m)) {
+				SetMaintenanceReadyState(m, false);
+				if (state != m.state || builds != m.remaining_builds || generations != m.remaining_generations) {
 					SaveMaintenance(meta, m, m.run);
 				} else {
 					meta.Commit();
 				}
 				return;
 			}
-			CheckMaintenance(m.catalog);
+			CheckMaintenance(catalog.Id());
+			job = make_uniq<Connection>(db);
 			auto previous = m.run;
 			m.run = UUID::ToString(UUID::GenerateRandomUUID());
 			m.state = "recovering";
@@ -723,72 +839,48 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			m.runs++;
 			SaveMaintenance(meta, m, previous);
 			std::lock_guard<std::mutex> guard_runtime(lock);
-			pending = maintenance.at(m.catalog);
-			active_maintenance = m.catalog;
+			active_maintenance = pending;
+			context = job->context;
 		}
+		string error;
 		try {
-			Connection job(db);
-			{
-				std::lock_guard<std::mutex> guard(lock);
-				context = job.context;
-			}
 			auto check = [&](const string &stage) {
-				if (pending.observe) {
-					pending.observe(stage);
+				if (pending->observe) {
+					pending->observe(stage);
 				}
-				CheckMaintenance(m.catalog);
-				if (job.context->IsInterrupted()) {
+				CheckMaintenance(catalog.Id());
+				if (job->context->IsInterrupted()) {
 					throw InterruptException();
 				}
 			};
 			check("maintenance_before_recovery");
-			m.recovered += VortexCatalog::RecoverBuilds(*job.context, m.catalog, m.max_objects, check);
-			StoreMaintenance(db, m, "collecting_builds");
+			m.recovered +=
+			    VortexCatalog::RecoverBuilds(*job->context, catalog.name, m.max_objects, check, &catalog.identity);
+			StoreMaintenance(db, catalog, m, "collecting_builds");
 			check("maintenance_before_build_gc");
-			auto builds = VortexCatalog::CollectBuilds(*job.context, m.catalog, m.max_objects, m.max_bytes, check);
+			auto builds = VortexCatalog::CollectBuilds(*job->context, catalog.name, m.max_objects, m.max_bytes, check,
+			                                           &catalog.identity);
 			m.builds += builds.builds;
 			m.bytes += builds.bytes;
-			StoreMaintenance(db, m, "collecting_generations");
+			StoreMaintenance(db, catalog, m, "collecting_generations");
 			check("maintenance_after_build_gc");
 			if (builds.builds < m.max_objects && builds.bytes < m.max_bytes) {
 				check("maintenance_before_generation_gc");
-				auto generations = VortexCatalog::Collect(*job.context, m.catalog, m.max_objects - builds.builds,
-				                                          m.max_bytes - builds.bytes, check);
+				auto generations = VortexCatalog::Collect(*job->context, catalog.name, m.max_objects - builds.builds,
+				                                          m.max_bytes - builds.bytes, check, &catalog.identity);
 				m.generations += generations.generations;
 				m.bytes += generations.artifact_bytes;
 			}
 			check("maintenance_after_generation_gc");
-			{
-				std::lock_guard<std::mutex> guard(io);
-				Metadata meta(db, m.catalog);
-				MaintenanceBacklog(meta, m);
-				meta.Commit();
-			}
-			StoreMaintenance(db, m, "idle");
-			check("maintenance_complete");
-			Clear();
-		} catch (const std::exception &error) {
-			bool cancelled_job;
-			{
-				std::lock_guard<std::mutex> guard(lock);
-				cancelled_job = stopping || maintenance_cancelled.count(m.catalog);
-			}
+		} catch (const std::exception &failure) {
+			error = failure.what();
+		}
+		if (FinishMaintenance(db, pending, m, error) && pending->observe) {
 			try {
-				std::lock_guard<std::mutex> guard(io);
-				Metadata meta(db, m.catalog);
-				auto current = LoadMaintenance(meta, m.catalog);
-				if (current.run != m.run) {
-					throw TransactionException("Vortex maintenance ownership changed");
-				}
-				m.enabled = false;
-				m.state = cancelled_job ? "cancelled" : "failed";
-				m.error = error.what();
-				SaveMaintenance(meta, m, m.run);
-			} catch (...) {
-				Clear();
-				throw;
+				pending->observe("maintenance_complete");
+			} catch (const std::exception &failure) {
+				FinishMaintenance(db, pending, m, failure.what());
 			}
-			Clear();
 		}
 	}
 	void Stage(DatabaseInstance &db, const Pending &pending, Policy &p, const string &stage) {
@@ -967,7 +1059,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		}
 		while (true) {
 			vector<std::shared_ptr<Pending>> work;
-			vector<PendingMaintenance> cleanup;
+			vector<std::shared_ptr<PendingMaintenance>> cleanup;
 			{
 				std::lock_guard<std::mutex> guard(lock);
 				if (stopping) {
@@ -1015,10 +1107,14 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				try {
 					RunMaintenance(*db, pending);
 				} catch (const std::exception &error) {
-					Clear();
+					std::lock_guard<std::mutex> guard_io(io);
+					ClearMaintenance(pending);
 					std::lock_guard<std::mutex> guard(lock);
-					maintenance_cancelled.insert(pending.catalog);
-					maintenance_errors[pending.catalog] = error.what();
+					auto entry = maintenance.find(pending->catalog.Id());
+					if (entry != maintenance.end() && entry->second == pending) {
+						maintenance_cancelled.insert(entry->first);
+						maintenance_errors[entry->first] = error.what();
+					}
 				}
 			}
 			std::unique_lock<std::mutex> guard(lock);
@@ -1032,7 +1128,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			done = true;
 			context.reset();
 			active = Key();
-			active_maintenance.clear();
+			active_maintenance.reset();
 		}
 		finished.notify_all();
 	}
@@ -1363,7 +1459,7 @@ void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalo
 		    "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_maintenance_v1("
 		    "id BOOLEAN PRIMARY KEY CHECK(id),enabled BOOLEAN NOT NULL,state VARCHAR NOT NULL "
 		    "CHECK(state IN "
-		    "('idle','recovering','collecting_builds','collecting_generations','cancelling','cancelled','failed')),"
+		    "('idle','blocked','recovering','collecting_builds','collecting_generations','cancelling','cancelled','failed')),"
 		    "run_id VARCHAR NOT NULL,"
 		    "max_objects BIGINT NOT NULL,max_bytes BIGINT NOT NULL,run_count BIGINT NOT NULL,"
 		    "reconciled_builds BIGINT NOT NULL,collected_builds BIGINT NOT NULL,collected_generations BIGINT NOT NULL,"
@@ -1477,67 +1573,69 @@ void DuckLakeVortexOptimizer::EnableMaintenance(ClientContext &context, const st
 	if (!max_objects || max_objects > 16 || !max_bytes || max_bytes > SOURCE_LIMIT) {
 		throw InvalidInputException("Invalid Vortex maintenance count or byte budget");
 	}
+	auto binding = ResolveMaintenanceCatalog(context, catalog, true);
 	auto owner = GetOwner(*context.db);
 	{
 		std::lock_guard<std::mutex> guard(owner->runtime->io);
-		owner->runtime->MaintenanceCapacity(catalog);
-		Metadata meta(*context.db, catalog);
+		owner->runtime->MaintenanceCapacity(*context.db, binding);
+		Metadata meta(*context.db, catalog, true, &binding.identity);
 		Initialized(meta);
 		meta.Query("INSERT INTO {METADATA_CATALOG}." + string(MAINTENANCE) + " VALUES(true,true,'idle',''," +
 		           to_string(max_objects) + "," + to_string(max_bytes) + ",0,0,0,0,0,0,0,'')");
 		meta.Commit();
-		owner->runtime->AddMaintenance(catalog, observe);
+		owner->runtime->AddMaintenance(binding, observe);
 	}
 	owner->runtime->Start(*context.db);
 }
 
 void DuckLakeVortexOptimizer::ResumeMaintenance(ClientContext &context, const string &catalog,
                                                 const std::function<void(const string &)> &observe) {
+	auto binding = ResolveMaintenanceCatalog(context, catalog, true);
 	auto owner = GetOwner(*context.db);
 	{
 		std::lock_guard<std::mutex> guard(owner->runtime->io);
-		Metadata meta(*context.db, catalog);
-		auto m = LoadMaintenance(meta, catalog);
-		if (owner->runtime->IsMaintenanceActive(catalog)) {
+		Metadata meta(*context.db, catalog, true, &binding.identity);
+		auto m = LoadMaintenance(meta);
+		if (owner->runtime->IsMaintenanceActive(binding.Id())) {
 			throw InvalidInputException("Vortex maintenance is still running");
 		}
-		owner->runtime->MaintenanceCapacity(catalog);
+		owner->runtime->MaintenanceCapacity(*context.db, binding);
 		m.enabled = true;
-		m.state = "idle";
-		m.error.clear();
+		SetMaintenanceReadyState(m, MaintenanceBacklog(meta, m));
 		SaveMaintenance(meta, m, m.run);
-		owner->runtime->AddMaintenance(catalog, observe);
+		owner->runtime->AddMaintenance(binding, observe);
 	}
 	owner->runtime->Start(*context.db);
 }
 
 void DuckLakeVortexOptimizer::CancelMaintenance(ClientContext &context, const string &catalog) {
+	auto binding = ResolveMaintenanceCatalog(context, catalog, true);
 	auto owner = GetOwner(*context.db);
-	{
-		std::lock_guard<std::mutex> guard(owner->runtime->io);
-		Metadata meta(*context.db, catalog);
-		auto m = LoadMaintenance(meta, catalog);
-		m.enabled = false;
-		m.state = owner->runtime->IsMaintenanceActive(catalog) ? "cancelling" : "cancelled";
-		SaveMaintenance(meta, m, m.run);
-	}
-	owner->runtime->CancelMaintenance(catalog);
+	std::lock_guard<std::mutex> guard(owner->runtime->io);
+	Metadata meta(*context.db, catalog, true, &binding.identity);
+	auto m = LoadMaintenance(meta);
+	m.enabled = false;
+	m.state = owner->runtime->IsMaintenanceActive(binding.Id()) ? "cancelling" : "cancelled";
+	SaveMaintenance(meta, m, m.run);
+	owner->runtime->CancelMaintenance(binding.Id());
 }
 
 vector<vector<Value>> DuckLakeVortexOptimizer::MaintenanceStatus(ClientContext &context, const string &catalog) {
+	auto binding = ResolveMaintenanceCatalog(context, catalog, false);
 	auto owner = GetOwner(*context.db);
 	std::lock_guard<std::mutex> guard(owner->runtime->io);
-	Metadata meta(*context.db, catalog);
+	Metadata meta(*context.db, catalog, true, &binding.identity);
 	Initialized(meta);
 	auto result = meta.Query("SELECT " + string(MAINTENANCE_COLUMNS) + " FROM {METADATA_CATALOG}." + MAINTENANCE);
 	auto chunk = result->Fetch();
 	vector<vector<Value>> rows;
 	if (chunk && chunk->size()) {
-		auto m = ReadMaintenance(*chunk, catalog);
+		auto m = ReadMaintenance(*chunk);
 		std::lock_guard<std::mutex> guard_runtime(owner->runtime->lock);
-		auto found = owner->runtime->maintenance_errors.find(catalog);
+		auto found = owner->runtime->maintenance_errors.find(binding.Id());
+		auto &active = owner->runtime->active_maintenance;
 		rows.push_back(
-		    {Value(m.state), Value::BOOLEAN(m.enabled), Value::BOOLEAN(owner->runtime->active_maintenance == catalog),
+		    {Value(m.state), Value::BOOLEAN(m.enabled), Value::BOOLEAN(active && active->catalog.Id() == binding.Id()),
 		     Value(m.run), Value::UBIGINT(m.runs), Value::UBIGINT(m.max_objects), Value::UBIGINT(m.max_bytes),
 		     Value::UBIGINT(m.recovered), Value::UBIGINT(m.builds), Value::UBIGINT(m.generations),
 		     Value::UBIGINT(m.bytes), Value::UBIGINT(m.remaining_builds), Value::UBIGINT(m.remaining_generations),

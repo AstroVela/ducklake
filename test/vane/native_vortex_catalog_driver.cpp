@@ -146,8 +146,9 @@ public:
 			return "{}";
 		}
 		if (op == "maintenance-resume") {
-			if (args.size() == 2) {
-				SQL(writer, "SELECT * FROM ducklake_resume_vortex_maintenance('lake')");
+			if (args.size() < 4) {
+				auto name = Value(args.size() == 3 ? args[2] : "lake").ToSQLString();
+				SQL(writer, "SELECT * FROM ducklake_resume_vortex_maintenance(" + name + ")");
 			} else {
 				DuckLakeVortexOptimizer::ResumeMaintenance(*writer.context, "lake",
 				                                           OptimizerObserver(args.at(2), args.at(3)));
@@ -155,7 +156,13 @@ public:
 			return "{}";
 		}
 		if (op == "maintenance-cancel") {
-			SQL(writer, "SELECT * FROM ducklake_cancel_vortex_maintenance('lake')");
+			auto name = Value(args.size() == 3 ? args[2] : "lake").ToSQLString();
+			SQL(writer, "SELECT * FROM ducklake_cancel_vortex_maintenance(" + name + ")");
+			return "{}";
+		}
+		if (op == "maintenance-reattach") {
+			SQL(writer, "DETACH lake");
+			Attach(writer, root);
 			return "{}";
 		}
 		if (op == "optimizer-init-active-transaction") {
@@ -231,7 +238,8 @@ public:
 			                : op == "build-status"       ? "ducklake_vortex_build_status"
 			                : op == "maintenance-status" ? "ducklake_vortex_maintenance_status"
 			                                             : "ducklake_vortex_optimizer_status";
-			auto result = SQL(writer, "SELECT * FROM " + string(function) + "('lake')");
+			auto name = Value(op == "maintenance-status" && args.size() == 3 ? args[2] : "lake").ToSQLString();
+			auto result = SQL(writer, "SELECT * FROM " + string(function) + "(" + name + ")");
 			ViewJSON json;
 			auto rows = json.Array();
 			for (idx_t row = 0; row < result->RowCount(); row++) {
@@ -1377,6 +1385,9 @@ private:
 			}
 			Write(marker, "ready");
 			pause->Stop();
+			if (mode == "fail-after-release") {
+				throw InvalidInputException("Injected optimizer failure after checkpoint");
+			}
 		};
 	}
 	string SearchJSON(const vector<vector<Value>> &rows, const string &diagnostics) {

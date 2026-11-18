@@ -41,6 +41,11 @@ private:
 
 enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
 
+struct DuckLakeVortexCatalogIdentity {
+	idx_t lake_oid;
+	idx_t metadata_oid;
+};
+
 struct DuckLakeVortexGCResult {
 	idx_t generations = 0, artifact_bytes = 0, remaining = 0;
 };
@@ -79,21 +84,26 @@ struct DuckLakeVortexIndex {
 	vector<string> SmallestSegments() const;
 	static DuckLakeVortexCollectionLock &PublicationLock();
 	static DuckLakeVortexCollectionLock &CollectionLock();
-	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog);
+	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog,
+	                                  optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);
 	static void Rollback(Connection &owner);
 	static void Initialized(DuckLakeTransaction &transaction);
 	static unique_ptr<QueryResult> Query(DuckLakeTransaction &transaction, const string &sql);
 	static void Initialize(Connection &owner, const string &catalog, ClientContext &caller);
+	static string CollectibleGenerationPredicate(idx_t max_artifact_bytes);
 	static DuckLakeVortexGCResult Collect(ClientContext &context, const string &catalog, idx_t max_generations,
 	                                      idx_t max_artifact_bytes,
-	                                      const std::function<void(const string &)> &observe = nullptr);
+	                                      const std::function<void(const string &)> &observe = nullptr,
+	                                      optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);
 	static vector<vector<Value>> GenerationStatus(Connection &owner, const string &catalog);
 	static vector<vector<Value>> BuildStatus(Connection &owner, const string &catalog);
 	static idx_t RecoverBuilds(ClientContext &context, const string &catalog, idx_t max_builds,
-	                           const std::function<void(const string &)> &observe = nullptr);
-	static DuckLakeVortexBuildGCResult CollectBuilds(ClientContext &context, const string &catalog, idx_t max_builds,
-	                                                 idx_t max_bytes,
-	                                                 const std::function<void(const string &)> &observe = nullptr);
+	                           const std::function<void(const string &)> &observe = nullptr,
+	                           optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);
+	static DuckLakeVortexBuildGCResult
+	CollectBuilds(ClientContext &context, const string &catalog, idx_t max_builds, idx_t max_bytes,
+	              const std::function<void(const string &)> &observe = nullptr,
+	              optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);
 	static DuckLakeVortexIndex ParseSegments(const string &reference, const string &table_uuid, idx_t field_id);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,

@@ -20,8 +20,14 @@ SELECT * FROM ducklake_resume_vortex_maintenance('lake');
 ```
 
 One maintenance policy covers all registered build roots and retired generations
-in that native catalog, including registered manual builds. Duplicate enable,
-missing initialization, invalid budgets and resume while running fail explicitly.
+in that native catalog, including registered manual builds. Enable, cancel and
+resume require autocommit and a writable attachment. Status can be read from a
+read-only attachment. Duplicate enable, missing initialization, invalid budgets
+and resume while running fail explicitly.
+The runtime binds each registration to the attached DuckLake and DuckDB
+metadata instances. Calls using different casing find the same registration.
+Each collector transaction verifies both identities before using catalog data.
+Reattaching a lake requires explicit resume for the new attachment.
 Caller reference JSON and unregistered directories remain outside GC ownership.
 The policy uses the existing database optimizer worker, with at most 16 registered
 maintenance catalogs and no additional background threads or build concurrency.
@@ -29,7 +35,10 @@ maintenance catalogs and no additional background threads or build concurrency.
 Maintenance has its own enabled flag, run ID, stage, error and progress counters.
 Disabling or cancelling an indexing policy does not cancel already authorized
 cleanup. Cancelling maintenance interrupts its current native checkpoints and
-stops further cleanup until explicit resume. A maintenance error is recorded
+stops further cleanup until explicit resume. Cancel and resume update the durable
+policy and worker registration in the same serialized transition. Completion
+records its last state and clears the running task within that boundary.
+A maintenance error is recorded
 and disables that policy; indexing and maintenance do not retry failed tasks.
 
 Restart preserves configuration and durable stages but starts neither indexing
@@ -50,8 +59,9 @@ The single worker serializes indexing and independent maintenance phases:
    published generations and deletes only registered owned leftovers.
 4. Persist `collecting_generations` and pass the remaining object/byte budget
    to the existing retired-generation collector.
-5. Refresh backlog counts and persist `idle`. Budget-limited unfinished work
-   can continue on a later worker pass; failed work requires explicit resume.
+5. Refresh backlog counts and persist `idle` or `blocked`. Budget-limited
+   unfinished work can continue on a later worker pass when it fits a full
+   pass. Failed work requires explicit resume.
 
 The object budget is 1–16 completed collections across both collectors per pass;
 reconciliation separately visits at most that many pending records. The byte
@@ -59,8 +69,13 @@ budget is 1–64 MiB shared across the two collection phases, using their existi
 accounting: reclaimed logical build-file lengths plus registered retired
 artifact bytes. Manifest verification, directory operations and metadata reads
 are not physical I/O quotas. The existing 4,096-entry build traversal limit and
-bounded partial truncation apply unchanged. A generation that cannot fit the
-remaining budget stays registered for another pass. Budgets never expand.
+bounded partial truncation apply unchanged. Generation selection excludes
+entries that exceed the available bytes before applying the object limit.
+Items whose combined size exceeds the budget stay registered for a later pass.
+When all remaining generations are referenced or exceed the entire pass
+budget, maintenance reports `blocked`. The worker observes backlog without
+opening empty runs or rewriting progress. Operators can collect explicitly with
+an allowed budget that fits a larger generation. Background budgets never expand.
 
 Both collectors retain their existing publication/admission locks, authenticated
 generation checks, POSIX descriptor operations, fsync and durable deletion
@@ -91,14 +106,17 @@ view, delayed typed fetch, unchanged B1 generations/hashes/mtimes and unchanged
 source bytes. It retains write quotas and rejects excess F while work is paused.
 Build failure/cancellation leave indexing stopped while maintenance cleans its
 registered leftovers. GC failure disables maintenance and requires explicit
-resume. Shared count/byte limits and cancellation of a 65 MiB partial scratch
-file exercise bounded continuation.
+resume. Count and byte fixtures observe both collectors after one completed
+pass. A 65 MiB partial scratch file exercises bounded continuation. The proof
+also covers a reattach while GC waits, cancellation at completion, a resumed
+policy surviving an old completion callback, and a blocked generation behind
+which smaller work fits.
 
 SIGKILL covers both sides of index publication and seven maintenance boundaries:
 before recovery, deletion ownership, partial unlink, partial truncation,
 retired-generation deletion, files removed before final progress, and coordinator
-completion. Explicit resume refreshes stale backlog counts without starting an
-empty cleanup run. Restart alone performs
+completion. Explicit resume refreshes stale backlog counts while the worker
+is busy and without starting an empty cleanup run. Restart alone performs
 no cleanup; explicit resume reconciles committed output before deletion and
 continues without rebuilding a winning merge. Existing SQL, recovery, lifecycle,
 index and GC proofs remain in CI, and the new proof's evidence is uploaded.
