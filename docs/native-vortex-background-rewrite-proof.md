@@ -121,35 +121,29 @@ The supported native metadata, local POSIX, managed namespace, fixed-schema,
 single-output and static SPFresh scope remains unchanged; online updates and
 dependency-pin changes are not introduced.
 
-### Local result (2026-10-29)
+### Local verification against #47
 
-The new proof passed 22 checks and 120 gated query comparisons with minimum
-fixture recall 1.0. Five controlled background rewrites advanced revision 3 to 8,
-retained concurrent appends and reduced current physical rows to 549. One
-enable/resume also drove four successive delete/append rounds without per-round
-intervention, ending at 643 physical rows. The unchanged 100,000-row capacity
-case released 3,968 slots while retaining its 95,904-row F and admitted a new
-write. A single worker completed source rewrite, T flush, selective index merge,
-F indexing and authorized maintenance. Unselected B generations stayed unchanged
-through each source rewrite, and held private views survived index and explicit
-source GC.
+The native ON and OFF builds were qualified on DuckLake `2387450b` with
+DuckDB `d8cdaa33`, Vortex `b20e34c2`, and the
+DuckDB Vortex wrapper `84cef204`. Both sets of pins match #47
+at `1c775d8a`.
 
-Five SIGKILL cases distinguish interrupted from committed work and require
-explicit optimizer/maintenance resumption. Failure, input conflict, cancellation
-and committed acknowledgement loss pause work without automatic retry. The two
-unsupported active-input samples retain the existing ANN and report recall 0.2
-(below minimum) and 0.7 (empty output) separately; their visibility/typed-row
-checks pass and they do not replace or weaken the gated query comparisons.
+- The background proof passed 29 checks and 124
+  gated query comparisons, with minimum fixture recall 1.0.
+  It completed in 92.65 seconds within the existing 180-second budget.
+- The Parquet and Puffin cases each reclaimed 128 unique positions. The
+  post-flush case reclaimed 63 rows before index merge. A later explicit
+  publication and subsequent GC did not erase the committed rewrite's result.
+- All 18 native process proofs, 19
+  functional gates and 32 ABI checks passed. Native ON passed
+  27 Vortex SQL cases with 1,080
+  assertions, including the new case with 49 assertions.
+- Native ON and OFF each passed 86 base cases with
+  3,582 assertions and 13
+  optional-extension skips. Parquet and Vortex recovery, deletion-inlining,
+  cleanup, and the four informational cost cases passed.
+- C++ and Python formatting, Rust formatting, Clippy, workspace tests, and
+  the Git diff check passed.
 
-- All 17 prior native process proofs passed.
-- ON passed 18 Vortex SQL cases / 664 assertions, including the new 34-assertion
-  configuration case. ON and OFF each passed 86 base cases / 3,582 assertions
-  with 13 optional-extension skips and Parquet recovery; ON passed Vortex recovery.
-- Audit passed 122 assertions. Rewrite/orphan groups passed 16 cases / 854
-  assertions with two ICU-dependent skips.
-- Four isolated cost cases passed nine queries each with minimum recall 1.0;
-  timing remains informational. Formatting, Rust formatting and diff checks
-  passed. Rust sources, native dependencies and their pins are unchanged.
-
-The qualified catalog driver SHA-256 is
-`d07aefd474c59ba2d1f348afce19bc723021437be500a11b5df9183e0c56a821`.
+The catalog driver SHA-256 is
+`b725430305b34a4548c0a358c7c2ca119df8c133a6f9b8c87ba242ac30a0669c`.
