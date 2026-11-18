@@ -126,15 +126,16 @@ dependency-pin changes are not introduced.
 
 ### Local verification against #47
 
-The native ON and OFF builds were qualified on DuckLake `2387450b` with
+The native ON and OFF builds were qualified on DuckLake `78d7040f` with
 DuckDB `d8cdaa33`, Vortex `b20e34c2`, and the
 DuckDB Vortex wrapper `84cef204`. Both sets of pins match #47
 at `1c775d8a`.
 
-- The background proof passed 29 checks and 124
+- The background proof passed 30 checks and 124
   gated query comparisons, with minimum fixture recall 1.0.
-  It completed in 92.65 seconds within the existing 180-second budget.
+  It completed in 93.45 seconds within the existing 180-second budget.
 - The Parquet and Puffin cases each reclaimed 128 unique positions. The
+  dense-overlap case retained 66 live rows through publication. The
   post-flush case reclaimed 63 rows before index merge. A later explicit
   publication and subsequent GC did not erase the committed rewrite's result.
 - All 18 native process proofs, 19
@@ -148,5 +149,6 @@ at `1c775d8a`.
 - C++ and Python formatting, Rust formatting, Clippy, workspace tests, and
   the Git diff check passed.
 
+A native suite reached its existing timeout on an earlier attempt. Its retry passed with the same binaries and limits.
 The catalog driver SHA-256 is
-`b725430305b34a4548c0a358c7c2ca119df8c133a6f9b8c87ba242ac30a0669c`.
+`f3c63c3e574908f36c7d0ccfa8e63265b2d20b5dade7b766e1ca429e178c39a8`.
