@@ -489,6 +489,40 @@ def stored_ownership(driver, root, checks):
         M.stop(native)
 
 
+def literal_artifact_paths(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        native.call("init")
+        original_root = root / "snapshot-{METADATA_CATALOG}"
+        original_root.mkdir()
+        reference = original_root / "report-{DATA_PATH}-'{METADATA_CATALOG}'.json"
+        native.call("build", "knn", reference, 0)
+        row = candidate(native)
+        require(
+            Path(row["index_root"]) == original_root and Path(row["reference_path"]) == reference,
+            "Registration changed literal artifact paths",
+        )
+        contents = reference.read_bytes()
+        native.call("reopen")
+        require(candidate(native) == row, "Reopen changed literal ownership paths")
+        require(collect(native, 1)["collected_builds"] == 1, "Literal workspace was not collectible")
+        gone(row)
+        recalls = []
+        qualify(native, "literal-generation", recalls)
+        native.call("build", "knn", root / "replacement.json", 1)
+        require(
+            native.call("gc", 1, LIMIT)["collected_generations"] == 1 and not GC.directory(row).exists(),
+            "Retirement did not find the original generation path",
+        )
+        require(reference.read_bytes() == contents, "Collection changed the caller's literal reference")
+        qualify(native, "after-literal-retirement", recalls)
+        native.finish()
+        checks.append("braces and quotes in caller paths survive registration, reopening, search and both collectors")
+        return {"reference_basename": reference.name, "fixture_recalls": recalls}
+    finally:
+        M.stop(native)
+
+
 def table_replacement(driver, root, checks):
     native = CAT.Native(driver, root / "native")
     try:
@@ -688,6 +722,7 @@ def main():
             ("retired-scratch", retired_scratch),
             ("namespace-ownership", namespace_ownership),
             ("stored-ownership", stored_ownership),
+            ("literal-artifact-paths", literal_artifact_paths),
             ("table-replacement", table_replacement),
             ("cancel-maintenance", cancel_maintenance),
             ("cancel-source-wait", cancel_source_wait),

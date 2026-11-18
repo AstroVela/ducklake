@@ -1,5 +1,6 @@
 #include "storage/ducklake_vortex_index_catalog.hpp"
 
+#include "common/ducklake_util.hpp"
 #include "common/ducklake_vortex_json.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/opener_file_system.hpp"
@@ -962,7 +963,11 @@ void DuckLakeVortexIndex::Initialized(DuckLakeTransaction &transaction) {
 }
 
 unique_ptr<QueryResult> DuckLakeVortexIndex::Query(DuckLakeTransaction &transaction, const string &sql) {
-	auto result = transaction.Query(sql);
+	auto &catalog = transaction.GetCatalog();
+	auto schema = DuckLakeUtil::SQLIdentifierToString(catalog.MetadataDatabaseName()) + "." +
+	              DuckLakeUtil::SQLIdentifierToString(catalog.MetadataSchemaName());
+	// Vortex statements qualify their tables with this token. Paths and descriptors in SQL literals are data.
+	auto result = transaction.ExecuteRaw(DuckLakeUtil::ReplaceSkippingQuotes(sql, "{METADATA_CATALOG}", schema));
 	if (result->HasError()) {
 		result->ThrowError();
 	}
