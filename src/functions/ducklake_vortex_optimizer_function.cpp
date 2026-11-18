@@ -6,7 +6,18 @@
 
 namespace duckdb {
 namespace {
-enum class Operation { INITIALIZE, ENABLE, RESUME, CANCEL, STATUS, WRITE_BUDGET };
+enum class Operation {
+	INITIALIZE,
+	ENABLE,
+	RESUME,
+	CANCEL,
+	STATUS,
+	WRITE_BUDGET,
+	ENABLE_MAINTENANCE,
+	RESUME_MAINTENANCE,
+	CANCEL_MAINTENANCE,
+	MAINTENANCE_STATUS
+};
 
 struct OptimizerBind : public TableFunctionData {
 	Operation operation;
@@ -47,6 +58,11 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 				throw InvalidInputException("Vortex write budgets must be positive");
 			}
 		}
+	}
+	if (OP == Operation::ENABLE_MAINTENANCE &&
+	    (input.inputs[1].GetValue<int64_t>() < 1 || input.inputs[1].GetValue<int64_t>() > 16 ||
+	     input.inputs[2].GetValue<int64_t>() < 1 || input.inputs[2].GetValue<int64_t>() > 64 * 1024 * 1024)) {
+		throw InvalidInputException("Invalid Vortex maintenance count or byte budget");
 	}
 	auto bind = make_uniq<OptimizerBind>();
 	bind->operation = OP;
@@ -98,6 +114,25 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 		         LogicalType::UBIGINT,
 		         LogicalType::VARCHAR,
 		         LogicalType::LIST(LogicalType::VARCHAR)};
+	} else if (OP == Operation::MAINTENANCE_STATUS) {
+		names = {"state",
+		         "enabled",
+		         "running",
+		         "run_id",
+		         "run_count",
+		         "max_objects",
+		         "max_bytes",
+		         "reconciled_builds",
+		         "collected_builds",
+		         "collected_generations",
+		         "collected_bytes",
+		         "remaining_builds",
+		         "remaining_generations",
+		         "error"};
+		types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+		         LogicalType::UBIGINT, LogicalType::VARCHAR};
 	} else {
 		names = {"state"};
 		types = {LogicalType::VARCHAR};
@@ -147,6 +182,22 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		case Operation::STATUS:
 			state.rows = DuckLakeVortexOptimizer::Status(context, text(0));
 			break;
+		case Operation::ENABLE_MAINTENANCE:
+			DuckLakeVortexOptimizer::EnableMaintenance(context, text(0), args[1].GetValue<idx_t>(),
+			                                           args[2].GetValue<idx_t>());
+			result = "enabled";
+			break;
+		case Operation::RESUME_MAINTENANCE:
+			DuckLakeVortexOptimizer::ResumeMaintenance(context, text(0));
+			result = "resumed";
+			break;
+		case Operation::CANCEL_MAINTENANCE:
+			DuckLakeVortexOptimizer::CancelMaintenance(context, text(0));
+			result = "cancellation_requested";
+			break;
+		case Operation::MAINTENANCE_STATUS:
+			state.rows = DuckLakeVortexOptimizer::MaintenanceStatus(context, text(0));
+			break;
 		case Operation::WRITE_BUDGET: {
 			DuckLakeVortexWriteBudget budget {args[4].GetValue<idx_t>(), args[5].GetValue<idx_t>(),
 			                                  args[6].GetValue<idx_t>(), args[7].GetValue<idx_t>()};
@@ -155,7 +206,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			break;
 		}
 		}
-		if (bind.operation != Operation::STATUS) {
+		if (bind.operation != Operation::STATUS && bind.operation != Operation::MAINTENANCE_STATUS) {
 			state.rows.push_back({Value(result)});
 		}
 		state.loaded = true;
@@ -173,6 +224,15 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 } // namespace
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader) {
+	loader.RegisterFunction(TableFunction("ducklake_enable_vortex_maintenance",
+	                                      {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT}, Execute,
+	                                      Bind<Operation::ENABLE_MAINTENANCE>, Init));
+	loader.RegisterFunction(TableFunction("ducklake_resume_vortex_maintenance", {LogicalType::VARCHAR}, Execute,
+	                                      Bind<Operation::RESUME_MAINTENANCE>, Init));
+	loader.RegisterFunction(TableFunction("ducklake_cancel_vortex_maintenance", {LogicalType::VARCHAR}, Execute,
+	                                      Bind<Operation::CANCEL_MAINTENANCE>, Init));
+	loader.RegisterFunction(TableFunction("ducklake_vortex_maintenance_status", {LogicalType::VARCHAR}, Execute,
+	                                      Bind<Operation::MAINTENANCE_STATUS>, Init));
 	loader.RegisterFunction(TableFunction("ducklake_initialize_vortex_optimizer", {LogicalType::VARCHAR}, Execute,
 	                                      Bind<Operation::INITIALIZE>, Init));
 	loader.RegisterFunction(TableFunction(
