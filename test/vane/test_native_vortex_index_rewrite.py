@@ -165,6 +165,7 @@ def failures(driver, root, checks):
             "rewrite_source_linked",
             "rewrite_before_commit",
             "rewrite_after_stage",
+            "rewrite_before_native_commit",
         ]
         rows = active_rows(native)
         for op in ["rewrite-fail", "rewrite-cancel"]:
@@ -202,7 +203,7 @@ def failures(driver, root, checks):
         M.qualify(native, "after-errors", recalls, 3)
         finish(native)
         checks.append(
-            "failure/cancellation at ten boundaries roll back source/index together; lost ACK after commit retains both published outputs"
+            "failure/cancellation at eleven boundaries roll back source/index together; lost ACK after commit retains both published outputs"
         )
         return {"fixture_recalls": recalls}
     finally:
@@ -236,6 +237,11 @@ def crash(driver, root, stage, checks):
         )
         output = Path(records[0]["new_path"])
         before_records = BG.status(native)
+        if stage in ("rewrite_source_linked", "rewrite_after_stage", "rewrite_after_commit"):
+            build = next(row for row in before_records if row["build_id"] == records[0]["build_id"])
+            require(
+                output.samefile(Path(build["workspace"]) / "rewrite.vortex"), "Linked source lost its private witness"
+            )
         MA.steady(native)
         require(BG.status(native) == before_records, "Restart implicitly recovered or cleaned a rewrite")
         native.call("maintenance-resume")
@@ -310,8 +316,10 @@ def collision(driver, root, checks):
             expected="destination already exists",
         )
         records = intents(native)
-        require(len(records) == 1 and records[0]["keep_file"], "Existing destination was claimed for collection")
+        require(len(records) == 1, "Expected one rewrite ownership record")
         output = Path(records[0]["new_path"])
+        build = next(row for row in BG.status(native) if row["build_id"] == records[0]["build_id"])
+        require(not output.samefile(Path(build["workspace"]) / "rewrite.vortex"), "Expected a distinct destination")
         require(native.call("head", "knn")["revision"] == 3, "Failed exclusive link published an index")
         native.call("maintenance-enable", 16, LIMIT)
         MA.drain(native)
@@ -324,6 +332,31 @@ def collision(driver, root, checks):
             "an existing destination fails the exclusive link and survives rollback and explicit GC unchanged"
         )
         return {"fixture_recalls": recalls}
+    finally:
+        M.stop(native)
+
+
+def cancel_lock_waits(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        rewritten, first, parts, frozen = setup(native, root)
+        before = active_rows(native)
+        for lock in ("collection", "publication"):
+            result = native.call("rewrite-cancel-lock", lock, SEG.generation(first), rewritten / f"{lock}.json", 3)
+            require(
+                result == {"waiting": True, "cancelled_before_release": True}, "Did not observe an interrupted wait"
+            )
+            if lock == "collection":
+                require(not intents(native), "Cancelled collection wait registered a build")
+            MA.drain(native)
+            require(
+                not intents(native) and active_rows(native) == before and native.call("head", "knn")["revision"] == 3,
+                "Cancelled rewrite changed the published inventory",
+            )
+        unchanged(native, parts, frozen)
+        finish(native)
+        checks.append("rewrite cancellation exits both observed maintenance lock waits before the holder releases")
+        return {"locks": ["collection", "publication"]}
     finally:
         M.stop(native)
 
@@ -425,6 +458,7 @@ def main():
         cases = [
             ("failures", failures),
             ("collision", collision),
+            ("cancel-lock-waits", cancel_lock_waits),
             ("deletion-quality", deletion_quality),
             ("capacity", capacity),
         ]
