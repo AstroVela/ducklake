@@ -1155,7 +1155,9 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 	if (current.ToJSON() != plan->before.ToJSON()) {
 		throw TransactionException("Vortex rewrite publication revision conflict");
 	}
-	auto &fs = FileSystem::GetFileSystem(*plan->caller);
+	auto &caller = *plan->caller;
+	auto &fs = FileSystem::GetFileSystem(caller);
+	auto data_path = ResolveLocalPath(fs.ExpandPath(transaction.GetCatalog().DataPath()));
 	auto files = transaction.GetMetadataManager().GetExtendedFilesForTable(table, snapshot);
 	vector<DuckLakeVortexIndexFile> identities;
 	idx_t remaining = MAX_ARTIFACTS;
@@ -1167,6 +1169,7 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 		if (std::find(plan->replaced.begin(), plan->replaced.end(), file.file_id.index) != plan->replaced.end()) {
 			throw InvalidInputException("Vortex rewrite source stayed active");
 		}
+		CheckInterrupted(caller);
 		auto bytes = Read(fs, file.file.path, remaining, false);
 		remaining -= bytes.size();
 		identities.push_back({file.file_id.index, file.file.path, Hash(bytes), file.row_count});
@@ -1182,8 +1185,12 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 	for (auto &segment : plan->candidate.segments) {
 		auto part = ParseReference(segment.reference, plan->table_uuid, plan->before.field_id);
 		part.root = segment.root;
+		CheckInterrupted(caller);
+		auto generation_path = LocalChild(part.root, part.generation);
+		CheckCollectibleDirectory(generation_path, data_path);
+		CheckBuildOwnership(transaction, part.root, part.generation, {generation_path});
 		auto before = remaining;
-		auto manifest = VerifyGeneration(fs, part, remaining);
+		auto manifest = VerifyGeneration(fs, part, data_path, remaining);
 		RegisterGeneration(transaction, part, manifest, before - remaining);
 	}
 	UpdateGenerationRefs(transaction, plan->table_uuid, plan->candidate);
@@ -2244,8 +2251,11 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 			}
 		} catch (const std::exception &cleanup) {
 			ErrorData failure(error);
-			failure.Merge(ErrorData(cleanup));
-			failure.Throw();
+			throw Exception(failure.ExtraInfo(), failure.Type(),
+			                failure.RawMessage() +
+			                    "\nVortex rewrite ownership reconciliation also failed. Inspect "
+			                    "rewrite status: " +
+			                    ErrorData(cleanup).RawMessage());
 		}
 		throw;
 	}
