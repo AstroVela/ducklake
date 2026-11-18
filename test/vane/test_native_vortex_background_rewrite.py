@@ -41,10 +41,11 @@ def published(native, revision):
     )
 
 
-def finish(native):
+def finish(native, maintenance=True):
     stop(native)
-    MA.drain(native)
-    native.call("maintenance-cancel")
+    if maintenance:
+        MA.drain(native)
+        native.call("maintenance-cancel")
     native.finish()
 
 
@@ -567,7 +568,7 @@ def overlapping_deletes(driver, root, checks, vectors=False):
             "AND count(*) FILTER (WHERE id%2=0 AND id>=100 AND id<356)=0 "
             "THEN true ELSE error('rewrite changed visibility or row ids') END FROM lake.items"
         )
-        finish(native)
+        finish(native, maintenance=False)
         checks.append(f"overlapping {mask} and inline masks count and reclaim exactly 128 unique positions")
         return {"unique_deletes": 128, "physical_rows": 3968}
     finally:
@@ -596,7 +597,7 @@ def stale_probe(driver, root, checks):
             row["enabled"] and row["run_count"] == 1 and not row["error"] and RW.active_rows(native) == 4224,
             "A superseded compaction probe affected the current optimizer",
         )
-        finish(native)
+        finish(native, maintenance=False)
         checks.extend(
             [
                 "compaction configuration and resume reject a retained catalog attachment",
@@ -633,7 +634,7 @@ def post_flush_priority(driver, root, checks):
         require(len(SEG.segments(native.call("head", "knn"))) == 3, "Post-flush scheduling changed the segment bound")
         recalls = []
         M.qualify(native, "post-flush-priority", recalls, 3)
-        finish(native)
+        finish(native, maintenance=False)
         checks.append("a candidate that becomes eligible during flush reclaims 63 rows before index merge")
         return {"fixture_recalls": recalls, "physical_rows": 4417}
     finally:
@@ -677,7 +678,7 @@ def superseded_publication(driver, root, checks, restart=False):
         require(
             native.call("head", "knn")["revision"] == 3 and RW.active_rows(native) == 3968, "Recovery changed the head"
         )
-        finish(native)
+        finish(native, maintenance=False)
         mode = "restart after GC" if restart else "lost acknowledgement"
         checks.append(f"{mode} confirms the committed rewrite after a newer explicit publication")
         return {"published_revision": 2, "ready_revision": 3}
