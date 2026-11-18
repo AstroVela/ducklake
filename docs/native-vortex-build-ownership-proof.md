@@ -135,13 +135,13 @@ generation-GC proof also exercises workspace collection with absolute, relative
 and symlinked DuckLake data paths. Literal braces and quotes in artifact
 paths are covered through registration, reopening, search and both collectors.
 
-On 2026-11-18, the Linux build from `7d677e7a` passed 29 ownership checks
-in 34.7 seconds against the 180-second budget. All 24 fixture queries achieved
+On 2026-11-18, the Linux build from `d74abbde` passed 30 ownership checks
+in 35.7 seconds against the 180-second budget. All 24 fixture queries achieved
 recall 1.0. Generation GC passed 37 checks. The ON build passed 24 Vortex SQL
 cases with 939 assertions. The ON and OFF builds each passed 86 base cases
 with 3,582 assertions and 13 optional-dependency skips. The ABI probe passed
 32 cases. The catalog driver SHA-256 was
-`a1aadcf67400ab7c40c5f14fdf4e7d4e2871936a489e09661f7854090640af59`.
+`53a7149661e62b56f3873f0557583dbf6ff576dbe9452be4acb7487cf272066b`.
 
 During qualification of `7c144400`, the segment-merge suite reached the 60-second native RPC
 limit while building its first segment for the pre-commit crash fixture. It
