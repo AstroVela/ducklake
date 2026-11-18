@@ -659,6 +659,9 @@ string RewriteInputs(ClientContext &context, DuckLakeTransaction &transaction, D
 		append("SELECT file_id,row_id,begin_snapshot FROM {METADATA_CATALOG}." + inlined + " WHERE file_id IN (" + ids +
 		           ") AND begin_snapshot<={SNAPSHOT_ID} ORDER BY file_id,row_id,begin_snapshot",
 		       plan.retire);
+	} else {
+		// Match an existing inline delete relation with no rows for the selected files.
+		identity += "#";
 	}
 	map<idx_t, DuckLakeFileListExtendedEntry> sources;
 	for (auto &file : transaction.GetMetadataManager().GetExtendedFilesForTable(table, snapshot)) {
@@ -1370,7 +1373,15 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 	if (!updated->Fetch()) {
 		throw TransactionException("Vortex rewrite publication ownership changed");
 	}
-	if (!plan->retire) {
+	if (plan->retire) {
+		vector<string> sources;
+		for (auto file_id : plan->replaced) {
+			sources.push_back("(" + to_string(file_id) + ")");
+		}
+		// The file remains in historical snapshots, but its end is a physical retirement.
+		Query(transaction, "INSERT INTO {METADATA_CATALOG}." + string(RETIRED_SOURCES) + " VALUES " +
+		                       StringUtil::Join(sources, ","));
+	} else {
 		Query(transaction, "UPDATE {METADATA_CATALOG}." + string(REWRITES) + " SET keep_file=true,new_file_id=" +
 		                       to_string(plan->new_file_id) + " WHERE build_id=" + Value(plan->build_id).ToSQLString());
 	}
@@ -1482,6 +1493,8 @@ void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog, C
 		                   "build_id VARCHAR PRIMARY KEY,table_uuid VARCHAR NOT NULL,source_root VARCHAR NOT NULL,"
 		                   "new_path VARCHAR NOT NULL,capture_snapshot BIGINT NOT NULL,new_file_id BIGINT NOT NULL,"
 		                   "keep_file BOOLEAN NOT NULL)");
+		Query(transaction,
+		      "CREATE TABLE {METADATA_CATALOG}." + string(RETIRED_SOURCES) + "(data_file_id BIGINT PRIMARY KEY)");
 		CheckInterrupted(owner, caller);
 		owner.Commit();
 	} catch (...) {
@@ -1995,6 +2008,13 @@ vector<string> DuckLakeVortexIndex::SmallestSegments() const {
 	}
 	std::sort(sizes.begin(), sizes.end());
 	return {sizes[0].second, sizes[1].second};
+}
+
+bool DuckLakeVortexIndex::HasRetiredSourceTable(DuckLakeTransaction &transaction) {
+	auto &catalog = transaction.GetCatalog();
+	return (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb") &&
+	       transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+	                                             RETIRED_SOURCES) != nullptr;
 }
 
 bool DuckLakeVortexIndex::CoversFile(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, idx_t file_id) {

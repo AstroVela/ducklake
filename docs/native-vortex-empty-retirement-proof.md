@@ -28,6 +28,9 @@ guards it refreshes the native write transaction, repeats the input and
 visibility checks, and validates the exact revision and sole named-index
 ownership. Source IDs and index references retire in that same transaction.
 Other B descriptors and artifact bytes are retained.
+The commit marks the retired source IDs so change feeds keep the original
+logical delete events. Snapshot expiry removes these markers when it removes
+the corresponding source metadata.
 
 The existing explicit data-compaction policy also selects an entirely empty B.
 It journals a `retire` task in `retiring` and then `publishing` before the native
@@ -82,8 +85,11 @@ appends, unchanged unselected generations, explicit 0-B empty/T/F queries,
 rebuilding the first B, malformed plan rejection, retained search/fetch after
 GC, quota recovery at 100,000 rows, stale DELETE/index publication races,
 caller catalog replacement, relocated sources, failure/cancel/lost-ack
-and six SIGKILL boundaries. A later append checks that the receipt still
-identifies the committed retirement after restart. The native SQL case also
+and six SIGKILL boundaries. An unrelated inline delete checks that creating
+its relation preserves the selected source identity during retirement. The
+audit regression checks original delete snapshots for inline and mixed masks
+and zero logical changes at retirement. A later append checks that the
+receipt identifies the committed retirement after restart. The SQL case also
 covers explicit and read-only transactions, a business column named
 `filename`, and whole-file DELETE after a vector column rename.
 

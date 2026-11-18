@@ -1880,6 +1880,14 @@ vector<DuckLakeDeleteScanEntry> DuckLakeMetadataManager::GetTableDeletions(DuckL
 	// Check if we have an inlined deletion table for this table (usually cached, no DB hit)
 	auto inlined_table_name = GetInlinedDeletionTableName(table_id, end_snapshot);
 	bool has_inlined_table = !inlined_table_name.empty();
+	string physical_retirement;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	if (DuckLakeVortexIndex::HasRetiredSourceTable(transaction)) {
+		physical_retirement = "EXISTS (SELECT 1 FROM {METADATA_CATALOG}." +
+		                      string(DuckLakeVortexIndex::RETIRED_SOURCES) +
+		                      " retired WHERE retired.data_file_id = data.data_file_id)";
+	}
+#endif
 
 	// Build the query with optional CTE for inlined deletions
 	// Deletes come in three flavors:
@@ -1939,8 +1947,9 @@ UNION ALL
 
 SELECT %s, data.end_snapshot FROM (
 	SELECT *
-	FROM {METADATA_CATALOG}.ducklake_data_file
+	FROM {METADATA_CATALOG}.ducklake_data_file data
 	WHERE table_id = %d AND end_snapshot >= %d AND end_snapshot <= {SNAPSHOT_ID}
+	%s
 ) AS data
 LEFT JOIN LATERAL (
 	SELECT DISTINCT ON (data_file_id)
@@ -1960,7 +1969,8 @@ USING (data_file_id), (
 ) current_delete
 )",
 	                            select_list, table_id.index, table_id.index, start_snapshot.snapshot_id, table_id.index,
-	                            select_list, table_id.index, start_snapshot.snapshot_id, table_id.index);
+	                            select_list, table_id.index, start_snapshot.snapshot_id,
+	                            physical_retirement.empty() ? "" : "AND NOT " + physical_retirement, table_id.index);
 
 	if (has_inlined_table) {
 		string null_file_cols = "NULL path, NULL path_is_relative, NULL file_size_bytes, NULL footer_size";
@@ -1982,10 +1992,11 @@ WHERE data.table_id = %d
       SELECT data_file_id FROM {METADATA_CATALOG}.ducklake_delete_file
       WHERE table_id = %d AND begin_snapshot <= {SNAPSHOT_ID}
   )
-  AND (data.end_snapshot IS NULL OR data.end_snapshot < %d OR data.end_snapshot > {SNAPSHOT_ID})
+  AND (data.end_snapshot IS NULL OR data.end_snapshot < %d OR data.end_snapshot > {SNAPSHOT_ID}%s)
 )",
 		                            GetFileSelectList("data"), null_file_cols, null_file_cols, table_id.index,
-		                            table_id.index, start_snapshot.snapshot_id);
+		                            table_id.index, start_snapshot.snapshot_id,
+		                            physical_retirement.empty() ? "" : " OR " + physical_retirement);
 	}
 
 	// Close the main_results CTE and do the final SELECT with LEFT JOIN on inlined_dels
@@ -4990,6 +5001,11 @@ WHERE %s (end_snapshot IS NOT NULL AND NOT EXISTS(
 		// delete the data files
 		tables_to_delete_from = {"ducklake_data_file", "ducklake_file_column_stats", "ducklake_file_variant_stats",
 		                         "ducklake_file_partition_value"};
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (DuckLakeVortexIndex::HasRetiredSourceTable(transaction)) {
+			tables_to_delete_from.push_back(DuckLakeVortexIndex::RETIRED_SOURCES);
+		}
+#endif
 		for (auto &delete_tbl : tables_to_delete_from) {
 			result = transaction.Query(StringUtil::Format(R"(
 DELETE FROM {METADATA_CATALOG}.%s

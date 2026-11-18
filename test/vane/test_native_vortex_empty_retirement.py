@@ -200,7 +200,9 @@ def exercise(proof, native, root, checks, workers):
     MA.drain(native)
     native.sql(
         "SELECT * FROM ducklake_expire_snapshots('lake',older_than=>now());"
-        "SELECT * FROM ducklake_cleanup_old_files('lake',cleanup_all=>true)"
+        "SELECT * FROM ducklake_cleanup_old_files('lake',cleanup_all=>true);"
+        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('expired retirement metadata remains') END "
+        "FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1"
     )
     require(
         all(not Path(f["uri"]).exists() for f in M.files([first, *parts])),
@@ -316,6 +318,11 @@ def crash(driver, root, stage, checks, *, append_after_restart=False):
             RW.active_rows(native) == (0 if committed else 4096),
             "Crash committed only half of source retirement",
         )
+        native.sql(
+            f"SELECT CASE WHEN count(*)={2 if committed else 0} THEN true "
+            "ELSE error('crash split retirement audit metadata') END "
+            "FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1"
+        )
         if committed:
             require(
                 head["reference"]["publication"] == durable["run_id"],
@@ -429,7 +436,7 @@ def source_binding(driver, root, checks):
         catalog = f"ducklake:{native.root / 'metadata.ducklake'}"
         native.sql(
             "DETACH lake; "
-            f"ATTACH '{catalog}' AS lake (DATA_PATH '{moved}', OVERRIDE_DATA_PATH TRUE);"
+            f"ATTACH {BASE.quote(catalog)} AS lake (DATA_PATH {BASE.quote(moved)}, OVERRIDE_DATA_PATH TRUE);"
             "SELECT CASE WHEN count(*)=4096 THEN true ELSE error('relocation changed the table contents') END "
             "FROM lake.items"
         )
@@ -445,6 +452,82 @@ def source_binding(driver, root, checks):
             ]
         )
         return {"active_rows": 4096}
+    finally:
+        M.stop(native)
+
+
+def unrelated_inline_delete(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        single(native, root)
+        SEG.add_f(native, 5000)
+        native.sql(
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('fixture already has inline file deletes') END "
+            "FROM information_schema.tables WHERE table_catalog='__ducklake_metadata_lake' "
+            "AND table_name='ducklake_inlined_delete_1'"
+        )
+        BG.pause(native, "retire_candidate_ready")
+        native.sql("DELETE FROM lake.items WHERE id=5000")
+        native.sql(
+            "SELECT CASE WHEN count(*)=1 THEN true ELSE error('expected one inline delete') END "
+            "FROM __ducklake_metadata_lake.ducklake_inlined_delete_1"
+        )
+        native.call("optimizer-release")
+        row = BG.published(native, 2)
+        require(row["run_count"] == 1 and RW.active_rows(native) == 128, "Unrelated inline delete affected retirement")
+        native.sql(
+            "SELECT CASE WHEN count(*)=127 AND min(id)=5001 THEN true "
+            "ELSE error('retirement changed the unindexed file visibility') END FROM lake.items"
+        )
+        BG.finish(native)
+        checks.append("an unrelated first inline deletion does not invalidate the selected retirement inputs")
+        return {"unindexed_physical_rows": 128, "unindexed_visible_rows": 127}
+    finally:
+        M.stop(native)
+
+
+def retirement_audit(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        native.sql(
+            "SET VARIABLE audit_start=(SELECT max(snapshot_id)+1 FROM lake.snapshots());"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',2048,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id%2=0;"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id=1;"
+            "DELETE FROM lake.items WHERE id%2=1;"
+            "SET VARIABLE audit_end=(SELECT max(snapshot_id) FROM lake.snapshots())"
+        )
+        native.sql(
+            "SELECT CASE WHEN "
+            "(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1)=2049 AND "
+            "(SELECT sum(delete_count) FROM __ducklake_metadata_lake.ducklake_delete_file "
+            "WHERE end_snapshot IS NULL)=2047 "
+            "THEN true ELSE error('expected an inline-only file and a mixed-mask file') END"
+        )
+        native.sql(
+            "CREATE TEMP TABLE audit_before AS SELECT snapshot_id,id FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('audit_start'),getvariable('audit_end'));"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "THEN true ELSE error('fixture lost logical delete events') END FROM audit_before"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.sql(
+            "SET VARIABLE retire_version=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('retirement emitted a delete') END FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('retire_version'),getvariable('retire_version'));"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('retirement emitted a change') END FROM "
+            "ducklake_table_changes('lake','main','items',getvariable('retire_version'),getvariable('retire_version'));"
+            "CREATE TEMP TABLE audit_after AS SELECT snapshot_id,id FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('audit_start'),getvariable('retire_version'));"
+            "SELECT CASE WHEN (SELECT count(*) FROM audit_after)=4096 AND NOT EXISTS("
+            "SELECT * FROM audit_before EXCEPT ALL SELECT * FROM audit_after) "
+            "THEN true ELSE error('retirement changed the logical delete history') END"
+        )
+        native.finish()
+        checks.append("inline-only and mixed delete masks retain their audit snapshots through physical retirement")
+        return {"logical_deletes": 4096, "new_retirement_events": 0}
     finally:
         M.stop(native)
 
@@ -479,6 +562,8 @@ def main():
             ("capacity", capacity),
             ("delete-publication-race", delete_publication_race),
             ("source-binding", source_binding),
+            ("unrelated-inline-delete", unrelated_inline_delete),
+            ("retirement-audit", retirement_audit),
             ("later-append", lambda d, r, c: crash(d, r, "retire_after_commit", c, append_after_restart=True)),
         ]
         cases += [
