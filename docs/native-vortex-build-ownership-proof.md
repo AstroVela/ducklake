@@ -25,7 +25,8 @@ can share an artifact root or use sibling directories. A claim that coincides
 with, contains or lies inside another owner's path is rejected. The same check
 protects published generations after their workspace registration is collected.
 The builder opens the root with the collector's POSIX path rules before it
-commits a task. Source capture checks the table UUID recorded by that task.
+commits a task. These rules reject root components containing a colon or a
+backslash. Source capture checks the table UUID recorded by the task.
 Replacing a table between registration and capture abandons the old build.
 
 Build state advances through `allocated`, `building` and `sealed`. Publication
@@ -130,10 +131,17 @@ revocation during cleanup and cancellation at both maintenance locks. The
 generation-GC proof also exercises workspace collection with absolute, relative
 and symlinked DuckLake data paths.
 
-On 2026-11-18, the Linux build from `4c4252b7` passed 24 ownership checks
-in 29.3 seconds against the 180-second budget. All 16 fixture queries achieved
+On 2026-11-18, the Linux build from `7c144400` passed 28 ownership checks
+in 32.8 seconds against the 180-second budget. All 20 fixture queries achieved
 recall 1.0. Generation GC passed 37 checks. The ON build passed 24 Vortex SQL
 cases with 939 assertions. The ON and OFF builds each passed 86 base cases
 with 3,582 assertions and 13 optional-dependency skips. The ABI probe passed
 32 cases. The catalog driver SHA-256 was
-`d36bd52f6d250d823f5227f95db171c4089f8fb542a0718c4412076a38271da6`.
+`2840355710eb27f290d032b184512fe1aef30fa459f86dcc8312a05f7e7d009b`.
+
+An initial run of the segment-merge suite reached the 60-second native RPC
+limit while building its first segment for the pre-commit crash fixture. It
+had created SDK scratch and an empty generation artifact directory. With the
+same binary and time limits, the isolated suite passed in 31.7 seconds and
+the full-matrix rerun passed the suite in 29.9 seconds. The cause of the single
+timeout is undetermined.
