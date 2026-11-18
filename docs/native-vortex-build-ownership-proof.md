@@ -129,17 +129,18 @@ used by #43. The process proof covers overlapping claims at admission and
 collection, disjoint sibling directories, directory-scoped grants, permission
 revocation during cleanup and cancellation at both maintenance locks. The
 generation-GC proof also exercises workspace collection with absolute, relative
-and symlinked DuckLake data paths.
+and symlinked DuckLake data paths. Literal braces and quotes in artifact
+paths are covered through registration, reopening, search and both collectors.
 
-On 2026-11-18, the Linux build from `7c144400` passed 28 ownership checks
-in 32.8 seconds against the 180-second budget. All 20 fixture queries achieved
+On 2026-11-18, the Linux build from `7d677e7a` passed 29 ownership checks
+in 34.7 seconds against the 180-second budget. All 24 fixture queries achieved
 recall 1.0. Generation GC passed 37 checks. The ON build passed 24 Vortex SQL
 cases with 939 assertions. The ON and OFF builds each passed 86 base cases
 with 3,582 assertions and 13 optional-dependency skips. The ABI probe passed
 32 cases. The catalog driver SHA-256 was
-`2840355710eb27f290d032b184512fe1aef30fa459f86dcc8312a05f7e7d009b`.
+`a1aadcf67400ab7c40c5f14fdf4e7d4e2871936a489e09661f7854090640af59`.
 
-An initial run of the segment-merge suite reached the 60-second native RPC
+During qualification of `7c144400`, the segment-merge suite reached the 60-second native RPC
 limit while building its first segment for the pre-commit crash fixture. It
 had created SDK scratch and an empty generation artifact directory. With the
 same binary and time limits, the isolated suite passed in 31.7 seconds and
