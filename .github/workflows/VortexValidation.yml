@@ -300,6 +300,13 @@ jobs:
             --driver build/index-shell/ducklake_vortex_catalog_driver \
             --probe build/index-cargo/ci/ducklake-vortex-index-probe \
             --output-dir build/index-logs/rewrite-append
+      - name: Validate explicit background data compaction and capacity recovery
+        run: |
+          python3 -I test/vane/test_native_vortex_background_rewrite.py \
+            --duckdb build/index-shell/duckdb \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --probe build/index-cargo/ci/ducklake-vortex-index-probe \
+            --output-dir build/index-logs/background-rewrite
       - name: Validate query projections and record isolated process cost
         run: |
           python3 -I test/vane/test_native_vortex_cost.py \

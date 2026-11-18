@@ -134,6 +134,11 @@ public:
 			SQL(writer, "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
 			return "{}";
 		}
+		if (op == "compaction-policy") {
+			SQL(writer, "SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn'," +
+			                args.at(2) + "," + args.at(3) + "," + args.at(4) + ")");
+			return "{}";
+		}
 		if (op == "maintenance-enable") {
 			if (args.size() == 4) {
 				SQL(writer,
@@ -160,13 +165,15 @@ public:
 			SQL(writer, "SELECT * FROM ducklake_cancel_vortex_maintenance(" + name + ")");
 			return "{}";
 		}
-		if (op == "maintenance-reattach") {
+		if (op == "maintenance-reattach" || op == "compaction-reattach") {
 			Connection caller(database);
-			caller.BeginTransaction();
-			SQL(caller, "SELECT count(*) FROM lake.items");
-			Require(!DuckLakeVortexOptimizer::MaintenanceStatus(*caller.context, "lake").empty(),
-			        "Could not inspect maintenance on the caller's existing metadata transaction");
-			caller.Commit();
+			if (op == "maintenance-reattach") {
+				caller.BeginTransaction();
+				SQL(caller, "SELECT count(*) FROM lake.items");
+				Require(!DuckLakeVortexOptimizer::MaintenanceStatus(*caller.context, "lake").empty(),
+				        "Could not inspect maintenance on the caller's existing metadata transaction");
+				caller.Commit();
+			}
 
 			caller.context->transaction.BeginTransaction();
 			Require(caller.context->transaction.IsAutoCommit(), "Fixture did not retain autocommit");
@@ -180,11 +187,20 @@ public:
 					operation();
 				} catch (const TransactionException &error) {
 					Require(string(error.what()).find("caller attachment changed") != string::npos,
-					        "Maintenance rejected the caller for the wrong reason");
+					        "Vortex control rejected the caller for the wrong reason");
 					return;
 				}
-				throw InvalidInputException("Maintenance accepted the reattached catalog for a stale caller");
+				throw InvalidInputException("Vortex control accepted the reattached catalog for a stale caller");
 			};
+			if (op == "compaction-reattach") {
+				reject_stale([&] {
+					DuckLakeVortexOptimizer::ConfigureCompaction(*caller.context, "LAKE", "main", "items", "knn", true,
+					                                             1, 1);
+				});
+				reject_stale([&] { DuckLakeVortexOptimizer::Resume(*caller.context, "LAKE", "main", "items", "knn"); });
+				caller.context->transaction.Rollback(nullptr);
+				return "{}";
+			}
 			reject_stale([&] { DuckLakeVortexOptimizer::MaintenanceStatus(*caller.context, "LAKE"); });
 			reject_stale([&] { DuckLakeVortexOptimizer::ResumeMaintenance(*caller.context, "LAKE"); });
 			caller.context->transaction.Rollback(nullptr);
@@ -1438,6 +1454,17 @@ public:
 			connection.context->Interrupt();
 			DuckLakeTransaction::Get(*connection.context, catalog).Commit();
 			throw InvalidInputException("Interrupted budget admission unexpectedly committed");
+		}
+		if (op == "concurrent-deletes") {
+			Connection first(database), second(database);
+			for (auto connection : {&first, &second}) {
+				connection->BeginTransaction();
+			}
+			SQL(first, ReadText(args.at(2)));
+			SQL(second, ReadText(args.at(3)));
+			first.Commit();
+			second.Commit();
+			return "{}";
 		}
 		if (op == "sql") {
 			SQL(writer, ReadText(args.at(2)));
