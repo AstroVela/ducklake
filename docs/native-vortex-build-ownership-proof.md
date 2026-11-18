@@ -124,3 +124,11 @@ collection, disjoint sibling directories, directory-scoped grants, permission
 revocation during cleanup and cancellation at both maintenance locks. The
 generation-GC proof also exercises workspace collection with absolute, relative
 and symlinked DuckLake data paths.
+
+On 2026-11-18, the Linux build from `4c4252b7` passed 24 ownership checks
+in 29.3 seconds against the 180-second budget. All 16 fixture queries achieved
+recall 1.0. Generation GC passed 37 checks. The ON build passed 24 Vortex SQL
+cases with 939 assertions. The ON and OFF builds each passed 86 base cases
+with 3,582 assertions and 13 optional-dependency skips. The ABI probe passed
+32 cases. The catalog driver SHA-256 was
+`d36bd52f6d250d823f5227f95db171c4089f8fb542a0718c4412076a38271da6`.
