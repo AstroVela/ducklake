@@ -132,12 +132,12 @@ row capacity, and it adds no SPFresh online update interface or fallback.
 
 Local qualification used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`,
 native wrapper `84cef204` and the static SPFresh SDK qualified by #44. The
-Linux build from `df32c661` passed 21 maintenance checks in
-65.1 seconds against the 180-second budget. All
+Linux build from `ae132d32` passed 21 maintenance checks in
+64.3 seconds against the 180-second budget. All
 97 fixture queries achieved recall 1.0. Seven merge/append/GC
 rounds reached revision 17 with three active generations and empty build and
 retirement registries. The catalog driver SHA-256 was
-`37c9caf1524aef4ab4268dcedce123272ed04388b4bd494a41e1474f4a53bb77`.
+`0a4e86c4057bbdf15a23122b4a85ef491af4c08ba7f3e0076e954679d71effab`.
 
 All 15 native process suites and 18 functional gates passed. Native ON passed
 25 Vortex SQL cases with 990 assertions. ON and OFF each passed
@@ -146,9 +146,10 @@ All 15 native process suites and 18 functional gates passed. Native ON passed
 fixture recall 1.0. Rust formatting, Clippy, workspace tests and the
 changed-file formatting and diff checks passed.
 
-The first matrix run reached the existing 60-second native RPC limit while
+The first matrix run for `2416e8b7` reached the existing 60-second native RPC limit while
 creating the initial B1 for the stored-ownership fixture. SPFresh scratch
 existed and the new generation's artifact directory was empty. The cause is
 undetermined. With the same driver and limits, the isolated build-ownership
 suite passed in 35.7 seconds and the complete matrix rerun passed that
-suite in 35.5 seconds.
+suite in 35.5 seconds. The current matrix also passed the
+build-ownership suite in 35.0 seconds.
