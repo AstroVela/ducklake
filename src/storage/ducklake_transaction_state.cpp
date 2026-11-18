@@ -601,7 +601,7 @@ DuckLakeTransactionState::GetNewDeleteFiles(const DuckLakeCommitState &commit_st
 		for (auto &file_entry : table_changes.new_delete_files) {
 			for (auto &file : file_entry.second) {
 				if (file.overwritten_delete_file.delete_file_id.IsValid()) {
-					// track the old delete file for deletion from metadata and disk
+					// Apply the previous mask's retirement when the new mask commits.
 					overwritten_delete_files.push_back(file.overwritten_delete_file);
 				}
 				auto delete_file = DuckLakeTransaction::GetNewDeleteFile(table_id, commit_state, file);

@@ -1375,12 +1375,19 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 	}
 	if (plan->retire) {
 		vector<string> sources;
+		set<DataFileIndex> source_ids;
 		for (auto file_id : plan->replaced) {
 			sources.push_back("(" + to_string(file_id) + ")");
+			source_ids.insert(DataFileIndex(file_id));
 		}
 		// The file remains in historical snapshots, but its end is a physical retirement.
-		Query(transaction, "INSERT INTO {METADATA_CATALOG}." + string(RETIRED_SOURCES) + " VALUES " +
+		Query(transaction, "INSERT INTO {METADATA_CATALOG}." +
+		                       string(DuckLakeMetadataManager::VortexRetiredSourceTable()) + " VALUES " +
 		                       StringUtil::Join(sources, ","));
+		auto masks = transaction.Query(snapshot, DuckLakeMetadataManager::DropDeleteFiles(source_ids));
+		if (masks->HasError()) {
+			masks->ThrowError();
+		}
 	} else {
 		Query(transaction, "UPDATE {METADATA_CATALOG}." + string(REWRITES) + " SET keep_file=true,new_file_id=" +
 		                       to_string(plan->new_file_id) + " WHERE build_id=" + Value(plan->build_id).ToSQLString());
@@ -1493,8 +1500,9 @@ void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog, C
 		                   "build_id VARCHAR PRIMARY KEY,table_uuid VARCHAR NOT NULL,source_root VARCHAR NOT NULL,"
 		                   "new_path VARCHAR NOT NULL,capture_snapshot BIGINT NOT NULL,new_file_id BIGINT NOT NULL,"
 		                   "keep_file BOOLEAN NOT NULL)");
-		Query(transaction,
-		      "CREATE TABLE {METADATA_CATALOG}." + string(RETIRED_SOURCES) + "(data_file_id BIGINT PRIMARY KEY)");
+		Query(transaction, "CREATE TABLE {METADATA_CATALOG}." +
+		                       string(DuckLakeMetadataManager::VortexRetiredSourceTable()) +
+		                       "(data_file_id BIGINT PRIMARY KEY)");
 		CheckInterrupted(owner, caller);
 		owner.Commit();
 	} catch (...) {
@@ -2010,16 +2018,10 @@ vector<string> DuckLakeVortexIndex::SmallestSegments() const {
 	return {sizes[0].second, sizes[1].second};
 }
 
-bool DuckLakeVortexIndex::HasRetiredSourceTable(DuckLakeTransaction &transaction) {
-	auto &catalog = transaction.GetCatalog();
-	return (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb") &&
-	       transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
-	                                             RETIRED_SOURCES) != nullptr;
-}
-
 bool DuckLakeVortexIndex::CoversFile(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, idx_t file_id) {
 	auto &catalog = transaction.GetCatalog();
-	if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+	if ((!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") ||
+	    !transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
 	                                           CATALOG_TABLE)) {
 		return false;
 	}
@@ -2097,8 +2099,6 @@ DuckLakeVortexIndex DuckLakeVortexIndex::RetireEmpty(ClientContext &context, con
 	plan->caller = context;
 	plan->identity = identity;
 	plan->catalog = catalog;
-	plan->schema = schema;
-	plan->table = table_name;
 	plan->selected = selected;
 	plan->optimizer_run_id = optimizer_run_id;
 	plan->build_id = optimizer_run_id.empty() ? UUID::ToString(UUID::GenerateRandomUUID()) : optimizer_run_id;
@@ -2117,6 +2117,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::RetireEmpty(ClientContext &context, con
 		auto entry = transaction.GetCatalog().GetEntry(*source.context, CatalogType::TABLE_ENTRY, schema, table_name,
 		                                               OnEntryNotFound::THROW_EXCEPTION);
 		auto &table = entry->Cast<DuckLakeTableEntry>();
+		plan->schema = table.schema.name;
+		plan->table = table.name;
 		plan->table_uuid = table.GetTableUUID();
 		plan->table_id = table.GetTableId().index;
 		plan->before = Lookup(transaction, table, name);

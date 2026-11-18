@@ -1049,6 +1049,12 @@ TransactionChangeInformation DuckLakeTransaction::GetTransactionChanges() const 
 			changes.altered_tables.insert(entry.first);
 		}
 	}
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	auto rewrite = DuckLakeVortexRewriteState::Get(*context.lock());
+	if (rewrite && rewrite->retire) {
+		changes.tables_rewrite_delete.insert(TableIndex(rewrite->table_id));
+	}
+#endif
 	return changes;
 }
 
@@ -1994,7 +2000,14 @@ void DuckLakeTransaction::DropTableMacro(DuckLakeTableMacroEntry &macro) {
 }
 
 void DuckLakeTransaction::DropFile(TableIndex table_id, DataFileIndex data_file_id, string path) {
-	state->tables_deleted_from.insert(table_id);
+	bool logical_delete = true;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	auto rewrite = DuckLakeVortexRewriteState::Get(*context.lock());
+	logical_delete = !rewrite || !rewrite->retire;
+#endif
+	if (logical_delete) {
+		state->tables_deleted_from.insert(table_id);
+	}
 	state->dropped_files.emplace(std::move(path), data_file_id);
 }
 

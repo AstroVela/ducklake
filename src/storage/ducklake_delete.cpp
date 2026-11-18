@@ -769,7 +769,23 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 		bool write_with_snapshots =
 		    existing_delete_data->HasEmbeddedSnapshots() || data_file_info.delete_file_id.IsValid();
 
-		if (write_with_snapshots) {
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (data_file_info.delete_file_id.IsValid() &&
+		    sorted_deletes.size() + existing_deletes.size() >= data_file_info.row_count &&
+		    DuckLakeVortexIndex::CoversFile(transaction, table, data_file_info.file_id.index)) {
+			auto complete = sorted_deletes;
+			complete.insert(existing_deletes.begin(), existing_deletes.end());
+			if (complete.size() == data_file_info.row_count) {
+				// Version the complete mask at commit and keep the previous mask for historical reads.
+				sorted_deletes = std::move(complete);
+				auto &previous = delete_file.overwritten_delete_file;
+				previous.delete_file_id = data_file_info.delete_file_id;
+				previous.path = data_file_info.delete_file.path;
+				previous.retain_for_snapshots = true;
+			}
+		}
+#endif
+		if (write_with_snapshots && !delete_file.overwritten_delete_file.retain_for_snapshots) {
 			FlushDeleteWithSnapshots(transaction, context, global_state, filename, data_file_info,
 			                         *existing_delete_data, sorted_deletes, delete_file);
 			return;
@@ -784,7 +800,8 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 		// set the delete file as overwriting existing deletes
 		delete_file.overwrites_existing_delete = true;
 	}
-	if (TryDropFullyDeletedFile(transaction, delete_file, data_file_info, sorted_deletes.size())) {
+	if (!delete_file.overwritten_delete_file.retain_for_snapshots &&
+	    TryDropFullyDeletedFile(transaction, delete_file, data_file_info, sorted_deletes.size())) {
 		return;
 	}
 
@@ -806,6 +823,7 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 
 	written_file.data_file_id = delete_file.data_file_id;
 	written_file.overwrites_existing_delete = delete_file.overwrites_existing_delete;
+	written_file.overwritten_delete_file = std::move(delete_file.overwritten_delete_file);
 
 	global_state.written_files.emplace(filename, std::move(written_file));
 }

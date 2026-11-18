@@ -62,7 +62,7 @@ statement ok
 ROLLBACK
 
 query I
-SELECT revision FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),1)
+SELECT revision FROM ducklake_retire_vortex_index_segment('LAKE','MAIN','ITEMS','knn',getvariable('empty_generation'),1)
 ----
 2
 

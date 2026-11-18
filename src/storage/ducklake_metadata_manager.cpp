@@ -1869,6 +1869,17 @@ WHERE data.table_id=%d AND data.begin_snapshot <= {SNAPSHOT_ID} AND (
 	return files;
 }
 
+static string VortexRetiredSourcePredicate(DuckLakeTransaction &transaction) {
+	auto &catalog = transaction.GetCatalog();
+	auto table = DuckLakeMetadataManager::VortexRetiredSourceTable();
+	if ((!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") ||
+	    !transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(), table)) {
+		return {};
+	}
+	return "EXISTS (SELECT 1 FROM {METADATA_CATALOG}." + string(table) +
+	       " retired WHERE retired.data_file_id = data.data_file_id)";
+}
+
 vector<DuckLakeDeleteScanEntry> DuckLakeMetadataManager::GetTableDeletions(DuckLakeTableEntry &table,
                                                                            DuckLakeSnapshot start_snapshot,
                                                                            DuckLakeSnapshot end_snapshot) {
@@ -1880,14 +1891,7 @@ vector<DuckLakeDeleteScanEntry> DuckLakeMetadataManager::GetTableDeletions(DuckL
 	// Check if we have an inlined deletion table for this table (usually cached, no DB hit)
 	auto inlined_table_name = GetInlinedDeletionTableName(table_id, end_snapshot);
 	bool has_inlined_table = !inlined_table_name.empty();
-	string physical_retirement;
-#ifdef DUCKLAKE_ENABLE_VORTEX
-	if (DuckLakeVortexIndex::HasRetiredSourceTable(transaction)) {
-		physical_retirement = "EXISTS (SELECT 1 FROM {METADATA_CATALOG}." +
-		                      string(DuckLakeVortexIndex::RETIRED_SOURCES) +
-		                      " retired WHERE retired.data_file_id = data.data_file_id)";
-	}
-#endif
+	auto physical_retirement = VortexRetiredSourcePredicate(transaction);
 
 	// Build the query with optional CTE for inlined deletions
 	// Deletes come in three flavors:
@@ -1917,7 +1921,8 @@ main_results AS (
 
 	// Main query: partial deletes from delete_file table and full file deletes
 	query += StringUtil::Format(R"(
-SELECT %s, current_delete.begin_snapshot FROM (
+SELECT %s, current_delete.begin_snapshot,
+       coalesce(previous_delete.end_snapshot = current_delete.begin_snapshot, false) AS versioned_delete FROM (
 	SELECT data_file_id, begin_snapshot, path, path_is_relative, file_size_bytes, footer_size, encryption_key, format
 	FROM {METADATA_CATALOG}.ducklake_delete_file
 	WHERE table_id = %d AND begin_snapshot <= {SNAPSHOT_ID}
@@ -1925,6 +1930,7 @@ SELECT %s, current_delete.begin_snapshot FROM (
 LEFT JOIN LATERAL (
 	SELECT DISTINCT ON (data_file_id)
 		data_file_id,
+		end_snapshot,
 		path,
 		path_is_relative,
 		file_size_bytes,
@@ -1932,7 +1938,8 @@ LEFT JOIN LATERAL (
 		encryption_key,
 		format
 	FROM {METADATA_CATALOG}.ducklake_delete_file
-	WHERE table_id = %d AND begin_snapshot < %d
+	WHERE table_id = %d AND (begin_snapshot < %d OR
+	      (end_snapshot = current_delete.begin_snapshot AND begin_snapshot < current_delete.begin_snapshot))
 	ORDER BY data_file_id, begin_snapshot DESC
 ) AS previous_delete
 USING (data_file_id)
@@ -1945,7 +1952,7 @@ USING (data_file_id)
 
 UNION ALL
 
-SELECT %s, data.end_snapshot FROM (
+SELECT %s, data.end_snapshot, false FROM (
 	SELECT *
 	FROM {METADATA_CATALOG}.ducklake_data_file data
 	WHERE table_id = %d AND end_snapshot >= %d AND end_snapshot <= {SNAPSHOT_ID}
@@ -1984,7 +1991,7 @@ UNION ALL
 SELECT data.data_file_id, %s, data.row_id_start, data.record_count, data.mapping_id,
        %s,
        %s,
-       inlined_dels.min_snapshot
+       inlined_dels.min_snapshot, false
 FROM {METADATA_CATALOG}.ducklake_data_file data
 JOIN inlined_dels ON data.data_file_id = inlined_dels.file_id
 WHERE data.table_id = %d
@@ -2005,7 +2012,7 @@ WHERE data.table_id = %d
 )
 SELECT main_results.*, inlined_dels.deletions
 FROM main_results
-LEFT JOIN inlined_dels ON main_results.data_file_id = inlined_dels.file_id
+LEFT JOIN inlined_dels ON main_results.data_file_id = inlined_dels.file_id AND NOT main_results.versioned_delete
 )";
 	} else {
 		query += R"(
@@ -2040,6 +2047,7 @@ FROM main_results
 		entry.delete_file = ReadDeleteFile(table, row, col_idx, IsEncrypted());
 		entry.previous_delete_file = ReadDeleteFile(table, row, col_idx, IsEncrypted());
 		entry.snapshot_id = row.GetValue<idx_t>(col_idx++);
+		col_idx++; // versioned_delete
 		// store the snapshot range for filtering embedded snapshot IDs
 		entry.start_snapshot = start_snapshot.snapshot_id;
 		entry.end_snapshot = end_snapshot.snapshot_id;
@@ -3925,8 +3933,13 @@ DuckLakeMetadataManager::DeleteOverwrittenDeleteFiles(const vector<DuckLakeOverw
 	}
 	string deleted_file_ids;
 	string scheduled_deletions;
+	set<DataFileIndex> retained_versions;
 	for (idx_t i = 0; i < overwritten_files.size(); ++i) {
 		auto &file = overwritten_files[i];
+		if (file.retain_for_snapshots) {
+			retained_versions.insert(file.delete_file_id);
+			continue;
+		}
 		auto &path = resolved_paths[i];
 		if (!deleted_file_ids.empty()) {
 			deleted_file_ids += ", ";
@@ -3940,8 +3953,11 @@ DuckLakeMetadataManager::DeleteOverwrittenDeleteFiles(const vector<DuckLakeOverw
 		                                          SQLString(path.path), path.path_is_relative ? "true" : "false");
 	}
 
-	string batch_query;
-	// delete the old delete file metadata records
+	auto batch_query = FlushDrop("ducklake_delete_file", "delete_file_id", retained_versions);
+	if (deleted_file_ids.empty()) {
+		return batch_query;
+	}
+	// delete old metadata for files no longer needed by a visible snapshot
 	batch_query += StringUtil::Format(R"(
 DELETE FROM {METADATA_CATALOG}.ducklake_delete_file
 WHERE delete_file_id IN (%s);
@@ -4960,20 +4976,29 @@ AND NOT EXISTS (
 		table_id_filter = StringUtil::Format("table_id IN (%s) OR", deleted_table_ids);
 	}
 
+	auto physical_retirement = VortexRetiredSourcePredicate(transaction);
 	result = transaction.Query(StringUtil::Format(R"(
-SELECT data_file_id, table_id, path, path_is_relative
-FROM {METADATA_CATALOG}.ducklake_data_file
+SELECT data_file_id, table_id, path, path_is_relative%s
+FROM {METADATA_CATALOG}.ducklake_data_file data
 WHERE %s (end_snapshot IS NOT NULL AND NOT EXISTS(
     SELECT snapshot_id
     FROM {METADATA_CATALOG}.ducklake_snapshot
     WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot
 ));)",
+	                                              physical_retirement.empty() ? "" : ", " + physical_retirement,
 	                                              table_id_filter));
+	if (result->HasError()) {
+		result->ThrowError();
+	}
 	vector<DuckLakeFileForCleanup> cleanup_files;
+	map<TableIndex, vector<string>> retired_sources;
 	for (auto &row : *result) {
 		DuckLakeFileForCleanup info;
 		info.id = DataFileIndex(row.GetValue<idx_t>(0));
 		TableIndex table_id(row.GetValue<idx_t>(1));
+		if (!physical_retirement.empty() && row.GetValue<bool>(4)) {
+			retired_sources[table_id].push_back(to_string(info.id.index));
+		}
 		DuckLakePath path;
 		path.path = row.GetValue<string>(2);
 		path.path_is_relative = row.GetValue<bool>(3);
@@ -5001,11 +5026,20 @@ WHERE %s (end_snapshot IS NOT NULL AND NOT EXISTS(
 		// delete the data files
 		tables_to_delete_from = {"ducklake_data_file", "ducklake_file_column_stats", "ducklake_file_variant_stats",
 		                         "ducklake_file_partition_value"};
-#ifdef DUCKLAKE_ENABLE_VORTEX
-		if (DuckLakeVortexIndex::HasRetiredSourceTable(transaction)) {
-			tables_to_delete_from.push_back(DuckLakeVortexIndex::RETIRED_SOURCES);
+		if (!retired_sources.empty()) {
+			tables_to_delete_from.push_back(VortexRetiredSourceTable());
+			for (auto &sources : retired_sources) {
+				auto inlined = GetInlinedDeletionTableName(sources.first, transaction.GetSnapshot());
+				if (inlined.empty()) {
+					continue;
+				}
+				result = transaction.Query("DELETE FROM {METADATA_CATALOG}." + inlined + " WHERE file_id IN (" +
+				                           StringUtil::Join(sources.second, ",") + ")");
+				if (result->HasError()) {
+					result->GetErrorObject().Throw("Failed to delete retired source masks in DuckLake: ");
+				}
+			}
 		}
-#endif
 		for (auto &delete_tbl : tables_to_delete_from) {
 			result = transaction.Query(StringUtil::Format(R"(
 DELETE FROM {METADATA_CATALOG}.%s

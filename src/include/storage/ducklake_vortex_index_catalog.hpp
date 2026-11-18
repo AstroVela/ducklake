@@ -72,7 +72,6 @@ struct DuckLakeVortexIndexSegment {
 
 struct DuckLakeVortexIndex {
 	static constexpr idx_t MAX_SEGMENTS = 3;
-	static constexpr const char *RETIRED_SOURCES = "ducklake_vortex_retired_sources_v1";
 	static const char *RewriteSourcePrefix() {
 		return "ducklake-vortex-rewrite-";
 	}
@@ -118,7 +117,6 @@ struct DuckLakeVortexIndex {
 	              optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);
 	static DuckLakeVortexIndex ParseSegments(const string &reference, const string &table_uuid, idx_t field_id);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
-	static bool HasRetiredSourceTable(DuckLakeTransaction &transaction);
 	static bool CoversFile(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, idx_t file_id);
 	static void CheckFileRetirements(ClientContext &context, DuckLakeTransaction &transaction);
 	static DuckLakeVortexIndex RetireEmpty(ClientContext &context, const string &catalog, const string &schema,

@@ -525,9 +525,93 @@ def retirement_audit(driver, root, checks):
             "SELECT * FROM audit_before EXCEPT ALL SELECT * FROM audit_after) "
             "THEN true ELSE error('retirement changed the logical delete history') END"
         )
+        SEG.add_f(native, 5000)
+        native.sql(
+            "DELETE FROM lake.items WHERE id=5000;"
+            "SELECT * FROM ducklake_expire_snapshots('lake',older_than=>now());"
+            "SELECT CASE WHEN count(*)=1 AND count(*) FILTER (WHERE d.end_snapshot IS NULL)=1 "
+            "THEN true ELSE error('retirement expiry left old masks or erased an active mask') END "
+            "FROM __ducklake_metadata_lake.ducklake_inlined_delete_1 i "
+            "LEFT JOIN __ducklake_metadata_lake.ducklake_data_file d ON d.data_file_id=i.file_id;"
+            "SELECT CASE WHEN count(*)=127 AND min(id)=5001 THEN true "
+            "ELSE error('expiry changed current visibility') END FROM lake.items"
+        )
         native.finish()
         checks.append("inline-only and mixed delete masks retain their audit snapshots through physical retirement")
+        checks.append("expiry removes only inline masks belonging to expired retired sources")
         return {"logical_deletes": 4096, "new_retirement_events": 0}
+    finally:
+        M.stop(native)
+
+
+def versioned_delete_mask(driver, root, checks, *, vectors=False):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        if vectors:
+            native.sql("CALL ducklake_set_option('lake','write_deletion_vectors',true,table_name=>'items')")
+        native.sql(
+            "CREATE TABLE lake.other(i INTEGER);"
+            "DELETE FROM lake.items WHERE id<128;"
+            "SET VARIABLE partial_version=(SELECT max(snapshot_id) FROM lake.snapshots())"
+        )
+        unrelated, finish_delete = root / "unrelated.sql", root / "finish-delete.sql"
+        unrelated.write_text("INSERT INTO lake.other VALUES(1)")
+        finish_delete.write_text("DELETE FROM lake.items")
+        native.call("concurrent-deletes", unrelated, finish_delete)
+        native.sql(
+            "SET VARIABLE final_version=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SET VARIABLE unrelated_version=getvariable('final_version')-1;"
+            "SELECT CASE WHEN "
+            "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('partial_version')))=3968 AND "
+            "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('unrelated_version')))=3968 AND "
+            "(SELECT count(*) FROM lake.items)=0 "
+            "THEN true ELSE error('final delete changed historical visibility') END;"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "AND count(*) FILTER (WHERE id<128 AND snapshot_id=getvariable('partial_version'))=128 "
+            "AND count(*) FILTER (WHERE id>=128 AND snapshot_id=getvariable('final_version'))=3968 "
+            "THEN true ELSE error('full mask assigned deletes to incorrect snapshots') END FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('partial_version'),getvariable('final_version'));"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('unrelated commit acquired deletes') END FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('unrelated_version'),"
+            "getvariable('unrelated_version'))"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.sql(
+            "SELECT CASE WHEN file_count=0 AND delete_file_count=0 THEN true "
+            "ELSE error('retired source masks still count toward current table size') END "
+            "FROM ducklake_table_info('lake') WHERE table_name='items';"
+            "SELECT CASE WHEN count(*)=3968 THEN true ELSE error('retirement discarded prior mask history') END "
+            "FROM lake.items AT (VERSION=>getvariable('partial_version'))"
+        )
+        native.finish()
+        mask = "Puffin" if vectors else "Parquet"
+        checks.append(f"a completed {mask} mask preserves prior visibility and uses its actual native commit snapshot")
+        return {"prior_deletions": 128, "final_deletions": 3968, "delete_format": mask}
+    finally:
+        M.stop(native)
+
+
+def append_after_retirement(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        single(native, root)
+        BG.pause(native, "retire_candidate_ready")
+        native.sql("BEGIN; INSERT INTO lake.items VALUES(5000,[0,0,0,0,0,0,0,0],'A','queued')")
+        native.call("optimizer-release")
+        BG.published(native, 2)
+        native.sql(
+            "COMMIT;"
+            "SELECT CASE WHEN count(*)=1 AND min(id)=5000 THEN true ELSE error('staged append was lost') END "
+            "FROM lake.items;"
+            "SELECT CASE WHEN changes_made LIKE 'rewrite_delete:%' THEN true "
+            "ELSE error('retirement journaled a logical delete') END "
+            "FROM __ducklake_metadata_lake.ducklake_snapshot_changes WHERE snapshot_id="
+            "(SELECT max(snapshot_id)-1 FROM lake.snapshots())"
+        )
+        BG.finish(native)
+        checks.append("an append staged before retirement commits afterward without a logical-delete conflict")
+        return {"appended_rows": 1, "revision": 2}
     finally:
         M.stop(native)
 
@@ -564,6 +648,9 @@ def main():
             ("source-binding", source_binding),
             ("unrelated-inline-delete", unrelated_inline_delete),
             ("retirement-audit", retirement_audit),
+            ("versioned-parquet-mask", versioned_delete_mask),
+            ("versioned-puffin-mask", lambda d, r, c: versioned_delete_mask(d, r, c, vectors=True)),
+            ("append-after-retirement", append_after_retirement),
             ("later-append", lambda d, r, c: crash(d, r, "retire_after_commit", c, append_after_restart=True)),
         ]
         cases += [

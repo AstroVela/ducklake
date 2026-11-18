@@ -9,9 +9,12 @@ generation references commit in the same native metadata transaction.
 
 Native DELETE retains a complete delete mask for a committed source covered by
 an index. The indexed file stays active, so current queries preserve coverage
-and return only visible rows while retirement is pending. Other unindexed files
-continue to use native full-file deletion. Final metadata commit rejects a file
-drop if a concurrent index publication has since covered that source.
+and return only visible rows while retirement is pending. When an existing
+external mask is completed, the prior descriptor ends at the actual DELETE
+commit and remains available to historical snapshots. Change feeds compare
+the new mask with its predecessor to report the newly deleted positions.
+Unindexed files continue to use native full-file deletion. Final metadata
+commit rejects a file drop if a concurrent index publication has covered it.
 
 ```sql
 SELECT * FROM ducklake_retire_vortex_index_segment(
@@ -26,11 +29,13 @@ positions. Any visible row prevents retirement. Independent T/F appends can
 commit during preparation. Under the existing write-admission and publication
 guards it refreshes the native write transaction, repeats the input and
 visibility checks, and validates the exact revision and sole named-index
-ownership. Source IDs and index references retire in that same transaction.
-Other B descriptors and artifact bytes are retained.
+ownership. Source IDs, active masks, and index references retire in that same
+transaction. The snapshot journal records physical compaction so a staged
+append can commit after retirement. Other B descriptors and artifact bytes
+are retained.
 The commit marks the retired source IDs so change feeds keep the original
-logical delete events. Snapshot expiry removes these markers when it removes
-the corresponding source metadata.
+logical delete events. Snapshot expiry removes the markers and inlined masks
+when it removes the corresponding source metadata.
 
 The existing explicit data-compaction policy also selects an entirely empty B.
 It journals a `retire` task in `retiring` and then `publishing` before the native
@@ -90,8 +95,9 @@ its relation preserves the selected source identity during retirement. The
 audit regression checks original delete snapshots for inline and mixed masks
 and zero logical changes at retirement. A later append checks that the
 receipt identifies the committed retirement after restart. The SQL case also
-covers explicit and read-only transactions, a business column named
-`filename`, and whole-file DELETE after a vector column rename.
+covers alternate-case catalog, schema and table names, explicit and read-only
+transactions, a business column named `filename`, and whole-file DELETE
+after a vector column rename.
 
 ## Local verification against #48
 
