@@ -138,8 +138,8 @@ SPFresh online update calls, dependency-pin changes or total-capacity increase.
 
 Linux used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`, the native
 wrapper `84cef204` and the static SPFresh SDK qualified by #45. The rewrite
-proof at `445002c6` passed 21 checks in
-61.8 seconds within the 180-second budget. All 88
+proof at `5a56aeb8` passed 21 checks in
+62.2 seconds within the 180-second budget. All 88
 gated fixture queries attained recall 1.0.
 Five rewrites advanced revision 3 to 8 and reduced current physical rows
 from 4,352 to 383 while preserving both unselected B generations.
@@ -150,11 +150,19 @@ write succeeded. The separate deletion-dense sample measured recall
 0.2 before rewrite and passed the post-rewrite gate.
 
 All 16 native process suites and 19 functional gates passed.
-Native ON passed 26 Vortex SQL cases with 1,027 assertions.
+Native ON passed 26 Vortex SQL cases with 1,028 assertions.
 The rewrite/orphan SQL groups passed 17 cases with
 881 assertions and 2 optional skips.
 ON and OFF each passed 86 base cases with 3,582 assertions and 13 optional
 skips. All 32 ABI checks and four isolated query-cost cases passed.
 Rust formatting, Clippy, workspace tests, changed-file formatting and diff
 checks passed. The catalog driver SHA-256 was
-`c025b647e6dd9cfa602c665cd799bcf179168d2c13c10c50c77b347d10bfee5b`.
+`6d1bdafbb4166c1f1a8aaf7545ce9089f90a5da7524b9bc09f11e20c78ef3aa3`.
+
+The first run of this matrix reached the existing 60-second call limit during
+the initial B1 build in the generation GC suite's source pin cancellation fixture.
+The native workspace existed and the new generation's artifact directory was
+empty. The first isolated run reached the same limit while
+constructing a merge candidate in a later fixture. The cause is undetermined. The same binary passed the isolated suite
+in 71.0 seconds and the complete matrix replay
+passed it in 70.8 seconds under the same limits.
