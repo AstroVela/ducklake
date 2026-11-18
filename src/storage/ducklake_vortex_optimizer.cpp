@@ -979,8 +979,9 @@ bool Grows(const LocalTableDataChanges &changes) {
 
 } // namespace
 
-unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
-                                                               unique_ptr<StorageLockKey> &publication_guard) {
+unique_ptr<StorageLockKey>
+DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
+                                    unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard) {
 	bool grows = false;
 	for (auto &entry : transaction.GetLocalChanges().Changes()) {
 		grows |= Grows(entry.GetTableChanges());
@@ -994,7 +995,11 @@ unique_ptr<StorageLockKey> DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransacti
 		}
 	}
 	// Use the same admission/publication order as configuration, and keep coverage stable through commit.
-	publication_guard = VortexCatalog::PublicationLock().GetSharedLock();
+	publication_guard = VortexCatalog::PublicationLock().GetSharedLock([&] {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
 	if (!admission) {
 		return nullptr;
 	}
@@ -1050,7 +1055,11 @@ void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const strin
 	}
 	auto owner = GetOwner(*context.db);
 	auto admission = owner->write_admission.GetExclusiveLock();
-	auto publication = VortexCatalog::PublicationLock().GetSharedLock();
+	auto publication = VortexCatalog::PublicationLock().GetSharedLock([&] {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
 	std::lock_guard<std::mutex> guard(owner->runtime->io);
 	if (context.IsInterrupted()) {
 		throw InterruptException();

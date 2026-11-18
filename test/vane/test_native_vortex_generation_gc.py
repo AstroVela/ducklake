@@ -153,10 +153,12 @@ def cancel_admission(driver, root, checks):
         rows = status(native)
         signatures = {row["generation"]: SEG.signature(directory(row)) for row in rows}
         results = []
-        for kind in ["search", "append", "merge"]:
+        builds = native.call("build-status")
+        for kind in ["search", "replace", "append", "merge"]:
             result = native.call("gc-cancel-admission", kind)
             require(result["interrupted_before_gc_unlock"], "Admission cancellation waited for GC release")
             require(native.call("head", "knn") == head and status(native) == rows, "Cancellation changed ownership")
+            require(native.call("build-status") == builds, "Waiting admission registered a build")
             owner = native.call("owners")
             require(owner["database_references"] == 2 and len(owner["connections"]) == 1, "Admission retained owners")
             require(
@@ -169,7 +171,7 @@ def cancel_admission(driver, root, checks):
         native.call("reopen")
         require(native.call("head", "knn") == head and status(native) == rows, "Reopen lost the untouched ready set")
         native.finish()
-        checks.append("query, append and merge capture cancel before GC unlock and release their dedicated owners")
+        checks.append("query, replacement, append and merge cancel before GC unlock and release their dedicated owners")
         return {"cases": results, "fixture_recalls": recalls}
     finally:
         M.stop(native)
@@ -208,6 +210,8 @@ def data_path(shell, root, kind, checks):
         "collected_artifact_bytes::BIGINT AS collected_artifact_bytes,"
         "remaining_generations::BIGINT AS remaining_generations "
         "FROM ducklake_collect_vortex_generations('lake',16,67108864);"
+        "SELECT collected_builds::BIGINT AS collected_builds,remaining_builds::BIGINT AS remaining_builds "
+        "FROM ducklake_collect_vortex_builds('lake',16,67108864);"
         "SELECT id AS after_id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1);"
         "SELECT count(*) AS source_rows_after FROM lake.items;"
         "SELECT count(*) AS registered_after,min(state) AS state_after,"
@@ -253,6 +257,10 @@ def data_path(shell, root, kind, checks):
         and values["references_after"] == 1
         and values["source_rows_after"] == 128,
         "DATA_PATH GC changed current references or source rows",
+    )
+    require(
+        values["collected_builds"] == 2 and values["remaining_builds"] == 0,
+        "DATA_PATH workspace cleanup did not finish both published tasks",
     )
     require(not (artifacts / CAT.generation(first)).exists(), "DATA_PATH GC retained the old generation")
     require((artifacts / CAT.generation(second)).is_dir(), "DATA_PATH GC removed the active generation")

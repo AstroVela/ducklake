@@ -20,9 +20,10 @@ use vortex_index::SourceFile;
 use vortex_index::file::file_version;
 use vortex_index::store::LocalGeneration;
 
-use crate::build::build_generation_checked;
+use crate::build::{
+    BuildTarget, build_generation_at, build_generation_checked, write_reference_at,
+};
 use crate::source::PhysicalSource;
-use crate::write_reference;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +151,50 @@ pub(crate) async fn build_checked(
         check,
     )
     .await?;
+    finish_reference(&source, reference, snapshot, generation, root, check)
+}
+
+pub(crate) async fn build_owned(
+    source: Arc<PhysicalSource>,
+    reference: &Path,
+    generation: String,
+    workspace: &Path,
+    session: VortexSession,
+    check: &dyn Fn(&str) -> VortexResult<()>,
+) -> VortexResult<()> {
+    let root = reference
+        .parent()
+        .ok_or_else(|| vortex_err!("Reference parent required"))?;
+    let scratch = workspace.join("scratch");
+    std::fs::create_dir(&scratch)?;
+    check("scratch_created")?;
+    let (snapshot, generation) = build_generation_at(
+        Arc::new(FileSource {
+            snapshot: snapshot(&source, source.snapshot().files.clone())?,
+            source: Arc::clone(&source),
+        }),
+        source.field.clone(),
+        source.capture.dimension,
+        BuildTarget {
+            root,
+            generation,
+            scratch: &scratch,
+        },
+        session,
+        check,
+    )
+    .await?;
+    finish_reference(&source, reference, snapshot, generation, workspace, check)
+}
+
+fn finish_reference(
+    source: &PhysicalSource,
+    reference: &Path,
+    snapshot: Snapshot,
+    generation: LocalGeneration,
+    temporary: &Path,
+    check: &dyn Fn(&str) -> VortexResult<()>,
+) -> VortexResult<()> {
     let descriptor = Reference {
         format_version: 1,
         table_uuid: source.capture.table_uuid.clone(),
@@ -160,6 +205,6 @@ pub(crate) async fn build_checked(
         generation,
     };
     check("before_reference")?;
-    write_reference(reference, &descriptor)?;
+    write_reference_at(reference, &descriptor, temporary, check)?;
     check("reference_ready")
 }
