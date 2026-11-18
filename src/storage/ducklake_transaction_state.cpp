@@ -713,11 +713,14 @@ CompactionInformation DuckLakeTransactionState::GetCompactionChanges(DuckLakeCom
 
 			idx_t row_id_limit = 0;
 			for (auto &compacted_file : compaction.source_files) {
-				row_id_limit += compacted_file.file.row_count;
-				if (!compacted_file.delete_files.empty()) {
-					row_id_limit -= compacted_file.delete_files.back().row_count;
+				const auto external_deletes =
+				    compacted_file.delete_files.empty() ? 0 : compacted_file.delete_files.back().row_count;
+				const auto inline_deletes = compacted_file.inlined_file_deletions.size();
+				const auto source_rows = compacted_file.file.row_count;
+				if (external_deletes > source_rows || inline_deletes > source_rows - external_deletes) {
+					throw InvalidInputException("Compaction delete count exceeds source rows");
 				}
-				row_id_limit -= compacted_file.inlined_file_deletions.size();
+				row_id_limit += source_rows - external_deletes - inline_deletes;
 				DuckLakeCompactedFileInfo file_info;
 				file_info.path = compacted_file.file.data.path;
 				file_info.source_id = compacted_file.file.id;

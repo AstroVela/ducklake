@@ -39,7 +39,9 @@ Generation-name order breaks ties.
 Scans consume every delete record at each position. When an active file has both
 mask types, metadata reports that an exact count is unavailable. SQL aggregates
 use visible rows, and rewrite publication skips the optional global-statistics
-refresh that requires an exact metadata count.
+refresh that requires an exact metadata count. The compactor stores disjoint
+masks in its commit record so its source row checks also use the unique deletion
+count.
 
 A candidate needs deletions, both thresholds, at least 65 remaining physical
 rows for the unchanged static SPFresh options, a nonempty rewrite output and

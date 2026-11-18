@@ -590,6 +590,7 @@ def dense_overlap(driver, root, checks):
             "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1)=80 "
             "THEN true ELSE error('dense overlap fixture did not preserve its 66 live rows') END"
         )
+        native.sql("CREATE TEMP TABLE visible_before_dense_rewrite AS SELECT id,rowid AS row_id FROM lake.items")
         configure(native, 4030, 98)
         selected = pause(native, "optimizer_before_rewrite")
         require(
@@ -603,8 +604,10 @@ def dense_overlap(driver, root, checks):
             "An unavailable exact metadata count disrupted an eligible rewrite",
         )
         native.sql(
-            "SELECT CASE WHEN count(*)=66 AND count(DISTINCT rowid)=66 AND min(id)=0 AND max(id)=65 "
-            "THEN true ELSE error('dense overlap changed visible rows in the replacement') END FROM lake.items"
+            "SELECT CASE WHEN (SELECT count(*) FROM lake.items)=66 "
+            "AND NOT EXISTS (SELECT id,row_id FROM visible_before_dense_rewrite "
+            "EXCEPT SELECT id,rowid FROM lake.items) "
+            "THEN true ELSE error('dense overlap changed visible rows or row ids in the replacement') END"
         )
         finish(native, maintenance=False)
         checks.append("dense overlap leaves 66 live rows and commits without using an inexact metadata count")
