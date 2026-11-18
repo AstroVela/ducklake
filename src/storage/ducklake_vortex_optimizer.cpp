@@ -113,12 +113,21 @@ struct MaintenanceCatalog {
 };
 
 MaintenanceCatalog ResolveMaintenanceCatalog(ClientContext &context, const string &name, bool write) {
-	if (write && (!context.transaction.IsAutoCommit() || (context.transaction.HasActiveTransaction() &&
-	                                                      context.transaction.ActiveTransaction().IsReadOnly()))) {
+	auto &transaction = context.transaction;
+	const bool active_transaction = transaction.HasActiveTransaction();
+	if (write &&
+	    (!transaction.IsAutoCommit() || (active_transaction && transaction.ActiveTransaction().IsReadOnly()))) {
 		throw TransactionException("Vortex maintenance controls require autocommit");
 	}
 	auto &manager = DatabaseManager::Get(context);
-	auto lake = manager.GetDatabase(name);
+	auto resolve = [&](const string &alias) {
+		auto attached = manager.GetDatabase(alias);
+		if (active_transaction && manager.GetDatabase(context, alias).get() != attached.get()) {
+			throw TransactionException("Vortex maintenance caller attachment changed");
+		}
+		return attached;
+	};
+	auto lake = resolve(name);
 	if (!lake || lake->GetCatalog().GetCatalogType() != "ducklake") {
 		throw InvalidInputException("Vortex maintenance requires an attached DuckLake catalog");
 	}
@@ -126,9 +135,20 @@ MaintenanceCatalog ResolveMaintenanceCatalog(ClientContext &context, const strin
 	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 		throw InvalidInputException("Vortex maintenance requires native DuckDB metadata");
 	}
-	auto metadata = manager.GetDatabase(catalog.MetadataDatabaseName());
-	if (!metadata || manager.GetDatabase(name) != lake) {
+	const auto &metadata_name = catalog.MetadataDatabaseName();
+	auto metadata = resolve(metadata_name);
+	if (!metadata || manager.GetDatabase(name) != lake || manager.GetDatabase(metadata_name) != metadata) {
 		throw TransactionException("Vortex maintenance catalog attachment changed");
+	}
+	if (active_transaction) {
+		auto caller_lake = transaction.ActiveTransaction().TryGetTransaction(*lake);
+		if (caller_lake) {
+			// A DuckLake transaction can retain its metadata attachment on a separate connection.
+			auto &metadata_context = *caller_lake->Cast<DuckLakeTransaction>().GetConnection().context;
+			if (manager.GetDatabase(metadata_context, metadata_name).get() != metadata.get()) {
+				throw TransactionException("Vortex maintenance caller metadata attachment changed");
+			}
+		}
 	}
 	if (write && (lake->IsReadOnly() || metadata->IsReadOnly())) {
 		throw TransactionException("Vortex maintenance controls require a writable DuckLake attachment");

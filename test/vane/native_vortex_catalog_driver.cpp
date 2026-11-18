@@ -161,9 +161,34 @@ public:
 			return "{}";
 		}
 		if (op == "maintenance-reattach") {
+			Connection caller(database);
+			caller.BeginTransaction();
+			SQL(caller, "SELECT count(*) FROM lake.items");
+			Require(!DuckLakeVortexOptimizer::MaintenanceStatus(*caller.context, "lake").empty(),
+			        "Could not inspect maintenance on the caller's existing metadata transaction");
+			caller.Commit();
+
+			caller.context->transaction.BeginTransaction();
+			Require(caller.context->transaction.IsAutoCommit(), "Fixture did not retain autocommit");
+			auto &original = Catalog::GetCatalog(*caller.context, "lake");
 			SQL(writer, "DETACH lake");
 			Attach(writer, root);
-			return "{}";
+			Require(&Catalog::GetCatalog(*caller.context, "LAKE") == &original,
+			        "The caller did not retain its original attachment");
+			auto reject_stale = [&](const std::function<void()> &operation) {
+				try {
+					operation();
+				} catch (const TransactionException &error) {
+					Require(string(error.what()).find("caller attachment changed") != string::npos,
+					        "Maintenance rejected the caller for the wrong reason");
+					return;
+				}
+				throw InvalidInputException("Maintenance accepted the reattached catalog for a stale caller");
+			};
+			reject_stale([&] { DuckLakeVortexOptimizer::MaintenanceStatus(*caller.context, "LAKE"); });
+			reject_stale([&] { DuckLakeVortexOptimizer::ResumeMaintenance(*caller.context, "LAKE"); });
+			caller.context->transaction.Rollback(nullptr);
+			return "{\"retained_status_rejected\":true,\"retained_resume_rejected\":true}";
 		}
 		if (op == "optimizer-init-active-transaction") {
 			Connection caller(database);

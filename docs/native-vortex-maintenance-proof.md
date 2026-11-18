@@ -26,8 +26,11 @@ read-only attachment. Duplicate enable, missing initialization, invalid budgets
 and resume while running fail explicitly.
 The runtime binds each registration to the attached DuckLake and DuckDB
 metadata instances. Calls using different casing find the same registration.
-Each collector transaction verifies both identities before using catalog data.
-Reattaching a lake requires explicit resume for the new attachment.
+The controls check attachments retained by the calling transaction, including
+the native metadata connection of an existing DuckLake transaction. Each
+collector transaction verifies both identities before using catalog data.
+Reattaching a lake requires explicit resume for the new attachment. A caller
+retaining the earlier attachment is rejected.
 Caller reference JSON and unregistered directories remain outside GC ownership.
 The policy uses the existing database optimizer worker, with at most 16 registered
 maintenance catalogs and no additional background threads or build concurrency.

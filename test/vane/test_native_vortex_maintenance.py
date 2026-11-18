@@ -398,7 +398,11 @@ def attachment_binding(driver, root, checks):
         native.call("optimizer-wait")
         original = status(native)
         require(original["running"] and original["state"] == "collecting_builds", "GC did not reach its lock boundary")
-        native.call("maintenance-reattach")
+        retained = native.call("maintenance-reattach")
+        require(
+            retained == {"retained_status_rejected": True, "retained_resume_rejected": True},
+            "A caller retaining the old attachment could inspect or resume its replacement",
+        )
         require(not status(native)["running"], "The new attachment inherited the old running registration")
         native.call("maintenance-resume", "maintenance_before_recovery", "pause")
         native.call("optimizer-wait")
@@ -416,7 +420,7 @@ def attachment_binding(driver, root, checks):
         native.call("maintenance-cancel")
         native.finish()
         checks.append("reattaching a lake while GC waits requires a new explicit registration before cleanup")
-        return {"old_run": original["run_id"], "new_run": resumed["run_id"]}
+        return {"old_run": original["run_id"], "new_run": resumed["run_id"], **retained}
     finally:
         M.stop(native)
 
