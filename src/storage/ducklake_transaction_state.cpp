@@ -592,7 +592,8 @@ NewNameMapInfo DuckLakeTransactionState::GetNewNameMaps(DuckLakeCommitState &com
 
 vector<DuckLakeDeleteFileInfo>
 DuckLakeTransactionState::GetNewDeleteFiles(const DuckLakeCommitState &commit_state,
-                                            vector<DuckLakeOverwrittenDeleteFile> &overwritten_delete_files) const {
+                                            vector<DuckLakeOverwrittenDeleteFile> &overwritten_delete_files,
+                                            string &flushed_inline_file_deletes) const {
 	vector<DuckLakeDeleteFileInfo> result;
 	// handle delete files made to existing files
 	for (auto &entry : local_changes.Changes()) {
@@ -600,6 +601,12 @@ DuckLakeTransactionState::GetNewDeleteFiles(const DuckLakeCommitState &commit_st
 		auto &table_changes = entry.GetTableChanges();
 		for (auto &file_entry : table_changes.new_delete_files) {
 			for (auto &file : file_entry.second) {
+				if (file.source == DeleteFileSource::FLUSH) {
+					flushed_inline_file_deletes += StringUtil::Format(
+					    "DELETE FROM {METADATA_CATALOG}.%s WHERE file_id=%llu AND begin_snapshot<=%llu;",
+					    DuckLakeMetadataManager::InlinedFileDeletionTableName(table_id), file.data_file_id.index,
+					    file.max_snapshot.GetIndex());
+				}
 				if (file.overwritten_delete_file.delete_file_id.IsValid()) {
 					// Apply the previous mask's retirement when the new mask commits.
 					overwritten_delete_files.push_back(file.overwritten_delete_file);
@@ -1557,7 +1564,8 @@ string DuckLakeTransactionState::CommitChanges(DuckLakeCommitState &commit_state
 	if (has_table_data_changes) {
 		// write new delete files
 		vector<DuckLakeOverwrittenDeleteFile> overwritten_delete_files;
-		auto file_list = GetNewDeleteFiles(commit_state, overwritten_delete_files);
+		string flushed_inline_file_deletes;
+		auto file_list = GetNewDeleteFiles(commit_state, overwritten_delete_files, flushed_inline_file_deletes);
 		vector<DuckLakePath> resolved_overwritten_paths;
 		resolved_overwritten_paths.reserve(overwritten_delete_files.size());
 		for (auto &file : overwritten_delete_files) {
@@ -1573,6 +1581,7 @@ string DuckLakeTransactionState::CommitChanges(DuckLakeCommitState &commit_state
 			    separator));
 		}
 		batch_queries += DuckLakeMetadataManager::WriteNewDeleteFiles(file_list, resolved_delete_paths);
+		batch_queries += flushed_inline_file_deletes;
 
 		// write new inlined deletes (for inlined data tables)
 		auto inlined_deletes = GetNewInlinedDeletes(commit_state);

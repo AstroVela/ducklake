@@ -643,7 +643,10 @@ def completed_mask_flush(driver, root, checks):
         native.call("concurrent-deletes", bulk, inline)
         native.sql(
             "SET VARIABLE partial_version=(SELECT max(snapshot_id) FROM lake.snapshots());"
-            "DELETE FROM lake.items;"
+            "BEGIN; DELETE FROM lake.items;"
+            "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('flush exposed a staged deletion') END FROM lake.items;"
+            "COMMIT;"
             "CREATE TEMP TABLE complete_masks AS SELECT delete_file_id,begin_snapshot "
             "FROM __ducklake_metadata_lake.ducklake_delete_file WHERE end_snapshot IS NULL;"
             "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
@@ -656,8 +659,43 @@ def completed_mask_flush(driver, root, checks):
         )
         native.call("retire", SEG.generation(first), 1)
         native.finish()
-        checks.append("flush preserves completed mask versions before retirement")
+        checks.append("flush preserves staged and committed complete masks before retirement")
         return {"prior_visible_rows": 3968}
+    finally:
+        M.stop(native)
+
+
+def flush_before_complete_mask(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        native.sql(
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items');"
+            "SET VARIABLE delete_start=(SELECT max(snapshot_id)+1 FROM lake.snapshots());"
+            "DELETE FROM lake.items WHERE id<128 AND id%2=0;"
+            "DELETE FROM lake.items WHERE id IN (128,129);"
+            "SET VARIABLE before_flush=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "BEGIN;"
+            "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
+            "DELETE FROM lake.items;"
+            "COMMIT;"
+            "SET VARIABLE final_delete=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SELECT CASE WHEN "
+            "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('before_flush')))=4030 "
+            "AND (SELECT count(*) FROM lake.items)=0 "
+            "THEN true ELSE error('superseded flush changed historical visibility') END;"
+            "SELECT CASE WHEN count(*)=4030 AND count(DISTINCT id)=4030 "
+            "AND count(*) FILTER (WHERE id IN (128,129))=0 "
+            "THEN true ELSE error('final delete repeated earlier inline deletions') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('final_delete'),getvariable('final_delete'));"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "THEN true ELSE error('superseded flush changed logical delete history') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('delete_start'),getvariable('final_delete'))"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.finish()
+        checks.append("a completing DELETE preserves inline history when it supersedes a flush in the same transaction")
+        return {"prior_visible_rows": 4030, "logical_deletes": 4096}
     finally:
         M.stop(native)
 
@@ -697,6 +735,7 @@ def main():
             ("versioned-parquet-mask", versioned_delete_mask),
             ("versioned-puffin-mask", lambda d, r, c: versioned_delete_mask(d, r, c, vectors=True)),
             ("completed-mask-flush", completed_mask_flush),
+            ("flush-before-completion", flush_before_complete_mask),
             ("append-after-retirement", append_after_retirement),
             ("later-append", lambda d, r, c: crash(d, r, "retire_after_commit", c, append_after_restart=True)),
         ]

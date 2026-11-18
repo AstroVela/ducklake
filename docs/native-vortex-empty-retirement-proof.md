@@ -38,6 +38,9 @@ are retained.
 The commit marks the retired source IDs so change feeds keep the original
 logical delete events. Flush keeps their inlined masks in metadata. Snapshot
 expiry removes the markers and inlined masks with the source metadata.
+An inline delete flush removes its metadata rows when its mask commits.
+If a completing DELETE supersedes that mask in the same transaction, the
+original inline rows remain visible to historical scans and change feeds.
 
 The existing explicit data-compaction policy also selects an entirely empty B.
 It journals a `retire` task in `retiring` and then `publishing` before the native
