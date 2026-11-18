@@ -127,16 +127,25 @@ source/vector/artifact budgets, the three-B limit and write admission ceilings
 remain unchanged. This does not compact source data or reclaim physical table
 row capacity, and it adds no SPFresh online update interface or fallback.
 
-Local qualification kept DuckDB v1.5.5 (`d8cdaa33`), Vortex `65dab44f`, native
-wrapper `b819cc03` and the qualified static SPFresh SDK unchanged from #44.
-The final catalog driver SHA-256 was
-`94bc584ac92bdf55338fdf1b0db586d2b4b13fec8d91f329189a0d26e2d9447e`.
-The process proof passed 16 checks and 97 fixture queries with recall 1.0,
-finishing seven merge/append/GC rounds at revision 17 with three active
-generations and no registered build/retirement backlog. ON passed 16 Vortex SQL
-cases (595 assertions) and Vortex recovery. ON/OFF each passed 86 base cases
-(3,582 assertions; 13 optional-dependency skips) and Parquet recovery. Audit
-passed 122 assertions; all 14 existing native process proofs passed. The isolated
-cost proof passed four cases with nine queries each and recall 1.0; timings
-remain informational. `make format-fix`, Rust formatting checks and
-`git diff --check` passed.
+Local qualification used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`,
+native wrapper `84cef204` and the static SPFresh SDK qualified by #44. The
+Linux build from `df32c661` passed 21 maintenance checks in
+65.1 seconds against the 180-second budget. All
+97 fixture queries achieved recall 1.0. Seven merge/append/GC
+rounds reached revision 17 with three active generations and empty build and
+retirement registries. The catalog driver SHA-256 was
+`37c9caf1524aef4ab4268dcedce123272ed04388b4bd494a41e1474f4a53bb77`.
+
+All 15 native process suites and 18 functional gates passed. Native ON passed
+25 Vortex SQL cases with 990 assertions. ON and OFF each passed
+86 base cases with 3,582 assertions and 13 optional-dependency skips. All
+32 ABI checks passed. Four isolated query-cost cases passed with minimum
+fixture recall 1.0. Rust formatting, Clippy, workspace tests and the
+changed-file formatting and diff checks passed.
+
+The first matrix run reached the existing 60-second native RPC limit while
+creating the initial B1 for the stored-ownership fixture. SPFresh scratch
+existed and the new generation's artifact directory was empty. The cause is
+undetermined. With the same driver and limits, the isolated build-ownership
+suite passed in 35.7 seconds and the complete matrix rerun passed that
+suite in 35.5 seconds.
