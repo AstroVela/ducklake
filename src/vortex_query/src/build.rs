@@ -13,6 +13,7 @@ use vortex_index::{
     Snapshot,
 };
 use vortex_index_spfresh::{SPFRESH_ID, SpFreshBuildLimits, SpFreshIndexBuilder};
+pub(crate) const POSTING_PAGE_LIMIT: u32 = 12;
 pub async fn build_generation(
     source: Arc<dyn IndexSource>,
     field: String,
@@ -97,7 +98,7 @@ pub(crate) async fn build_generation_at(
     };
     let builder = SpFreshIndexBuilder::try_new(scratch.to_path_buf(), session, limits)?;
     let options = serde_json::json!({"format_version":1, "dimension":dimension,
-        "head_count":64, "posting_page_limit":12, "replicas":4});
+        "head_count":64, "posting_page_limit":POSTING_PAGE_LIMIT, "replicas":4});
     let expected = metadata.clone();
     let metadata = builder
         .build(

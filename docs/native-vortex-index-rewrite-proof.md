@@ -25,12 +25,17 @@ segment must have deletions eligible for DuckLake's existing rewrite operator.
 Unchanged selected files can remain in the replacement generation. Other B,
 unindexed F and committed T are not rewritten into that generation.
 
-The captured DuckLake snapshot fixes the planned new file ID and commit snapshot.
-The first prototype uses a catalog snapshot/revision CAS: any intervening native
-data commit, schema change, index publication or alias installation can cause an
+The original #46 prototype fixed the new file ID and commit snapshot at capture
+and used a catalog snapshot/revision CAS: any intervening native
+data commit, schema change, index publication or alias installation could cause an
 explicit conflict. Other connections can read and commit while construction
 runs; a losing rewrite rolls back without replay. There is no automatic rewrite
 retry, source-to-F downgrade, compatibility decoder or fallback.
+
+The [late-binding follow-up](native-vortex-rewrite-append-proof.md) permits
+independent T/F appends by validating selected inputs and binding the final file
+ID before atomic commit. It retains explicit conflicts for changed inputs or
+index ownership and all original budgets.
 
 The prospective replacement must still fit the existing static SPFresh options,
 including at least 65 physical rows. Index/source/vector budgets and write quotas
@@ -135,6 +140,8 @@ artifact/source namespaces. It adds no automatic data-compaction policy, native
 SPFresh online update calls, dependency-pin changes or total-capacity increase.
 
 ### Local qualification (2026-11-18)
+
+These results record the qualification of #46 before the late-binding follow-up.
 
 Linux used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`, the native
 wrapper `84cef204` and the static SPFresh SDK qualified by #45. The rewrite
