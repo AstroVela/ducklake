@@ -1,4 +1,5 @@
 #include "storage/ducklake_metadata_manager.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_variant_stats.hpp"
 #include "common/ducklake_util.hpp"
@@ -4678,7 +4679,7 @@ vector<DuckLakeFileForCleanup> DuckLakeMetadataManager::GetOrphanFilesForCleanup
 
 		auto query = StringUtil::Format(R"(SELECT filename
 FROM read_blob({DATA_PATH} || '**') files
-WHERE suffix(filename, '.parquet')
+WHERE (suffix(filename, '.parquet') OR suffix(filename, '.vortex'))
 AND NOT EXISTS (
 	SELECT 1 FROM %s known_files WHERE known_files.full_path = files.filename
 )
@@ -4692,8 +4693,16 @@ AND NOT EXISTS (
 
 		vector<DuckLakeFileForCleanup> result;
 		for (auto &row : *res) {
+			auto path = row.GetValue<string>(0);
+			auto separator_pos = path.find_last_of("/\\");
+			auto filename = separator_pos == string::npos ? path : path.substr(separator_pos + 1);
+			// The registered rewrite collector owns this namespace before publication.
+			if (StringUtil::StartsWith(filename, DuckLakeVortexIndex::RewriteSourcePrefix()) &&
+			    StringUtil::EndsWith(filename, ".vortex")) {
+				continue;
+			}
 			DuckLakeFileForCleanup info;
-			info.path = row.GetValue<string>(0);
+			info.path = std::move(path);
 			result.push_back(std::move(info));
 		}
 		drop_temp_table();

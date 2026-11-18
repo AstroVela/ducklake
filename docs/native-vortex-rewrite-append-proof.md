@@ -34,10 +34,12 @@ bound; binding does not assume a canonical scan order.
 
 Once private construction finishes, the source is linked to its registered path
 using the existing exclusive same-filesystem operation. The final phase holds
-write admission and exclusive publication, validates selected inputs, and rebases
-the dedicated native transaction to the freshly checked commit snapshot. Its
-`next_file_id` is now the actual replacement ID, even if concurrent flushes used
-the provisional ID during construction.
+write admission and exclusive publication before opening the actual metadata
+write transaction. That transaction validates the selected inputs, supplies the
+commit snapshot and final file ID, and commits publication. A writer admitted
+ahead of the rewrite is visible to validation and commit in both deferred and
+immediate transaction modes. Concurrent flushes can consume the provisional
+file ID during construction.
 
 Binding authenticates the prepared generation, obtains verified private native
 artifact copies, and uses the existing public `import_bundle` interface to retain
@@ -65,6 +67,11 @@ snapshot retention. Restart starts neither rewrite nor collection implicitly.
 Old private query views remain usable after index GC, native snapshot expiry and
 canonical source-file cleanup.
 
+Private preparation and final sealing have distinct checkpoints. The build
+registry remains `building` during both phases and records `published` in the
+transaction that publishes the final generation. Recovery rechecks published
+ownership before collecting the registered workspace.
+
 ```sh
 python3 -I test/vane/test_native_vortex_rewrite_append.py \
     --duckdb build/index-shell/duckdb \
@@ -83,9 +90,11 @@ Additional cases cover selected-input delete/update conflicts, alias conflicts,
 target-schema rejection, unrelated schema commits, writers waiting at final
 publication, failure/cancellation at binding boundaries, corrupt prepared bytes,
 and SIGKILL before/after final seal, reference staging and metadata commit with
-acknowledged concurrent appends. The existing #46 proof retains full-capacity
-reclamation and its earlier atomicity/recovery checks, with its independent
-append expectations updated to the new behavior.
+acknowledged concurrent appends. In both transaction modes the proof queues the
+rewrite behind an already-admitted writer and checks that the exact appended row
+survives. It checks the build registry around both kinds of seal and the atomic
+publication. The #46 proof exercises full-capacity reclamation, cancellation and
+recovery with the late-binding implementation.
 
 ### Local result (2026-10-29)
 

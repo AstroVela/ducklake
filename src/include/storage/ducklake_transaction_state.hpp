@@ -33,8 +33,8 @@ struct DuckLakeCommitContext {
 	//! Executes the batched snapshot/changes SQL against the metadata DB.
 	std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string &)> execute_commit_batch;
 	//! Optional hooks below default to a no-op/constant; callers override only the ones they need.
-	//! Clears the metadata manager cache if a clear was pending.
-	std::function<void()> flush_cache_if_pending = []() {
+	//! Runs final local checks and cache cleanup before attempting the commit.
+	std::function<void()> before_commit = []() {
 	};
 	//! Commits the underlying metadata connection.
 	std::function<void()> commit_connection = []() {

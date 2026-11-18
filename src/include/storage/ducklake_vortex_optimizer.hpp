@@ -2,14 +2,15 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
 #include <functional>
 
 namespace duckdb {
 class ClientContext;
 class Connection;
+class DatabaseInstance;
 class ExtensionLoader;
 class DuckLakeTransaction;
-class StorageLockKey;
 
 struct DuckLakeVortexWriteBudget {
 	idx_t inline_rows, inline_bytes, unindexed_rows, unindexed_bytes;
@@ -39,7 +40,10 @@ public:
 	static vector<vector<Value>> MaintenanceStatus(ClientContext &context, const string &catalog);
 	static void SetWriteBudget(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                           const string &index, const DuckLakeVortexWriteBudget &budget);
-	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context);
+	static DuckLakeVortexCollectionLock &WriteAdmissionLock(DatabaseInstance &db);
+	static unique_ptr<DuckLakeVortexCollectionLock::Key>
+	AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
+	           unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard);
 };
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader);
