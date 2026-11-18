@@ -9,7 +9,6 @@
 namespace duckdb {
 
 class ExtensionLoader;
-class StorageLock;
 void RegisterDuckLakeVortexReadView(ExtensionLoader &loader);
 
 struct DuckLakeVortexViewOptions {

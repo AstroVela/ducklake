@@ -10,7 +10,6 @@ namespace duckdb {
 class DuckLakeTransaction;
 class DuckLakeTableEntry;
 class ExtensionLoader;
-class StorageLock;
 class ClientContext;
 
 class DuckLakeVortexCollectionLock {
@@ -31,6 +30,7 @@ public:
 
 	DuckLakeVortexCollectionLock();
 	unique_ptr<Key> GetSharedLock(const std::function<void()> &check);
+	unique_ptr<Key> TryGetSharedLock();
 	unique_ptr<Key> GetExclusiveLock(const std::function<void()> &check);
 	unique_ptr<Key> TryGetExclusiveLock();
 
@@ -76,7 +76,7 @@ struct DuckLakeVortexIndex {
 	void ValidateCoverage(const vector<DuckLakeVortexIndexFile> &current) const;
 	vector<DuckLakeVortexIndexFile> SelectedFiles(const vector<string> &generations) const;
 	vector<string> SmallestSegments() const;
-	static StorageLock &PublicationLock();
+	static DuckLakeVortexCollectionLock &PublicationLock();
 	static DuckLakeVortexCollectionLock &CollectionLock();
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog);
 	static void Rollback(Connection &owner);

@@ -8,7 +8,6 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
@@ -19,12 +18,11 @@
 #include "mbedtls_wrapper.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <mutex>
 #include <set>
-#include <thread>
 #ifndef _WIN32
 #include <cerrno>
 #include <dirent.h>
@@ -39,7 +37,10 @@ using namespace vortex_detail;
 
 struct DuckLakeVortexCollectionLock::State {
 	std::mutex lock;
-	std::atomic<idx_t> readers {0};
+	std::condition_variable changed;
+	idx_t readers = 0;
+	idx_t waiting_writers = 0;
+	bool writer = false;
 };
 
 DuckLakeVortexCollectionLock::DuckLakeVortexCollectionLock() : state(make_shared_ptr<State>()) {
@@ -50,19 +51,21 @@ DuckLakeVortexCollectionLock::Key::Key(shared_ptr<State> state_p, bool exclusive
 }
 
 DuckLakeVortexCollectionLock::Key::~Key() {
+	std::lock_guard<std::mutex> guard(state->lock);
 	if (exclusive) {
-		state->lock.unlock();
-	} else {
-		state->readers--;
+		state->writer = false;
+	} else if (--state->readers) {
+		return;
 	}
+	state->changed.notify_all();
 }
 
 unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexCollectionLock::GetSharedLock(const std::function<void()> &check) {
-	std::unique_lock<std::mutex> pending(state->lock, std::defer_lock);
-	while (!pending.try_lock()) {
+	std::unique_lock<std::mutex> guard(state->lock);
+	while (state->writer || state->waiting_writers) {
 		check();
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		state->changed.wait_for(guard, std::chrono::milliseconds(1));
 	}
 	check();
 	auto key = make_uniq<Key>(state, false);
@@ -70,30 +73,44 @@ DuckLakeVortexCollectionLock::GetSharedLock(const std::function<void()> &check) 
 	return key;
 }
 
-unique_ptr<DuckLakeVortexCollectionLock::Key>
-DuckLakeVortexCollectionLock::GetExclusiveLock(const std::function<void()> &check) {
-	std::unique_lock<std::mutex> pending(state->lock, std::defer_lock);
-	while (!pending.try_lock()) {
-		check();
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+unique_ptr<DuckLakeVortexCollectionLock::Key> DuckLakeVortexCollectionLock::TryGetSharedLock() {
+	std::unique_lock<std::mutex> guard(state->lock, std::try_to_lock);
+	if (!guard.owns_lock() || state->writer || state->waiting_writers) {
+		return nullptr;
 	}
-	while (state->readers != 0) {
-		check();
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	}
-	check();
-	auto key = make_uniq<Key>(state, true);
-	pending.release();
+	auto key = make_uniq<Key>(state, false);
+	state->readers++;
 	return key;
 }
 
+unique_ptr<DuckLakeVortexCollectionLock::Key>
+DuckLakeVortexCollectionLock::GetExclusiveLock(const std::function<void()> &check) {
+	std::unique_lock<std::mutex> guard(state->lock);
+	state->waiting_writers++;
+	try {
+		while (state->writer || state->readers) {
+			check();
+			state->changed.wait_for(guard, std::chrono::milliseconds(1));
+		}
+		check();
+		auto key = make_uniq<Key>(state, true);
+		state->waiting_writers--;
+		state->writer = true;
+		return key;
+	} catch (...) {
+		state->waiting_writers--;
+		state->changed.notify_all();
+		throw;
+	}
+}
+
 unique_ptr<DuckLakeVortexCollectionLock::Key> DuckLakeVortexCollectionLock::TryGetExclusiveLock() {
-	std::unique_lock<std::mutex> pending(state->lock, std::try_to_lock);
-	if (!pending.owns_lock() || state->readers != 0) {
+	std::unique_lock<std::mutex> guard(state->lock, std::try_to_lock);
+	if (!guard.owns_lock() || state->writer || state->waiting_writers || state->readers) {
 		return nullptr;
 	}
 	auto key = make_uniq<Key>(state, true);
-	pending.release();
+	state->writer = true;
 	return key;
 }
 
@@ -234,17 +251,6 @@ bool CheckDirectoryAccess(ClientContext &context, const string &root) {
 void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
 	if (!CheckDirectoryAccess(context, root)) {
 		throw IOException("Vortex index output directory does not exist: %s", root);
-	}
-}
-
-unique_ptr<StorageLockKey> AcquirePublicationLock(const std::function<void()> &check) {
-	while (true) {
-		check();
-		auto key = DuckLakeVortexIndex::PublicationLock().TryGetExclusiveLock();
-		if (key) {
-			return key;
-		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 }
 
@@ -974,8 +980,8 @@ unique_ptr<QueryResult> DuckLakeVortexIndex::Query(DuckLakeTransaction &transact
 	return result;
 }
 
-StorageLock &DuckLakeVortexIndex::PublicationLock() {
-	static StorageLock lock;
+DuckLakeVortexCollectionLock &DuckLakeVortexIndex::PublicationLock() {
+	static DuckLakeVortexCollectionLock lock;
 	return lock;
 }
 
@@ -989,7 +995,7 @@ void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog, C
 		throw InvalidInputException("Vortex index catalog requires an idle dedicated connection");
 	}
 	CheckInterrupted(owner, caller);
-	auto guard = PublicationLock().GetExclusiveLock();
+	auto guard = PublicationLock().GetExclusiveLock([&] { CheckInterrupted(owner, caller); });
 	try {
 		CheckInterrupted(owner, caller);
 		auto &transaction = Begin(owner, catalog);
@@ -1072,7 +1078,7 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 		CheckInterrupted(context);
 	};
 	auto admissions = CollectionLock().GetExclusiveLock(interrupt);
-	auto publication = AcquirePublicationLock(interrupt);
+	auto publication = PublicationLock().GetExclusiveLock(interrupt);
 	check("gc_acquired");
 	Connection owner(*context.db);
 	DuckLakeVortexGCResult collected;
@@ -1238,7 +1244,7 @@ idx_t DuckLakeVortexIndex::RecoverBuilds(ClientContext &context, const string &c
 		CheckInterrupted(context);
 	};
 	auto admissions = CollectionLock().GetExclusiveLock(interrupt);
-	auto publication = AcquirePublicationLock(interrupt);
+	auto publication = PublicationLock().GetExclusiveLock(interrupt);
 	interrupt();
 	Connection owner(*context.db);
 	try {
@@ -1292,7 +1298,7 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 	};
 	check("build_gc_waiting");
 	auto admissions = CollectionLock().GetExclusiveLock(interrupt);
-	auto publication = AcquirePublicationLock(interrupt);
+	auto publication = PublicationLock().GetExclusiveLock(interrupt);
 	check("build_gc_acquired");
 	Connection owner(*context.db);
 	DuckLakeVortexBuildGCResult collected;
@@ -1540,7 +1546,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 	};
 	try {
 		// Take the metadata snapshot after all preceding namespace claims have committed.
-		auto registration = AcquirePublicationLock(interrupt);
+		auto registration = PublicationLock().GetExclusiveLock(interrupt);
 		auto &transaction = Begin(owner, catalog_name);
 		Initialized(transaction);
 		auto &catalog = transaction.GetCatalog();
@@ -1692,7 +1698,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 		throw InvalidInputException("Vortex index publication requires an idle dedicated connection");
 	}
 	CheckInterrupted(owner, caller);
-	auto publication = AcquirePublicationLock([&] { CheckInterrupted(owner, caller); });
+	auto publication = PublicationLock().GetExclusiveLock([&] { CheckInterrupted(owner, caller); });
 	bool attempted = false;
 	bool committed = false;
 	try {

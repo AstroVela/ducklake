@@ -620,6 +620,31 @@ def cancel_source_wait(driver, root, checks):
         M.stop(native)
 
 
+def publication_progress(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, reference, first, frozen = SEG.setup(native, root)
+        native.sql("CREATE TABLE lake.publication_markers(i INTEGER)")
+        for ordinal, mode in enumerate(["finish", "cancel"], 1):
+            require(
+                native.call("publication-commit-order", mode, reference)["ordered"], "Publication lost its reservation"
+            )
+            native.sql(
+                f"SELECT CASE WHEN count(*)={ordinal} THEN true ELSE error('Lost commit') END "
+                "FROM lake.publication_markers"
+            )
+        require(native.call("head", "finish")["revision"] == 1, "Reserved publication did not commit")
+        native.call("head", "cancel", expected="No published Vortex index")
+        SEG.unchanged(native, first, frozen)
+        native.finish()
+        checks.append(
+            "a queued publication precedes later commits and cancelling it reopens admission to those commits"
+        )
+        return {"modes": ["finish", "cancel"], "later_commits": 2}
+    finally:
+        M.stop(native)
+
+
 def permission(driver, root, policy, stage, checks):
     native = CAT.Native(driver, root / "native")
     try:
@@ -726,6 +751,7 @@ def main():
             ("table-replacement", table_replacement),
             ("cancel-maintenance", cancel_maintenance),
             ("cancel-source-wait", cancel_source_wait),
+            ("publication-progress", publication_progress),
             ("allowed-workspace", allowed_workspace),
         ]:
             directory = root / name

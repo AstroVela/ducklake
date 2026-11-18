@@ -259,6 +259,65 @@ public:
 			        "Build status committed pending work");
 			return "{\"caller_rollback\":true}";
 		}
+		if (op == "publication-commit-order") {
+			const bool cancel = args.at(2) == "cancel";
+			Require(cancel || args.at(2) == "finish", "Unknown publication ordering case");
+			Connection caller(database), owner(database), later(database);
+			SQL(later, "BEGIN; INSERT INTO lake.publication_markers VALUES (1)");
+			auto &gate = DuckLakeVortexIndex::PublicationLock();
+			auto first_commit = gate.GetSharedLock([] {});
+			std::promise<void> validated, resume, committing;
+			auto inside = validated.get_future();
+			auto release = resume.get_future();
+			auto started = committing.get_future();
+			auto publisher = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), args.at(3), 0,
+				                                    *caller.context, [&](const string &stage) {
+					                                    if (stage == "after_validation") {
+						                                    validated.set_value();
+						                                    release.wait_for(std::chrono::seconds(5));
+					                                    }
+				                                    });
+			});
+			// The first commit keeps the exclusive guard unavailable. A refused shared admission signals reservation.
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			bool reserved = false;
+			while (std::chrono::steady_clock::now() < deadline) {
+				if (!gate.TryGetSharedLock()) {
+					reserved = true;
+					break;
+				}
+				std::this_thread::yield();
+			}
+			auto late_commit = std::async(std::launch::async, [&] {
+				committing.set_value();
+				later.Commit();
+			});
+			started.wait();
+			bool late_waited = late_commit.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+			bool ordered;
+			if (cancel) {
+				caller.Interrupt();
+				const bool stopped = publisher.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+				ordered = stopped && late_commit.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+				first_commit.reset();
+			} else {
+				first_commit.reset();
+				ordered = inside.wait_for(std::chrono::seconds(5)) == std::future_status::ready &&
+				          late_commit.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
+			}
+			resume.set_value();
+			bool interrupted = false;
+			try {
+				publisher.get();
+			} catch (const InterruptException &) {
+				interrupted = true;
+			}
+			late_commit.get();
+			Require(reserved && late_waited && ordered && cancel == interrupted,
+			        "Publication reservation lost ordering or retained a cancelled guard");
+			return "{\"ordered\":true}";
+		}
 		if (op == "build-cancel-source-wait") {
 			const auto &stage = args.at(2);
 			Require(stage == "before_source_admission" || stage == "before_publish_source_admission",
@@ -421,11 +480,11 @@ public:
 		if (op == "gc-cancel-wait" || op == "build-gc-cancel-wait" || op == "build-recovery-cancel-wait") {
 			Require(args.at(2) == "admissions" || args.at(2) == "publication", "Unknown GC wait lock");
 			unique_ptr<DuckLakeVortexCollectionLock::Key> admission_blocker;
-			unique_ptr<StorageLockKey> publication_blocker;
+			unique_ptr<DuckLakeVortexCollectionLock::Key> publication_blocker;
 			if (args.at(2) == "admissions") {
 				admission_blocker = DuckLakeVortexIndex::CollectionLock().GetSharedLock([] {});
 			} else {
-				publication_blocker = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+				publication_blocker = DuckLakeVortexIndex::PublicationLock().GetSharedLock([] {});
 			}
 			Connection collector(database);
 			std::promise<void> waiting;
@@ -978,7 +1037,7 @@ public:
 		if (op == "budget-config-interrupt") {
 			Connection caller(database);
 			auto statement = ReadText(args.at(2));
-			auto publication = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock();
+			auto publication = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock([] {});
 			std::promise<void> started;
 			auto ready = started.get_future();
 			auto configuring = std::async(std::launch::async, [&] {
@@ -1037,7 +1096,7 @@ public:
 		}
 		if (op == "cancel-init" || op == "cancel-publish") {
 			Connection caller(database);
-			auto guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			auto guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock([] {});
 			auto &connections = ConnectionManager::Get(*caller.context);
 			auto existing = connections.GetConnectionList();
 			auto before = existing.size();

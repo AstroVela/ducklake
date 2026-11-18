@@ -44,6 +44,9 @@ lock. A caller can cancel while waiting for either lock. A stopped waiter
 releases its locks and connection while the other operation still holds its lock.
 Capture and publication also observe cancellation while physical source cleanup
 holds its exclusive admission lock.
+Once an exclusive publication is queued, later shared commit guards wait while
+existing commits finish. Cancelling the queued publisher releases its reservation
+and lets waiting commits proceed.
 
 ## Explicit recovery and bounded collection
 
