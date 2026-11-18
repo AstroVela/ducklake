@@ -95,17 +95,17 @@ covers explicit and read-only transactions, a business column named
 
 ## Local verification against #48
 
-The native ON and OFF builds were verified on DuckLake `1b61c19c`, which
+The native ON and OFF builds were verified on DuckLake `684c5f5f`, which
 incorporates #48 at `9563536f`. The dependency pins are DuckDB
 `d8cdaa33`, Vortex `b20e34c2`, and the DuckDB Vortex
 wrapper `84cef204`.
 
-Empty-segment retirement passed 20 checks and
+Empty-segment retirement passed 22 checks and
 88 query comparisons with minimum recall
-1.0 in 37.55 seconds. Background
+1.0 in 40.12 seconds. Background
 rewrite passed 30 checks and 124
 comparisons with minimum recall 1.0 in
-90.73 seconds. Both used the existing 180-second budget.
+87.04 seconds. Both used the existing 180-second budget.
 The retirement SQL case passed 64 assertions.
 
 All 19 native process proofs passed. ON passed
@@ -119,7 +119,8 @@ The deletion-inlining, audit, rewrite and orphan suites passed
 checks, the 32-case binary ABI matrix, the isolated cost
 checks, formatting, Clippy with warnings denied, and Rust workspace tests
 passed. The complete DELETE group passed 13 cases
-and 156 assertions.
+and 156 assertions. The table change suite passed
+11 cases and 684 assertions.
 
 The qualified catalog driver SHA-256 is
-`37faebf0669fb2ebb31443222995ca01b5f83fa2b5b6fa7c4a66b61c61b3036d`.
+`091baff995dcd28c8bb3e37e6831dee6e2a03f034d73ffa92f883b6b9380d3e0`.
