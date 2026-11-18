@@ -186,7 +186,7 @@ public:
 			Require(
 			    SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
 			        0,
-			        "The caller could not roll back its own transaction");
+			    "The caller could not roll back its own transaction");
 			return "{}";
 		}
 		if (op == "optimizer-enable") {
