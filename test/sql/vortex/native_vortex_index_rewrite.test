@@ -89,6 +89,11 @@ SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',
 ----
 reserved for DuckDB extensions
 
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+requires a new absolute reference path
+
 query I
 SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrites_v1
 ----

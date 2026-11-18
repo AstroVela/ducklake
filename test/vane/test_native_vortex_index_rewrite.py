@@ -184,6 +184,10 @@ def failures(driver, root, checks):
                         "commit outcome is unknown" not in response["error"].lower(),
                         "A failure before COMMIT was reported as an ambiguous outcome",
                     )
+                    require(
+                        "ducklake_max_retry_count" not in response["error"],
+                        "Rewrite reported a tuning hint for its fixed retry policy",
+                    )
                 require(
                     native.call("head", "knn")["revision"] == 3 and active_rows(native) == rows,
                     "Failed rewrite committed files or index independently",

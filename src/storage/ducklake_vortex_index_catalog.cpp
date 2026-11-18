@@ -2083,7 +2083,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 			throw InvalidInputException("Vortex rewrite requires an installed write budget for this index");
 		}
 		auto &fs = FileSystem::GetFileSystem(context);
-		if (!fs.IsPathAbsolute(reference_path) || reference_path.back() == '/' || fs.FileExists(reference_path)) {
+		if (!fs.IsPathAbsolute(reference_path) || reference_path.back() == '/' || fs.FileExists(reference_path) ||
+		    fs.DirectoryExists(reference_path)) {
 			throw InvalidInputException("Vortex rewrite requires a new absolute reference path");
 		}
 		auto root = Canonical(
