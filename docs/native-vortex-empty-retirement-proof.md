@@ -87,24 +87,33 @@ identifies the committed retirement after restart. The native SQL case also
 covers explicit and read-only transactions, a business column named
 `filename`, and whole-file DELETE after a vector column rename.
 
-## Local result (2026-10-29)
+## Local verification against #48
 
-The process proof passed 17 checks and 84 gated query comparisons with minimum
-fixture recall 1.0, including all six SIGKILL boundaries. Three separate B
-retirements accepted concurrent appends and preserved unselected generations.
-The last retirement left an explicit zero-B plan; empty/T-only/F+T reads and
-rebuilding the new first B passed. Under the unchanged 100,000-row/vector limit,
-retirement released all 4,096 B slots, retained 95,904 F rows and admitted a new T.
-Old indexed and zero-B private views survived index and explicit source GC.
+The native ON and OFF builds were verified on DuckLake `1b61c19c`, which
+incorporates #48 at `9563536f`. The dependency pins are DuckDB
+`d8cdaa33`, Vortex `b20e34c2`, and the DuckDB Vortex
+wrapper `84cef204`.
 
-All 18 preceding native process proofs passed. ON passed 19 Vortex SQL cases /
-706 assertions, including the new 42-assertion public-API case, plus Vortex
-recovery. ON and OFF each passed 86 base cases / 3,582 assertions with 13
-optional-extension skips and Parquet recovery. OFF exposes no retirement API.
-Additional DELETE, deletion-inlining, audit, rewrite and orphan groups passed
-48 cases / 2,231 assertions with five optional HTTPFS/ICU skips. Rust build,
-formatting and Clippy with warnings denied passed. Four isolated cost cases
-passed nine queries each with minimum recall 1.0; timings remain informational.
+Empty-segment retirement passed 20 checks and
+88 query comparisons with minimum recall
+1.0 in 37.55 seconds. Background
+rewrite passed 30 checks and 124
+comparisons with minimum recall 1.0 in
+90.73 seconds. Both used the existing 180-second budget.
+The retirement SQL case passed 64 assertions.
+
+All 19 native process proofs passed. ON passed
+28 Vortex SQL cases and 1144
+assertions. The base matrix passed 86 cases and
+3582 assertions on ON and 86 cases
+and 3582 assertions on OFF, with
+13 optional tests skipped on each configuration.
+The deletion-inlining, audit, rewrite and orphan suites passed
+37 cases and 2119 assertions. Recovery and cleanup
+checks, the 32-case binary ABI matrix, the isolated cost
+checks, formatting, Clippy with warnings denied, and Rust workspace tests
+passed. The complete DELETE group passed 13 cases
+and 156 assertions.
 
 The qualified catalog driver SHA-256 is
-`d756779172afb03cfc5f898b352aab128f6581e876c3cdd8a1489e3b9c6f8949`.
+`37faebf0669fb2ebb31443222995ca01b5f83fa2b5b6fa7c4a66b61c61b3036d`.
