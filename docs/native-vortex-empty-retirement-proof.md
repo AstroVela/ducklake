@@ -101,17 +101,17 @@ after a vector column rename.
 
 ## Local verification against #48
 
-The native ON and OFF builds were verified on DuckLake `684c5f5f`, which
+The native ON and OFF builds were verified on DuckLake `675c1e5f`, which
 incorporates #48 at `9563536f`. The dependency pins are DuckDB
 `d8cdaa33`, Vortex `b20e34c2`, and the DuckDB Vortex
 wrapper `84cef204`.
 
-Empty-segment retirement passed 22 checks and
+Empty-segment retirement passed 26 checks and
 88 query comparisons with minimum recall
-1.0 in 40.12 seconds. Background
+1.0 in 42.94 seconds. Background
 rewrite passed 30 checks and 124
 comparisons with minimum recall 1.0 in
-87.04 seconds. Both used the existing 180-second budget.
+87.99 seconds. Both used the existing 180-second budget.
 The retirement SQL case passed 64 assertions.
 
 All 19 native process proofs passed. ON passed
@@ -124,9 +124,12 @@ The deletion-inlining, audit, rewrite and orphan suites passed
 37 cases and 2119 assertions. Recovery and cleanup
 checks, the 32-case binary ABI matrix, the isolated cost
 checks, formatting, Clippy with warnings denied, and Rust workspace tests
-passed. The complete DELETE group passed 13 cases
+passed. The catalog, merge, and build ownership proofs passed on rerun after
+fixture builds timed out. Each retained its 180-second outer budget. OFF removed
+retirement markers from a copy of a catalog
+created by ON. The complete DELETE group passed 13 cases
 and 156 assertions. The table change suite passed
 11 cases and 684 assertions.
 
 The qualified catalog driver SHA-256 is
-`091baff995dcd28c8bb3e37e6831dee6e2a03f034d73ffa92f883b6b9380d3e0`.
+`5b27e6f6c628f1fb00ba0a53bce25b9835679fa5d93d09d5c2d79cbc42b2502f`.
