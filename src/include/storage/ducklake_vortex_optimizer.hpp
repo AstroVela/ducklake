@@ -33,7 +33,8 @@ public:
 	static vector<vector<Value>> Status(ClientContext &context, const string &catalog);
 	static void SetWriteBudget(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                           const string &index, const DuckLakeVortexWriteBudget &budget);
-	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context);
+	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
+	                                             unique_ptr<StorageLockKey> &publication_guard);
 };
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader);

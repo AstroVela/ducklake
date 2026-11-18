@@ -1,6 +1,6 @@
 # Registered native Vortex build ownership
 
-This validation draft follows [DuckLake #43](https://github.com/AstroVela/ducklake/pull/43).
+This proof extends [DuckLake #43](https://github.com/AstroVela/ducklake/pull/43).
 It registers native build work before writing artifacts, reconciles stopped
 tasks explicitly, and collects their owned workspaces and abandoned candidates.
 It reuses the pinned Vortex index provider and static SPFresh SDK.
@@ -18,6 +18,13 @@ is created exclusively after registration. SDK scratch and reference temporary
 files stay inside it; admitted source files are copied into memory. Sealed
 generations retain the existing layout under the canonical artifact root.
 
+Registration takes the publication lock before opening its metadata snapshot.
+It checks the planned workspace, generation directory and caller reference
+against paths claimed by other builds and registered generations. Two builds
+can share an artifact root or use sibling directories. A claim that coincides
+with, contains or lies inside another owner's path is rejected. The same check
+protects published generations after their workspace registration is collected.
+
 Build state advances through `allocated`, `building` and `sealed`. Publication
 sets `published` and `keep_generation=true` in the same transaction as the
 generation registration, named references and index revision CAS. A synchronous
@@ -29,7 +36,8 @@ candidate may also be explicitly published before collection claims it.
 The whole native build holds the shared collection guard through publication
 and error reconciliation, including bootstrap and full replacement builds.
 Recovery and both collectors take the exclusive guard before the publication
-lock. They cannot abandon or delete a live native builder's workspace.
+lock. A caller can cancel while waiting for either lock. A stopped waiter
+releases its locks and connection while the other operation still holds its lock.
 
 ## Explicit recovery and bounded collection
 
@@ -52,6 +60,13 @@ claiming each task, then durably records `deleting` and whether its generation
 must be kept. A published task loses only its workspace; an abandoned task can
 lose both its workspace and planned generation. Published-generation retirement
 remains the responsibility of `ducklake_collect_vortex_generations`.
+
+The collector rechecks each selected directory against other owners and the
+resolved DuckLake data directory before inspecting the filesystem. It uses the
+caller's DuckDB filesystem settings before inspection and at each filesystem
+mutation. With external access disabled, a directory grant on a published
+workspace suffices to collect it. Revoking access after `deleting` preserves
+the checkpoint for an authorized call to resume.
 
 The returned columns are `collected_builds`, `collected_bytes` and
 `remaining_builds`. The last count includes pending tasks that need explicit
@@ -102,14 +117,10 @@ sharing roots and external filesystem writers are outside this proof. Existing
 global source, row, vector, manifest, artifact, three-B and write-admission
 budgets are unchanged. It adds no SPFresh native online Add/Delete calls.
 
-Local qualification kept DuckDB v1.5.5 (`d8cdaa33`), Vortex `65dab44f`, the native
-wrapper `b819cc03` and the qualified static SPFresh SDK unchanged from #43.
-The final catalog driver SHA-256 was
-`d8a9d9cce462cafc36699c28c52b910a2671af86f37ed18ee7d5cd9feed43c33`.
-The new process proof passed 14 checks and 14 fixture queries with recall 1.0.
-ON passed 15 Vortex SQL cases (566 assertions) and Vortex recovery. ON/OFF each
-passed 86 base cases (3,582 assertions; 13 optional-dependency skips) and Parquet
-recovery. Audit passed 122 assertions. All 13 existing native process proofs
-passed. The isolated cost proof passed four cases with nine queries each and
-recall 1.0; timings remain informational. `make format-fix`, Rust formatting,
-and workspace Clippy with all targets/features and warnings denied passed.
+The synchronized dependency pins are DuckDB v1.5.5 (`d8cdaa33`), Vortex
+`b20e34c2`, the native wrapper `84cef204` and the same static SPFresh SDK
+used by #43. The process proof covers overlapping claims at admission and
+collection, disjoint sibling directories, directory-scoped grants, permission
+revocation during cleanup and cancellation at both maintenance locks. The
+generation-GC proof also exercises workspace collection with absolute, relative
+and symlinked DuckLake data paths.

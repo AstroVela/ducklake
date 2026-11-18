@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection.hpp"
 #include <functional>
@@ -11,6 +12,30 @@ class DuckLakeTableEntry;
 class ExtensionLoader;
 class StorageLock;
 class ClientContext;
+
+class DuckLakeVortexCollectionLock {
+	struct State;
+
+public:
+	class Key {
+	public:
+		Key(shared_ptr<State> state, bool exclusive);
+		~Key();
+		Key(const Key &) = delete;
+		Key &operator=(const Key &) = delete;
+
+	private:
+		shared_ptr<State> state;
+		bool exclusive;
+	};
+
+	DuckLakeVortexCollectionLock();
+	unique_ptr<Key> GetSharedLock(const std::function<void()> &check);
+	unique_ptr<Key> GetExclusiveLock(const std::function<void()> &check);
+
+private:
+	shared_ptr<State> state;
+};
 
 enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
 
@@ -51,12 +76,12 @@ struct DuckLakeVortexIndex {
 	vector<DuckLakeVortexIndexFile> SelectedFiles(const vector<string> &generations) const;
 	vector<string> SmallestSegments() const;
 	static StorageLock &PublicationLock();
-	static StorageLock &CollectionLock();
+	static DuckLakeVortexCollectionLock &CollectionLock();
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog);
 	static void Rollback(Connection &owner);
 	static void Initialized(DuckLakeTransaction &transaction);
 	static unique_ptr<QueryResult> Query(DuckLakeTransaction &transaction, const string &sql);
-	static void Initialize(Connection &owner, const string &catalog);
+	static void Initialize(Connection &owner, const string &catalog, ClientContext &caller);
 	static DuckLakeVortexGCResult Collect(ClientContext &context, const string &catalog, idx_t max_generations,
 	                                      idx_t max_artifact_bytes,
 	                                      const std::function<void(const string &)> &observe = nullptr);
@@ -71,7 +96,7 @@ struct DuckLakeVortexIndex {
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
 	                                   const string &table, const string &name, const string &reference,
-	                                   idx_t expected_revision,
+	                                   idx_t expected_revision, ClientContext &caller,
 	                                   const std::function<void(const string &)> &observe = nullptr,
 	                                   DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
 	                                   const vector<string> &merge_generations = {});

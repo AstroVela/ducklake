@@ -418,6 +418,162 @@ def retired_scratch(driver, root, checks):
         M.stop(native)
 
 
+def namespace_ownership(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, reference, first, frozen = SEG.setup(native, root)
+        owner = candidate(native)
+        workspace = Path(owner["workspace"])
+        generation = GC.directory(owner)
+        reference_bytes = reference.read_bytes()
+        for directory in [workspace, generation]:
+            output = directory / "next.json"
+            native.call("build", "second", output, 0, expected="overlaps another registered owner")
+            require(status(native) == [owner] and not output.exists(), "A rejected path changed build ownership")
+        require(collect(native)["collected_builds"] == 1, "Published workspace was not collected")
+        native.call("build", "second", generation / "next.json", 0, expected="overlaps another registered owner")
+        require(not status(native), "A generation-only ownership conflict registered a new build")
+        sibling = artifacts / (generation.name + "-sibling")
+        sibling.mkdir()
+        native.call("build", "second", sibling / "second.json", 0)
+        require(collect(native)["collected_builds"] == 1, "A disjoint sibling could not collect its workspace")
+        require(reference.read_bytes() == reference_bytes, "Caller reference changed during ownership checks")
+        SEG.unchanged(native, first, frozen)
+        recalls = []
+        qualify(native, "after-ownership-checks", recalls)
+        native.finish()
+        checks.append("registered workspaces and generations reject nested builds, including after scratch collection")
+        return {"distinct_sibling_published": True, "fixture_recalls": recalls}
+    finally:
+        M.stop(native)
+
+
+def stored_ownership(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, first, frozen = SEG.setup(native, root)
+        collect(native)
+        for name in ["one", "two"]:
+            native.call(
+                "fail-build",
+                "build_workspace_created",
+                artifacts / (name + ".json"),
+                1,
+                expected="Injected native build failure",
+            )
+        first_task, other = status(native)
+        workspace = Path(first_task["workspace"])
+        require(not list(workspace.iterdir()), "Expected an empty registered workspace")
+        # Model a recorded reference claim inside an empty workspace. The check precedes the deleting checkpoint.
+        table = "__ducklake_metadata_lake.ducklake_vortex_builds_v1"
+        where = " WHERE build_id=" + BASE.quote(other["build_id"])
+        native.sql(f"UPDATE {table} SET reference_path=" + BASE.quote(workspace / "reserved.json") + where)
+        before = status(native)
+        native.call("build-gc", 1, 1, expected="overlaps another registered owner")
+        require(status(native) == before and workspace.is_dir(), "Conflicting claims changed the collection checkpoint")
+        native.sql(f"UPDATE {table} SET reference_path=" + BASE.quote(other["reference_path"]) + where)
+        require(collect(native)["collected_builds"] == 2, "Disjoint recorded claims did not resume collection")
+        SEG.unchanged(native, first, frozen)
+        native.finish()
+        checks.append("collection revalidates stored reference claims before marking or removing an empty workspace")
+        return {"tasks": 2, "states_preserved": True}
+    finally:
+        M.stop(native)
+
+
+def cancel_maintenance(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        native.call("init")
+        cases = []
+        for operation in ["build-recovery", "build-gc"]:
+            for lock in ["admissions", "publication"]:
+                result = native.call(operation + "-cancel-wait", lock)
+                require(result["interrupted_before_unlock"], "Cancelled maintenance waited for the blocker")
+                require(not status(native), "Waiting maintenance changed build ownership")
+                owner = native.call("owners")
+                require(
+                    owner["database_references"] == 2 and len(owner["connections"]) == 1,
+                    "Waiting maintenance retained a connection",
+                )
+                cases.append({"operation": operation, "lock": lock})
+        require(
+            native.call("recover-builds", 1) == 0 and collect(native, 1)["collected_builds"] == 0,
+            "Waiting maintenance retained a lock",
+        )
+        native.finish()
+        checks.append("recovery and workspace GC cancel at either lock before its holder releases it")
+        return {"interrupted_before_unlock": cases}
+    finally:
+        M.stop(native)
+
+
+def permission(driver, root, policy, stage, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, first, frozen = SEG.setup(native, root)
+        collect(native)
+        row = failed(native, artifacts / "stopped.json")
+        workspace = Path(row["workspace"])
+        scratch = workspace / "scratch"
+        for name in ["one", "two"]:
+            (scratch / name).write_bytes(name.encode())
+        before = SEG.signature(workspace)
+        head = native.call("head", "knn")
+        setting = (
+            "SET enable_external_access=false;"
+            if policy == "external-access"
+            else "SET disabled_filesystems='LocalFileSystem';"
+        )
+        if stage == "initial":
+            native.sql(setting)
+            native.call("build-gc", 1, LIMIT, expected="disabled by configuration")
+        else:
+            policy_file = root / "policy.sql"
+            policy_file.write_text(setting)
+            native.call("build-gc-policy", stage, 1, LIMIT, policy_file, expected="disabled by configuration")
+        after = SEG.signature(workspace)
+        expected_removed = int(stage == "build_gc_file_deleted")
+        require(
+            len(before) - len(after) == expected_removed and all(before.get(k) == v for k, v in after.items()),
+            "Collection changed protected files after denial",
+        )
+        checkpoint = dict(row, state="abandoned" if stage == "initial" else "deleting")
+        require(
+            candidate(native) == checkpoint and native.call("head", "knn") == head,
+            "Denied collection changed the index or lost its checkpoint",
+        )
+        native.call("reopen")
+        require(
+            candidate(native) == checkpoint and collect(native, 1)["collected_builds"] == 1,
+            "Authorized cleanup failed to resume",
+        )
+        gone(row)
+        SEG.unchanged(native, first, frozen)
+        native.finish()
+        checks.append(f"{policy} at {stage} stops workspace cleanup and preserves its durable checkpoint")
+        return {"policy": policy, "stage": stage, "files_removed_before_denial": expected_removed}
+    finally:
+        M.stop(native)
+
+
+def allowed_workspace(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, frozen = SEG.setup(native, root)
+        owner = candidate(native)
+        native.sql("SET allowed_directories=[" + BASE.quote(owner["workspace"]) + "];SET enable_external_access=false;")
+        require(collect(native, 1)["collected_builds"] == 1, "Granting the published workspace did not allow its GC")
+        gone(owner)
+        native.call("reopen")
+        SEG.unchanged(native, first, frozen)
+        native.finish()
+        checks.append("a grant scoped to the published workspace permits cleanup and preserves the sealed generation")
+        return {"collected_builds": 1}
+    finally:
+        M.stop(native)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["duckdb", "driver", "probe", "output-dir"]:
@@ -449,10 +605,23 @@ def main():
             directory = root / (mode + "-" + stage)
             directory.mkdir()
             report["races"].append(live_race(driver, directory, mode, stage, report["checks"]))
-        for name, exercise_case in [("recovery-bounds", recovery_bounds), ("retired-scratch", retired_scratch)]:
+        for name, exercise_case in [
+            ("recovery-bounds", recovery_bounds),
+            ("retired-scratch", retired_scratch),
+            ("namespace-ownership", namespace_ownership),
+            ("stored-ownership", stored_ownership),
+            ("cancel-maintenance", cancel_maintenance),
+            ("allowed-workspace", allowed_workspace),
+        ]:
             directory = root / name
             directory.mkdir()
             report[name] = exercise_case(driver, directory, report["checks"])
+        report["permissions"] = []
+        for policy in ["external-access", "disabled-filesystem"]:
+            for stage in ["initial", "build_gc_before_unlink", "build_gc_file_deleted"]:
+                directory = root / (policy + "-" + stage)
+                directory.mkdir()
+                report["permissions"].append(permission(driver, directory, policy, stage, report["checks"]))
         require(not list(private.iterdir()), "Build cleanup proof leaked private query leases")
         report["status"] = "passed"
     except Exception as error:
