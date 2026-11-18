@@ -35,6 +35,7 @@ public:
 	unique_ptr<Key> GetSharedLock(const std::function<void()> &check);
 	unique_ptr<Key> TryGetSharedLock();
 	idx_t SharedWaitCount() const;
+	idx_t WaitingWriterCount() const;
 	unique_ptr<Key> GetExclusiveLock(const std::function<void()> &check);
 	unique_ptr<Key> TryGetExclusiveLock();
 
@@ -147,6 +148,7 @@ struct DuckLakeVortexRewriteState : public ClientContextState {
 	idx_t table_id = 0, snapshot_id = 0, schema_version = 0, new_file_id = 0;
 	idx_t copy_plans = 0, new_rows = 0, new_bytes = 0;
 	idx_t staged_source_bytes = 0;
+	vector<string> staged_inputs;
 	vector<idx_t> replaced;
 	vector<DuckLakeVortexIndexFile> selected_files;
 	DuckLakeVortexIndex before, candidate;

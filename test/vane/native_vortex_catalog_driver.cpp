@@ -379,8 +379,11 @@ public:
 		if (op == "rewrite-cancel-lock") {
 			Connection caller(database);
 			const bool collection = args.at(2) == "collection";
-			Require(collection || args.at(2) == "publication", "Unknown rewrite lock fixture");
-			auto &lock = collection ? DuckLakeVortexIndex::CollectionLock() : DuckLakeVortexIndex::PublicationLock();
+			const bool publication = args.at(2) == "publication";
+			Require(collection || publication || args.at(2) == "write-admission", "Unknown rewrite lock fixture");
+			auto &lock = collection    ? DuckLakeVortexIndex::CollectionLock()
+			             : publication ? DuckLakeVortexIndex::PublicationLock()
+			                           : DuckLakeVortexOptimizer::WriteAdmissionLock(*caller.context->db);
 			unique_ptr<DuckLakeVortexCollectionLock::Key> guard;
 			const auto observed = lock.SharedWaitCount();
 			if (collection) {
@@ -410,7 +413,7 @@ public:
 			bool waiting = false;
 			while (std::chrono::steady_clock::now() - start < std::chrono::seconds(5) &&
 			       rewrite.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-				waiting = collection ? lock.SharedWaitCount() > observed : !lock.TryGetSharedLock();
+				waiting = collection ? lock.SharedWaitCount() > observed : lock.WaitingWriterCount() != 0;
 				if (waiting) {
 					break;
 				}
@@ -423,6 +426,35 @@ public:
 			Require(rewrite.get() && waiting && cancelled_before_release,
 			        "Rewrite did not cancel after entering the actual lock wait");
 			return "{\"waiting\":true,\"cancelled_before_release\":true}";
+		}
+		if (op == "rewrite-build-gc-source-wait") {
+			Connection collector(database);
+			auto &lock = DuckLakeVortexReadView::AdmissionLock();
+			auto old_file_cleanup = lock.GetExclusiveLock([] {});
+			const auto observed = lock.SharedWaitCount();
+			auto collection = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::CollectBuilds(*collector.context, "lake", 1, std::stoull(args.at(2)));
+			});
+			auto start = std::chrono::steady_clock::now();
+			while (lock.SharedWaitCount() == observed &&
+			       std::chrono::steady_clock::now() - start < std::chrono::seconds(5) &&
+			       collection.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+				std::this_thread::yield();
+			}
+			const bool waited = lock.SharedWaitCount() > observed;
+			old_file_cleanup.reset();
+			auto result = collection.get();
+			Require(waited, "Rewrite build collection did not wait for the old-file cleanup guard");
+			return BuildGCJSON(result);
+		}
+		if (op == "rewrite-stage-limit") {
+			DuckLakeVortexRewriteState plan;
+			plan.caller = *writer.context;
+			plan.staged_inputs.resize(4094);
+			auto path = root + "/unopened.vortex";
+			plan.selected_files.push_back({1, path, "", 1});
+			DuckLakeVortexIndex::StageRewriteInput(plan, 1, path, 1);
+			return "{}";
 		}
 		if (op == "rewrite-reader-race") {
 			Connection reader(database), rewriter(database);

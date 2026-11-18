@@ -96,6 +96,11 @@ idx_t DuckLakeVortexCollectionLock::SharedWaitCount() const {
 	return state->shared_waits;
 }
 
+idx_t DuckLakeVortexCollectionLock::WaitingWriterCount() const {
+	std::lock_guard<std::mutex> guard(state->lock);
+	return state->waiting_writers;
+}
+
 unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexCollectionLock::GetExclusiveLock(const std::function<void()> &check) {
 	std::unique_lock<std::mutex> guard(state->lock);
@@ -135,6 +140,7 @@ const char *BUILDS = "ducklake_vortex_builds_v1";
 const char *REWRITES = "ducklake_vortex_rewrites_v1";
 const idx_t MAX_MANIFEST = 1024 * 1024;
 const idx_t MAX_ARTIFACTS = 64 * 1024 * 1024;
+const idx_t MAX_BUILD_CLEANUP_ENTRIES = 4096;
 
 string Hash(const string &bytes) {
 	return "sha256:" + Hex(duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes));
@@ -265,6 +271,13 @@ bool CheckDirectoryAccess(ClientContext &context, const string &root) {
 void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
 	if (!CheckDirectoryAccess(context, root)) {
 		throw IOException("Vortex index output directory does not exist: %s", root);
+	}
+}
+
+void CheckBuildReferenceWriteAccess(FileSystem &fs, const string &path) {
+	auto &opener = fs.Cast<OpenerFileSystem>();
+	if (opener.IsDuckDBExtensionName(path)) {
+		opener.VerifyCanAccessExtension(path, FileFlags::FILE_FLAGS_WRITE);
 	}
 }
 
@@ -929,7 +942,7 @@ void InspectBuild(int32_t fd, const string &prefix, CollectionPlan &plan,
 		check("build_gc_inspecting");
 		Relative(name, true);
 		auto path = prefix + "/" + name;
-		if (plan.files.size() + plan.directories.size() >= 4096) {
+		if (plan.files.size() + plan.directories.size() >= MAX_BUILD_CLEANUP_ENTRIES) {
 			throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex build cleanup entry budget exceeded");
 		}
 		struct stat info;
@@ -1092,6 +1105,10 @@ string DuckLakeVortexIndex::StageRewriteInput(DuckLakeVortexRewriteState &plan, 
 	if (selected == plan.selected_files.end() || selected->uri != uri || selected->row_count != rows) {
 		throw InvalidInputException("Vortex rewrite input descriptor changed");
 	}
+	// The collector also counts the workspace and the compactor's single output.
+	if (plan.staged_inputs.size() >= MAX_BUILD_CLEANUP_ENTRIES - 2) {
+		throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex rewrite input entry budget exceeded");
+	}
 	auto &caller = *plan.caller;
 	CheckInterrupted(caller);
 	auto &fs = FileSystem::GetFileSystem(caller);
@@ -1108,6 +1125,7 @@ string DuckLakeVortexIndex::StageRewriteInput(DuckLakeVortexRewriteState &plan, 
 		throw IOException("Cannot stage complete Vortex rewrite input");
 	}
 	plan.staged_source_bytes += bytes.size();
+	plan.staged_inputs.push_back(path);
 	return path;
 }
 
@@ -1698,6 +1716,11 @@ DuckLakeVortexIndex::CollectBuilds(ClientContext &context, const string &catalog
 			check("build_gc_deleting");
 			bool complete = true;
 			if (directory) {
+				unique_ptr<DuckLakeVortexCollectionLock::Key> source_admission;
+				if (!source_root.empty()) {
+					// Keep the managed link stable while counting and releasing private links.
+					source_admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
+				}
 				if (!source_root.empty() && !keep_source) {
 					RemoveLinkedRewriteSource(context, directory->fd, ".build-" + id, source_root, source_name, check);
 				}
@@ -1906,10 +1929,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		auto separator = reference_path.find_last_of('/');
 		root = Canonical(reference_path.substr(0, separator == 0 ? 1 : separator));
 		CheckBuildDirectoryAccess(context, root);
-		auto &opener = fs.Cast<OpenerFileSystem>();
-		if (opener.IsDuckDBExtensionName(reference_path)) {
-			opener.VerifyCanAccessExtension(reference_path, FileFlags::FILE_FLAGS_WRITE);
-		}
+		CheckBuildReferenceWriteAccess(fs, reference_path);
 		if (reference_path.back() == '/' || fs.FileExists(reference_path)) {
 			throw InvalidInputException("Build reference must be new, canonical and outside the managed data path");
 		}
@@ -2069,6 +2089,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 		auto root = Canonical(
 		    reference_path.substr(0, reference_path.find_last_of('/') == 0 ? 1 : reference_path.find_last_of('/')));
 		CheckBuildDirectoryAccess(context, root);
+		CheckBuildReferenceWriteAccess(fs, reference_path);
 		auto managed = fs.ExpandPath(catalog.DataPath());
 		while (managed.size() > 1 && managed.back() == '/') {
 			managed.pop_back();
@@ -2125,6 +2146,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 			throw IOException("Cannot create Vortex rewrite workspace");
 		}
 		SyncDirectory(root_fd->fd);
+		auto work_fd = OpenDirectory(root_fd->fd, ".build-" + plan->build_id, false);
 		BuildState(owner, catalog_name, plan->build_id, "building", &identity);
 		plan->check("rewrite_before_copy");
 		{
@@ -2141,6 +2163,14 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 		    !transaction.GetNewNameMaps().name_maps.empty()) {
 			throw InvalidInputException("Vortex rewrite requires one nonempty compaction without new name maps");
 		}
+		// Never mix staged input entries with the native builder's scratch and generation.
+		for (auto &input : plan->staged_inputs) {
+			CheckInterrupted(source, context);
+			fs.RemoveFile(input);
+		}
+		CheckBuildDirectoryAccess(context, plan->workspace);
+		SyncDirectory(work_fd->fd);
+		plan->staged_inputs.clear();
 		plan->check("rewrite_written");
 		DuckLakeVortexReadView view;
 		view.managed_data_path = managed;
@@ -2206,7 +2236,6 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 		plan->check("rewrite_candidate_ready");
 		CheckBuildDirectoryAccess(context, plan->workspace);
 		CheckBuildDirectoryAccess(context, plan->source_root);
-		auto work_fd = OpenDirectory(root_fd->fd, ".build-" + plan->build_id, false);
 		auto fd = openat(work_fd->fd, "rewrite.vortex", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 		if (fd < 0) {
 			throw IOException("Cannot open private Vortex rewrite source");

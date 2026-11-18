@@ -84,6 +84,11 @@ Vortex rewrite controls require autocommit
 statement ok
 ROLLBACK
 
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-reserved.duckdb_extension',2)
+----
+reserved for DuckDB extensions
+
 query I
 SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrites_v1
 ----

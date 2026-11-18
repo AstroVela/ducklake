@@ -14,7 +14,6 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/storage/object_cache.hpp"
-#include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <chrono>
@@ -1127,7 +1126,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 
 struct Owner : public ObjectCacheEntry {
 	std::shared_ptr<Runtime> runtime = std::make_shared<Runtime>();
-	StorageLock write_admission;
+	DuckLakeVortexCollectionLock write_admission;
 	~Owner() override {
 		runtime->Stop();
 	}
@@ -1310,7 +1309,11 @@ bool Grows(const LocalTableDataChanges &changes) {
 
 } // namespace
 
-unique_ptr<StorageLockKey>
+DuckLakeVortexCollectionLock &DuckLakeVortexOptimizer::WriteAdmissionLock(DatabaseInstance &db) {
+	return GetOwner(db)->write_admission;
+}
+
+unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
                                     unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard) {
 	auto rewrite = DuckLakeVortexRewriteState::Get(context);
@@ -1325,10 +1328,9 @@ DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientCont
 		grows |= Grows(entry.GetTableChanges());
 	}
 	auto &catalog = transaction.GetCatalog();
-	unique_ptr<StorageLockKey> admission;
+	unique_ptr<DuckLakeVortexCollectionLock::Key> admission;
 	if (grows && (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb")) {
-		admission = GetOwner(*context.db)->write_admission.GetExclusiveLock();
-		interrupt();
+		admission = WriteAdmissionLock(*context.db).GetExclusiveLock(interrupt);
 	}
 	// Use the same admission/publication order as configuration, and keep coverage stable through commit.
 	publication_guard = rewrite ? VortexCatalog::PublicationLock().GetExclusiveLock(interrupt)
@@ -1386,13 +1388,14 @@ void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const strin
 	    !budget.unindexed_bytes || budget.unindexed_bytes > SOURCE_LIMIT) {
 		throw InvalidInputException("Invalid Vortex write budget limits");
 	}
-	auto owner = GetOwner(*context.db);
-	auto admission = owner->write_admission.GetExclusiveLock();
-	auto publication = VortexCatalog::PublicationLock().GetSharedLock([&] {
+	auto interrupt = [&] {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-	});
+	};
+	auto owner = GetOwner(*context.db);
+	auto admission = owner->write_admission.GetExclusiveLock(interrupt);
+	auto publication = VortexCatalog::PublicationLock().GetSharedLock(interrupt);
 	std::lock_guard<std::mutex> guard(owner->runtime->io);
 	if (context.IsInterrupted()) {
 		throw InterruptException();
@@ -1430,7 +1433,11 @@ void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalo
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex optimizer catalog requires an idle dedicated connection");
 	}
-	auto admission = GetOwner(*owner.context->db)->write_admission.GetExclusiveLock();
+	auto admission = WriteAdmissionLock(*owner.context->db).GetExclusiveLock([&] {
+		if (owner.context->IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
 	try {
 		auto &transaction = VortexCatalog::Begin(owner, catalog);
 		VortexCatalog::Initialized(transaction);

@@ -178,6 +178,12 @@ def failures(driver, root, checks):
                     3,
                     expected="Injected indexed rewrite failure" if op.endswith("fail") else "Interrupted",
                 )
+                if stage == "rewrite_before_native_commit":
+                    response = json.loads((native.root / "responses" / f"{native.requests}.json").read_text())
+                    require(
+                        "commit outcome is unknown" not in response["error"].lower(),
+                        "A failure before COMMIT was reported as an ambiguous outcome",
+                    )
                 require(
                     native.call("head", "knn")["revision"] == 3 and active_rows(native) == rows,
                     "Failed rewrite committed files or index independently",
@@ -239,11 +245,18 @@ def crash(driver, root, stage, checks):
         before_records = BG.status(native)
         if stage in ("rewrite_source_linked", "rewrite_after_stage", "rewrite_after_commit"):
             build = next(row for row in before_records if row["build_id"] == records[0]["build_id"])
-            require(
-                output.samefile(Path(build["workspace"]) / "rewrite.vortex"), "Linked source lost its private witness"
-            )
+            workspace = Path(build["workspace"])
+            require(output.samefile(workspace / "rewrite.vortex"), "Linked source lost its private witness")
+            require(not list(workspace.glob("input-*.vortex")), "Staged inputs survived into the native build")
         MA.steady(native)
         require(BG.status(native) == before_records, "Restart implicitly recovered or cleaned a rewrite")
+        if committed:
+            collected = native.call("rewrite-build-gc-source-wait", LIMIT)
+            require(
+                collected["collected_builds"] == 1 and not workspace.exists() and output.exists(),
+                "Guarded build collection lost the retained source or kept its workspace",
+            )
+            checks.append("published rewrite witness collection waits for the old-file cleanup admission guard")
         native.call("maintenance-resume")
         MA.drain(native)
         require(
@@ -341,7 +354,7 @@ def cancel_lock_waits(driver, root, checks):
     try:
         rewritten, first, parts, frozen = setup(native, root)
         before = active_rows(native)
-        for lock in ("collection", "publication"):
+        for lock in ("collection", "publication", "write-admission"):
             result = native.call("rewrite-cancel-lock", lock, SEG.generation(first), rewritten / f"{lock}.json", 3)
             require(
                 result == {"waiting": True, "cancelled_before_release": True}, "Did not observe an interrupted wait"
@@ -355,10 +368,20 @@ def cancel_lock_waits(driver, root, checks):
             )
         unchanged(native, parts, frozen)
         finish(native)
-        checks.append("rewrite cancellation exits both observed maintenance lock waits before the holder releases")
-        return {"locks": ["collection", "publication"]}
+        checks.append("rewrite cancellation exits all three observed lock waits before the holder releases")
+        return {"locks": ["collection", "publication", "write-admission"]}
     finally:
         M.stop(native)
+
+
+def stage_limit(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        native.call("rewrite-stage-limit", expected="rewrite input entry budget exceeded")
+        checks.append("rewrite staging reserves the workspace and output entries within the existing collector limit")
+        return {}
+    finally:
+        native.finish()
 
 
 def deletion_quality(driver, root, checks):
@@ -459,6 +482,7 @@ def main():
             ("failures", failures),
             ("collision", collision),
             ("cancel-lock-waits", cancel_lock_waits),
+            ("stage-limit", stage_limit),
             ("deletion-quality", deletion_quality),
             ("capacity", capacity),
         ]

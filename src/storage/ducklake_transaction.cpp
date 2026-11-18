@@ -34,7 +34,6 @@
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
-#include "duckdb/storage/storage_lock.hpp"
 #endif
 
 namespace duckdb {
@@ -1474,19 +1473,19 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 #endif
 		return result;
 	};
-	context.flush_cache_if_pending = [&]() {
+	context.before_commit = [&]() {
 		if (metadata_manager->TakePendingCacheClear()) {
 			metadata_manager->ClearCache();
 		}
-	};
-	context.commit_connection = [&]() {
-		auto &metadata_catalog = Catalog::GetCatalog(*connection->context, ducklake_catalog.MetadataDatabaseName());
 #ifdef DUCKLAKE_ENABLE_VORTEX
 		auto rewrite = DuckLakeVortexRewriteState::Get(*this->context.lock());
 		if (rewrite) {
 			rewrite->check("rewrite_before_native_commit");
 		}
 #endif
+	};
+	context.commit_connection = [&]() {
+		auto &metadata_catalog = Catalog::GetCatalog(*connection->context, ducklake_catalog.MetadataDatabaseName());
 		state->CommitMetadataConnection(*connection, metadata_catalog);
 	};
 	context.try_rollback = [&]() {

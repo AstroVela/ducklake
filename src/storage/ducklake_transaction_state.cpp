@@ -1767,7 +1767,7 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 				res->GetErrorObject().Throw("Failed to flush changes into DuckLake: ");
 			}
 			bool flushed_inlined = !flushed_inlined_tables.empty();
-			context.flush_cache_if_pending();
+			context.before_commit();
 			commit_outcome = DuckLakeCommitOutcome::UNKNOWN;
 			context.commit_connection();
 			commit_outcome = DuckLakeCommitOutcome::COMMITTED;
