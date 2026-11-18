@@ -31,6 +31,7 @@ public:
 	DuckLakeVortexCollectionLock();
 	unique_ptr<Key> GetSharedLock(const std::function<void()> &check);
 	unique_ptr<Key> TryGetSharedLock();
+	idx_t SharedWaitCount() const;
 	unique_ptr<Key> GetExclusiveLock(const std::function<void()> &check);
 	unique_ptr<Key> TryGetExclusiveLock();
 

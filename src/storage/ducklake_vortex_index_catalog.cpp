@@ -40,6 +40,7 @@ struct DuckLakeVortexCollectionLock::State {
 	std::condition_variable changed;
 	idx_t readers = 0;
 	idx_t waiting_writers = 0;
+	idx_t shared_waits = 0;
 	bool writer = false;
 };
 
@@ -63,9 +64,12 @@ DuckLakeVortexCollectionLock::Key::~Key() {
 unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexCollectionLock::GetSharedLock(const std::function<void()> &check) {
 	std::unique_lock<std::mutex> guard(state->lock);
-	while (state->writer || state->waiting_writers) {
-		check();
-		state->changed.wait_for(guard, std::chrono::milliseconds(1));
+	if (state->writer || state->waiting_writers) {
+		state->shared_waits++;
+		do {
+			check();
+			state->changed.wait_for(guard, std::chrono::milliseconds(1));
+		} while (state->writer || state->waiting_writers);
 	}
 	check();
 	auto key = make_uniq<Key>(state, false);
@@ -81,6 +85,11 @@ unique_ptr<DuckLakeVortexCollectionLock::Key> DuckLakeVortexCollectionLock::TryG
 	auto key = make_uniq<Key>(state, false);
 	state->readers++;
 	return key;
+}
+
+idx_t DuckLakeVortexCollectionLock::SharedWaitCount() const {
+	std::lock_guard<std::mutex> guard(state->lock);
+	return state->shared_waits;
 }
 
 unique_ptr<DuckLakeVortexCollectionLock::Key>

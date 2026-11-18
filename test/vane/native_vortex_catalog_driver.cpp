@@ -266,10 +266,9 @@ public:
 			SQL(later, "BEGIN; INSERT INTO lake.publication_markers VALUES (1)");
 			auto &gate = DuckLakeVortexIndex::PublicationLock();
 			auto first_commit = gate.GetSharedLock([] {});
-			std::promise<void> validated, resume, committing;
+			std::promise<void> validated, resume;
 			auto inside = validated.get_future();
 			auto release = resume.get_future();
-			auto started = committing.get_future();
 			auto publisher = std::async(std::launch::async, [&] {
 				return DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), args.at(3), 0,
 				                                    *caller.context, [&](const string &stage) {
@@ -289,12 +288,17 @@ public:
 				}
 				std::this_thread::yield();
 			}
-			auto late_commit = std::async(std::launch::async, [&] {
-				committing.set_value();
-				later.Commit();
-			});
-			started.wait();
-			bool late_waited = late_commit.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+			const auto before = gate.SharedWaitCount();
+			auto late_commit = std::async(std::launch::async, [&] { later.Commit(); });
+			const auto admission_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (gate.SharedWaitCount() == before && std::chrono::steady_clock::now() < admission_deadline &&
+			       late_commit.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout) {
+				std::this_thread::yield();
+			}
+			// Only the actual COMMIT can enter a shared wait in this fixture.
+			const auto shared_waits = gate.SharedWaitCount() - before;
+			const bool late_waited =
+			    shared_waits == 1 && late_commit.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
 			bool ordered;
 			if (cancel) {
 				caller.Interrupt();
@@ -316,7 +320,7 @@ public:
 			late_commit.get();
 			Require(reserved && late_waited && ordered && cancel == interrupted,
 			        "Publication reservation lost ordering or retained a cancelled guard");
-			return "{\"ordered\":true}";
+			return "{\"ordered\":true,\"shared_waits\":" + to_string(shared_waits) + "}";
 		}
 		if (op == "build-cancel-source-wait") {
 			const auto &stage = args.at(2);

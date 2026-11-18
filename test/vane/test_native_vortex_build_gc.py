@@ -626,9 +626,8 @@ def publication_progress(driver, root, checks):
         _, reference, first, frozen = SEG.setup(native, root)
         native.sql("CREATE TABLE lake.publication_markers(i INTEGER)")
         for ordinal, mode in enumerate(["finish", "cancel"], 1):
-            require(
-                native.call("publication-commit-order", mode, reference)["ordered"], "Publication lost its reservation"
-            )
+            result = native.call("publication-commit-order", mode, reference)
+            require(result == {"ordered": True, "shared_waits": 1}, "The later commit did not wait on publication")
             native.sql(
                 f"SELECT CASE WHEN count(*)={ordinal} THEN true ELSE error('Lost commit') END "
                 "FROM lake.publication_markers"
