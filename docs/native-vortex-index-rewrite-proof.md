@@ -37,7 +37,8 @@ including at least 65 physical rows. Index/source/vector budgets and write quota
 do not expand. The data directory and private workspace must share a filesystem;
 the final source link is exclusive and does not overwrite an existing file.
 An existing destination causes an explicit error and remains protected from
-the registered build collector.
+the registered build collector. Reference names are checked with DuckDB's
+extension-filename write rule before registration.
 
 ## Private construction and one metadata commit
 
@@ -51,9 +52,11 @@ creating the workspace. The compactor filters candidates to the selected B and
 scans private copies of the selected files. Each copy is checked against the
 sealed descriptor's URI, physical row count and content hash. The compactor
 writes the output inside the workspace and preserves logical row IDs while
-removing deleted versions. The native SPFresh builder receives owned buffers
-for the prospective inventory and
-binds its row map to the planned stable file ID. It uses the normal registered
+removing deleted versions. Staging reserves one entry each for the workspace
+and output within the existing 4,096-entry collection limit. After compaction
+the operation removes the staged inputs and syncs the workspace directory
+before the native builder creates scratch and generation artifacts. SPFresh
+receives owned buffers and binds its row map to the planned stable file ID. It uses the normal registered
 generation, scratch, sealing, verification and reference-writing path.
 
 After construction, the operation fsyncs the private output and its directory,
@@ -78,8 +81,10 @@ The registered build collector rechecks index/build ownership and native file
 metadata, including historical file rows. A managed link can be removed after
 abandonment if it is unreferenced and matches the live private file by device
 and inode. Directory access is checked before opening and removing the managed
-link. The collector removes the managed link first and charges bytes when it
-releases the last link in the workspace. The shared budget and bounded
+link. The collector holds source admission across the link-count check and
+private unlink, serializing with the native old-file collector. It removes
+an abandoned managed link first and charges bytes when it releases the last
+link in the workspace. The shared budget and bounded
 truncation rules also apply to staged inputs. Completion removes both registry
 rows together.
 
@@ -115,8 +120,9 @@ unchanged.
 
 Failure and cancellation cover allocation, private copy, native build/seal,
 reference staging, final source link, metadata staging and the final commit
-boundary. A separate regression observes cancellation during collection and
-publication lock waits. SIGKILL
+boundary. A failure before COMMIT reports an abort. Regressions observe
+cancellation during collection, write-admission and publication lock waits,
+and order private-witness collection against native old-file cleanup. SIGKILL
 covers registered allocation, private copy, sealing, linked source, staged atomic
 metadata and committed publication. Recovery remains explicit through catalog
 maintenance. Concurrent writes cause inspectable conflicts; reader admission and
@@ -132,8 +138,8 @@ SPFresh online update calls, dependency-pin changes or total-capacity increase.
 
 Linux used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`, the native
 wrapper `84cef204` and the static SPFresh SDK qualified by #45. The rewrite
-proof at `3b37bf28` passed 19 checks in
-61.3 seconds within the 180-second budget. All 88
+proof at `445002c6` passed 21 checks in
+61.8 seconds within the 180-second budget. All 88
 gated fixture queries attained recall 1.0.
 Five rewrites advanced revision 3 to 8 and reduced current physical rows
 from 4,352 to 383 while preserving both unselected B generations.
@@ -144,11 +150,11 @@ write succeeded. The separate deletion-dense sample measured recall
 0.2 before rewrite and passed the post-rewrite gate.
 
 All 16 native process suites and 19 functional gates passed.
-Native ON passed 26 Vortex SQL cases with 1,026 assertions.
+Native ON passed 26 Vortex SQL cases with 1,027 assertions.
 The rewrite/orphan SQL groups passed 17 cases with
 881 assertions and 2 optional skips.
 ON and OFF each passed 86 base cases with 3,582 assertions and 13 optional
 skips. All 32 ABI checks and four isolated query-cost cases passed.
 Rust formatting, Clippy, workspace tests, changed-file formatting and diff
 checks passed. The catalog driver SHA-256 was
-`2724e1f8d0cd554252bd80aa2733f8fe8cc80f42d390403f388fc4f4f8c84849`.
+`c025b647e6dd9cfa602c665cd799bcf179168d2c13c10c50c77b347d10bfee5b`.
