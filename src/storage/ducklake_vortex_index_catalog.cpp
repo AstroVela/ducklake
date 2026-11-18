@@ -166,12 +166,15 @@ void Relative(const string &path, bool component) {
 	}
 }
 
-string ResolveLocalPath(const string &path) {
+string ResolveLocalPath(const string &path, const char *missing_message = nullptr) {
 #ifdef _WIN32
 	throw NotImplementedException("Native Vortex index publication is qualified on POSIX paths");
 #else
 	std::unique_ptr<char, decltype(&free)> resolved(realpath(path.c_str(), nullptr), free);
 	if (!resolved) {
+		if (errno == ENOENT && missing_message) {
+			throw InvalidInputException("%s", missing_message);
+		}
 		throw InvalidInputException("Cannot resolve local Vortex index path: %s", path);
 	}
 	return resolved.get();
@@ -239,6 +242,11 @@ void OutsideManagedDataPath(const string &path, const string &data_path) {
 	if (path == data_path || StringUtil::StartsWith(path, prefix)) {
 		throw InvalidInputException("Vortex index artifacts must be outside the managed data path");
 	}
+}
+
+void CheckCollectibleDirectory(const string &directory, const string &data_path) {
+	OutsideManagedDataPath(directory, data_path);
+	OutsideManagedDataPath(data_path, directory);
 }
 
 string Read(FileSystem &fs, const string &path, idx_t limit, bool canonical) {
@@ -1317,7 +1325,7 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 			}
 			CheckBuildOwnership(inspect, root, generation, targets);
 			for (auto &target : targets) {
-				OutsideManagedDataPath(managed, target);
+				CheckCollectibleDirectory(target, managed);
 			}
 			owner.Commit();
 			check("build_gc_before_inspect");
@@ -1557,15 +1565,12 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		while (managed.size() > 1 && managed.back() == '/') {
 			managed.pop_back();
 		}
-		if (!fs.DirectoryExists(managed)) {
-			throw InvalidInputException("Vortex index build requires materialized Vortex files");
-		}
-		managed = ResolveLocalPath(managed);
+		managed = ResolveLocalPath(managed, "Vortex index build requires materialized Vortex files");
 		OutsideManagedDataPath(root, managed);
 		workspace = LocalChild(root, ".build-" + id);
 		auto generation_path = LocalChild(root, generation);
-		OutsideManagedDataPath(managed, workspace);
-		OutsideManagedDataPath(managed, generation_path);
+		CheckCollectibleDirectory(workspace, managed);
+		CheckCollectibleDirectory(generation_path, managed);
 		CheckBuildOwnership(transaction, root, generation, {workspace, generation_path, reference_path});
 		if (fs.DirectoryExists(workspace) || fs.FileExists(workspace) || fs.DirectoryExists(generation_path) ||
 		    fs.FileExists(generation_path) || fs.DirectoryExists(reference_path)) {
@@ -1733,7 +1738,9 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 			auto part = ParseReference(segment.reference, table.GetTableUUID(), field.GetFieldIndex().index);
 			part.root = segment.root;
 			CheckInterrupted(owner, caller);
-			CheckBuildOwnership(transaction, part.root, part.generation, {LocalChild(part.root, part.generation)});
+			auto generation_path = LocalChild(part.root, part.generation);
+			CheckCollectibleDirectory(generation_path, data_path);
+			CheckBuildOwnership(transaction, part.root, part.generation, {generation_path});
 			auto before = artifact_budget;
 			auto manifest = VerifyGeneration(fs, part, data_path, artifact_budget);
 			RegisterGeneration(transaction, part, manifest, before - artifact_budget);
