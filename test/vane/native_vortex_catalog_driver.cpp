@@ -448,7 +448,7 @@ public:
 				const auto observed = publication.SharedWaitCount();
 				auto blocker = publication.GetExclusiveLock([] {});
 				auto commit = std::async(std::launch::async, [&] { SQL(writer, ReadText(args.at(6))); });
-				auto wait_for_lock = [](const auto &waiting) {
+				auto wait_for_lock = [](const std::function<bool()> &waiting) {
 					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 					while (!waiting() && std::chrono::steady_clock::now() < deadline) {
 						std::this_thread::yield();
