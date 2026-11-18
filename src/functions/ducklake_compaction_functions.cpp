@@ -2,6 +2,7 @@
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_schema_entry.hpp"
+#include "storage/ducklake_delete_filter.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_insert.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
@@ -78,10 +79,11 @@ DuckLakeCompaction::DuckLakeCompaction(PhysicalPlan &physical_plan, const vector
                                        DuckLakeTableEntry &table, vector<DuckLakeCompactionFileEntry> source_files_p,
                                        string encryption_key_p, optional_idx partition_id,
                                        vector<Value> partition_values_p, optional_idx row_id_start,
-                                       PhysicalOperator &child, CompactionType type)
+                                       PhysicalOperator &child, CompactionType type, DataFileFormat file_format_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 0), table(table),
       source_files(std::move(source_files_p)), encryption_key(std::move(encryption_key_p)), partition_id(partition_id),
-      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type) {
+      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type),
+      file_format(file_format_p) {
 	children.push_back(child);
 }
 
@@ -129,7 +131,7 @@ SourceResultType DuckLakeCompaction::GetDataInternal(ExecutionContext &context, 
 // Sink
 //===--------------------------------------------------------------------===//
 unique_ptr<GlobalSinkState> DuckLakeCompaction::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<DuckLakeInsertGlobalState>(table);
+	return make_uniq<DuckLakeInsertGlobalState>(context, table, file_format);
 }
 
 SinkResultType DuckLakeCompaction::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
@@ -191,6 +193,8 @@ SinkFinalizeType DuckLakeCompaction::Finalize(Pipeline &pipeline, Event &event, 
 		rewrite->new_rows = compaction_entry.written_file.row_count;
 		rewrite->new_bytes = compaction_entry.written_file.file_size_bytes;
 		compaction_entry.written_file.file_name = rewrite->new_path;
+		// The registered rewrite collector verifies ownership of this path after rollback.
+		compaction_entry.written_file.created_by_ducklake = false;
 	}
 #endif
 
@@ -509,6 +513,9 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	// set the files to scan as only the files we are trying to compact
 	vector<DuckLakeFileListEntry> files_to_scan;
 	vector<DuckLakeCompactionFileEntry> actionable_source_files;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	auto rewrite = DuckLakeVortexRewriteState::Get(context);
+#endif
 	for (auto &source : source_files) {
 		DuckLakeFileListEntry result;
 		result.file = source.file.data;
@@ -523,7 +530,21 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 				if (source.delete_files.back().end_snapshot.IsValid()) {
 					continue;
 				}
-				result.delete_file = source.delete_files.back().data;
+				const auto &delete_file = source.delete_files.back();
+				result.delete_file = delete_file.data;
+				if (!source.inlined_file_deletions.empty()) {
+					// Row accounting in the compaction record needs disjoint masks.
+					// The reader still sees the original masks at the transaction snapshot.
+					auto external = DuckLakeDeleteFilter::ScanDeleteFile(context, result.delete_file, optional_idx(),
+					                                                     transaction.GetSnapshot().snapshot_id,
+					                                                     source.file.row_count);
+					if (external.deleted_rows.size() != delete_file.row_count) {
+						throw InvalidInputException("Compaction delete file row count changed");
+					}
+					for (auto position : external.deleted_rows) {
+						source.inlined_file_deletions.erase(position);
+					}
+				}
 			}
 			break;
 		}
@@ -537,6 +558,12 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 		default:
 			throw InternalException("Invalid Compaction Type");
 		}
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (rewrite) {
+			result.file.path = DuckLakeVortexIndex::StageRewriteInput(*rewrite, source.file.id.index, result.file.path,
+			                                                          source.file.row_count);
+		}
+#endif
 		actionable_source_files.push_back(source);
 		// check if this file is adjacent (row-id wise) to the previous file
 		if (!source.file.row_id_start.IsValid()) {
@@ -671,7 +698,6 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	copy->file_path =
 	    copy_options.filename_pattern.CreateFilename(fs, copy_options.file_path, copy_options.file_extension, 0);
 #ifdef DUCKLAKE_ENABLE_VORTEX
-	auto rewrite = DuckLakeVortexRewriteState::Get(context);
 	if (rewrite) {
 		if (rewrite->copy_plans++) {
 			throw InvalidInputException("Vortex rewrite requires one schema and partition group");

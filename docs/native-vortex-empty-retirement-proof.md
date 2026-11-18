@@ -18,24 +18,25 @@ SELECT * FROM ducklake_retire_vortex_index_segment(
     'lake','main','items','knn','generation-<uuid>',<expected_revision>);
 ```
 
-The explicit operation selects exactly one ready generation. It authenticates
-its captured source files, schema and delete metadata and checks native row
-visibility restricted to those source paths. Any visible row prevents
-retirement. Under the existing write-admission/publication guards it validates
-fresh committed inputs, the exact named-index revision and exclusive named-index
-ownership. Independent T/F appends can commit during preparation. It rebases
-the native snapshot, retires all selected source IDs and removes their index
-references atomically. It creates no output data file, row map, workspace or
-ANN generation. Other B descriptors and artifact bytes are retained.
+The explicit operation requires a writable autocommit caller and binds its
+DuckLake and metadata attachments. It selects exactly one ready generation
+and checks each source against its active file ID, resolved path, row count
+and content hash. It proves emptiness from the union of inline and file delete
+positions. Any visible row prevents retirement. Independent T/F appends can
+commit during preparation. Under the existing write-admission and publication
+guards it refreshes the native write transaction, repeats the input and
+visibility checks, and validates the exact revision and sole named-index
+ownership. Source IDs and index references retire in that same transaction.
+Other B descriptors and artifact bytes are retained.
 
 The existing explicit data-compaction policy also selects an entirely empty B.
 It journals a `retire` task in `retiring` and then `publishing` before the native
-commit. The durable run UUID is the plan's publication identity. Recovery checks
-both exact revision and publication identity; the absence of a selected B alone
-cannot attribute another publisher's work to this task. Failures/cancellation
-stop scheduling, committed acknowledgement loss records `published` and pauses,
-and explicit resume reconciles interrupted work before fresh planning. Restart
-starts no optimizer or maintenance worker.
+commit. The durable run UUID is the plan's publication identity. The same
+transaction stores a receipt for the run and revision. Recovery can reconcile
+that receipt after another publisher advances the index. Failures and
+cancellation stop scheduling. Committed acknowledgement loss records
+`published` and pauses. Explicit resume reconciles interrupted work before
+fresh planning.
 
 ## Explicit zero-B plan
 
@@ -80,9 +81,11 @@ The process proof covers three separate retirements, concurrent T/flush/T
 appends, unchanged unselected generations, explicit 0-B empty/T/F queries,
 rebuilding the first B, malformed plan rejection, retained search/fetch after
 GC, quota recovery at 100,000 rows, stale DELETE/index publication races,
-failure/cancel/lost-ack/publication races and six SIGKILL boundaries. A native
-SQL case checks the public API, empty sources, snapshot retention and rebuilding.
-The new proof is also part of the existing exact-pin native validation workflow.
+caller catalog replacement, relocated sources, failure/cancel/lost-ack
+and six SIGKILL boundaries. A later append checks that the receipt still
+identifies the committed retirement after restart. The native SQL case also
+covers explicit and read-only transactions, a business column named
+`filename`, and whole-file DELETE after a vector column rename.
 
 ## Local result (2026-10-29)
 

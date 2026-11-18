@@ -7,7 +7,7 @@ verifies and opens each encoded file once, then reuses that reader when
 constructing its physical source.
 
 The verified-reader API is in [Vortex #27](https://github.com/AstroVela/vortex/pull/27),
-pinned at `531fed6588d1b1b0492f1a50cad42179ce68faa5` in the query library,
+pinned at `307eaf56644845f45dfe6099d7148e6b6afb17a5` in the query library,
 probe, lockfile and native validation workflow.
 
 ## Ownership and binding
@@ -16,11 +16,15 @@ Previously, `PhysicalSource` hashed source contents and opened a Vortex reader
 to inspect dtype and row count. `LocalFileSource::from_buffers` then repeated
 the content hash and opened another reader for the same bytes.
 
-`VerifiedFile::from_buffer` checks the expected absolute source identity,
-lowercase SHA-256 digest, encoded byte budget and embedded physical row count.
+`VerifiedFile::from_buffer` retains the expected opaque source URI and checks
+the lowercase SHA-256 digest, encoded byte budget and embedded physical row count.
 It owns the immutable Vortex reader and retains the verified descriptor in
 private fields. The adapter inspects its dtype and validates DuckLake vector
 and business field IDs/types through that existing reader.
+
+Relative paths and `file:` URI identities pass through verified construction
+and assembly. `LocalFileSource::open` enforces absolute native filesystem paths.
+The captured URI remains part of the complete source and sealed-index identity.
 
 `LocalFileSource::from_verified` consumes those objects. It checks the complete
 inventory, every descriptor field, expected dtype, schema fingerprint and
@@ -44,6 +48,14 @@ scan/take order and duplicates, missing/unknown inventories, complete identity
 rebinding, self-consistent wrong schemas, row-count mismatches, corrupt bytes
 and aggregate budget enforcement. Existing file and buffer constructors use
 the same verified-reader assembly and retain their existing contracts.
+
+The verified-reader ownership regression covers absolute, relative and `file:`
+identities. It removes canonical source files before construction and releases
+the caller's buffers before assembly, scan and ordered duplicate take. The
+SQL proof builds indexes from exported envelopes and executes binary SQL for
+five DATA_PATH representations. Relative and `file:` cases also reject a URI
+mutation against the published index while an existing view keeps its ranked
+result and releases all resource counts on close.
 
 Run the native ON/OFF gates and all six lifecycle/process proofs as described
 in #35. Build the Rust query library and probe together from the locked

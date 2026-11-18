@@ -1,4 +1,5 @@
 #include "storage/ducklake_metadata_manager.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_variant_stats.hpp"
 #include "common/ducklake_util.hpp"
@@ -492,8 +493,8 @@ WHERE table_id = {TABLE_ID} AND schema_version = {SCHEMA_VERSION})";
 	return GetBeginSnapshotForTable(table_id);
 }
 
-string DuckLakeMetadataManager::GetNetDataFileRowCountSql(TableIndex table_id, const string &inlined_deletion_table) {
-	// Compute sum(record_count) - sum(delete_count) - inlined_deletions in a single query.
+string DuckLakeMetadataManager::GetExactDataFileRowCountSql(TableIndex table_id, const string &inlined_deletion_table) {
+	// Count visible data rows when the delete masks cannot overlap.
 	// Delete files are only counted if their corresponding data file is still visible.
 	// (When a data file's end_snapshot is set — e.g. TRUNCATE — associated deletes don't count.)
 	string inlined_deletion_subquery = "0";
@@ -524,16 +525,36 @@ SELECT
   -
   %s)",
 	                                  inlined_deletion_subquery);
+	if (!inlined_deletion_table.empty()) {
+		query = StringUtil::Format(R"(
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+  FROM {METADATA_CATALOG}.ducklake_delete_file del
+  JOIN {METADATA_CATALOG}.ducklake_data_file data ON data.data_file_id = del.data_file_id
+  WHERE del.table_id = {TABLE_ID} AND del.delete_count > 0
+    AND del.begin_snapshot <= {SNAPSHOT_ID} AND (del.end_snapshot IS NULL OR del.end_snapshot > {SNAPSHOT_ID})
+    AND data.begin_snapshot <= {SNAPSHOT_ID} AND (data.end_snapshot IS NULL OR data.end_snapshot > {SNAPSHOT_ID})
+    AND EXISTS (SELECT 1 FROM {METADATA_CATALOG}.%s i
+                WHERE i.file_id = data.data_file_id AND i.begin_snapshot <= {SNAPSHOT_ID})
+) THEN NULL ELSE (%s) END
+)",
+		                           inlined_deletion_table, query);
+	}
 	return StringUtil::Replace(query, "{TABLE_ID}", to_string(table_id.index));
 }
 
-idx_t DuckLakeMetadataManager::GetNetDataFileRowCount(TableIndex table_id, DuckLakeSnapshot snapshot) {
-	auto query = GetNetDataFileRowCountSql(table_id, GetInlinedDeletionTableName(table_id, snapshot));
+optional_idx DuckLakeMetadataManager::GetExactDataFileRowCount(TableIndex table_id, DuckLakeSnapshot snapshot) {
+	auto query = GetExactDataFileRowCountSql(table_id, GetInlinedDeletionTableName(table_id, snapshot));
 	auto result = transaction.Query(snapshot, query);
-	for (auto &row : *result) {
-		return row.GetValue<idx_t>(0);
+	if (result->HasError()) {
+		result->ThrowError();
 	}
-	return 0;
+	for (auto &row : *result) {
+		if (!row.IsNull(0)) {
+			return row.GetValue<idx_t>(0);
+		}
+	}
+	return optional_idx();
 }
 
 string DuckLakeMetadataManager::GetNetInlinedRowCountSql(const string &inlined_table_name) {
@@ -4678,7 +4699,7 @@ vector<DuckLakeFileForCleanup> DuckLakeMetadataManager::GetOrphanFilesForCleanup
 
 		auto query = StringUtil::Format(R"(SELECT filename
 FROM read_blob({DATA_PATH} || '**') files
-WHERE suffix(filename, '.parquet')
+WHERE (suffix(filename, '.parquet') OR suffix(filename, '.vortex'))
 AND NOT EXISTS (
 	SELECT 1 FROM %s known_files WHERE known_files.full_path = files.filename
 )
@@ -4692,8 +4713,16 @@ AND NOT EXISTS (
 
 		vector<DuckLakeFileForCleanup> result;
 		for (auto &row : *res) {
+			auto path = row.GetValue<string>(0);
+			auto separator_pos = path.find_last_of("/\\");
+			auto filename = separator_pos == string::npos ? path : path.substr(separator_pos + 1);
+			// The registered rewrite collector owns this namespace before publication.
+			if (StringUtil::StartsWith(filename, DuckLakeVortexIndex::RewriteSourcePrefix()) &&
+			    StringUtil::EndsWith(filename, ".vortex")) {
+				continue;
+			}
 			DuckLakeFileForCleanup info;
-			info.path = row.GetValue<string>(0);
+			info.path = std::move(path);
 			result.push_back(std::move(info));
 		}
 		drop_temp_table();

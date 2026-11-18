@@ -199,7 +199,11 @@ vector<PartitionStatistics> DuckLakeGetPartitionStats(ClientContext &context, Ge
 		return result;
 	}
 
-	idx_t net_count = table.GetNetDataFileRowCount(*transaction) + table.GetNetInlinedRowCount(*transaction);
+	auto data_file_rows = table.GetExactDataFileRowCount(*transaction);
+	if (!data_file_rows.IsValid()) {
+		return result;
+	}
+	idx_t net_count = data_file_rows.GetIndex() + table.GetNetInlinedRowCount(*transaction);
 
 	// MIN/MAX can be answered from the catalog column stats, but only when those stats are exact.
 	// Global column stats only ever widen on insert (via MergeStats) and are never tightened by deletes

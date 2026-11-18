@@ -713,11 +713,14 @@ CompactionInformation DuckLakeTransactionState::GetCompactionChanges(DuckLakeCom
 
 			idx_t row_id_limit = 0;
 			for (auto &compacted_file : compaction.source_files) {
-				row_id_limit += compacted_file.file.row_count;
-				if (!compacted_file.delete_files.empty()) {
-					row_id_limit -= compacted_file.delete_files.back().row_count;
+				const auto external_deletes =
+				    compacted_file.delete_files.empty() ? 0 : compacted_file.delete_files.back().row_count;
+				const auto inline_deletes = compacted_file.inlined_file_deletions.size();
+				const auto source_rows = compacted_file.file.row_count;
+				if (external_deletes > source_rows || inline_deletes > source_rows - external_deletes) {
+					throw InvalidInputException("Compaction delete count exceeds source rows");
 				}
-				row_id_limit -= compacted_file.inlined_file_deletions.size();
+				row_id_limit += source_rows - external_deletes - inline_deletes;
 				DuckLakeCompactedFileInfo file_info;
 				file_info.path = compacted_file.file.data.path;
 				file_info.source_id = compacted_file.file.id;
@@ -844,6 +847,11 @@ void DuckLakeTransactionState::RecomputeGlobalStatsAfterRewrite(string &batch_qu
 		return;
 	}
 
+	auto visible_data_rows = context.get_exact_data_file_row_count(table_id);
+	if (!visible_data_rows.IsValid()) {
+		return;
+	}
+
 	// Build a field_index -> column_type map for the per-file stats merge below. `columns` is the full flattened
 	// schema (roots + nested leaves), so per-file stats keyed by a nested-leaf FieldIndex resolve here too - without
 	// the leaves, an un-rewritten file's nested-leaf stats would be dropped and the global min/max corrupted.
@@ -927,7 +935,7 @@ void DuckLakeTransactionState::RecomputeGlobalStatsAfterRewrite(string &batch_qu
 	// 2. Delete-free gate: the merged parquet stats are exact only if no deletions remain on the table's data files.
 	//    That holds iff the gross row count of the post-rewrite files equals the net (delete-adjusted) data-file count.
 	//    (Covers partial rewrites with delete_threshold > 0, leftover delete files, and inlined file deletions.)
-	if (parquet_gross_rows != context.get_net_data_file_row_count(table_id)) {
+	if (parquet_gross_rows != visible_data_rows.GetIndex()) {
 		return;
 	}
 
@@ -1767,7 +1775,7 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 				res->GetErrorObject().Throw("Failed to flush changes into DuckLake: ");
 			}
 			bool flushed_inlined = !flushed_inlined_tables.empty();
-			context.flush_cache_if_pending();
+			context.before_commit();
 			commit_outcome = DuckLakeCommitOutcome::UNKNOWN;
 			context.commit_connection();
 			commit_outcome = DuckLakeCommitOutcome::COMMITTED;
@@ -1800,7 +1808,7 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 				// Add additional information on the number of retries and suggest to increase it
 				std::ostringstream error_message;
 				error_message << "Failed to commit DuckLake transaction." << '\n';
-				if (finished_retrying) {
+				if (finished_retrying && retry_config.max_retry_count) {
 					error_message << "Exceeded the maximum retry count of " << retry_config.max_retry_count
 					              << " set by the ducklake_max_retry_count setting." << '\n'
 					              << ". Consider increasing the value with: e.g., \"SET ducklake_max_retry_count = "
@@ -1820,7 +1828,14 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 
 			// retry the transaction (with a new snapshot id)
 			// clear the inlined table caches - the rollback undid any table creation from the previous attempt
-			context.prepare_retry();
+			try {
+				context.prepare_retry();
+			} catch (...) {
+				// A retry can fail while restoring transaction-local options. The
+				// existing outcome guard retains files if a commit was uncertain.
+				CleanupFiles();
+				throw;
+			}
 		}
 	}
 	// If we got here, this snapshot was successful

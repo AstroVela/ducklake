@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import time
 
 SPEC = importlib.util.spec_from_file_location(
@@ -293,7 +294,7 @@ def interruption(driver, root, kind, checks):
         M.stop(native)
 
 
-def crash(driver, root, stage, checks):
+def crash(driver, root, stage, checks, *, append_after_restart=False):
     native = CAT.Native(driver, root / "native")
     try:
         single(native, root)
@@ -321,21 +322,41 @@ def crash(driver, root, stage, checks):
                 "Restart lost retirement publication identity",
             )
         OPT.steady(native, OPT.status(native))
-        native.call("optimizer-resume")
-        row = OPT.wait(
-            native,
-            lambda s: s["compaction_reason"] == "no_segments" and not s["running"],
-            "post-crash retirement",
-        )
+        if append_after_restart:
+            SEG.add_f(native, 5000)
+            native.call("append", "knn", root / "artifacts" / "later-B.json", 2)
+            require(native.call("head", "knn")["revision"] == 3, "Later append did not advance the published revision")
+            native.sql(
+                "SELECT CASE WHEN state='published' THEN true "
+                "ELSE error('resume lost the committed retirement receipt') END "
+                "FROM ducklake_resume_vortex_optimizer('lake','main','items','knn')"
+            )
+            row = OPT.steady(native, OPT.status(native))
+            require(
+                row["published_revision"] == 2 and row["run_id"] == durable["run_id"],
+                "A later publication changed the recovered retirement identity",
+            )
+        else:
+            native.call("optimizer-resume")
+            row = OPT.wait(
+                native,
+                lambda s: s["compaction_reason"] == "no_segments" and not s["running"],
+                "post-crash retirement",
+            )
         require(
             row["run_count"] == (1 if committed else 2),
             "Crash recovery replayed a committed task or auto retried",
         )
         native.call("maintenance-resume")
         recalls = []
-        qualify(native, "restarted-empty", recalls, 0)
+        qualify(native, "restarted", recalls, int(append_after_restart))
         BG.finish(native)
-        checks.append(f"SIGKILL at {stage} recovers a complete old/new plan; only explicit resume schedules fresh work")
+        if append_after_restart:
+            checks.append("a later append after restart preserves the committed retirement receipt")
+        else:
+            checks.append(
+                f"SIGKILL at {stage} recovers a complete old/new plan; only explicit resume schedules fresh work"
+            )
         return {"fixture_recalls": recalls}
     finally:
         M.stop(native)
@@ -396,6 +417,38 @@ def delete_publication_race(driver, root, checks):
         M.stop(native)
 
 
+def source_binding(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        generation = SEG.generation(first)
+        native.call("retire-reattach", generation)
+
+        moved = root / "relocated-data"
+        shutil.copytree(native.root / "data", moved)
+        catalog = f"ducklake:{native.root / 'metadata.ducklake'}"
+        native.sql(
+            "DETACH lake; "
+            f"ATTACH '{catalog}' AS lake (DATA_PATH '{moved}', OVERRIDE_DATA_PATH TRUE);"
+            "SELECT CASE WHEN count(*)=4096 THEN true ELSE error('relocation changed the table contents') END "
+            "FROM lake.items"
+        )
+        before = native.call("head", "knn")
+        native.call("retire", generation, 1, expected="source file identity changed")
+        require(native.call("head", "knn") == before, "Input identity rejection changed the index revision")
+        require(RW.active_rows(native) == 4096, "Input identity rejection dropped active sources")
+        native.finish()
+        checks.extend(
+            [
+                "retirement rejects a stale caller attachment",
+                "retirement checks the active file ID against its resolved path after managed data relocation",
+            ]
+        )
+        return {"active_rows": 4096}
+    finally:
+        M.stop(native)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["duckdb", "driver", "probe", "output-dir"]:
@@ -422,7 +475,12 @@ def main():
     try:
         report["main"] = exercise(proof, native, directory, report["checks"], workers)
         report["cases"] = []
-        cases = [("capacity", capacity), ("delete-publication-race", delete_publication_race)]
+        cases = [
+            ("capacity", capacity),
+            ("delete-publication-race", delete_publication_race),
+            ("source-binding", source_binding),
+            ("later-append", lambda d, r, c: crash(d, r, "retire_after_commit", c, append_after_restart=True)),
+        ]
         cases += [
             (kind, lambda d, r, c, k=kind: interruption(d, r, k, c)) for kind in ["failure", "cancel", "ack", "race"]
         ]

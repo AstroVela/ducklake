@@ -1,4 +1,5 @@
 #include "storage/ducklake_transaction.hpp"
+#include "storage/ducklake_vortex.hpp"
 
 #include "storage/ducklake_commit_state.hpp"
 #include "storage/ducklake_transaction_state.hpp"
@@ -33,7 +34,6 @@
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
-#include "duckdb/storage/storage_lock.hpp"
 #endif
 
 namespace duckdb {
@@ -88,6 +88,18 @@ void LocalTableChanges::CleanupFiles(DatabaseInstance &db) {
 				fs.TryRemoveFile(del_file.file_name);
 			}
 		}
+		for (auto &compaction : table_changes.compactions) {
+			auto &file = compaction.written_file;
+			if (file.file_name.empty()) {
+				continue;
+			}
+			if (file.created_by_ducklake) {
+				fs.TryRemoveFile(file.file_name);
+			}
+			for (auto &delete_file : file.delete_files) {
+				fs.TryRemoveFile(delete_file.file_name);
+			}
+		}
 		for (auto &file : table_changes.new_delete_files) {
 			for (auto &delete_files : file.second) {
 				fs.TryRemoveFile(delete_files.file_name);
@@ -104,6 +116,7 @@ void LocalTableChanges::CleanupFiles(DatabaseInstance &db) {
 #endif
 		table_changes.new_data_files.clear();
 		table_changes.new_delete_files.clear();
+		table_changes.compactions.clear();
 	}
 }
 
@@ -630,6 +643,18 @@ void LocalTableChanges::CleanupFiles(ClientContext &context, TableIndex table_id
 				fs.TryRemoveFile(del_file.file_name);
 			}
 		}
+		for (auto &compaction : table_changes.compactions) {
+			auto &file = compaction.written_file;
+			if (file.file_name.empty()) {
+				continue;
+			}
+			if (file.created_by_ducklake) {
+				fs.TryRemoveFile(file.file_name);
+			}
+			for (auto &delete_file : file.delete_files) {
+				fs.TryRemoveFile(delete_file.file_name);
+			}
+		}
 		for (auto &file : table_changes.new_delete_files) {
 			for (auto &delete_files : file.second) {
 				fs.TryRemoveFile(delete_files.file_name);
@@ -772,11 +797,9 @@ void DuckLakeTransaction::Commit() {
 	try {
 		if (ChangesMade()) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
-			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock());
-			auto rewrite = DuckLakeVortexRewriteState::Get(*context.lock());
-			auto publication_guard = rewrite ? DuckLakeVortexIndex::PublicationLock().GetExclusiveLock()
-			                                 : DuckLakeVortexIndex::PublicationLock().GetSharedLock();
-			if (rewrite) {
+			unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard;
+			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock(), publication_guard);
+			if (DuckLakeVortexRewriteState::Get(*context.lock())) {
 				DuckLakeVortexIndex::CheckRewriteCommit(*context.lock(), *this);
 			} else {
 				DuckLakeVortexIndex::CheckFileRetirements(*context.lock(), *this);
@@ -802,6 +825,8 @@ void DuckLakeTransaction::Commit() {
 		throw;
 	}
 	connection.reset();
+	data_file_formats.clear();
+	pending_data_file_formats.clear();
 	state->local_changes.Clear();
 	SetRequiresNewInlinedTable(false);
 }
@@ -815,6 +840,8 @@ void DuckLakeTransaction::Rollback() {
 		connection.reset();
 	}
 	state->CleanupFiles();
+	data_file_formats.clear();
+	pending_data_file_formats.clear();
 	state->local_changes.Clear();
 	SetRequiresNewInlinedTable(false);
 }
@@ -856,7 +883,7 @@ case_insensitive_map_t<unique_ptr<DuckLakeCatalogSet>> &DuckLakeTransaction::Get
 
 bool DuckLakeTransaction::ChangesMade() const {
 	return state->SchemaChangesMade() || state->local_changes.HasChanges() || !state->dropped_files.empty() ||
-	       !new_name_maps.name_maps.empty();
+	       !new_name_maps.name_maps.empty() || !pending_data_file_formats.empty();
 }
 
 void GetTransactionTableChanges(reference<CatalogEntry> table_entry, TransactionChangeInformation &changes) {
@@ -1014,6 +1041,13 @@ TransactionChangeInformation DuckLakeTransaction::GetTransactionChanges() const 
 		}
 		auto &table_changes = entry.GetTableChanges();
 		AddTableChanges(table_id, table_changes, changes);
+	}
+	// The first file-format transition changes the table's write contract. Use
+	// the existing snapshot conflict protocol to order it with schema changes.
+	for (auto &entry : pending_data_file_formats) {
+		if (dropped_tables.find(entry.first) == dropped_tables.end()) {
+			changes.altered_tables.insert(entry.first);
+		}
 	}
 	return changes;
 }
@@ -1441,10 +1475,16 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 #endif
 		return result;
 	};
-	context.flush_cache_if_pending = [&]() {
+	context.before_commit = [&]() {
 		if (metadata_manager->TakePendingCacheClear()) {
 			metadata_manager->ClearCache();
 		}
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		auto rewrite = DuckLakeVortexRewriteState::Get(*this->context.lock());
+		if (rewrite) {
+			rewrite->check("rewrite_before_native_commit");
+		}
+#endif
 	};
 	context.commit_connection = [&]() {
 		auto &metadata_catalog = Catalog::GetCatalog(*connection->context, ducklake_catalog.MetadataDatabaseName());
@@ -1459,6 +1499,17 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		metadata_manager->ClearInlinedTableCaches();
 		connection->BeginTransaction();
 		snapshot.reset();
+		data_file_formats.clear();
+		for (auto &entry : pending_data_file_formats) {
+			if (state->dropped_tables.find(entry.first) != state->dropped_tables.end()) {
+				continue;
+			}
+			DuckLakeConfigOption option;
+			option.table_id = entry.first;
+			option.option.key = "experimental_data_file_format";
+			option.option.value = DataFileFormatToString(entry.second);
+			SetConfigOption(option);
+		}
 	};
 	context.query_metadata = [&](string q) {
 		return metadata_manager->Query(q);
@@ -1515,12 +1566,12 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		}
 		return names;
 	};
-	context.get_net_data_file_row_count = [&](TableIndex table_id) -> idx_t {
+	context.get_exact_data_file_row_count = [&](TableIndex table_id) -> optional_idx {
 		auto entry = ducklake_catalog.GetEntryById(*this, transaction_snapshot, table_id);
 		if (!entry) {
-			return 0;
+			return optional_idx();
 		}
-		return entry->Cast<DuckLakeTableEntry>().GetNetDataFileRowCount(*this);
+		return entry->Cast<DuckLakeTableEntry>().GetExactDataFileRowCount(*this);
 	};
 	context.get_net_inlined_row_count = [&](TableIndex table_id) -> idx_t {
 		auto entry = ducklake_catalog.GetEntryById(*this, transaction_snapshot, table_id);
@@ -1550,7 +1601,54 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 #endif
 }
 
+DataFileFormat DuckLakeTransaction::GetDataFileFormat(TableIndex table_id) {
+	if (!table_id.IsValid() || table_id.IsTransactionLocal()) {
+		return DataFileFormat::PARQUET;
+	}
+	auto cached = data_file_formats.find(table_id);
+	if (cached != data_file_formats.end()) {
+		return cached->second;
+	}
+	auto result =
+	    Query(StringUtil::Format("SELECT value FROM {METADATA_CATALOG}.ducklake_metadata "
+	                             "WHERE key = 'experimental_data_file_format' AND scope = 'table' AND scope_id = %d",
+	                             table_id.index));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to read DuckLake data file format: ");
+	}
+	auto chunk = result->Fetch();
+	auto format = chunk && chunk->size() ? DataFileFormatFromString(chunk->GetValue(0, 0).GetValue<string>())
+	                                     : DataFileFormat::PARQUET;
+	data_file_formats.emplace(table_id, format);
+	return format;
+}
+
 void DuckLakeTransaction::SetConfigOption(const DuckLakeConfigOption &option) {
+	if (option.option.key == "experimental_data_file_format") {
+		if (!option.table_id.IsValid() || option.table_id.IsTransactionLocal() || option.schema_id.IsValid()) {
+			throw InvalidInputException("experimental_data_file_format requires a committed table scope");
+		}
+		auto entry = ducklake_catalog.GetEntryById(*this, GetSnapshot(), option.table_id);
+		if (!entry || IsDeleted(*entry)) {
+			throw CatalogException("DuckLake format option table no longer exists");
+		}
+		auto &table = entry->Cast<DuckLakeTableEntry>();
+		auto format = DataFileFormatFromString(option.option.value);
+		auto current_format = GetDataFileFormat(option.table_id);
+		if (format == DataFileFormat::VORTEX) {
+			DuckLakeVortex::ValidateTable(table);
+		} else if (current_format == DataFileFormat::VORTEX) {
+			throw NotImplementedException("Experimental Vortex tables cannot change their data file format");
+		}
+		if (current_format == format) {
+			// In particular, the default Parquet setting needs no metadata row.
+			return;
+		}
+		metadata_manager->SetConfigOption(option);
+		data_file_formats[option.table_id] = format;
+		pending_data_file_formats[option.table_id] = format;
+		return;
+	}
 	// write the config option to the metadata
 	metadata_manager->SetConfigOption(option);
 	// set the option in the catalog
@@ -1617,17 +1715,25 @@ string DuckLakeTransaction::GetDefaultSchemaName() {
 }
 
 #ifdef DUCKLAKE_ENABLE_VORTEX
-void DuckLakeTransaction::RebaseVortexRewrite(const DuckLakeSnapshot &fresh) {
-	if (!DuckLakeVortexRewriteState::Get(*context.lock())) {
-		throw InternalException("Only a prepared Vortex rewrite can rebase its commit snapshot");
+DuckLakeSnapshot DuckLakeTransaction::RefreshVortexRewriteSnapshot() {
+	auto rewrite = DuckLakeVortexRewriteState::Get(*context.lock());
+	if (!rewrite) {
+		throw InternalException("Only a prepared Vortex rewrite can refresh its commit snapshot");
 	}
+	// Write admission holds exclusive publication through this transaction's commit.
+	auto &metadata = GetConnection();
+	metadata.Rollback();
+	metadata.BeginTransaction();
+	DuckLakeVortexIndex::CheckCatalogIdentity(*this, rewrite->identity);
+	metadata_manager->ClearCache();
 	lock_guard<mutex> guard(snapshot_lock);
-	if (!snapshot || snapshot->snapshot_id > fresh.snapshot_id) {
+	auto fresh = metadata_manager->GetSnapshot();
+	if (!snapshot || snapshot->snapshot_id > fresh->snapshot_id) {
 		throw TransactionException("Vortex rewrite snapshot changed before commit");
 	}
-	*snapshot = fresh;
-	catalog_version = fresh.schema_version;
-	metadata_manager->ClearCache();
+	snapshot = std::move(fresh);
+	catalog_version = snapshot->schema_version;
+	return *snapshot;
 }
 #endif
 

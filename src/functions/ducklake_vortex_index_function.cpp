@@ -48,14 +48,14 @@ static void ExecuteCatalog(ClientContext &context, TableFunctionInput &input, Da
 	auto &data = input.bind_data->Cast<IndexCatalogBind>();
 	Connection owner(*context.db);
 	if (data.initialize) {
-		DuckLakeVortexIndex::Initialize(owner, StringValue::Get(data.args[0]));
+		DuckLakeVortexIndex::Initialize(owner, StringValue::Get(data.args[0]), context);
 		output.SetValue(0, 0, Value::BOOLEAN(true));
 	} else {
 		auto record = DuckLakeVortexIndex::Publish(
 		    owner, StringValue::Get(data.args[0]), StringValue::Get(data.args[1]), StringValue::Get(data.args[2]),
 		    StringValue::Get(data.args[3]), StringValue::Get(data.args[4]),
-		    data.args[data.operation == DuckLakeVortexIndexOperation::MERGE ? 6 : 5].GetValue<idx_t>(), nullptr,
-		    data.operation, data.merge_generations);
+		    data.args[data.operation == DuckLakeVortexIndexOperation::MERGE ? 6 : 5].GetValue<idx_t>(), context,
+		    nullptr, data.operation, data.merge_generations);
 		output.SetValue(0, 0, Value::UBIGINT(record.revision));
 		output.SetValue(1, 0, Value(record.generation));
 	}
