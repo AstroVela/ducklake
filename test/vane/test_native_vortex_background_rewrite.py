@@ -575,6 +575,44 @@ def overlapping_deletes(driver, root, checks, vectors=False):
         M.stop(native)
 
 
+def dense_overlap(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        single_segment(native, root)
+        bulk = SEG.sql(native, root, "DELETE FROM lake.items WHERE id>=66")
+        inline = root / "inline-delete.sql"
+        inline.write_text("DELETE FROM lake.items WHERE id>=66 AND id<146")
+        native.call("concurrent-deletes", bulk, inline)
+        native.sql(
+            "SELECT CASE WHEN (SELECT count(*) FROM lake.items)=66 "
+            "AND (SELECT sum(delete_count) FROM __ducklake_metadata_lake.ducklake_delete_file "
+            "WHERE end_snapshot IS NULL)=4030 "
+            "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1)=80 "
+            "THEN true ELSE error('dense overlap fixture did not preserve its 66 live rows') END"
+        )
+        configure(native, 4030, 98)
+        selected = pause(native, "optimizer_before_rewrite")
+        require(
+            selected["reclaimable_rows"] == 4030 and selected["remaining_rows"] == 66,
+            "The dense overlap candidate did not count unique deleted positions",
+        )
+        native.call("optimizer-release")
+        row = published(native, 2)
+        require(
+            row["run_count"] == 1 and RW.active_rows(native) == 66,
+            "An unavailable exact metadata count disrupted an eligible rewrite",
+        )
+        native.sql(
+            "SELECT CASE WHEN count(*)=66 AND count(DISTINCT rowid)=66 AND min(id)=0 AND max(id)=65 "
+            "THEN true ELSE error('dense overlap changed visible rows in the replacement') END FROM lake.items"
+        )
+        finish(native, maintenance=False)
+        checks.append("dense overlap leaves 66 live rows and commits without using an inexact metadata count")
+        return {"unique_deletes": 4030, "physical_rows": 66}
+    finally:
+        M.stop(native)
+
+
 def stale_probe(driver, root, checks):
     native = CAT.Native(driver, root / "native")
     try:
@@ -767,6 +805,7 @@ def main():
             ("pipeline", pipeline),
             ("overlapping-parquet-deletes", overlapping_deletes),
             ("overlapping-puffin-deletes", lambda d, r, c: overlapping_deletes(d, r, c, vectors=True)),
+            ("dense-overlap", dense_overlap),
             ("stale-probe", stale_probe),
             ("post-flush-priority", post_flush_priority),
             ("superseded-ack", superseded_publication),

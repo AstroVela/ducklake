@@ -1564,12 +1564,12 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		}
 		return names;
 	};
-	context.get_net_data_file_row_count = [&](TableIndex table_id) -> idx_t {
+	context.get_exact_data_file_row_count = [&](TableIndex table_id) -> optional_idx {
 		auto entry = ducklake_catalog.GetEntryById(*this, transaction_snapshot, table_id);
 		if (!entry) {
-			return 0;
+			return optional_idx();
 		}
-		return entry->Cast<DuckLakeTableEntry>().GetNetDataFileRowCount(*this);
+		return entry->Cast<DuckLakeTableEntry>().GetExactDataFileRowCount(*this);
 	};
 	context.get_net_inlined_row_count = [&](TableIndex table_id) -> idx_t {
 		auto entry = ducklake_catalog.GetEntryById(*this, transaction_snapshot, table_id);

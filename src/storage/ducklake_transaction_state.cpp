@@ -844,6 +844,11 @@ void DuckLakeTransactionState::RecomputeGlobalStatsAfterRewrite(string &batch_qu
 		return;
 	}
 
+	auto visible_data_rows = context.get_exact_data_file_row_count(table_id);
+	if (!visible_data_rows.IsValid()) {
+		return;
+	}
+
 	// Build a field_index -> column_type map for the per-file stats merge below. `columns` is the full flattened
 	// schema (roots + nested leaves), so per-file stats keyed by a nested-leaf FieldIndex resolve here too - without
 	// the leaves, an un-rewritten file's nested-leaf stats would be dropped and the global min/max corrupted.
@@ -927,7 +932,7 @@ void DuckLakeTransactionState::RecomputeGlobalStatsAfterRewrite(string &batch_qu
 	// 2. Delete-free gate: the merged parquet stats are exact only if no deletions remain on the table's data files.
 	//    That holds iff the gross row count of the post-rewrite files equals the net (delete-adjusted) data-file count.
 	//    (Covers partial rewrites with delete_threshold > 0, leftover delete files, and inlined file deletions.)
-	if (parquet_gross_rows != context.get_net_data_file_row_count(table_id)) {
+	if (parquet_gross_rows != visible_data_rows.GetIndex()) {
 		return;
 	}
 

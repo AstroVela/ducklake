@@ -37,8 +37,9 @@ from the active masks under the source read guard and existing byte ceiling. The
 selected B has the greatest reclaimable-row count among eligible generations.
 Generation-name order breaks ties.
 Scans consume every delete record at each position. When an active file has both
-mask types, the query optimizer leaves aggregate counts to the scan because
-metadata totals cannot establish an exact count.
+mask types, metadata reports that an exact count is unavailable. SQL aggregates
+use visible rows, and rewrite publication skips the optional global-statistics
+refresh that requires an exact metadata count.
 
 A candidate needs deletions, both thresholds, at least 65 remaining physical
 rows for the unchanged static SPFresh options, a nonempty rewrite output and

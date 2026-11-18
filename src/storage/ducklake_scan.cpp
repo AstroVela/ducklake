@@ -3,7 +3,6 @@
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_table_entry.hpp"
-#include "storage/ducklake_metadata_manager.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_transaction.hpp"
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
@@ -200,33 +199,11 @@ vector<PartitionStatistics> DuckLakeGetPartitionStats(ClientContext &context, Ge
 		return result;
 	}
 
-	// An external delete mask and an inline mask can contain the same position.
-	// Metadata counts alone cannot prove an exact partition count for those files.
-	auto &metadata = transaction->GetMetadataManager();
-	auto inline_deletes = metadata.GetInlinedDeletionTableName(table_id, current_snapshot);
-	if (!inline_deletes.empty()) {
-		auto masks = transaction->Query(current_snapshot, StringUtil::Format(R"(
-SELECT 1
-FROM {METADATA_CATALOG}.ducklake_delete_file del
-JOIN {METADATA_CATALOG}.ducklake_data_file data ON data.data_file_id = del.data_file_id
-WHERE del.table_id = %llu AND del.delete_count > 0
-  AND del.begin_snapshot <= {SNAPSHOT_ID} AND (del.end_snapshot IS NULL OR del.end_snapshot > {SNAPSHOT_ID})
-  AND data.begin_snapshot <= {SNAPSHOT_ID} AND (data.end_snapshot IS NULL OR data.end_snapshot > {SNAPSHOT_ID})
-  AND EXISTS (SELECT 1 FROM {METADATA_CATALOG}.%s i
-              WHERE i.file_id = data.data_file_id AND i.begin_snapshot <= {SNAPSHOT_ID})
-LIMIT 1
-)",
-		                                                                     table_id.index, inline_deletes));
-		if (masks->HasError()) {
-			masks->ThrowError();
-		}
-		auto mixed = masks->Fetch();
-		if (mixed && mixed->size()) {
-			return result;
-		}
+	auto data_file_rows = table.GetExactDataFileRowCount(*transaction);
+	if (!data_file_rows.IsValid()) {
+		return result;
 	}
-
-	idx_t net_count = table.GetNetDataFileRowCount(*transaction) + table.GetNetInlinedRowCount(*transaction);
+	idx_t net_count = data_file_rows.GetIndex() + table.GetNetInlinedRowCount(*transaction);
 
 	// MIN/MAX can be answered from the catalog column stats, but only when those stats are exact.
 	// Global column stats only ever widen on insert (via MergeStats) and are never tightened by deletes
