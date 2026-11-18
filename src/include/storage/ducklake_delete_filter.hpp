@@ -58,9 +58,11 @@ public:
 
 	static DeleteFileScanResult ScanDeleteFile(ClientContext &context, const DuckLakeFileData &delete_file,
 	                                           optional_idx snapshot_filter_min = optional_idx(),
-	                                           optional_idx snapshot_filter_max = optional_idx());
+	                                           optional_idx snapshot_filter_max = optional_idx(),
+	                                           optional_idx source_rows = optional_idx());
 	//! Scan a puffin deletion vector file and return the deleted row positions
-	static DeleteFileScanResult ScanDeletionVectorFile(ClientContext &context, const DuckLakeFileData &delete_file);
+	static DeleteFileScanResult ScanDeletionVectorFile(ClientContext &context, const DuckLakeFileData &delete_file,
+	                                                   optional_idx source_rows = optional_idx());
 
 private:
 	//! Scan the data file to get the global row_ids at specific file positions

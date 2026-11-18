@@ -20,7 +20,8 @@ inclusive and must be met. Configuration requires an existing optimizer policy;
 enabling it also requires an installed write budget selecting the same index.
 It does not resume a cancelled/stopped optimizer, authorize catalog maintenance,
 expire snapshots or change write/scan/index budgets. Configure only when no
-optimizer task is running; use the existing cancel/resume API for active work.
+optimizer task is running. Configuration and resume use the caller's writable
+catalog and metadata attachments in autocommit.
 
 Fresh explicit optimizer initialization creates the task columns required by
 this prototype. Serialized policy format 2 includes the enable flag and two
@@ -30,9 +31,11 @@ legacy decoder, compatibility layer or fallback.
 ## Candidate selection and bounded scheduling
 
 The planner reads current file, delete-file and inlined-deletion metadata for
-the named index's active files. It reads counts rather than vector data or all
-historical deletion row IDs. The selected B is the eligible generation with the
-greatest reclaimable-row count; equal counts use generation-name ordering.
+the named index's active files. Counts suffice for files with one deletion
+representation. For files with both, the planner subtracts overlapping positions
+from the active masks under the source read guard and existing byte ceiling. The
+selected B has the greatest reclaimable-row count among eligible generations.
+Generation-name order breaks ties.
 
 A candidate needs deletions, both thresholds, at least 65 remaining physical
 rows for the unchanged static SPFresh options, a nonempty rewrite output and
@@ -49,7 +52,9 @@ missing-coverage boundary requiring an explicit rebuild. This draft does not
 add empty-B retirement or a new query plan for that case. An entirely masked
 but still-active input is classified as an empty rewrite output and skipped.
 
-An eligible source rewrite takes priority over flush/index work at planning.
+An eligible source rewrite takes priority at the initial probe and at the probe
+after a committed flush. If a candidate becomes eligible during flush, the
+worker completes the flush and selects the rewrite before index work.
 One worker pass creates one durable `rewrite` task with one selected generation,
 captured index revision and unique reference path. It enters `rewriting`, calls
 the existing #47 rewrite protocol, then persists its final generation and
@@ -68,14 +73,17 @@ threads or native build concurrency.
 ## Failure, cancellation and retention
 
 Real input/index conflicts and failures stop the optimizer with a recorded
-error. Cancellation uses existing native checkpoints. A lost acknowledgement
-whose publication is confirmed retains the committed source/index and records
-`published`, but pauses the optimizer for explicit inspection/resume.
-Failed or cancelled tasks do not retry automatically.
+error. Probe results and pre-task failures are applied only to the policy that
+requested the probe. Cancellation uses existing native checkpoints. A successful
+rewrite records the task's run, generation and revision in the same metadata
+commit as the source and index. Each policy retains one such receipt, including
+after a newer index publication or GC. A lost acknowledgement with a matching
+receipt records `published` and pauses the optimizer for explicit inspection
+and resume.
 
-Restart starts no optimizer/maintenance work. Explicit optimizer resume checks
-whether an interrupted task already published; committed work is retained,
-otherwise future work is freshly planned against current metadata. The
+Restart starts no optimizer or maintenance work. On explicit resume, the receipt
+confirms a committed rewrite. For an interrupted rewrite without a receipt,
+the worker plans future work from current metadata. The
 independently enabled maintenance policy recovers registered builds and collects
 workspaces and retired index generations under its existing shared count/byte
 budget. Open private query views retain search and delayed typed fetch after GC.
@@ -100,9 +108,12 @@ The proof runs repeated background rewrites with concurrent T/flush/T commits,
 current B/F/T query comparisons, unchanged unselected generations and old private
 views surviving both index GC and explicit source snapshot expiry/cleanup.
 Other cases cover default opt-out, exact row/percentage thresholds, mixed delete
-file/inlined counts, single-B priority, inspectable unsupported candidates,
+file and inline overlap in Parquet and Puffin, post-flush priority, superseded
+probes, caller attachment binding, and inspectable unsupported candidates,
 100,000-row capacity recovery, the complete rewrite/flush/merge/index pipeline,
-input conflicts, cancellation, injected failures and SIGKILL task boundaries.
+input conflicts, cancellation, and SIGKILL task boundaries. A newer explicit
+index publication can supersede the rewrite before acknowledgement or restart,
+including after collection of the retired generation.
 The supported native metadata, local POSIX, managed namespace, fixed-schema,
 single-output and static SPFresh scope remains unchanged; online updates and
 dependency-pin changes are not introduced.

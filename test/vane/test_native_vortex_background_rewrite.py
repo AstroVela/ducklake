@@ -266,7 +266,10 @@ def selection(driver, root, checks):
         signature = SEG.signature(Path(retained["root"]) / SEG.generation(retained))
         native.call("optimizer-cancel")
         native.call("optimizer-release")
-        OPT.wait(native, lambda s: not s["running"] and not s["enabled"], "cancel after first committed rewrite")
+        cancelled = OPT.wait(
+            native, lambda s: not s["running"] and not s["enabled"], "cancel after first committed rewrite"
+        )
+        require(cancelled["state"] == "cancelled", "Terminal observation overwrote a later cancellation")
         native.call("optimizer-resume")
         row = published(native, 5)
         require(
@@ -513,6 +516,172 @@ def pipeline(driver, root, checks):
         M.stop(native)
 
 
+def single_segment(native, root, flush_rows=100000):
+    artifacts, reference, _, _ = SEG.setup(native, root)
+    native.call("optimizer-init")
+    native.call("optimizer-enable", artifacts, flush_rows, 4194304, 100000, RW.LIMIT)
+    stop(native)
+    native.sql(
+        "SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',256,4194304,256,67108864);"
+        "CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')"
+    )
+    return artifacts, reference
+
+
+def overlapping_deletes(driver, root, checks, vectors=False):
+    native = CAT.Native(driver, root / "native")
+    try:
+        single_segment(native, root)
+        if vectors:
+            native.sql("CALL ducklake_set_option('lake','write_deletion_vectors',true,table_name=>'items')")
+        bulk = SEG.sql(native, root, "DELETE FROM lake.items WHERE id>=100 AND id<228")
+        inline = root / "inline-delete.sql"
+        inline.write_text("DELETE FROM lake.items WHERE id=100")
+        native.call("concurrent-deletes", bulk, inline)
+        mask = "puffin" if vectors else "parquet"
+        native.sql(
+            "SELECT CASE WHEN "
+            "(SELECT count(*) FROM lake.items WHERE id>=100 AND id<228)=0 "
+            "AND (SELECT count(*) FROM lake.items)=3968 "
+            "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file "
+            f"WHERE end_snapshot IS NULL AND delete_count=128 AND format='{mask}')=1 "
+            "THEN true ELSE error('active delete masks do not hide the exact union of deleted rows') END"
+        )
+        configure(native, 129, 1)
+        native.call("optimizer-resume")
+        row = OPT.wait(native, lambda s: s["compaction_reason"] == "below_threshold", "overlap below threshold")
+        require(
+            row["run_count"] == 0 and row["reclaimable_rows"] == 128 and row["remaining_rows"] == 3968,
+            "An overlapping delete was counted twice",
+        )
+        stop(native)
+        configure(native, 128, 1)
+        native.call("optimizer-resume")
+        row = published(native, 2)
+        require(row["run_count"] == 1 and RW.active_rows(native) == 3968, "Rewrite reclaimed the wrong row count")
+        native.sql(
+            "SELECT CASE WHEN count(*)=3968 AND count(DISTINCT rowid)=3968 "
+            "AND count(*) FILTER (WHERE id>=100 AND id<228)=0 "
+            "THEN true ELSE error('rewrite changed visibility or row ids') END FROM lake.items"
+        )
+        finish(native)
+        checks.append(f"overlapping {mask} and inline masks count and reclaim exactly 128 unique positions")
+        return {"unique_deletes": 128, "physical_rows": 3968}
+    finally:
+        M.stop(native)
+
+
+def stale_probe(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, reference = single_segment(native, root, flush_rows=128)
+        native.call("compaction-reattach")
+        guarded = OPT.status(native)
+        require(
+            not guarded["enabled"] and not guarded["compaction_enabled"],
+            "A retained attachment changed or resumed compaction",
+        )
+        native.call("publish", "alias", reference, 0)
+        configure(native)
+        pause(native, "optimizer_before_probe")
+        configure(native, enabled=False)
+        native.sql("CALL ducklake_set_option('lake','data_inlining_row_limit',1000,table_name=>'items')")
+        OPT.insert(native, 200000, 128)
+        native.call("optimizer-release")
+        row = OPT.wait(native, lambda s: s["state"] == "flushed", "flush after superseded compaction probe")
+        require(
+            row["enabled"] and row["run_count"] == 1 and not row["error"] and RW.active_rows(native) == 4224,
+            "A superseded compaction probe affected the current optimizer",
+        )
+        finish(native)
+        checks.extend(
+            [
+                "compaction configuration and resume reject a retained catalog attachment",
+                "a stale failed compaction probe leaves the current flush and index policy enabled",
+            ]
+        )
+        return {"flush_runs": 1, "physical_rows": 4224}
+    finally:
+        M.stop(native)
+
+
+def post_flush_priority(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, _, _, _, _ = M.setup(native, root)
+        native.call("optimizer-init")
+        native.call("optimizer-enable", artifacts, 128, 4194304, 128, RW.LIMIT)
+        stop(native)
+        native.sql(
+            "SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',256,4194304,256,67108864);"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',1000,table_name=>'items')"
+        )
+        OPT.insert(native, 200000, 128)
+        configure(native, 63, 40)
+        row = pause(native, "optimizer_flushed")
+        require(row["run_count"] == 1 and row["task_kind"] == "flush", "Fixture did not start with a flush")
+        native.sql("DELETE FROM lake.items WHERE id>=5000 AND id<5063")
+        native.call("optimizer-release")
+        row = published(native, 6)
+        require(
+            row["run_count"] == 4 and RW.active_rows(native) == 4417,
+            "Index merge removed the eligible compaction candidate after flush",
+        )
+        require(len(SEG.segments(native.call("head", "knn"))) == 3, "Post-flush scheduling changed the segment bound")
+        recalls = []
+        M.qualify(native, "post-flush-priority", recalls, 3)
+        finish(native)
+        checks.append("a candidate that becomes eligible during flush reclaims 63 rows before index merge")
+        return {"fixture_recalls": recalls, "physical_rows": 4417}
+    finally:
+        M.stop(native)
+
+
+def superseded_publication(driver, root, checks, restart=False):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _ = single_segment(native, root)
+        native.sql("DELETE FROM lake.items WHERE id<128")
+        configure(native, 128, 1)
+        stage = "rewrite_after_commit"
+        native.call("optimizer-resume", stage, "pause" if restart else "fail-after-release")
+        native.call("optimizer-wait")
+        publishing = OPT.status(native)
+        require(publishing["state"] == "publishing", "Rewrite had already acknowledged publication")
+        require(native.call("head", "knn")["revision"] == 2, "Rewrite did not commit its successor")
+        native.call("build", "knn", artifacts / "superseding.json", 2)
+        if restart:
+            OPT.crash(native, stage)
+            native.call("recover-builds", 16)
+            native.call("build-gc", 16, RW.LIMIT)
+            native.call("gc", 16, RW.LIMIT)
+            require(
+                all(
+                    row["generation"] != publishing["candidate_generation"] for row in native.call("generation-status")
+                ),
+                "Superseded generation was still registered during recovery",
+            )
+            native.call("optimizer-resume")
+            row = published(native, 2)
+        else:
+            native.call("optimizer-release")
+            row = OPT.wait(native, lambda s: not s["enabled"] and not s["running"], "lost rewrite acknowledgement")
+            require("committed but acknowledgement failed" in row["error"], "Lost acknowledgement was not reported")
+        require(
+            row["state"] == "published" and row["published_revision"] == 2 and row["run_count"] == 1,
+            "A newer ready revision hid a committed rewrite",
+        )
+        require(
+            native.call("head", "knn")["revision"] == 3 and RW.active_rows(native) == 3968, "Recovery changed the head"
+        )
+        finish(native)
+        mode = "restart after GC" if restart else "lost acknowledgement"
+        checks.append(f"{mode} confirms the committed rewrite after a newer explicit publication")
+        return {"published_revision": 2, "ready_revision": 3}
+    finally:
+        M.stop(native)
+
+
 def crash(driver, root, stage, checks):
     native = CAT.Native(driver, root / "native")
     try:
@@ -592,6 +761,12 @@ def main():
             ("selection", selection),
             ("capacity", capacity),
             ("pipeline", pipeline),
+            ("overlapping-parquet-deletes", overlapping_deletes),
+            ("overlapping-puffin-deletes", lambda d, r, c: overlapping_deletes(d, r, c, vectors=True)),
+            ("stale-probe", stale_probe),
+            ("post-flush-priority", post_flush_priority),
+            ("superseded-ack", superseded_publication),
+            ("superseded-restart", lambda d, r, c: superseded_publication(d, r, c, restart=True)),
             ("retirement-boundary", retirement_boundary),
         ]
         for kind in ["small", "empty", "groups"]:

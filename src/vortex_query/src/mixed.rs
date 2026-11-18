@@ -706,6 +706,7 @@ impl MixedView {
                     distance: squared_l2(&request.query, vector)?,
                 });
             }
+            check("segment_reranked")?;
         }
         check("after_ann")?;
         let mut routes = Routes {
