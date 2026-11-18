@@ -534,14 +534,14 @@ def overlapping_deletes(driver, root, checks, vectors=False):
         single_segment(native, root)
         if vectors:
             native.sql("CALL ducklake_set_option('lake','write_deletion_vectors',true,table_name=>'items')")
-        bulk = SEG.sql(native, root, "DELETE FROM lake.items WHERE id>=100 AND id<228")
+        bulk = SEG.sql(native, root, "DELETE FROM lake.items WHERE id%2=0 AND id>=100 AND id<356")
         inline = root / "inline-delete.sql"
         inline.write_text("DELETE FROM lake.items WHERE id=100")
         native.call("concurrent-deletes", bulk, inline)
         mask = "puffin" if vectors else "parquet"
         native.sql(
             "SELECT CASE WHEN "
-            "(SELECT count(*) FROM lake.items WHERE id>=100 AND id<228)=0 "
+            "(SELECT count(*) FROM lake.items WHERE id%2=0 AND id>=100 AND id<356)=0 "
             "AND (SELECT count(*) FROM lake.items)=3968 "
             "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file "
             f"WHERE end_snapshot IS NULL AND delete_count=128 AND format='{mask}')=1 "
@@ -561,7 +561,7 @@ def overlapping_deletes(driver, root, checks, vectors=False):
         require(row["run_count"] == 1 and RW.active_rows(native) == 3968, "Rewrite reclaimed the wrong row count")
         native.sql(
             "SELECT CASE WHEN count(*)=3968 AND count(DISTINCT rowid)=3968 "
-            "AND count(*) FILTER (WHERE id>=100 AND id<228)=0 "
+            "AND count(*) FILTER (WHERE id%2=0 AND id>=100 AND id<356)=0 "
             "THEN true ELSE error('rewrite changed visibility or row ids') END FROM lake.items"
         )
         finish(native)

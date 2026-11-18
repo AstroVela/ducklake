@@ -841,6 +841,15 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		errors.erase(p.Id());
 		changed.notify_all();
 	}
+	void Reconfigure(const Policy &p) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto found = policies.find(p.Id());
+		if (found != policies.end()) {
+			// Invalidate an in-flight probe, even when the thresholds return to earlier values.
+			found->second = std::make_shared<Pending>(Pending {p, found->second->observe});
+		}
+		changed.notify_all();
+	}
 	bool IsCurrent(const std::shared_ptr<Pending> &pending) {
 		std::lock_guard<std::mutex> guard(lock);
 		return policies.at(pending->policy.Id()) == pending;
@@ -1101,7 +1110,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		if (current.run != p.run) {
 			throw TransactionException("Optimizer task ownership changed");
 		}
-		if (!owns_task && (!current.enabled || Encode(current) != Encode(p))) {
+		if (!owns_task && !current.enabled) {
 			meta.Commit();
 			return;
 		}
@@ -1148,10 +1157,6 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				Metadata meta(db, p.config.catalog);
 				auto current = Load(meta, p);
 				if (!IsCurrent(pending) || !current.enabled || current.run != p.run) {
-					meta.Commit();
-					return;
-				}
-				if (Encode(current) != Encode(p)) {
 					meta.Commit();
 					return;
 				}
@@ -1852,7 +1857,7 @@ void DuckLakeVortexOptimizer::ConfigureCompaction(ClientContext &context, const 
 	p.rewrite_deleted = p.rewrite_remaining = 0;
 	p.rewrite_reason = enabled ? "awaiting_probe" : "disabled";
 	Save(meta, p, p.run);
-	owner->runtime->changed.notify_all();
+	owner->runtime->Reconfigure(p);
 }
 
 void DuckLakeVortexOptimizer::RecordRewritePublication(DuckLakeTransaction &transaction,
