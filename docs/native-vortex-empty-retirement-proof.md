@@ -13,6 +13,8 @@ and return only visible rows while retirement is pending. When an existing
 external mask is completed, the prior descriptor ends at the actual DELETE
 commit and remains available to historical snapshots. Change feeds compare
 the new mask with its predecessor to report the newly deleted positions.
+The completion check counts the union of external masks, inline deletes and
+the current DELETE's positions. Inline deletes keep their original snapshots.
 Expiry retains the predecessor while the successor still serves a retained
 snapshot or remains active.
 Unindexed files continue to use native full-file deletion. Final metadata
@@ -41,6 +43,9 @@ expiry removes the markers and inlined masks with the source metadata.
 An inline delete flush removes its metadata rows when its mask commits.
 If a completing DELETE supersedes that mask in the same transaction, the
 original inline rows remain visible to historical scans and change feeds.
+Commit retries identify masks published after the reader's snapshot using
+their allocated file IDs. This catches a concurrent flush whose mask retains
+an earlier deletion snapshot.
 
 The existing explicit data-compaction policy also selects an entirely empty B.
 It journals a `retire` task in `retiring` and then `publishing` before the native

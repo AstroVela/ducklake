@@ -296,8 +296,8 @@ ReaderInitializeType DuckLakeMultiFileReader::InitializeReader(MultiFileReaderDa
 				delete_filter->Initialize(context, file_entry.delete_file);
 			}
 			if (delete_map && !file_entry.delete_file.path.empty()) {
-				auto delete_data_copy = make_shared_ptr<DuckLakeDeleteData>(*delete_filter->delete_data);
-				delete_map->AddDeleteData(reader.GetFileName(), std::move(delete_data_copy));
+				delete_map->AddDeleteData(reader.GetFileName(), *delete_filter->delete_data,
+				                          file_entry.inlined_file_deletions);
 			}
 			// Apply inlined file deletions (stored in metadata database instead of delete file)
 			if (!file_entry.inlined_file_deletions.empty()) {

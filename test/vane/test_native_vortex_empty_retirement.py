@@ -562,7 +562,10 @@ def versioned_delete_mask(driver, root, checks, *, vectors=False):
         native.sql(
             "CREATE TABLE lake.other(i INTEGER);"
             "DELETE FROM lake.items WHERE id<128;"
-            "SET VARIABLE partial_version=(SELECT max(snapshot_id) FROM lake.snapshots())"
+            "SET VARIABLE partial_version=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id=128;"
+            "SET VARIABLE inline_version=(SELECT max(snapshot_id) FROM lake.snapshots())"
         )
         unrelated, finish_delete = root / "unrelated.sql", root / "finish-delete.sql"
         unrelated.write_text("INSERT INTO lake.other VALUES(1)")
@@ -573,12 +576,13 @@ def versioned_delete_mask(driver, root, checks, *, vectors=False):
             "SET VARIABLE unrelated_version=getvariable('final_version')-1;"
             "SELECT CASE WHEN "
             "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('partial_version')))=3968 AND "
-            "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('unrelated_version')))=3968 AND "
+            "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('unrelated_version')))=3967 AND "
             "(SELECT count(*) FROM lake.items)=0 "
             "THEN true ELSE error('final delete changed historical visibility') END;"
             "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
             "AND count(*) FILTER (WHERE id<128 AND snapshot_id=getvariable('partial_version'))=128 "
-            "AND count(*) FILTER (WHERE id>=128 AND snapshot_id=getvariable('final_version'))=3968 "
+            "AND count(*) FILTER (WHERE id=128 AND snapshot_id=getvariable('inline_version'))=1 "
+            "AND count(*) FILTER (WHERE id>=129 AND snapshot_id=getvariable('final_version'))=3967 "
             "THEN true ELSE error('full mask assigned deletes to incorrect snapshots') END FROM "
             "ducklake_table_deletions('lake','main','items',getvariable('partial_version'),getvariable('final_version'));"
             "SELECT CASE WHEN count(*)=0 THEN true ELSE error('unrelated commit acquired deletes') END FROM "
@@ -594,16 +598,18 @@ def versioned_delete_mask(driver, root, checks, *, vectors=False):
             "FROM lake.items AT (VERSION=>getvariable('partial_version'))"
         )
         native.sql(
+            "SET VARIABLE superseded_versions=(SELECT list(snapshot_id) FROM lake.snapshots() "
+            "WHERE snapshot_id>=getvariable('partial_version') AND snapshot_id<getvariable('final_version'));"
             "SELECT * FROM ducklake_expire_snapshots('lake',"
-            "versions=>[getvariable('partial_version'),getvariable('unrelated_version')]);"
-            "SELECT CASE WHEN count(*)=3968 AND min(id)=128 "
+            "versions=>getvariable('superseded_versions'));"
+            "SELECT CASE WHEN count(*)=3967 AND min(id)=129 "
             "THEN true ELSE error('expiry changed the retained DELETE event') END FROM "
             "ducklake_table_deletions('lake','main','items',getvariable('final_version'),getvariable('final_version'))"
         )
         native.finish()
         mask = "Puffin" if vectors else "Parquet"
-        checks.append(f"a completed {mask} mask preserves exact DELETE events across commit and selective expiry")
-        return {"prior_deletions": 128, "final_deletions": 3968, "delete_format": mask}
+        checks.append(f"a completed {mask} mask with a disjoint inline deletion preserves exact DELETE history")
+        return {"prior_deletions": 129, "final_deletions": 3967, "delete_format": mask}
     finally:
         M.stop(native)
 
@@ -700,6 +706,38 @@ def flush_before_complete_mask(driver, root, checks):
         M.stop(native)
 
 
+def concurrent_mask_flush(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        SEG.setup(native, root)
+        native.sql(
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id<128;"
+            "DELETE FROM lake.items WHERE id IN (128,2048)"
+        )
+        flush = root / "flush.sql"
+        flush.write_text("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
+        native.call("concurrent-deletes", flush, flush, expected="deleted from it")
+        native.sql("DELETE FROM lake.items WHERE id=129")
+        stale_delete = root / "delete.sql"
+        stale_delete.write_text("DELETE FROM lake.items WHERE id>=256 AND id<384")
+        native.call("concurrent-deletes", flush, stale_delete, expected="deleted from it")
+        native.sql(
+            "SELECT CASE WHEN count(*)=2 AND count(DISTINCT data_file_id)=2 THEN true "
+            "ELSE error('flush left multiple active masks for a source') END "
+            "FROM __ducklake_metadata_lake.ducklake_delete_file WHERE end_snapshot IS NULL;"
+            "SELECT CASE WHEN count(*)=3965 AND count(DISTINCT id)=3965 "
+            "AND count(*) FILTER (WHERE id<130 OR id=2048)=0 "
+            "AND count(*) FILTER (WHERE id>=256 AND id<384)=128 "
+            "THEN true ELSE error('overlapping mask publications changed visibility') END FROM lake.items"
+        )
+        native.finish()
+        checks.append("backdated flush masks conflict with concurrent flush and DELETE on the same source")
+        return {"active_masks": 2, "visible_rows": 3965}
+    finally:
+        M.stop(native)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["duckdb", "driver", "probe", "output-dir"]:
@@ -736,6 +774,7 @@ def main():
             ("versioned-puffin-mask", lambda d, r, c: versioned_delete_mask(d, r, c, vectors=True)),
             ("completed-mask-flush", completed_mask_flush),
             ("flush-before-completion", flush_before_complete_mask),
+            ("concurrent-mask-flush", concurrent_mask_flush),
             ("append-after-retirement", append_after_retirement),
             ("later-append", lambda d, r, c: crash(d, r, "retire_after_commit", c, append_after_restart=True)),
         ]

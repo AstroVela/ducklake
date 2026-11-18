@@ -745,7 +745,7 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 	delete_file.data_file_path = filename;
 	delete_file.data_file_id = data_file_info.file_id;
 	// check if the file already has deletes
-	auto existing_delete_data = delete_map->GetDeleteData(filename);
+	auto previous_deletes = delete_map->GetDeleteData(filename);
 
 	// check if we should use inlined file deletions instead of creating a delete file
 	if (data_file_info.file_id.IsValid()) {
@@ -760,40 +760,29 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 		}
 	}
 
-	if (existing_delete_data) {
+	if (previous_deletes) {
 		// deletes already exist for this file
-		auto &existing_deletes = existing_delete_data->deleted_rows;
+		auto &external = previous_deletes->external;
+		auto &existing_deletes = external.deleted_rows;
 
 		// we check if we need to write the snapshot information into our deletion file
 		// that basically happens if the file already has embedded snapshots
 		// or if it's a delete file from a different transaction (committed delete file)
-		bool write_with_snapshots =
-		    existing_delete_data->HasEmbeddedSnapshots() || data_file_info.delete_file_id.IsValid();
+		bool write_with_snapshots = external.HasEmbeddedSnapshots() || data_file_info.delete_file_id.IsValid();
 
 #ifdef DUCKLAKE_ENABLE_VORTEX
+		auto &inlined = previous_deletes->inlined;
 		if (write_with_snapshots && data_file_info.file_id.IsValid() &&
-		    sorted_deletes.size() + existing_deletes.size() >= data_file_info.row_count &&
-		    DuckLakeVortexIndex::CoversFile(transaction, table, data_file_info.file_id.index)) {
+		    data_file_info.file.data_format == DataFileFormat::VORTEX &&
+		    sorted_deletes.size() + existing_deletes.size() + inlined.size() >= data_file_info.row_count) {
 			auto complete = sorted_deletes;
 			complete.insert(existing_deletes.begin(), existing_deletes.end());
-			if (complete.size() == data_file_info.row_count) {
-				// An inline flush staged earlier in this transaction may have included these
-				// positions. Keep their original history in metadata if the flush is superseded.
-				auto snapshot = transaction.GetSnapshot();
-				auto inlined =
-				    transaction.GetMetadataManager().GetInlinedDeletionTableName(table.GetTableId(), snapshot);
-				if (!inlined.empty()) {
-					auto positions = transaction.Query(
-					    snapshot, StringUtil::Format("SELECT row_id FROM {METADATA_CATALOG}.%s "
-					                                 "WHERE file_id=%llu AND begin_snapshot<={SNAPSHOT_ID}",
-					                                 inlined, data_file_info.file_id.index));
-					if (positions->HasError()) {
-						positions->ThrowError();
-					}
-					for (auto &row : *positions) {
-						complete.erase(row.GetValue<idx_t>(0));
-					}
-				}
+			// Keep original inline history, including when this DELETE supersedes a staged flush.
+			for (auto pos : inlined) {
+				complete.erase(pos);
+			}
+			if (complete.size() + inlined.size() == data_file_info.row_count &&
+			    DuckLakeVortexIndex::CoversFile(transaction, table, data_file_info.file_id.index)) {
 				// Version the external positions at the actual commit and keep the predecessor.
 				sorted_deletes = std::move(complete);
 				auto &previous = delete_file.overwritten_delete_file;
@@ -804,8 +793,8 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 		}
 #endif
 		if (write_with_snapshots && !delete_file.overwritten_delete_file.retain_for_snapshots) {
-			FlushDeleteWithSnapshots(transaction, context, global_state, filename, data_file_info,
-			                         *existing_delete_data, sorted_deletes, delete_file);
+			FlushDeleteWithSnapshots(transaction, context, global_state, filename, data_file_info, external,
+			                         sorted_deletes, delete_file);
 			return;
 		}
 

@@ -85,6 +85,11 @@ struct DuckLakeDeleteFileWriter {
 };
 
 struct DuckLakeDeleteMap {
+	struct FileDeletes {
+		DuckLakeDeleteData external;
+		set<idx_t> inlined;
+	};
+
 	void AddExtendedFileInfo(DuckLakeFileListExtendedEntry file_entry) {
 		auto filename = file_entry.file.path;
 		file_map.emplace(std::move(filename), std::move(file_entry));
@@ -106,13 +111,13 @@ struct DuckLakeDeleteMap {
 		return &delete_entry->second;
 	}
 
-	optional_ptr<DuckLakeDeleteData> GetDeleteData(const string &filename) {
+	optional_ptr<FileDeletes> GetDeleteData(const string &filename) {
 		lock_guard<mutex> guard(lock);
 		auto entry = delete_data_map.find(filename);
 		if (entry == delete_data_map.end()) {
 			return nullptr;
 		}
-		return entry->second.get();
+		return &entry->second;
 	}
 
 	void ClearDeletes(const string &filename) {
@@ -120,15 +125,15 @@ struct DuckLakeDeleteMap {
 		delete_data_map.erase(filename);
 	}
 
-	void AddDeleteData(const string &filename, shared_ptr<DuckLakeDeleteData> delete_data) {
+	void AddDeleteData(const string &filename, const DuckLakeDeleteData &external, const set<idx_t> &inlined) {
 		lock_guard<mutex> guard(lock);
-		delete_data_map.emplace(filename, std::move(delete_data));
+		delete_data_map.emplace(filename, FileDeletes {external, inlined});
 	}
 
 private:
 	mutex lock;
 	unordered_map<string, DuckLakeFileListExtendedEntry> file_map;
-	unordered_map<string, shared_ptr<DuckLakeDeleteData>> delete_data_map;
+	unordered_map<string, FileDeletes> delete_data_map;
 };
 
 #ifdef DUCKLAKE_VANE_DISTRIBUTED
