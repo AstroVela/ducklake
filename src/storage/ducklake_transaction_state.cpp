@@ -1767,7 +1767,7 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 				res->GetErrorObject().Throw("Failed to flush changes into DuckLake: ");
 			}
 			bool flushed_inlined = !flushed_inlined_tables.empty();
-			context.flush_cache_if_pending();
+			context.before_commit();
 			commit_outcome = DuckLakeCommitOutcome::UNKNOWN;
 			context.commit_connection();
 			commit_outcome = DuckLakeCommitOutcome::COMMITTED;
@@ -1800,7 +1800,7 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 				// Add additional information on the number of retries and suggest to increase it
 				std::ostringstream error_message;
 				error_message << "Failed to commit DuckLake transaction." << '\n';
-				if (finished_retrying) {
+				if (finished_retrying && retry_config.max_retry_count) {
 					error_message << "Exceeded the maximum retry count of " << retry_config.max_retry_count
 					              << " set by the ducklake_max_retry_count setting." << '\n'
 					              << ". Consider increasing the value with: e.g., \"SET ducklake_max_retry_count = "

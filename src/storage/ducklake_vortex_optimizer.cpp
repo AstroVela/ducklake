@@ -14,8 +14,6 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/storage/object_cache.hpp"
-#include "duckdb/storage/storage_lock.hpp"
-#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <chrono>
@@ -113,47 +111,7 @@ struct MaintenanceCatalog {
 };
 
 MaintenanceCatalog ResolveMaintenanceCatalog(ClientContext &context, const string &name, bool write) {
-	auto &transaction = context.transaction;
-	const bool active_transaction = transaction.HasActiveTransaction();
-	if (write &&
-	    (!transaction.IsAutoCommit() || (active_transaction && transaction.ActiveTransaction().IsReadOnly()))) {
-		throw TransactionException("Vortex maintenance controls require autocommit");
-	}
-	auto &manager = DatabaseManager::Get(context);
-	auto resolve = [&](const string &alias) {
-		auto attached = manager.GetDatabase(alias);
-		if (active_transaction && manager.GetDatabase(context, alias).get() != attached.get()) {
-			throw TransactionException("Vortex maintenance caller attachment changed");
-		}
-		return attached;
-	};
-	auto lake = resolve(name);
-	if (!lake || lake->GetCatalog().GetCatalogType() != "ducklake") {
-		throw InvalidInputException("Vortex maintenance requires an attached DuckLake catalog");
-	}
-	auto &catalog = lake->GetCatalog().Cast<DuckLakeCatalog>();
-	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
-		throw InvalidInputException("Vortex maintenance requires native DuckDB metadata");
-	}
-	const auto &metadata_name = catalog.MetadataDatabaseName();
-	auto metadata = resolve(metadata_name);
-	if (!metadata || manager.GetDatabase(name) != lake || manager.GetDatabase(metadata_name) != metadata) {
-		throw TransactionException("Vortex maintenance catalog attachment changed");
-	}
-	if (active_transaction) {
-		auto caller_lake = transaction.ActiveTransaction().TryGetTransaction(*lake);
-		if (caller_lake) {
-			// A DuckLake transaction can retain its metadata attachment on a separate connection.
-			auto &metadata_context = *caller_lake->Cast<DuckLakeTransaction>().GetConnection().context;
-			if (manager.GetDatabase(metadata_context, metadata_name).get() != metadata.get()) {
-				throw TransactionException("Vortex maintenance caller metadata attachment changed");
-			}
-		}
-	}
-	if (write && (lake->IsReadOnly() || metadata->IsReadOnly())) {
-		throw TransactionException("Vortex maintenance controls require a writable DuckLake attachment");
-	}
-	return {name, {lake->oid, metadata->oid}};
+	return {name, VortexCatalog::ResolveCatalog(context, name, write, "Vortex maintenance")};
 }
 
 struct Maintenance {
@@ -454,7 +412,8 @@ vector<string> InlineSourceColumns(Metadata &meta, DuckLakeTableEntry &table, co
 
 void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> changes = nullptr,
            optional_ptr<const vector<FlushedInlinedTableInfo>> flushed = nullptr,
-           optional_ptr<const unordered_map<string, DataFileIndex>> dropped = nullptr) {
+           optional_ptr<const unordered_map<string, DataFileIndex>> dropped = nullptr,
+           optional_ptr<const DuckLakeVortexRewriteState> rewrite = nullptr) {
 	auto &table = Table(meta, p);
 	FlushConfiguration(*meta.connection.context, table);
 	auto snapshot = meta.transaction.GetSnapshot();
@@ -517,6 +476,17 @@ void Probe(Metadata &meta, Policy &p, optional_ptr<const LocalTableDataChanges> 
 	if (index) {
 		for (auto &file : index->files) {
 			covered.insert(file.id);
+		}
+	}
+	if (rewrite) {
+		if (!index || p.uuid != rewrite->table_uuid || p.config.index != rewrite->before.name ||
+		    revision != rewrite->before.revision) {
+			throw TransactionException("Vortex rewrite budget index identity changed");
+		}
+		for (auto id : rewrite->replaced) {
+			if (!covered.erase(id)) {
+				throw InvalidInputException("Vortex rewrite includes an uncovered source");
+			}
 		}
 	}
 	std::set<idx_t> replaced;
@@ -1156,7 +1126,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 
 struct Owner : public ObjectCacheEntry {
 	std::shared_ptr<Runtime> runtime = std::make_shared<Runtime>();
-	StorageLock write_admission;
+	DuckLakeVortexCollectionLock write_admission;
 	~Owner() override {
 		runtime->Stop();
 	}
@@ -1275,15 +1245,18 @@ void PendingInline(Metadata &meta, Policy &p, const vector<FlushedInlinedTableIn
 	}
 }
 
-void AddWrite(Policy &p, DuckLakeTableEntry &table, const LocalTableDataChanges &changes) {
+void AddWrite(Policy &p, DuckLakeTableEntry &table, const LocalTableDataChanges &changes,
+              optional_ptr<const DuckLakeVortexRewriteState> rewrite = nullptr) {
 	auto file = [&](const DuckLakeDataFile &data) {
 		if (data.format != DataFileFormat::VORTEX || !data.encryption_key.empty()) {
 			throw InvalidInputException("Vortex write budgets require unencrypted Vortex output");
 		}
 		p.source_rows += data.row_count;
 		p.source_bytes += data.file_size_bytes;
-		p.f_rows += data.row_count;
-		p.f_bytes += data.file_size_bytes;
+		if (!rewrite || data.file_name != rewrite->new_path) {
+			p.f_rows += data.row_count;
+			p.f_bytes += data.file_size_bytes;
+		}
 	};
 	for (auto &data : changes.new_data_files) {
 		file(data);
@@ -1336,31 +1309,37 @@ bool Grows(const LocalTableDataChanges &changes) {
 
 } // namespace
 
-unique_ptr<StorageLockKey>
+DuckLakeVortexCollectionLock &DuckLakeVortexOptimizer::WriteAdmissionLock(DatabaseInstance &db) {
+	return GetOwner(db)->write_admission;
+}
+
+unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
                                     unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard) {
+	auto rewrite = DuckLakeVortexRewriteState::Get(context);
+	auto interrupt = [&] {
+		if (context.IsInterrupted() || (rewrite && rewrite->caller->IsInterrupted())) {
+			throw InterruptException();
+		}
+	};
+	interrupt();
 	bool grows = false;
 	for (auto &entry : transaction.GetLocalChanges().Changes()) {
 		grows |= Grows(entry.GetTableChanges());
 	}
 	auto &catalog = transaction.GetCatalog();
-	unique_ptr<StorageLockKey> admission;
+	unique_ptr<DuckLakeVortexCollectionLock::Key> admission;
 	if (grows && (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb")) {
-		admission = GetOwner(*context.db)->write_admission.GetExclusiveLock();
-		if (context.IsInterrupted()) {
-			throw InterruptException();
-		}
+		admission = WriteAdmissionLock(*context.db).GetExclusiveLock(interrupt);
 	}
 	// Use the same admission/publication order as configuration, and keep coverage stable through commit.
-	publication_guard = VortexCatalog::PublicationLock().GetSharedLock([&] {
-		if (context.IsInterrupted()) {
-			throw InterruptException();
-		}
-	});
+	publication_guard = rewrite ? VortexCatalog::PublicationLock().GetExclusiveLock(interrupt)
+	                            : VortexCatalog::PublicationLock().GetSharedLock(interrupt);
 	if (!admission) {
 		return nullptr;
 	}
-	Metadata meta(*context.db, catalog.GetName(), false);
+	Metadata meta(*context.db, rewrite ? rewrite->catalog : catalog.GetName(), false,
+	              rewrite ? &rewrite->identity : nullptr);
 	try {
 		if (HasWriteBudgetTable(meta)) {
 			for (auto &entry : transaction.GetLocalChanges().Changes()) {
@@ -1385,16 +1364,15 @@ DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientCont
 				if (table.GetTableId() != entry.GetTableIndex()) {
 					throw InvalidInputException("Vortex write budget table identity changed");
 				}
-				Probe(meta, p, &changes, &transaction.GetFlushedInlinedTables(), &transaction.GetDroppedFiles());
+				Probe(meta, p, &changes, &transaction.GetFlushedInlinedTables(), &transaction.GetDroppedFiles(),
+				      rewrite.get());
 				PendingInline(meta, p, transaction.GetFlushedInlinedTables());
-				AddWrite(p, table, changes);
+				AddWrite(p, table, changes, rewrite.get());
 				CheckWriteBudget(p, ReadBudget(*row, 0, 2));
 			}
 		}
 		meta.Commit();
-		if (context.IsInterrupted()) {
-			throw InterruptException();
-		}
+		interrupt();
 		return admission;
 	} catch (...) {
 		VortexCatalog::Rollback(meta.connection);
@@ -1410,13 +1388,14 @@ void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const strin
 	    !budget.unindexed_bytes || budget.unindexed_bytes > SOURCE_LIMIT) {
 		throw InvalidInputException("Invalid Vortex write budget limits");
 	}
-	auto owner = GetOwner(*context.db);
-	auto admission = owner->write_admission.GetExclusiveLock();
-	auto publication = VortexCatalog::PublicationLock().GetSharedLock([&] {
+	auto interrupt = [&] {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-	});
+	};
+	auto owner = GetOwner(*context.db);
+	auto admission = owner->write_admission.GetExclusiveLock(interrupt);
+	auto publication = VortexCatalog::PublicationLock().GetSharedLock(interrupt);
 	std::lock_guard<std::mutex> guard(owner->runtime->io);
 	if (context.IsInterrupted()) {
 		throw InterruptException();
@@ -1454,7 +1433,11 @@ void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalo
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex optimizer catalog requires an idle dedicated connection");
 	}
-	auto admission = GetOwner(*owner.context->db)->write_admission.GetExclusiveLock();
+	auto admission = WriteAdmissionLock(*owner.context->db).GetExclusiveLock([&] {
+		if (owner.context->IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
 	try {
 		auto &transaction = VortexCatalog::Begin(owner, catalog);
 		VortexCatalog::Initialized(transaction);

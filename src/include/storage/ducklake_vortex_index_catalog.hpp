@@ -4,6 +4,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include <functional>
 
 namespace duckdb {
@@ -11,6 +12,8 @@ class DuckLakeTransaction;
 class DuckLakeTableEntry;
 class ExtensionLoader;
 class ClientContext;
+struct DuckLakeSnapshot;
+struct DuckLakeVortexRewriteState;
 
 class DuckLakeVortexCollectionLock {
 	struct State;
@@ -32,6 +35,7 @@ public:
 	unique_ptr<Key> GetSharedLock(const std::function<void()> &check);
 	unique_ptr<Key> TryGetSharedLock();
 	idx_t SharedWaitCount() const;
+	idx_t WaitingWriterCount() const;
 	unique_ptr<Key> GetExclusiveLock(const std::function<void()> &check);
 	unique_ptr<Key> TryGetExclusiveLock();
 
@@ -68,6 +72,9 @@ struct DuckLakeVortexIndexSegment {
 
 struct DuckLakeVortexIndex {
 	static constexpr idx_t MAX_SEGMENTS = 3;
+	static const char *RewriteSourcePrefix() {
+		return "ducklake-vortex-rewrite-";
+	}
 	string name;
 	idx_t revision;
 	uint32_t field_id;
@@ -84,6 +91,9 @@ struct DuckLakeVortexIndex {
 	vector<string> SmallestSegments() const;
 	static DuckLakeVortexCollectionLock &PublicationLock();
 	static DuckLakeVortexCollectionLock &CollectionLock();
+	static DuckLakeVortexCatalogIdentity ResolveCatalog(ClientContext &context, const string &name, bool write,
+	                                                    const char *operation);
+	static void CheckCatalogIdentity(DuckLakeTransaction &transaction, const DuckLakeVortexCatalogIdentity &identity);
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog,
 	                                  optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);
 	static void Rollback(Connection &owner);
@@ -119,6 +129,30 @@ struct DuckLakeVortexIndex {
 	                const string &expected_table_uuid = "", optional_idx expected_field_id = optional_idx(),
 	                DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
 	                const vector<string> &merge_generations = {});
+	static DuckLakeVortexIndex Rewrite(ClientContext &context, const string &catalog, const string &schema,
+	                                   const string &table, const string &index, const string &generation,
+	                                   const string &reference, idx_t expected_revision,
+	                                   const std::function<void(const string &)> &observe = nullptr);
+	static void CheckRewriteCommit(ClientContext &context, DuckLakeTransaction &transaction);
+	static void PublishRewrite(ClientContext &context, DuckLakeTransaction &transaction,
+	                           const DuckLakeSnapshot &snapshot);
+	static string StageRewriteInput(DuckLakeVortexRewriteState &plan, idx_t file_id, const string &uri, idx_t rows);
+};
+
+struct DuckLakeVortexRewriteState : public ClientContextState {
+	static shared_ptr<DuckLakeVortexRewriteState> Get(ClientContext &context);
+	string catalog, schema, table, table_uuid, build_id, selected, reference, workspace, private_path, source_root,
+	    new_path;
+	optional_ptr<ClientContext> caller;
+	DuckLakeVortexCatalogIdentity identity;
+	idx_t table_id = 0, snapshot_id = 0, schema_version = 0, new_file_id = 0;
+	idx_t copy_plans = 0, new_rows = 0, new_bytes = 0;
+	idx_t staged_source_bytes = 0;
+	vector<string> staged_inputs;
+	vector<idx_t> replaced;
+	vector<DuckLakeVortexIndexFile> selected_files;
+	DuckLakeVortexIndex before, candidate;
+	std::function<void(const string &)> check;
 };
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader);

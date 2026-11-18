@@ -26,6 +26,9 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#ifdef DUCKLAKE_ENABLE_VORTEX
+#include "storage/ducklake_vortex_index_catalog.hpp"
+#endif
 
 namespace duckdb {
 
@@ -176,6 +179,23 @@ SinkFinalizeType DuckLakeCompaction::Finalize(Pipeline &pipeline, Event &event, 
 		compaction_entry.written_file = global_state.written_files[0];
 	}
 	compaction_entry.type = type;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	auto rewrite = DuckLakeVortexRewriteState::Get(context);
+	if (rewrite) {
+		if (type != CompactionType::REWRITE_DELETES || table.GetTableId().index != rewrite->table_id ||
+		    global_state.written_files.size() != 1 || !rewrite->replaced.empty()) {
+			throw InvalidInputException("Vortex rewrite requires one nonempty source compaction");
+		}
+		for (auto &file : source_files) {
+			rewrite->replaced.push_back(file.file.id.index);
+		}
+		rewrite->new_rows = compaction_entry.written_file.row_count;
+		rewrite->new_bytes = compaction_entry.written_file.file_size_bytes;
+		compaction_entry.written_file.file_name = rewrite->new_path;
+		// The registered rewrite collector verifies ownership of this path after rollback.
+		compaction_entry.written_file.created_by_ducklake = false;
+	}
+#endif
 
 	auto &transaction = DuckLakeTransaction::Get(context, global_state.table.catalog);
 	transaction.AddCompaction(global_state.table.GetTableId(), std::move(compaction_entry));
@@ -269,6 +289,23 @@ void DuckLakeCompactor::GenerateCompactions(DuckLakeTableEntry &table,
 	// FIXME: pass in the sort_data so that list of files is approximately sorted in the same way
 	// (sorted by the min/max metadata)
 	auto files = metadata_manager.GetFilesForCompaction(table, type, delete_threshold, snapshot, filter_options);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	auto rewrite = DuckLakeVortexRewriteState::Get(context);
+	if (rewrite) {
+		if (type != CompactionType::REWRITE_DELETES || table.GetTableId().index != rewrite->table_id) {
+			throw InvalidInputException("Vortex rewrite table or compaction type mismatch");
+		}
+		auto &selected = rewrite->selected_files;
+		files.erase(std::remove_if(files.begin(), files.end(),
+		                           [&](const DuckLakeCompactionFileEntry &file) {
+			                           return std::none_of(selected.begin(), selected.end(),
+			                                               [&](const DuckLakeVortexIndexFile &part) {
+				                                               return part.id == file.file.id.index;
+			                                               });
+		                           }),
+		            files.end());
+	}
+#endif
 
 	// iterate over the files and split into separate compaction groups
 	compaction_map_t<DuckLakeCompactionCandidates> candidates;
@@ -475,6 +512,9 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	// set the files to scan as only the files we are trying to compact
 	vector<DuckLakeFileListEntry> files_to_scan;
 	vector<DuckLakeCompactionFileEntry> actionable_source_files;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	auto rewrite = DuckLakeVortexRewriteState::Get(context);
+#endif
 	for (auto &source : source_files) {
 		DuckLakeFileListEntry result;
 		result.file = source.file.data;
@@ -503,6 +543,12 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 		default:
 			throw InternalException("Invalid Compaction Type");
 		}
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (rewrite) {
+			result.file.path = DuckLakeVortexIndex::StageRewriteInput(*rewrite, source.file.id.index, result.file.path,
+			                                                          source.file.row_count);
+		}
+#endif
 		actionable_source_files.push_back(source);
 		// check if this file is adjacent (row-id wise) to the previous file
 		if (!source.file.row_id_start.IsValid()) {
@@ -636,6 +682,14 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	auto &fs = FileSystem::GetFileSystem(context);
 	copy->file_path =
 	    copy_options.filename_pattern.CreateFilename(fs, copy_options.file_path, copy_options.file_extension, 0);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	if (rewrite) {
+		if (rewrite->copy_plans++) {
+			throw InvalidInputException("Vortex rewrite requires one schema and partition group");
+		}
+		copy->file_path = rewrite->private_path;
+	}
+#endif
 	copy->use_tmp_file = copy_options.use_tmp_file;
 	copy->filename_pattern = std::move(copy_options.filename_pattern);
 	copy->file_extension = std::move(copy_options.file_extension);
