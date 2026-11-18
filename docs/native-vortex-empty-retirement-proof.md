@@ -11,8 +11,10 @@ Native DELETE retains a complete delete mask for a committed source covered by
 an index. The indexed file stays active, so current queries preserve coverage
 and return only visible rows while retirement is pending. When an existing
 external mask is completed, the prior descriptor ends at the actual DELETE
-commit and remains available to historical snapshots. Change feeds compare
-the new mask with its predecessor to report the newly deleted positions.
+commit and remains available to historical snapshots. Change feeds combine
+each Vortex file's mask versions and inline deletes by position to find the
+first deletion before applying the requested snapshot interval. A flat mask
+uses its delete commit even when the data file embeds row insertion snapshots.
 The completion check counts the union of external masks, inline deletes and
 the current DELETE's positions. Inline deletes keep their original snapshots.
 Expiry retains the predecessor while the successor still serves a retained

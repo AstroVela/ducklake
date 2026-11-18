@@ -65,6 +65,8 @@ public:
 	                                                   optional_idx source_rows = optional_idx());
 
 private:
+	void InitializeVortexDeletionScan(ClientContext &context, const DuckLakeDeleteScanEntry &delete_scan);
+
 	//! Scan the data file to get the global row_ids at specific file positions
 	//! Returns a map from file_position to global_row_id
 	static unordered_map<idx_t, idx_t> ScanDataFileRowIds(ClientContext &context, const DuckLakeFileData &data_file,

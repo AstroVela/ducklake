@@ -380,7 +380,47 @@ void DuckLakeDeleteFilter::PopulateSnapshotMapFromPositions(
 	}
 }
 
+void DuckLakeDeleteFilter::InitializeVortexDeletionScan(ClientContext &context,
+                                                        const DuckLakeDeleteScanEntry &delete_scan) {
+	auto first_deletion = delete_scan.inlined_file_deletions;
+	auto record = [&](idx_t position, idx_t snapshot) {
+		auto entry = first_deletion.emplace(position, snapshot);
+		entry.first->second = MinValue(entry.first->second, snapshot);
+	};
+	for (auto &mask : delete_scan.vortex_masks) {
+		auto deletes =
+		    ScanDeleteFile(context, mask.file, optional_idx(), delete_scan.end_snapshot, delete_scan.row_count);
+		for (idx_t i = 0; i < deletes.deleted_rows.size(); i++) {
+			auto snapshot = deletes.has_embedded_snapshots ? deletes.snapshot_ids[i] : mask.begin_snapshot;
+			record(deletes.deleted_rows[i], snapshot);
+		}
+	}
+	if (delete_scan.vortex_drop_snapshot.IsValid()) {
+		for (idx_t position = 0; position < delete_scan.row_count; position++) {
+			record(position, delete_scan.vortex_drop_snapshot.GetIndex());
+		}
+	}
+	// Find each position's earliest delete before applying the requested snapshot range.
+	auto start_snapshot = delete_scan.start_snapshot.GetIndex();
+	auto end_snapshot = delete_scan.end_snapshot.GetIndex();
+	for (idx_t position = 0; position < delete_scan.row_count; position++) {
+		auto entry = first_deletion.find(position);
+		if (entry != first_deletion.end() && entry->second >= start_snapshot && entry->second <= end_snapshot) {
+			continue;
+		}
+		delete_data->deleted_rows.push_back(position);
+		if (entry != first_deletion.end()) {
+			first_deletion.erase(entry);
+		}
+	}
+	PopulateSnapshotMapFromPositions(context, delete_scan.file, first_deletion);
+}
+
 void DuckLakeDeleteFilter::Initialize(ClientContext &context, const DuckLakeDeleteScanEntry &delete_scan) {
+	if (delete_scan.file.data_format == DataFileFormat::VORTEX) {
+		InitializeVortexDeletionScan(context, delete_scan);
+		return;
+	}
 	// Scanning deletes - we need to scan the opposite (i.e. only the rows that were deleted)
 	// rows_to_scan[i] = true means row i was deleted and should be returned
 	auto rows_to_scan = make_unsafe_uniq_array<bool>(delete_scan.row_count);

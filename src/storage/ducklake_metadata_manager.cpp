@@ -1905,12 +1905,17 @@ vector<DuckLakeDeleteScanEntry> DuckLakeMetadataManager::GetTableDeletions(DuckL
 	if (has_inlined_table) {
 		query = StringUtil::Format(R"(
 WITH inlined_dels AS (
-	SELECT file_id,
-	       LIST(STRUCT_PACK(row_id := row_id, snapshot_id := begin_snapshot)) as deletions,
-	       MIN(begin_snapshot) as min_snapshot
-	FROM {METADATA_CATALOG}.%s
-	WHERE begin_snapshot >= %d AND begin_snapshot <= {SNAPSHOT_ID}
-	GROUP BY file_id
+	SELECT del.file_id,
+	       LIST(STRUCT_PACK(row_id := del.row_id, snapshot_id := del.begin_snapshot)) AS deletions,
+	       MIN(del.begin_snapshot) AS min_snapshot,
+	       MAX(del.begin_snapshot) AS max_snapshot
+	FROM {METADATA_CATALOG}.%s del
+	JOIN {METADATA_CATALOG}.ducklake_data_file data ON data.data_file_id = del.file_id
+	WHERE del.begin_snapshot <= {SNAPSHOT_ID} AND (
+	    (data.file_format = 'vortex' AND (data.end_snapshot IS NULL OR del.begin_snapshot < data.end_snapshot))
+	    OR (data.file_format IS DISTINCT FROM 'vortex' AND del.begin_snapshot >= %d)
+	)
+	GROUP BY del.file_id
 ),
 main_results AS (
 )",
@@ -1921,8 +1926,7 @@ main_results AS (
 
 	// Main query: partial deletes from delete_file table and full file deletes
 	query += StringUtil::Format(R"(
-SELECT %s, current_delete.begin_snapshot,
-       coalesce(previous_delete.end_snapshot = current_delete.begin_snapshot, false) AS versioned_delete FROM (
+SELECT %s, current_delete.begin_snapshot, false AS file_dropped FROM (
 	SELECT data_file_id, begin_snapshot, path, path_is_relative, file_size_bytes, footer_size, encryption_key, format
 	FROM {METADATA_CATALOG}.ducklake_delete_file
 	WHERE table_id = %d AND begin_snapshot <= {SNAPSHOT_ID}
@@ -1930,7 +1934,6 @@ SELECT %s, current_delete.begin_snapshot,
 LEFT JOIN LATERAL (
 	SELECT DISTINCT ON (data_file_id)
 		data_file_id,
-		end_snapshot,
 		path,
 		path_is_relative,
 		file_size_bytes,
@@ -1938,8 +1941,7 @@ LEFT JOIN LATERAL (
 		encryption_key,
 		format
 	FROM {METADATA_CATALOG}.ducklake_delete_file
-	WHERE table_id = %d AND (begin_snapshot < %d OR
-	      (end_snapshot = current_delete.begin_snapshot AND begin_snapshot < current_delete.begin_snapshot))
+	WHERE table_id = %d AND begin_snapshot < %d
 	ORDER BY data_file_id, begin_snapshot DESC
 ) AS previous_delete
 USING (data_file_id)
@@ -1952,7 +1954,7 @@ USING (data_file_id)
 
 UNION ALL
 
-SELECT %s, data.end_snapshot, false FROM (
+SELECT %s, data.end_snapshot, true FROM (
 	SELECT *
 	FROM {METADATA_CATALOG}.ducklake_data_file data
 	WHERE table_id = %d AND end_snapshot >= %d AND end_snapshot <= {SNAPSHOT_ID}
@@ -1994,7 +1996,7 @@ SELECT data.data_file_id, %s, data.row_id_start, data.record_count, data.mapping
        inlined_dels.min_snapshot, false
 FROM {METADATA_CATALOG}.ducklake_data_file data
 JOIN inlined_dels ON data.data_file_id = inlined_dels.file_id
-WHERE data.table_id = %d
+WHERE data.table_id = %d AND inlined_dels.max_snapshot >= %d
   AND data.data_file_id NOT IN (
       SELECT data_file_id FROM {METADATA_CATALOG}.ducklake_delete_file
       WHERE table_id = %d AND begin_snapshot <= {SNAPSHOT_ID}
@@ -2002,7 +2004,7 @@ WHERE data.table_id = %d
   AND (data.end_snapshot IS NULL OR data.end_snapshot < %d OR data.end_snapshot > {SNAPSHOT_ID}%s)
 )",
 		                            GetFileSelectList("data"), null_file_cols, null_file_cols, table_id.index,
-		                            table_id.index, start_snapshot.snapshot_id,
+		                            start_snapshot.snapshot_id, table_id.index, start_snapshot.snapshot_id,
 		                            physical_retirement.empty() ? "" : " OR " + physical_retirement);
 	}
 
@@ -2012,7 +2014,7 @@ WHERE data.table_id = %d
 )
 SELECT main_results.*, inlined_dels.deletions
 FROM main_results
-LEFT JOIN inlined_dels ON main_results.data_file_id = inlined_dels.file_id AND NOT main_results.versioned_delete
+LEFT JOIN inlined_dels ON main_results.data_file_id = inlined_dels.file_id
 )";
 	} else {
 		query += R"(
@@ -2029,6 +2031,7 @@ FROM main_results
 
 	// Build entries from the unified query result
 	vector<DuckLakeDeleteScanEntry> files;
+	unordered_map<idx_t, idx_t> vortex_sources;
 	for (auto &row : *result) {
 		DuckLakeDeleteScanEntry entry;
 		idx_t col_idx = 0;
@@ -2047,10 +2050,25 @@ FROM main_results
 		entry.delete_file = ReadDeleteFile(table, row, col_idx, IsEncrypted());
 		entry.previous_delete_file = ReadDeleteFile(table, row, col_idx, IsEncrypted());
 		entry.snapshot_id = row.GetValue<idx_t>(col_idx++);
-		col_idx++; // versioned_delete
+		auto file_dropped = row.GetValue<bool>(col_idx++);
 		// store the snapshot range for filtering embedded snapshot IDs
 		entry.start_snapshot = start_snapshot.snapshot_id;
 		entry.end_snapshot = end_snapshot.snapshot_id;
+		if (entry.file.data_format == DataFileFormat::VORTEX) {
+			// Fold every retained descriptor into the scan of its physical source.
+			auto source = vortex_sources.emplace(file_id, files.size());
+			auto &scan = source.second ? entry : files[source.first->second];
+			if (!entry.delete_file.path.empty()) {
+				scan.vortex_masks.push_back({std::move(entry.delete_file), entry.snapshot_id.GetIndex()});
+			}
+			if (file_dropped) {
+				scan.vortex_drop_snapshot = entry.snapshot_id;
+			}
+			if (!source.second) {
+				// Each metadata row for the same file has the same inlined history.
+				continue;
+			}
+		}
 
 		// Parse inlined file deletions from the LIST column (last column)
 		if (!row.IsNull(col_idx)) {
@@ -2060,7 +2078,8 @@ FROM main_results
 				auto &struct_children = StructValue::GetChildren(child);
 				auto row_id = struct_children[0].GetValue<idx_t>();
 				auto snapshot_id = struct_children[1].GetValue<idx_t>();
-				entry.inlined_file_deletions[row_id] = snapshot_id;
+				auto position = entry.inlined_file_deletions.emplace(row_id, snapshot_id);
+				position.first->second = MinValue(position.first->second, snapshot_id);
 			}
 		}
 
