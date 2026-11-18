@@ -545,6 +545,9 @@ def overlapping_deletes(driver, root, checks, vectors=False):
             "AND (SELECT count(*) FROM lake.items)=3968 "
             "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file "
             f"WHERE end_snapshot IS NULL AND delete_count=128 AND format='{mask}')=1 "
+            "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1 i "
+            "JOIN __ducklake_metadata_lake.ducklake_delete_file d ON i.file_id=d.data_file_id "
+            "WHERE d.end_snapshot IS NULL AND i.row_id=50)=1 "
             "THEN true ELSE error('active delete masks do not hide the exact union of deleted rows') END"
         )
         configure(native, 129, 1)
