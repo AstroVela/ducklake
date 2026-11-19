@@ -1527,9 +1527,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Create(ClientContext &context, const st
 		auto &transaction = Begin(owner, catalog_name, &identity);
 		Initialized(transaction);
 		auto &catalog = transaction.GetCatalog();
-		auto entry = catalog.GetEntry(*owner.context, CatalogType::TABLE_ENTRY, schema, table_name,
-		                              OnEntryNotFound::THROW_EXCEPTION);
-		auto &table = entry->Cast<DuckLakeTableEntry>();
+		auto &table =
+		    catalog.GetEntry<TableCatalogEntry>(*owner.context, schema, table_name).Cast<DuckLakeTableEntry>();
 		DuckLakeVortex::ValidateTable(table);
 		if (DuckLakeVortex::GetFormat(*owner.context, table) != DataFileFormat::VORTEX ||
 		    table.GetColumns().PhysicalColumnCount() != 4 || table.GetColumns().LogicalColumnCount() != 4) {
@@ -1538,7 +1537,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Create(ClientContext &context, const st
 		for (auto name : {"id", "category", "payload"}) {
 			DuckLakeVortexReadView::ResolveField(table, name);
 		}
-		auto &embedding = DuckLakeVortexReadView::ResolveField(table, "embedding");
+		// QueryEnd releases schema pins. Own the field ID and UUID needed after the emptiness check.
+		auto field_id = DuckLakeVortexReadView::ResolveField(table, "embedding").GetFieldIndex().index;
 		auto uuid = table.GetTableUUID();
 		auto existing = Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
 		                                       " WHERE table_uuid=" + Value(uuid).ToSQLString() +
@@ -1577,7 +1577,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Create(ClientContext &context, const st
 		DuckLakeVortexIndex result;
 		result.name = name;
 		result.revision = 1;
-		result.field_id = embedding.GetFieldIndex().index;
+		result.field_id = field_id;
 		result.dimension = dimension;
 		result.root = canonical_root;
 		DuckLakeVortexOptimizer::CheckIndexDefinition(transaction, uuid, result);

@@ -111,13 +111,14 @@ The proof exercises 11 stages: empty, committed T, hidden uncommitted writes,
 atomic update/delete/insert, small F, F during first build, concurrent F/T,
 first B/F/T, mutations beside B, second independent B, and reopen after SIGKILL
 with nonempty metadata WAL. An old T view preserves original typed versions
-through flush, indexing and restart. Native row IDs survive materialization;
-the second B leaves the first descriptor and artifact signature unchanged.
+through flush, indexing and restart. The proof compares typed SQL rows and
+native row IDs across materialization and restart. The second B preserves the
+first descriptor and artifact signature.
 
 The process proof also cancels a create while it is waiting for the
 publication lock, then checks the catalog before creating the index.
 `native_vortex_basic_flow.test` covers writable autocommit admission,
-format rollback, directory validation, dimension conflicts in both setup
-orders, prepared queries across T/F/B and row IDs after reopen. The proof
+format rollback, table type, directory validation, dimension conflicts in
+both setup orders, prepared queries across T/F/B, and row IDs across flush. The proof
 uses the existing manifest-v3 representation, query tolerances and
 write and maintenance budgets.

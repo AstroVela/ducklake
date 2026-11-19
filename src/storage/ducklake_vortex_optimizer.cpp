@@ -364,8 +364,7 @@ DuckLakeTableEntry &Table(Metadata &meta, Policy &p) {
 	auto &catalog = meta.transaction.GetCatalog();
 	optional_ptr<CatalogEntry> entry;
 	if (p.uuid.empty()) {
-		entry = catalog.GetEntry(*meta.connection.context, CatalogType::TABLE_ENTRY, p.config.schema, p.config.table,
-		                         OnEntryNotFound::THROW_EXCEPTION);
+		entry = &catalog.GetEntry<TableCatalogEntry>(*meta.connection.context, p.config.schema, p.config.table);
 	} else {
 		auto snapshot = meta.transaction.GetSnapshot();
 		auto identity = meta.transaction.Query(

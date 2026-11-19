@@ -18,6 +18,14 @@ statement ok
 SELECT * FROM ducklake_initialize_vortex_indexes('lake')
 
 statement ok
+CREATE VIEW lake.items_view AS SELECT * FROM lake.items
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items_view','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+items_view is not an table
+
+statement ok
 BEGIN
 
 statement ok
@@ -73,6 +81,14 @@ SELECT revision FROM ducklake_create_vortex_index('lake','main','items','knn','_
 
 statement ok
 SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement error
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items_view','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,100000,4194304,100000,67108864)
+----
+items_view is not an table
+
+statement ok
+DROP VIEW lake.items_view
 
 query III
 SELECT (SELECT count(*) FROM ducklake_vortex_generation_status('lake')),(SELECT count(*) FROM ducklake_vortex_build_status('lake')),array_length(regexp_extract_all(reference,'"generation":"[^"]+"')) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
