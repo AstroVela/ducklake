@@ -731,7 +731,7 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 	ctx.get_inlined_table_names = [this](TableIndex table_id) {
 		return LookupInlinedTableNames(table_id);
 	};
-	ctx.get_net_data_file_row_count = [this](TableIndex table_id) -> idx_t {
+	ctx.get_exact_data_file_row_count = [this](TableIndex table_id) -> optional_idx {
 		// The inlined-file-deletion table is deterministically named but created lazily.
 		// Probe its existence; if absent, the SQL omits the inlined-deletion subterm.
 		auto inlined_deletion_table = DuckLakeMetadataManager::InlinedFileDeletionTableName(table_id);
@@ -743,12 +743,15 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 			inlined_deletion_table.clear();
 		}
 		auto sql = SubstitutePlaceholders(
-		    DuckLakeMetadataManager::GetNetDataFileRowCountSql(table_id, inlined_deletion_table), transaction_snapshot);
-		auto result = RunQuery(sql, "read net data file row count");
+		    DuckLakeMetadataManager::GetExactDataFileRowCountSql(table_id, inlined_deletion_table),
+		    transaction_snapshot);
+		auto result = RunQuery(sql, "read exact data file row count");
 		for (auto &row : *result) {
-			return row.GetValue<idx_t>(0);
+			if (!row.IsNull(0)) {
+				return row.GetValue<idx_t>(0);
+			}
 		}
-		return 0;
+		return optional_idx();
 	};
 	ctx.get_net_inlined_row_count = [this](TableIndex table_id) -> idx_t {
 		idx_t total = 0;
