@@ -321,6 +321,13 @@ jobs:
             --driver build/index-shell/ducklake_vortex_catalog_driver \
             --probe build/index-cargo/ci/ducklake-vortex-index-probe \
             --output-dir build/index-logs/sparse-rewrite
+      - name: Validate atomic empty-file pruning and retained B sources
+        run: |
+          python3 -I test/vane/test_native_vortex_prune_files.py \
+            --duckdb build/index-shell/duckdb \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --probe build/index-cargo/ci/ducklake-vortex-index-probe \
+            --output-dir build/index-logs/prune-files
       - name: Validate query projections and record isolated process cost
         run: |
           python3 -I test/vane/test_native_vortex_cost.py \

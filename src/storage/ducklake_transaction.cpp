@@ -1051,7 +1051,7 @@ TransactionChangeInformation DuckLakeTransaction::GetTransactionChanges() const 
 	}
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	auto rewrite = DuckLakeVortexRewriteState::Get(*context.lock());
-	if (rewrite && rewrite->retire) {
+	if (rewrite && (rewrite->retire || rewrite->prune)) {
 		changes.tables_rewrite_delete.insert(TableIndex(rewrite->table_id));
 	}
 #endif
@@ -2003,7 +2003,7 @@ void DuckLakeTransaction::DropFile(TableIndex table_id, DataFileIndex data_file_
 	bool logical_delete = true;
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	auto rewrite = DuckLakeVortexRewriteState::Get(*context.lock());
-	logical_delete = !rewrite || !rewrite->retire;
+	logical_delete = !rewrite || (!rewrite->retire && !rewrite->prune);
 #endif
 	if (logical_delete) {
 		state->tables_deleted_from.insert(table_id);
