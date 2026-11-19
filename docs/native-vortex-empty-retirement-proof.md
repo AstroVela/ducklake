@@ -16,6 +16,8 @@ each Vortex file's mask versions and inline deletes by position to find the
 first deletion before applying the requested snapshot interval. A flat mask
 uses its delete commit even when the data file embeds row insertion snapshots.
 SQL predicates on deletion scans run after the per-row snapshots are assigned.
+The reader uses physical file positions to assign snapshots to separate
+versions of a logical row stored in the same file after flush.
 The completion check counts the union of external masks, inline deletes and
 the current DELETE's positions. Inline deletes keep their original snapshots.
 Expiry retains the predecessor while the successor still serves a retained

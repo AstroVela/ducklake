@@ -290,64 +290,6 @@ shared_ptr<BaseFileReader> DuckLakeVortex::CreateReader(ClientContext &context, 
 #endif
 }
 
-unordered_map<idx_t, idx_t> DuckLakeVortex::ScanRowIds(ClientContext &context, const DuckLakeFileData &file,
-                                                       const unordered_set<idx_t> &file_positions) {
-	ValidateEnabled();
-#ifdef DUCKLAKE_ENABLE_VORTEX
-	unordered_map<idx_t, idx_t> result;
-	TableFunction scan;
-	vector<LogicalType> types;
-	vector<string> names;
-	auto bind_data = BindVortexFile(context, file.path, scan, types, names);
-	optional_idx row_id_column;
-	for (idx_t i = 0; i < names.size(); i++) {
-		if (names[i] == "_ducklake_internal_row_id") {
-			if (types[i] != LogicalType::BIGINT) {
-				throw InvalidInputException("Vortex file has an invalid DuckLake row-id type");
-			}
-			row_id_column = i;
-			break;
-		}
-	}
-	if (!row_id_column.IsValid()) {
-		return result;
-	}
-	vector<column_t> ids {row_id_column.GetIndex(), MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
-	TableFunctionInitInput init(bind_data.get(), std::move(ids), {}, nullptr);
-	auto global = scan.init_global(context, init);
-	ThreadContext thread(context);
-	ExecutionContext execution(context, thread, nullptr);
-	auto local = scan.init_local(execution, init, global.get());
-	DataChunk chunk;
-	chunk.Initialize(context, {LogicalType::BIGINT, LogicalType::UBIGINT});
-	idx_t row_offset = 0;
-	while (true) {
-		chunk.Reset();
-		TableFunctionInput input(bind_data.get(), local.get(), global.get());
-		scan.function(context, input, chunk);
-		if (chunk.size() == 0) {
-			break;
-		}
-		for (idx_t i = 0; i < chunk.size(); i++) {
-			auto position = chunk.GetValue(1, i).GetValue<idx_t>();
-			if (position != row_offset + i) {
-				throw InvalidInputException("Vortex scan did not preserve physical row order");
-			}
-			if (file_positions.count(position)) {
-				auto row_id = chunk.GetValue(0, i);
-				if (!row_id.IsNull()) {
-					result.emplace(position, row_id.GetValue<idx_t>());
-				}
-			}
-		}
-		row_offset += chunk.size();
-	}
-	return result;
-#else
-	throw InternalException("Vortex support is disabled");
-#endif
-}
-
 void DuckLakeVortex::ValidateTable(DuckLakeTableEntry &table) {
 	ValidateEnabled();
 #ifdef DUCKLAKE_ENABLE_VORTEX

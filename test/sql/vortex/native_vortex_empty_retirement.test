@@ -229,4 +229,48 @@ SELECT revision FROM ducklake_retire_vortex_index_segment('lake','main','named_f
 2
 
 statement ok
+CREATE TABLE lake.row_versions(id INTEGER, val INTEGER)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'row_versions')
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'row_versions')
+
+statement ok
+INSERT INTO lake.row_versions VALUES (1,10)
+
+statement ok
+UPDATE lake.row_versions SET val=20 WHERE id=1
+
+statement ok
+SET VARIABLE version_update=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'row_versions')
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'row_versions')
+
+statement ok
+DELETE FROM lake.row_versions
+
+statement ok
+SET VARIABLE version_delete=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+# Both row versions share a logical row ID but have separate positions and deletion snapshots.
+query IIIT
+SELECT file_row_number,rowid,val,CASE WHEN snapshot_id=getvariable('version_update') THEN 'update' WHEN snapshot_id=getvariable('version_delete') THEN 'delete' ELSE 'unexpected' END FROM ducklake_table_deletions('lake','main','row_versions',getvariable('version_update'),getvariable('version_delete')) ORDER BY val
+----
+0	0	10	update
+1	0	20	delete
+
+query TTI
+SELECT change_type,CASE WHEN snapshot_id=getvariable('version_update') THEN 'update' WHEN snapshot_id=getvariable('version_delete') THEN 'delete' ELSE 'unexpected' END,val FROM ducklake_table_changes('lake','main','row_versions',getvariable('version_update'),getvariable('version_delete')) ORDER BY snapshot_id,change_type
+----
+update_postimage	update	20
+update_preimage	update	10
+delete	delete	20
+
+statement ok
 DETACH lake
