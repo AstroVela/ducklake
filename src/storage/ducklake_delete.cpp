@@ -16,6 +16,10 @@
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "storage/ducklake_delete.hpp"
+#ifdef DUCKLAKE_ENABLE_VORTEX
+#include "storage/ducklake_metadata_manager.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
+#endif
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_schema_entry.hpp"
 #include "common/ducklake_data_file.hpp"
@@ -590,6 +594,12 @@ bool DuckLakeDelete::TryDropFullyDeletedFile(DuckLakeTransaction &transaction, c
 	if (delete_count != data_file_info.row_count) {
 		return false;
 	}
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	if (delete_file.data_file_id.IsValid() &&
+	    DuckLakeVortexIndex::CoversFile(transaction, table, delete_file.data_file_id.index)) {
+		return false;
+	}
+#endif
 	// ALL rows in this file are deleted - drop the file
 	if (delete_file.data_file_id.IsValid()) {
 		transaction.DropFile(table.GetTableId(), delete_file.data_file_id, data_file_info.file.path);
@@ -735,7 +745,7 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 	delete_file.data_file_path = filename;
 	delete_file.data_file_id = data_file_info.file_id;
 	// check if the file already has deletes
-	auto existing_delete_data = delete_map->GetDeleteData(filename);
+	auto previous_deletes = delete_map->GetDeleteData(filename);
 
 	// check if we should use inlined file deletions instead of creating a delete file
 	if (data_file_info.file_id.IsValid()) {
@@ -750,24 +760,48 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 		}
 	}
 
-	if (existing_delete_data) {
+	if (previous_deletes) {
 		// deletes already exist for this file
-		auto &existing_deletes = existing_delete_data->deleted_rows;
+		auto &external = previous_deletes->external;
+		auto &existing_deletes = external.deleted_rows;
 
 		// we check if we need to write the snapshot information into our deletion file
 		// that basically happens if the file already has embedded snapshots
 		// or if it's a delete file from a different transaction (committed delete file)
-		bool write_with_snapshots =
-		    existing_delete_data->HasEmbeddedSnapshots() || data_file_info.delete_file_id.IsValid();
+		bool write_with_snapshots = external.HasEmbeddedSnapshots() || data_file_info.delete_file_id.IsValid();
 
-		if (write_with_snapshots) {
-			FlushDeleteWithSnapshots(transaction, context, global_state, filename, data_file_info,
-			                         *existing_delete_data, sorted_deletes, delete_file);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		auto &inlined = previous_deletes->inlined;
+		if (write_with_snapshots && data_file_info.file_id.IsValid() &&
+		    data_file_info.file.data_format == DataFileFormat::VORTEX &&
+		    sorted_deletes.size() + existing_deletes.size() + inlined.size() >= data_file_info.row_count) {
+			auto complete = sorted_deletes;
+			complete.insert(existing_deletes.begin(), existing_deletes.end());
+			// Keep original inline history, including when this DELETE supersedes a staged flush.
+			for (auto pos : inlined) {
+				complete.erase(pos);
+			}
+			if (complete.size() + inlined.size() == data_file_info.row_count &&
+			    DuckLakeVortexIndex::CoversFile(transaction, table, data_file_info.file_id.index)) {
+				// Version the external positions at the actual commit and keep the predecessor.
+				sorted_deletes = std::move(complete);
+				auto &previous = delete_file.overwritten_delete_file;
+				previous.delete_file_id = data_file_info.delete_file_id;
+				previous.path = data_file_info.delete_file.path;
+				previous.retain_for_snapshots = true;
+			}
+		}
+#endif
+		if (write_with_snapshots && !delete_file.overwritten_delete_file.retain_for_snapshots) {
+			FlushDeleteWithSnapshots(transaction, context, global_state, filename, data_file_info, external,
+			                         sorted_deletes, delete_file);
 			return;
 		}
 
-		// transaction-local deletes without metadata
-		sorted_deletes.insert(existing_deletes.begin(), existing_deletes.end());
+		if (!delete_file.overwritten_delete_file.retain_for_snapshots) {
+			// transaction-local deletes without metadata
+			sorted_deletes.insert(existing_deletes.begin(), existing_deletes.end());
+		}
 
 		// clear the deletes
 		delete_map->ClearDeletes(filename);
@@ -775,7 +809,8 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 		// set the delete file as overwriting existing deletes
 		delete_file.overwrites_existing_delete = true;
 	}
-	if (TryDropFullyDeletedFile(transaction, delete_file, data_file_info, sorted_deletes.size())) {
+	if (!delete_file.overwritten_delete_file.retain_for_snapshots &&
+	    TryDropFullyDeletedFile(transaction, delete_file, data_file_info, sorted_deletes.size())) {
 		return;
 	}
 
@@ -797,6 +832,7 @@ void DuckLakeDelete::FlushDelete(DuckLakeTransaction &transaction, ClientContext
 
 	written_file.data_file_id = delete_file.data_file_id;
 	written_file.overwrites_existing_delete = delete_file.overwrites_existing_delete;
+	written_file.overwritten_delete_file = std::move(delete_file.overwritten_delete_file);
 
 	global_state.written_files.emplace(filename, std::move(written_file));
 }

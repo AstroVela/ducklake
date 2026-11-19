@@ -43,7 +43,7 @@ refresh that requires an exact metadata count. The compactor stores disjoint
 masks in its commit record so its source row checks also use the unique deletion
 count.
 
-A candidate needs deletions, both thresholds, at least 65 remaining physical
+A nonempty source rewrite needs deletions, both thresholds, at least 65 remaining physical
 rows for the unchanged static SPFresh options, a nonempty rewrite output and
 one supported rewrite schema/partition group. Status exposes
 `compaction_enabled`, thresholds, `compaction_candidate`, `reclaimable_rows`,
@@ -53,10 +53,10 @@ consume run IDs through repeated failing builds. Source/index identity errors
 still fail explicitly; no generation or missing coverage is silently skipped.
 Planning counters reflect the last probe and can lag a just-completed commit;
 task publication and registered ownership determine collection safety.
-If native DELETE retires an entire indexed source file, that is an existing
-missing-coverage boundary requiring an explicit rebuild. This draft does not
-add empty-B retirement or a new query plan for that case. An entirely masked
-but still-active input is classified as an empty rewrite output and skipped.
+Entirely masked B now uses the [metadata-only retirement protocol](native-vortex-empty-retirement-proof.md).
+Native DELETE retains indexed inputs until that atomic operation removes both
+source inventory and index references. A partially live B with no nonempty
+rewrite output still starts no rewrite task.
 
 An eligible source rewrite takes priority at the initial probe and at the probe
 after a committed flush. If a candidate becomes eligible during flush, the

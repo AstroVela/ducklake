@@ -152,7 +152,6 @@ impl PhysicalSource {
         if capture.format_version != 1
             || capture.table_uuid.is_empty()
             || !(1..=4096).contains(&capture.dimension)
-            || capture.files.is_empty()
         {
             vortex_bail!("Invalid DuckLake capture or vector dimension");
         }
@@ -181,6 +180,20 @@ impl PhysicalSource {
             if !visible.insert(*row) {
                 vortex_bail!("Duplicate visible DuckLake row address");
             }
+        }
+        if let Some(business) = &capture.business_fields
+            && [
+                capture.field_id,
+                business.id,
+                business.category,
+                business.payload,
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+                != 4
+        {
+            vortex_bail!("Business projection requires distinct field IDs");
         }
         let mut files = BTreeMap::new();
         let mut remaining = budget.min(MAX_SOURCE_BYTES);
@@ -216,21 +229,8 @@ impl PhysicalSource {
             {
                 vortex_bail!("DuckLake indexed field requires FLOAT[]");
             }
-            if let Some(business) = &capture.business_fields {
-                if [
-                    capture.field_id,
-                    business.id,
-                    business.category,
-                    business.payload,
-                ]
-                .into_iter()
-                .collect::<BTreeSet<_>>()
-                .len()
-                    != 4
-                {
-                    vortex_bail!("Business projection requires distinct field IDs");
-                }
-                if !matches!(
+            if let Some(business) = &capture.business_fields
+                && (!matches!(
                     fields.field(physical_name(business.id)),
                     Some(DType::Primitive(PType::I64, _))
                 ) || !matches!(
@@ -239,9 +239,9 @@ impl PhysicalSource {
                 ) || !matches!(
                     fields.field(physical_name(business.payload)),
                     Some(DType::Utf8(_))
-                ) {
-                    vortex_bail!("Business projection schema does not match the capture");
-                }
+                ))
+            {
+                vortex_bail!("Business projection schema does not match the capture");
             }
             let mut physical_snapshot = snapshot.clone();
             physical_snapshot.schema_fingerprint = schema_fingerprint(&dtype)?;

@@ -165,7 +165,7 @@ public:
 			SQL(writer, "SELECT * FROM ducklake_cancel_vortex_maintenance(" + name + ")");
 			return "{}";
 		}
-		if (op == "maintenance-reattach" || op == "compaction-reattach") {
+		if (op == "maintenance-reattach" || op == "compaction-reattach" || op == "retire-reattach") {
 			Connection caller(database);
 			if (op == "maintenance-reattach") {
 				caller.BeginTransaction();
@@ -192,6 +192,13 @@ public:
 				}
 				throw InvalidInputException("Vortex control accepted the reattached catalog for a stale caller");
 			};
+			if (op == "retire-reattach") {
+				reject_stale([&] {
+					DuckLakeVortexIndex::RetireEmpty(*caller.context, "LAKE", "main", "items", "knn", args.at(2), 1);
+				});
+				caller.context->transaction.Rollback(nullptr);
+				return "{}";
+			}
 			if (op == "compaction-reattach") {
 				reject_stale([&] {
 					DuckLakeVortexOptimizer::ConfigureCompaction(*caller.context, "LAKE", "main", "items", "knn", true,
@@ -321,6 +328,11 @@ public:
 				yyjson_mut_arr_append(rows, value);
 			}
 			return json.Finish(rows);
+		}
+		if (op == "retire") {
+			return DuckLakeVortexIndex::RetireEmpty(*writer.context, "lake", "main", "items", "knn", args.at(2),
+			                                        std::stoull(args.at(3)))
+			    .ToJSON();
 		}
 		if (op == "rewrite") {
 			return DuckLakeVortexIndex::Rewrite(*writer.context, "lake", "main", "items", "knn", args.at(2), args.at(3),
@@ -1220,7 +1232,7 @@ public:
 				auto error = ducklake_vortex_query_error(output.get());
 				Require(error && string(error).find(expected) != string::npos, "Wrong binary handoff rejection");
 			};
-			run({}, "Invalid native binary source inventory");
+			run({}, "Admitted source inventory must match every captured file");
 			auto changed = sources;
 			changed.pop_back();
 			run(changed, "inventory");
