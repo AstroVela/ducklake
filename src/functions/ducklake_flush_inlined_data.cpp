@@ -432,7 +432,7 @@ static void FlushInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &c
 	}
 
 	// Query the inlined deletions with file paths and existing delete file info
-	auto retirement = metadata_manager.VortexRetiredSourcePredicate();
+	auto retirement = metadata_manager.VortexFileMarkerPredicate(DuckLakeMetadataManager::VortexRetiredSourceTable());
 	string file_filter;
 	if (!retirement.empty()) {
 		// Keep historical inline masks for a retired source and for a completed mask version.

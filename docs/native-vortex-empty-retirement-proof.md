@@ -82,8 +82,8 @@ batch can append the new first B under the same named index/revision protocol.
 The existing three-B, 100,000-row, 64-MiB source/vector/artifact, inline,
 manifest and write budgets remain unchanged. No compatibility layer, implicit
 raw-vector fallback, new backend options, dependency pins or online SPFresh
-mutation is introduced. A partially live B still uses the existing nonempty
-rewrite constraints, including the native 65-row minimum.
+mutation is introduced. A B with 1–64 visible rows can use [sparse compaction into F](native-vortex-sparse-rewrite-proof.md).
+The indexed rewrite still requires at least 65 rows.
 
 ## Retention and validation
 

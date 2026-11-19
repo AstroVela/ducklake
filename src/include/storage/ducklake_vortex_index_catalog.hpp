@@ -44,6 +44,7 @@ private:
 };
 
 enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
+enum class DuckLakeVortexRewriteMode { INDEXED, FILES };
 
 struct DuckLakeVortexCatalogIdentity {
 	idx_t lake_oid;
@@ -72,6 +73,7 @@ struct DuckLakeVortexIndexSegment {
 
 struct DuckLakeVortexIndex {
 	static constexpr idx_t MAX_SEGMENTS = 3;
+	static constexpr idx_t MIN_BUILD_ROWS = 65;
 	static const char *RewriteSourcePrefix() {
 		return "ducklake-vortex-rewrite-";
 	}
@@ -141,7 +143,8 @@ struct DuckLakeVortexIndex {
 	                                   const string &table, const string &index, const string &generation,
 	                                   const string &reference, idx_t expected_revision,
 	                                   const std::function<void(const string &)> &observe = nullptr,
-	                                   const string &optimizer_run_id = "");
+	                                   const string &optimizer_run_id = "",
+	                                   DuckLakeVortexRewriteMode mode = DuckLakeVortexRewriteMode::INDEXED);
 	static void CheckRewriteCommit(ClientContext &context, DuckLakeTransaction &transaction);
 	static void PublishRewrite(ClientContext &context, DuckLakeTransaction &transaction,
 	                           const DuckLakeSnapshot &snapshot);
@@ -151,12 +154,12 @@ struct DuckLakeVortexIndex {
 struct DuckLakeVortexRewriteState : public ClientContextState {
 	static shared_ptr<DuckLakeVortexRewriteState> Get(ClientContext &context);
 	string catalog, schema, table, table_uuid, build_id, selected, reference, workspace, private_path, source_root,
-	    new_path, input_identity, optimizer_run_id;
+	    new_path, input_identity, optimizer_run_id, output_version;
 	optional_ptr<ClientContext> caller;
 	DuckLakeVortexCatalogIdentity identity;
 	idx_t table_id = 0, snapshot_id = 0, schema_version = 0, new_file_id = 0, commit_snapshot_id = 0;
 	idx_t copy_plans = 0, new_rows = 0, new_bytes = 0;
-	bool retire = false;
+	bool retire = false, to_f = false;
 	idx_t staged_source_bytes = 0;
 	vector<string> staged_inputs;
 	vector<idx_t> replaced;

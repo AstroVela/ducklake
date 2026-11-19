@@ -213,10 +213,9 @@ public:
 	virtual vector<DuckLakeFileListExtendedEntry>
 	GetExtendedFilesForTable(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
 	                         const FilterPushdownInfo *filter_info = nullptr);
-	virtual vector<DuckLakeCompactionFileEntry> GetFilesForCompaction(DuckLakeTableEntry &table, CompactionType type,
-	                                                                  double deletion_threshold,
-	                                                                  DuckLakeSnapshot snapshot,
-	                                                                  DuckLakeFileSizeOptions options);
+	virtual vector<DuckLakeCompactionFileEntry>
+	GetFilesForCompaction(DuckLakeTableEntry &table, CompactionType type, double deletion_threshold,
+	                      DuckLakeSnapshot snapshot, DuckLakeFileSizeOptions options, bool include_undeleted = false);
 	virtual idx_t GetBeginSnapshotForTable(TableIndex table_id);
 	virtual idx_t GetBeginSnapshotForSchemaVersion(TableIndex table_id, idx_t schema_version);
 	virtual optional_idx GetExactDataFileRowCount(TableIndex table_id, DuckLakeSnapshot snapshot);
@@ -302,8 +301,12 @@ public:
 	static const char *VortexRetiredSourceTable() {
 		return "ducklake_vortex_retired_sources_v1";
 	}
-	//! SQL predicate for the retirement status of source rows aliased as data.
-	string VortexRetiredSourcePredicate();
+	static const char *VortexRewriteOutputTable() {
+		return "ducklake_vortex_rewrite_outputs_v1";
+	}
+	bool HasVortexFileMarkerTable(const char *marker_table);
+	//! SQL predicate for a physical rewrite marker on a file row aliased as data.
+	string VortexFileMarkerPredicate(const char *marker_table);
 	//! Caller supplies one resolved path per overwritten file, in the same order.
 	static string DeleteOverwrittenDeleteFiles(const vector<DuckLakeOverwrittenDeleteFile> &overwritten_files,
 	                                           const vector<DuckLakePath> &resolved_paths);
