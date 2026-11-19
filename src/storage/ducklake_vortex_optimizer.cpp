@@ -1122,7 +1122,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			if (current.run != p.run) {
 				throw TransactionException("Optimizer task ownership changed");
 			}
-			if (p.kind != "retire" && p.kind != "rewrite_f") {
+			if (p.kind == "prune") {
+				current.generation = "generation-" + p.run;
+			} else if (p.kind != "retire" && p.kind != "rewrite_f") {
 				current.generation = Candidate(meta.connection, p.reference);
 			}
 			current.state = "publishing";

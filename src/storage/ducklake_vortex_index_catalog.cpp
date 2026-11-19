@@ -1304,7 +1304,8 @@ string DuckLakeVortexIndex::StageRewriteInput(DuckLakeVortexRewriteState &plan, 
 
 void DuckLakeVortexIndex::CheckRewriteCommit(ClientContext &context, DuckLakeTransaction &transaction) {
 	auto plan = DuckLakeVortexRewriteState::Get(context);
-	if (!plan || (!plan->retire && !plan->bind)) {
+	if (!plan || (!plan->retire && !plan->prune && !plan->bind) ||
+	    (plan->prune && plan->candidate.generation.empty())) {
 		throw InvalidInputException("Vortex rewrite candidate is not prepared");
 	}
 	auto &caller = *plan->caller;
@@ -1329,10 +1330,8 @@ void DuckLakeVortexIndex::CheckRewriteCommit(ClientContext &context, DuckLakeTra
 		throw TransactionException("Vortex rewrite input or schema changed before commit");
 	}
 	plan->commit_snapshot_id = snapshot.snapshot_id + 1;
-	if (!plan->retire) {
-		if (!plan->prune) {
-			plan->new_file_id = snapshot.next_file_id;
-		}
+	if (plan->bind) {
+		plan->new_file_id = snapshot.next_file_id;
 		plan->bind(plan->new_file_id);
 	}
 	plan->check(plan->retire ? "retire_before_commit" : "rewrite_before_commit");
@@ -2392,7 +2391,10 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 	plan->to_f = to_f;
 	plan->prune = prune;
 	plan->optimizer_run_id = optimizer_run_id;
-	plan->build_id = UUID::ToString(UUID::GenerateRandomUUID());
+	plan->build_id = prune && !optimizer_run_id.empty() ? optimizer_run_id : UUID::ToString(UUID::GenerateRandomUUID());
+	if (prune && UUID::ToString(UUID::FromString(plan->build_id)) != plan->build_id) {
+		throw InvalidInputException("Invalid Vortex prune publication identity");
+	}
 	auto generation = "generation-" + plan->build_id;
 	bool registered = false, committed = false;
 	plan->check = [&](const string &stage) {
@@ -2648,25 +2650,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 				view.sources.push_back({file.id, std::move(bytes)});
 			}
 			view.admission_json = json.Finish(admission);
-			if (prune) {
-				BuildNative(context, view, reference_path, generation, plan->workspace, check_native_paths);
-			} else {
-				build = make_uniq<NativeBuildInput>(context, view, reference_path, generation, plan->workspace,
-				                                    check_native_paths);
-				prepared.reset(ducklake_vortex_prepare(&build->input));
-				build->Check(ducklake_vortex_prepare_error(prepared.get()));
-			}
-			auto provisional_id = plan->new_file_id;
-			plan->bind = [&, provisional_id](idx_t final_id) {
-				if (!prune) {
-					DuckLakeVortexBindInput input {prepared.get(), provisional_id, final_id,
-					                               DuckLakeVortexControl::Check, &build->control};
-					std::unique_ptr<char, decltype(&ducklake_vortex_build_error_free)> error(
-					    ducklake_vortex_bind(&input), ducklake_vortex_build_error_free);
-					build->Check(error.get());
-				}
-				auto replacement = ParseReference(Read(fs, reference_path, MAX_MANIFEST, true), plan->table_uuid,
-				                                  plan->before.field_id);
+			auto compose_candidate = [&](DuckLakeVortexIndex replacement, const string &publication) {
 				replacement.root = root;
 				vector<DuckLakeVortexIndexSegment> segments;
 				for (auto &segment : plan->before.segments) {
@@ -2675,12 +2659,38 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 					}
 				}
 				segments.push_back({root, replacement.generation, replacement.reference, replacement.files});
-				auto publication = prune ? (optimizer_run_id.empty() ? plan->build_id : optimizer_run_id) : "";
 				Compose(replacement, std::move(segments), plan->table_uuid, publication);
 				replacement.name = name;
 				replacement.revision = expected_revision + 1;
 				plan->candidate = std::move(replacement);
 			};
+			if (prune) {
+				BuildNative(context, view, reference_path, generation, plan->workspace, check_native_paths);
+				auto replacement = ParseReference(Read(fs, reference_path, MAX_MANIFEST, true), plan->table_uuid,
+				                                  plan->before.field_id);
+				if (replacement.generation != generation || replacement.dimension != plan->before.dimension ||
+				    replacement.files.size() != inputs.size()) {
+					throw InvalidInputException("Vortex prune candidate identity changed");
+				}
+				replacement.ValidateCoverage(inputs);
+				compose_candidate(std::move(replacement), plan->build_id);
+			} else {
+				build = make_uniq<NativeBuildInput>(context, view, reference_path, generation, plan->workspace,
+				                                    check_native_paths);
+				prepared.reset(ducklake_vortex_prepare(&build->input));
+				build->Check(ducklake_vortex_prepare_error(prepared.get()));
+				auto provisional_id = plan->new_file_id;
+				plan->bind = [&, provisional_id, compose_candidate](idx_t final_id) {
+					DuckLakeVortexBindInput input {prepared.get(), provisional_id, final_id,
+					                               DuckLakeVortexControl::Check, &build->control};
+					std::unique_ptr<char, decltype(&ducklake_vortex_build_error_free)> error(
+					    ducklake_vortex_bind(&input), ducklake_vortex_build_error_free);
+					build->Check(error.get());
+					compose_candidate(ParseReference(Read(fs, reference_path, MAX_MANIFEST, true), plan->table_uuid,
+					                                 plan->before.field_id),
+					                  "");
+				};
+			}
 		}
 		plan->check("rewrite_candidate_ready");
 		if (!prune) {

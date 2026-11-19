@@ -73,6 +73,14 @@ def exercise(proof, native, root, checks, workers):
         and row["reclaimable_rows"] == 2048,
         "Planner did not durably select whole-file pruning",
     )
+    generation = "generation-" + row["run_id"]
+    owners = [owner for owner in native.call("build-status") if owner["generation"] == generation]
+    require(len(owners) == 1, "Prune did not register its task generation")
+    sealed = json.loads(Path(owners[0]["reference_path"]).read_text())
+    require(
+        SEG.generation({"reference": sealed}) == generation and M.files([{"reference": sealed}]) == [healthy],
+        "Prune sealed a different generation or retained inventory",
+    )
     no_output(native)
     native.call("sql", BG.APP.append_sql(native, root))
     native.sql("INSERT INTO expected SELECT rowid,id,embedding,category,payload FROM lake.items WHERE id>=10000")
@@ -87,7 +95,8 @@ def exercise(proof, native, root, checks, workers):
     ready = SEG.segments(head)
     require(
         head["reference"]["publication"] == row["run_id"]
-        and SEG.generation(ready[-1]) == row["candidate_generation"]
+        and SEG.generation(ready[-1]) == generation == row["candidate_generation"]
+        and ready[-1]["reference"] == sealed
         and ready[:2] == parts
         and M.files([ready[-1]]) == [healthy],
         "Pruning lost exact task ownership, retained coverage or an unselected B",
@@ -147,6 +156,7 @@ def exercise(proof, native, root, checks, workers):
     checks.extend(
         [
             "one B drops only its fully masked member and rebuilds retained coverage; both unselected generations remain byte-identical",
+            "prune publishes the sealed registered generation and exact retained inventory after concurrent writes",
             "concurrent T/flush/T commits survive atomic source/index publication without allocating a replacement data file",
             "current and historical row IDs/typed values, category filtering and B/F/T top-k match native visibility",
             "index GC preserves native historical sources; explicit source GC preserves healthy bytes and old/new views with delayed fetch",
