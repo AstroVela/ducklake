@@ -1412,7 +1412,7 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 	if (plan->to_f) {
 		Query(transaction, "INSERT INTO {METADATA_CATALOG}." +
 		                       string(DuckLakeMetadataManager::VortexRewriteOutputTable()) + " VALUES (" +
-		                       to_string(plan->new_file_id) + ")");
+		                       to_string(plan->new_file_id) + "," + to_string(snapshot.snapshot_id) + ")");
 		Query(transaction, "UPDATE {METADATA_CATALOG}." + string(BUILDS) +
 		                       " SET state='published' WHERE build_id=" + Value(plan->build_id).ToSQLString());
 	}
@@ -1529,7 +1529,8 @@ void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog, C
 		                       "(data_file_id BIGINT PRIMARY KEY)");
 		Query(transaction, "CREATE TABLE {METADATA_CATALOG}." +
 		                       string(DuckLakeMetadataManager::VortexRewriteOutputTable()) +
-		                       "(data_file_id BIGINT PRIMARY KEY)");
+		                       "(data_file_id BIGINT NOT NULL,snapshot_id BIGINT NOT NULL,"
+		                       "PRIMARY KEY(data_file_id,snapshot_id))");
 		CheckInterrupted(owner, caller);
 		owner.Commit();
 	} catch (...) {

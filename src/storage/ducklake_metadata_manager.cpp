@@ -1811,11 +1811,18 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetTableInsertions(DuckLa
 	string select_list = GetFileSelectList("data") +
 	                     ", data.row_id_start, data.begin_snapshot, data.partial_max, data.mapping_id, " +
 	                     GetDeleteFileSelectList("del");
-	auto physical_output = VortexFileMarkerPredicate(VortexRewriteOutputTable());
+	auto marker_table = VortexRewriteOutputTable();
+	const bool has_rewrite_markers = HasVortexFileMarkerTable(marker_table);
+	if (has_rewrite_markers) {
+		select_list += ", (SELECT list(marker.snapshot_id) FROM {METADATA_CATALOG}." + string(marker_table) +
+		               " marker WHERE marker.data_file_id=data.data_file_id AND marker.snapshot_id BETWEEN " +
+		               to_string(start_snapshot.snapshot_id) + " AND {SNAPSHOT_ID})";
+	}
 	// Files either match the exact snapshot range
 	// Or they have partial_max set, which means they are a file with many snapshot ids, and might contain
 	// the snapshot we need
-	auto query = StringUtil::Format(R"(
+	auto query =
+	    StringUtil::Format(R"(
 SELECT %s
 FROM {METADATA_CATALOG}.ducklake_data_file data, (
 	SELECT
@@ -1829,10 +1836,9 @@ FROM {METADATA_CATALOG}.ducklake_data_file data, (
 WHERE data.table_id=%d AND data.begin_snapshot <= {SNAPSHOT_ID} AND (
 	(data.begin_snapshot >= %d) OR
 	(data.partial_max IS NOT NULL AND data.partial_max >= %d)
-)%s;
+);
 		)",
-	                                select_list, table_id.index, start_snapshot.snapshot_id, start_snapshot.snapshot_id,
-	                                physical_output.empty() ? "" : " AND NOT " + physical_output);
+	                       select_list, table_id.index, start_snapshot.snapshot_id, start_snapshot.snapshot_id);
 
 	auto result = transaction.Query(end_snapshot, query);
 	if (result->HasError()) {
@@ -1849,7 +1855,8 @@ WHERE data.table_id=%d AND data.begin_snapshot <= {SNAPSHOT_ID} AND (
 		col_idx++;
 		auto begin_snapshot = row.GetValue<idx_t>(col_idx++);
 		file_entry.snapshot_id = begin_snapshot;
-		if (!row.IsNull(col_idx)) {
+		const bool has_partial_snapshot = !row.IsNull(col_idx);
+		if (has_partial_snapshot) {
 			auto partial_max = row.GetValue<idx_t>(col_idx);
 			// Set upper bound filter if partial_max > end_snapshot
 			SetSnapshotFilter(end_snapshot, partial_max, file_entry);
@@ -1865,16 +1872,30 @@ WHERE data.table_id=%d AND data.begin_snapshot <= {SNAPSHOT_ID} AND (
 		}
 		col_idx++;
 		file_entry.delete_file = ReadDeleteFile(table, row, col_idx, IsEncrypted());
+		if (has_rewrite_markers && !row.IsNull(col_idx)) {
+			if (!has_partial_snapshot) {
+				// Every row in an unmerged rewrite output belongs to its physical publication.
+				continue;
+			}
+			auto snapshots = row.GetValue<Value>(col_idx);
+			for (auto &snapshot : ListValue::GetChildren(snapshots)) {
+				file_entry.snapshot_filter_excluded.push_back(snapshot.GetValue<idx_t>());
+			}
+		}
 		files.push_back(std::move(file_entry));
 	}
 	return files;
 }
 
-string DuckLakeMetadataManager::VortexFileMarkerPredicate(const char *marker_table) {
+bool DuckLakeMetadataManager::HasVortexFileMarkerTable(const char *marker_table) {
 	auto &catalog = transaction.GetCatalog();
-	if ((!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") ||
-	    !transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
-	                                           marker_table)) {
+	return (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb") &&
+	       transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+	                                             marker_table);
+}
+
+string DuckLakeMetadataManager::VortexFileMarkerPredicate(const char *marker_table) {
+	if (!HasVortexFileMarkerTable(marker_table)) {
 		return {};
 	}
 	return "EXISTS (SELECT 1 FROM {METADATA_CATALOG}." + string(marker_table) +
@@ -2181,6 +2202,13 @@ DuckLakeMetadataManager::GetFilesForCompaction(DuckLakeTableEntry &table, Compac
 	                          "data.end_snapshot, data.mapping_id, sr.schema_version , data.partial_max, "
 	                          "data.partition_id, partition_info.keys, " +
 	                          GetFileSelectList("data");
+	string rewrite_marker;
+	if (type == CompactionType::MERGE_ADJACENT_TABLES) {
+		rewrite_marker = VortexFileMarkerPredicate(VortexRewriteOutputTable());
+		if (!rewrite_marker.empty()) {
+			data_select_list += ", " + rewrite_marker;
+		}
+	}
 	string delete_select_list = "del.data_file_id AS del_data_file_id,"
 	                            "del.delete_file_id AS del_delete_file_id, "
 	                            "del.delete_count, "
@@ -2274,6 +2302,9 @@ ORDER BY data.begin_snapshot, data.row_id_start, data.data_file_id, del.begin_sn
 		}
 		col_idx++;
 		new_entry.file.data = ReadDataFile(table, row, col_idx, IsEncrypted());
+		if (!rewrite_marker.empty()) {
+			new_entry.has_physical_rewrite_rows = row.GetValue<bool>(col_idx++);
+		}
 		if (files.empty() || files.back().file.id != new_entry.file.id) {
 			// new file - push it into the file list
 			files.push_back(std::move(new_entry));
@@ -4838,6 +4869,7 @@ string DuckLakeMetadataManager::WriteMergeAdjacent(const vector<DuckLakeCompacte
 	}
 	string deleted_file_ids;
 	string scheduled_deletions;
+	vector<string> rewrite_sources;
 	for (idx_t i = 0; i < compactions.size(); ++i) {
 		auto &compaction = compactions[i];
 		auto &path = resolved_paths[i];
@@ -4847,6 +4879,11 @@ string DuckLakeMetadataManager::WriteMergeAdjacent(const vector<DuckLakeCompacte
 			deleted_file_ids += ", ";
 		}
 		deleted_file_ids += to_string(compaction.source_id.index);
+		if (compaction.has_physical_rewrite_rows) {
+			D_ASSERT(compaction.new_id.IsValid());
+			rewrite_sources.push_back(
+			    StringUtil::Format("(%llu,%llu)", compaction.source_id.index, compaction.new_id.index));
+		}
 
 		// schedule the file for deletion
 		if (!scheduled_deletions.empty()) {
@@ -4860,6 +4897,18 @@ string DuckLakeMetadataManager::WriteMergeAdjacent(const vector<DuckLakeCompacte
 	vector<string> tables_to_delete_from {"ducklake_data_file", "ducklake_file_column_stats", "ducklake_delete_file",
 	                                      "ducklake_file_partition_value", "ducklake_file_variant_stats"};
 	string batch_query;
+	if (!rewrite_sources.empty()) {
+		// Merge retains row snapshots, so only transfer the physical snapshots of its marked inputs.
+		batch_query += StringUtil::Format(R"(
+INSERT INTO {METADATA_CATALOG}.%s
+SELECT DISTINCT sources.new_id, markers.snapshot_id
+FROM (VALUES %s) AS sources(old_id,new_id)
+JOIN {METADATA_CATALOG}.%s markers ON markers.data_file_id=sources.old_id;
+)",
+		                                  VortexRewriteOutputTable(), StringUtil::Join(rewrite_sources, ","),
+		                                  VortexRewriteOutputTable());
+		tables_to_delete_from.push_back(VortexRewriteOutputTable());
+	}
 	for (auto &delete_from_tbl : tables_to_delete_from) {
 		batch_query += StringUtil::Format(R"(
 DELETE FROM {METADATA_CATALOG}.%s
@@ -5045,7 +5094,7 @@ WHERE %s (end_snapshot IS NOT NULL AND NOT EXISTS(
 		// delete the data files
 		tables_to_delete_from = {"ducklake_data_file", "ducklake_file_column_stats", "ducklake_file_variant_stats",
 		                         "ducklake_file_partition_value"};
-		if (!VortexFileMarkerPredicate(VortexRewriteOutputTable()).empty()) {
+		if (HasVortexFileMarkerTable(VortexRewriteOutputTable())) {
 			tables_to_delete_from.push_back(VortexRewriteOutputTable());
 		}
 		if (!retired_sources.empty()) {

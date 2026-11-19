@@ -304,6 +304,7 @@ public:
 	static const char *VortexRewriteOutputTable() {
 		return "ducklake_vortex_rewrite_outputs_v1";
 	}
+	bool HasVortexFileMarkerTable(const char *marker_table);
 	//! SQL predicate for a physical rewrite marker on a file row aliased as data.
 	string VortexFileMarkerPredicate(const char *marker_table);
 	//! Caller supplies one resolved path per overwritten file, in the same order.
