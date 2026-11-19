@@ -26,7 +26,10 @@ the runtime's usual six linked extensions. `extension_config_vane_native_vortex.
 requires `VANE_LOADABLE_EXTENSIONS=vortex;ducklake`, native DuckLake execution
 and the qualified static SDK. Configuration checks the registered DuckLake
 and Vortex source paths and the SDK's Vortex revision. The Vane and DuckLake
-vcpkg installs use separate roots. `DUCKLAKE_VANE_NATIVE` selects the
+vcpkg installs use separate roots. This profile requires the static native
+Vortex wrapper with its default Rust features. Configuration rejects cached
+wrapper options that select a different manifest, linkage or features.
+`DUCKLAKE_VANE_NATIVE` selects the
 Vane engine's context-taking MERGE planner constructors, shared with its
 distributed build. It enables no distributed callbacks. The existing
 distributed profile remains a separate build entry.

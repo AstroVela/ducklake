@@ -3,6 +3,13 @@ foreach(_DUCKLAKE_VANE_PROVIDER IN ITEMS vortex ducklake)
     message(FATAL_ERROR "Vane native Vortex requires VANE_LOADABLE_EXTENSIONS=vortex;ducklake")
   endif()
 endforeach()
+foreach(_DUCKLAKE_VANE_WRAPPER_OPTION IN ITEMS
+    VORTEX_VANE_DISTRIBUTED USE_SHARED_VORTEX
+    VORTEX_ENABLE_INDEX_SPFRESH VORTEX_ENABLE_INDEX_HNSWLIB)
+  if(${_DUCKLAKE_VANE_WRAPPER_OPTION})
+    message(FATAL_ERROR "Vane native Vortex requires ${_DUCKLAKE_VANE_WRAPPER_OPTION}=OFF")
+  endif()
+endforeach()
 set(DUCKLAKE_VANE_DISTRIBUTED OFF CACHE BOOL
     "Use the native DuckLake transaction and query path" FORCE)
 set(DUCKLAKE_VANE_NATIVE ON CACHE BOOL
