@@ -4,6 +4,9 @@ The basic native path now starts with an empty table. One named query works
 before the first ANN generation, through inline writes (T), flushed Vortex
 files (F), background static indexing (B), and subsequent B/F/T mixtures.
 
+For the installed `vane.connect()` entry and matching optional providers, see
+[Vane native realtime vector flow](vane-native-vortex-proof.md).
+
 `ducklake_create_vortex_index` publishes a typed zero-B definition at revision
 1. Use a writable DuckLake attachment in autocommit mode, an empty,
 fixed-schema Vortex table, dimension 1–4096 and an existing absolute index

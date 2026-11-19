@@ -38,10 +38,14 @@ endif()
 
 option(DUCKLAKE_VANE_DISTRIBUTED
        "Build the explicit Vane distributed DuckLake scan interface" OFF)
-if(DUCKLAKE_VANE_DISTRIBUTED)
+option(DUCKLAKE_VANE_NATIVE "Build against Vane's native DuckDB engine interface" OFF)
+if(DUCKLAKE_VANE_NATIVE OR DUCKLAKE_VANE_DISTRIBUTED)
 	if(NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp")
-		message(FATAL_ERROR "DUCKLAKE_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
+		message(FATAL_ERROR "The Vane DuckLake interfaces require the Vane DuckDB source tree")
 	endif()
+	add_definitions(-DDUCKLAKE_VANE_ENGINE)
+endif()
+if(DUCKLAKE_VANE_DISTRIBUTED)
 	add_definitions(-DDUCKLAKE_VANE_DISTRIBUTED)
 endif()
 
