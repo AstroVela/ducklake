@@ -79,9 +79,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             build/runtime/cargo/build
-          key: vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'vortex-extension/vortex-extension-vane/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-${{ github.sha }}
+          key: vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'vortex-extension/vortex-extension/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-${{ github.sha }}
           restore-keys: |
-            vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'vortex-extension/vortex-extension-vane/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-
+            vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'vortex-extension/vortex-extension/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-
       - name: Set up pinned vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:

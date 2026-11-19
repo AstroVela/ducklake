@@ -53,7 +53,7 @@ def main() -> None:
         ),
     }
     manifests = {
-        "vortex": wrapper / "vortex-extension-vane/Cargo.toml",
+        "vortex": wrapper / "vortex-extension/Cargo.toml",
         "ducklake": source / "src/vortex_query/Cargo.toml",
     }
     for name, manifest in manifests.items():
@@ -64,7 +64,6 @@ def main() -> None:
                 "about",
                 "generate",
                 "--locked",
-                "--all-features",
                 "--fail",
                 "--config",
                 str(wrapper / "about.toml"),
