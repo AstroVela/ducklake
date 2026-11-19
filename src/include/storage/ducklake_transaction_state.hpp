@@ -33,8 +33,8 @@ struct DuckLakeCommitContext {
 	//! Executes the batched snapshot/changes SQL against the metadata DB.
 	std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string &)> execute_commit_batch;
 	//! Optional hooks below default to a no-op/constant; callers override only the ones they need.
-	//! Clears the metadata manager cache if a clear was pending.
-	std::function<void()> flush_cache_if_pending = []() {
+	//! Runs final local checks and cache cleanup before attempting the commit.
+	std::function<void()> before_commit = []() {
 	};
 	//! Commits the underlying metadata connection.
 	std::function<void()> commit_connection = []() {
@@ -77,9 +77,9 @@ struct DuckLakeCommitContext {
 	std::function<vector<string>(TableIndex)> get_inlined_table_names = [](TableIndex) {
 		return vector<string> {};
 	};
-	//! Net (delete-adjusted) row count of a table's regular data files.
-	std::function<idx_t(TableIndex)> get_net_data_file_row_count = [](TableIndex) {
-		return 0;
+	//! Exact visible row count of regular data files, when available from metadata.
+	std::function<optional_idx(TableIndex)> get_exact_data_file_row_count = [](TableIndex) {
+		return optional_idx();
 	};
 	//! Net (delete-adjusted) row count of a table's inlined-data tables.
 	std::function<idx_t(TableIndex)> get_net_inlined_row_count = [](TableIndex) {
@@ -157,9 +157,9 @@ public:
 	bool TryMergeInlinedStats(const vector<DuckLakeColumnSchemaEntry> &columns,
 	                          const vector<string> &inlined_table_names, DuckLakeSnapshot snapshot,
 	                          DuckLakeTableStats &target, const DuckLakeCommitContext &context);
-	vector<DuckLakeDeleteFileInfo>
-	GetNewDeleteFiles(const DuckLakeCommitState &commit_state,
-	                  vector<DuckLakeOverwrittenDeleteFile> &overwritten_delete_files) const;
+	vector<DuckLakeDeleteFileInfo> GetNewDeleteFiles(const DuckLakeCommitState &commit_state,
+	                                                 vector<DuckLakeOverwrittenDeleteFile> &overwritten_delete_files,
+	                                                 string &flushed_inline_file_deletes) const;
 	vector<DuckLakeDeletedInlinedDataInfo> GetNewInlinedDeletes(DuckLakeCommitState &commit_state) const;
 	vector<DuckLakeInlinedFileDeletionInfo> GetNewInlinedFileDeletes(DuckLakeCommitState &commit_state);
 	NewNameMapInfo GetNewNameMaps(DuckLakeCommitState &commit_state);
