@@ -15,13 +15,51 @@ statement ok
 CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
 
 statement ok
-CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
-
-statement ok
 SELECT * FROM ducklake_initialize_vortex_indexes('lake')
 
 statement ok
-SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+BEGIN
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+ROLLBACK
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+requires a Vortex table with four business columns
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.items VALUES(1,[0,0],'A','rolled back')
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+Vortex index creation controls require autocommit
+
+statement ok
+ROLLBACK
+
+statement ok
+COPY (SELECT 'file, not an index directory') TO '__WORKING_DIRECTORY__/__TEST_DIR__/basic-root-file' (FORMAT CSV)
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/basic-root-file',2)
+----
+Vortex index output directory does not exist
+
+query II
+SELECT (SELECT count(*) FROM lake.items),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1)
+----
+0	0
 
 statement error
 SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',0)
@@ -32,6 +70,9 @@ query I
 SELECT revision FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
 ----
 1
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
 
 query III
 SELECT (SELECT count(*) FROM ducklake_vortex_generation_status('lake')),(SELECT count(*) FROM ducklake_vortex_build_status('lake')),array_length(regexp_extract_all(reference,'"generation":"[^"]+"')) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
@@ -51,7 +92,17 @@ root must be absolute
 statement error
 SELECT * FROM ducklake_create_vortex_index('lake','main','items','bad','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_basic_data',2)
 ----
-outside managed data
+outside the managed data path
+
+statement error
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',3,100000,4194304,100000,67108864)
+----
+Optimizer ready index vector specification changed
+
+query I
+SELECT count(*) FROM ducklake_vortex_optimizer_status('lake')
+----
+0
 
 statement ok
 SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,100000,4194304,100000,67108864)
@@ -61,6 +112,44 @@ SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')
 
 statement ok
 SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',1000,4194304,256,67108864)
+
+statement ok
+CREATE TABLE lake.policy_first(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'policy_first')
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','policy_first','policy_knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,100000,4194304,100000,67108864)
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','policy_first','policy_knn')
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','policy_first','policy_knn',1000,4194304,256,67108864)
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','policy_first','policy_knn','__WORKING_DIRECTORY__/__TEST_DIR__',3)
+----
+Optimizer ready index vector specification changed
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1 WHERE index_name='policy_knn'
+----
+0
+
+query I
+SELECT revision FROM ducklake_create_vortex_index('lake','main','policy_first','policy_knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+1
+
+statement ok
+INSERT INTO lake.policy_first VALUES (1,[0,0],'A','matching policy')
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','policy_first','policy_knn',[0,0]::FLOAT[],1)
+----
+1
 
 query I
 SELECT count(*) FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],10)
@@ -179,6 +268,17 @@ query IT
 SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
 ----
 200000	B旁实时
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_basic.ducklake' AS lake (READ_ONLY)
+
+statement error
+SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+Vortex index creation controls require a writable DuckLake attachment
 
 statement ok
 DETACH lake

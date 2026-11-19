@@ -21,6 +21,7 @@ BASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BASE)
 require = BASE.require
 address = BASE.address
+float32_vector = BASE.float32_vector
 
 
 class Worker:
@@ -94,7 +95,8 @@ class Worker:
         )
 
     def fetch(self, name: str, rows: list[dict], expected: str | None = None):
-        return self.call({"op": "fetch", "view": name, "capture_digest": self.digests[name], "rows": rows}, expected)
+        result = self.call({"op": "fetch", "view": name, "capture_digest": self.digests[name], "rows": rows}, expected)
+        return [float32_business(row) for row in result] if expected is None else None
 
     def stats(self) -> dict:
         return self.call({"op": "stats"})
@@ -135,11 +137,16 @@ def refs(rows: list[dict]) -> list[dict]:
     return [{"file_id": row["file_id"], "row_offset": row["row_offset"]} for row in rows]
 
 
+def float32_business(row: dict) -> dict:
+    return {**row, "embedding": float32_vector(row["embedding"])}
+
+
 def business(row: dict) -> dict:
-    return {key: row[key] for key in ("id", "embedding", "category", "payload")}
+    return float32_business({key: row[key] for key in ("id", "embedding", "category", "payload")})
 
 
 def qualify(hits: list[dict], rows: list[dict], query: list[float], allowed=None) -> None:
+    query = float32_vector(query)
     lookup = {address(row): row for row in rows}
     allow = None if allowed is None else {address(row) for row in allowed}
     require(
@@ -151,9 +158,9 @@ def qualify(hits: list[dict], rows: list[dict], query: list[float], allowed=None
             address(hit) in lookup and (allow is None or address(hit) in allow),
             "retained search returned an invisible or disallowed address",
         )
-        row = lookup[address(hit)]
-        require(hit["row"] == business(row), "retained business take changed its logical version")
-        require(hit["embedding"] == row["embedding"], "retained vector take changed")
+        row = business(lookup[address(hit)])
+        require(float32_business(hit["row"]) == row, "retained business take changed its logical version")
+        require(float32_vector(hit["embedding"]) == row["embedding"], "retained vector take changed")
         distance = sum((a - b) ** 2 for a, b in zip(query, row["embedding"]))
         require(
             math.isfinite(hit["distance"]) and math.isclose(hit["distance"], distance, rel_tol=1e-5, abs_tol=1e-4),
@@ -163,12 +170,52 @@ def qualify(hits: list[dict], rows: list[dict], query: list[float], allowed=None
     require(ordering == sorted(ordering), "retained rank order changed")
 
 
+def exercise_float32(proof, workers: list[Worker], checks: list[str]) -> None:
+    for name, embedding, query, identifier in (
+        ("fractional", "[(id::FLOAT + 0.1::FLOAT),0::FLOAT,0,0,0,0,0,0]", [13.1, 0, 0, 0, 0, 0, 0, 0], 13),
+        (
+            "rounded-query",
+            "[(100000000::FLOAT + id::FLOAT*16::FLOAT),1::FLOAT,0,0,0,0,0,0]",
+            [100000110.0, 1, 0, 0, 0, 0, 0, 0],
+            7,
+        ),
+    ):
+        directory = proof.root / name
+        proof.create(directory, rows=128, embedding=embedding)
+        capture, rows = proof.capture(directory, name)
+        reference = proof.build(capture, name)
+        sql_rows = proof.sql(directory, "SELECT id, embedding, category, payload FROM lake.items ORDER BY id;")
+        by_id = {row["id"]: row for row in sql_rows}
+        raw_rows = [{**row, "embedding": by_id[row["id"]]["embedding"]} for row in rows]
+        worker = Worker(proof, f"{name}-retained")
+        workers.append(worker)
+        worker.open("float32", capture, reference)
+        # Send the raw decimal query so the native Float32 parse is exercised.
+        hits = worker.search("float32", query)
+        qualify(hits, rows, query)
+        qualify(hits, raw_rows, query)
+        require(
+            hits[0]["row"]["id"] == identifier and hits[0]["distance"] == 0.0,
+            "Float32 query rounding changed the retained self-neighbor or its zero distance",
+        )
+        selected = [
+            next(row for row in raw_rows if row["id"] == value) for value in (identifier, identifier - 1, identifier)
+        ]
+        require(
+            worker.fetch("float32", refs(selected)) == [business(row) for row in selected],
+            "Float32 business fetch changed duplicate order or SQL values",
+        )
+        require(worker.close_view("float32") == empty_stats(), "Float32 regression retained reservations")
+        worker.finish(eof=True)
+    checks.append("Float32 fractional business/fetch equality and raw query rounding preserve retained results")
+
+
 def exercise(proof, workers: list[Worker], checks: list[str]) -> dict:
     directory = proof.root / "lake"
     proof.create(directory)
     proof.sql(
         directory,
-        "UPDATE lake.items SET payload=NULL WHERE id=131;" "UPDATE lake.items SET category=NULL WHERE id=129;",
+        "UPDATE lake.items SET payload=NULL WHERE id=131;UPDATE lake.items SET category=NULL WHERE id=129;",
     )
     capture, rows = proof.capture(directory, "original")
     reference = proof.build(capture, "original")
@@ -308,8 +355,7 @@ def exercise(proof, workers: list[Worker], checks: list[str]) -> dict:
 
     proof.sql(
         directory,
-        "CALL ducklake_rewrite_data_files('lake', delete_threshold => 0);"
-        "CALL ducklake_merge_adjacent_files('lake');",
+        "CALL ducklake_rewrite_data_files('lake', delete_threshold => 0);CALL ducklake_merge_adjacent_files('lake');",
     )
     compacted, compacted_rows = proof.capture(directory, "compacted")
     require(
@@ -378,6 +424,7 @@ def exercise(proof, workers: list[Worker], checks: list[str]) -> dict:
     checks.append(
         "close isolates remaining views, rejects closed handles, reuses budgets and releases leases on stdin EOF"
     )
+    exercise_float32(proof, workers, checks)
     return {
         "old_source_bytes": opened["source_bytes"],
         "old_artifact_bytes": opened["artifact_bytes"],

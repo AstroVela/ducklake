@@ -37,7 +37,15 @@ def exercise(proof, native, root, checks, workers):
     )
     native.call("init")
     native.call("optimizer-init")
-    native.sql(f"SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn',{BASE.quote(artifacts)},8)")
+    create = f"SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn',{BASE.quote(artifacts)},8)"
+    statement = root / "create.sql"
+    statement.write_text(create)
+    native.call("cancel-create-lock", statement)
+    native.sql(
+        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Canceled create published a definition') END "
+        "FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1"
+    )
+    native.sql(create)
     head = native.call("head", "knn")
     require(head["revision"] == 1 and not SEG.segments(head), "Empty definition fabricated an ANN generation")
     require(not native.call("build-status") and not native.call("generation-status"), "Definition invoked ANN build")
@@ -148,6 +156,7 @@ def exercise(proof, native, root, checks, workers):
     native.finish()
     checks.extend(
         [
+            "cancelling create in the publication lock wait leaves no committed index definition",
             "empty table creates an explicit zero-B definition without native ANN artifacts",
             "one named query sees committed T immediately and hides uncommitted vector/business mutations",
             "small F is queryable before ANN; background threshold builds first B while F/T remain visible",
