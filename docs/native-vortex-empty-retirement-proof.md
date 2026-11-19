@@ -44,6 +44,8 @@ The commit marks the retired source IDs so change feeds keep the original
 logical delete events. Flush keeps their inlined masks in metadata. Snapshot
 expiry removes the markers and inlined masks with the source metadata.
 An inline delete flush removes its metadata rows when its mask commits.
+When the inline and external masks overlap, flush keeps the earliest deletion
+snapshot for each position and clears every inline record it examined.
 If a completing DELETE supersedes that mask in the same transaction, the
 original inline rows remain visible to historical scans and change feeds.
 Commit retries identify masks published after the reader's snapshot using

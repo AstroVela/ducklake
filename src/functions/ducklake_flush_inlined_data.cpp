@@ -525,7 +525,7 @@ LEFT JOIN (
 			PositionWithSnapshot pos_with_snap;
 			pos_with_snap.position = row_id;
 			pos_with_snap.snapshot_id = static_cast<int64_t>(begin_snapshot);
-			file_info.deletions.insert(pos_with_snap);
+			MergeDeletePosition(file_info.deletions, pos_with_snap);
 		}
 	}
 

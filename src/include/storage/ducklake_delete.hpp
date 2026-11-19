@@ -28,6 +28,14 @@ struct PositionWithSnapshot {
 	}
 };
 
+inline void MergeDeletePosition(set<PositionWithSnapshot> &positions, const PositionWithSnapshot &deletion) {
+	auto existing = positions.insert(deletion);
+	if (!existing.second && deletion.snapshot_id < existing.first->snapshot_id) {
+		auto next = positions.erase(existing.first);
+		positions.emplace_hint(next, deletion);
+	}
+}
+
 inline void MergeDeletesWithSnapshots(const DeleteFileScanResult &scan_result, idx_t fallback_snapshot,
                                       set<PositionWithSnapshot> &result) {
 	for (idx_t i = 0; i < scan_result.deleted_rows.size(); i++) {
@@ -38,7 +46,7 @@ inline void MergeDeletesWithSnapshots(const DeleteFileScanResult &scan_result, i
 		} else {
 			pos_with_snap.snapshot_id = static_cast<int64_t>(fallback_snapshot);
 		}
-		result.insert(pos_with_snap);
+		MergeDeletePosition(result, pos_with_snap);
 	}
 }
 
@@ -52,7 +60,7 @@ inline void MergeDeletesWithSnapshots(const DuckLakeDeleteData &delete_data, idx
 		} else {
 			pos_with_snap.snapshot_id = static_cast<int64_t>(fallback_snapshot);
 		}
-		result.insert(pos_with_snap);
+		MergeDeletePosition(result, pos_with_snap);
 	}
 }
 

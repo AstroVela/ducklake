@@ -793,6 +793,13 @@ def concurrent_complete_mask(driver, root, checks, *, vectors=False):
             "FROM ducklake_table_changes('lake','main','items',getvariable('first_delete'),getvariable('final_delete')) "
             "WHERE snapshot_id=getvariable('final_delete') AND change_type='delete'"
         )
+        for projection in ("snapshot_id", "snapshot_id,rowid"):
+            native.sql(
+                "SELECT CASE WHEN count(*)=1 AND min(snapshot_id)=getvariable('inline_delete') "
+                "THEN true ELSE error('business filter changed the projected deletion snapshot') END FROM "
+                f"(SELECT {projection} FROM ducklake_table_deletions("
+                "'lake','main','items',getvariable('first_delete'),getvariable('final_delete')) WHERE id=128)"
+            )
         native.finish()
         mask = "Puffin" if vectors else "Parquet"
         checks.append(f"concurrent inline and completing {mask} deletes preserve the first event per row")
@@ -826,6 +833,41 @@ def flushed_source_delete_snapshot(driver, root, checks):
         native.finish()
         checks.append("full DELETE of a flushed Vortex source uses its delete commit for all audit rows")
         return {"logical_deletes": 128}
+    finally:
+        M.stop(native)
+
+
+def flush_late_inline_mask(driver, root, checks, *, vectors=False):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        if vectors:
+            native.sql("CALL ducklake_set_option('lake','write_deletion_vectors',true,table_name=>'items')")
+        native.sql("CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items')")
+        complete, inline = root / "complete.sql", root / "inline.sql"
+        complete.write_text("DELETE FROM lake.items")
+        inline.write_text("DELETE FROM lake.items WHERE id=0")
+        native.call("concurrent-deletes", complete, inline)
+        native.sql(
+            "SET VARIABLE late_inline=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SET VARIABLE full_delete=getvariable('late_inline')-1;"
+            "SELECT CASE WHEN (SELECT count(*) FROM lake.items AT (VERSION=>getvariable('full_delete')))=0 "
+            "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1)=1 "
+            "THEN true ELSE error('expected an older complete mask and a later inline deletion') END;"
+            "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
+            "SELECT CASE WHEN (SELECT count(*) FROM lake.items AT (VERSION=>getvariable('full_delete')))=0 "
+            "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1)=0 "
+            "THEN true ELSE error('inline flush changed historical visibility') END;"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "AND min(snapshot_id)=getvariable('full_delete') AND max(snapshot_id)=getvariable('full_delete') "
+            "THEN true ELSE error('inline flush changed the first DELETE snapshot') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('full_delete'),getvariable('late_inline'))"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.finish()
+        mask = "Puffin" if vectors else "Parquet"
+        checks.append(f"flush preserves the earlier {mask} deletion when a stale inline deletion commits later")
+        return {"logical_deletes": 4096, "historical_live_rows": 0, "delete_format": mask}
     finally:
         M.stop(native)
 
@@ -870,6 +912,8 @@ def main():
             ("concurrent-parquet-completion", concurrent_complete_mask),
             ("concurrent-puffin-completion", lambda d, r, c: concurrent_complete_mask(d, r, c, vectors=True)),
             ("flushed-source-delete-snapshot", flushed_source_delete_snapshot),
+            ("late-inline-parquet-flush", flush_late_inline_mask),
+            ("late-inline-puffin-flush", lambda d, r, c: flush_late_inline_mask(d, r, c, vectors=True)),
             ("append-after-retirement", append_after_retirement),
             ("later-append", lambda d, r, c: crash(d, r, "retire_after_commit", c, append_after_restart=True)),
         ]
