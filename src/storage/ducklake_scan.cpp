@@ -272,6 +272,14 @@ DuckLakeFunctionInfo::Create(DuckLakeTableEntry &table, DuckLakeTransaction &tra
 	return result;
 }
 
+void DuckLakeFunctionInfo::SetScanType(TableFunction &function, DuckLakeScanType type) {
+	scan_type = type;
+	if (type == DuckLakeScanType::SCAN_DELETIONS) {
+		// Deletion snapshot IDs are assigned in FinalizeChunk, after file readers apply filters.
+		function.filter_pushdown = false;
+	}
+}
+
 shared_ptr<DuckLakeTransaction> DuckLakeFunctionInfo::GetTransaction() {
 	auto result = transaction.lock();
 	if (!result) {
@@ -331,7 +339,7 @@ unique_ptr<FunctionData> DuckLakeScanDeserialize(Deserializer &deserializer, Tab
 	    Catalog::GetEntry<TableCatalogEntry>(context, catalog_name, schema_name, table_name).Cast<DuckLakeTableEntry>();
 
 	auto function_info = DuckLakeFunctionInfo::Create(table_entry, transaction, snapshot);
-	function_info->scan_type = scan_type;
+	function_info->SetScanType(function, scan_type);
 	function_info->start_snapshot = std::move(start_snapshot);
 	function.function_info = std::move(function_info);
 

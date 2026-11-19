@@ -782,9 +782,21 @@ def concurrent_complete_mask(driver, root, checks, *, vectors=False):
             "THEN true ELSE error('concurrent deletion history has duplicate rows') END "
             "FROM ducklake_table_deletions('lake','main','items',getvariable('first_delete'),getvariable('final_delete'))"
         )
+        for version, count in (("first_delete", 128), ("inline_delete", 1), ("final_delete", 3967)):
+            native.sql(
+                f"SELECT CASE WHEN count(*)={count} THEN true ELSE error('snapshot filter changed the event set') END "
+                "FROM ducklake_table_deletions('lake','main','items',getvariable('first_delete'),getvariable('final_delete')) "
+                f"WHERE snapshot_id=getvariable('{version}')"
+            )
+        native.sql(
+            "SELECT CASE WHEN count(*)=3967 AND min(id)=129 THEN true ELSE error('change filter lost DELETE events') END "
+            "FROM ducklake_table_changes('lake','main','items',getvariable('first_delete'),getvariable('final_delete')) "
+            "WHERE snapshot_id=getvariable('final_delete') AND change_type='delete'"
+        )
         native.finish()
         mask = "Puffin" if vectors else "Parquet"
         checks.append(f"concurrent inline and completing {mask} deletes preserve the first event per row")
+        checks.append(f"snapshot predicates filter finalized {mask} deletion events and table changes")
         return {"logical_deletes": 4096, "final_deletes": 3967, "delete_format": mask}
     finally:
         M.stop(native)
