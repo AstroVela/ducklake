@@ -393,6 +393,11 @@ struct DuckLakeFileListEntry {
 	unordered_map<idx_t, pair<string, string>> column_min_max;
 };
 
+struct DuckLakeDeleteMaskVersion {
+	DuckLakeFileData file;
+	idx_t begin_snapshot;
+};
+
 struct DuckLakeDeleteScanEntry {
 	DuckLakeFileData file;
 	DuckLakeFileData delete_file;
@@ -409,6 +414,9 @@ struct DuckLakeDeleteScanEntry {
 	DataFileIndex file_id;
 	//! Inlined file deletions {row_id -> snapshot_id}
 	unordered_map<idx_t, idx_t> inlined_file_deletions;
+	//! Vortex change scans collect the full delete history of each physical source.
+	vector<DuckLakeDeleteMaskVersion> vortex_masks;
+	optional_idx vortex_drop_snapshot;
 };
 
 struct DuckLakeFileListExtendedEntry {

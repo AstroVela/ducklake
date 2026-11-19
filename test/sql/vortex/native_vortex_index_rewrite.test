@@ -73,6 +73,32 @@ SELECT sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file WHERE 
 ----
 384
 
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-readonly.json',2)
+----
+Vortex rewrite controls require autocommit
+
+statement ok
+ROLLBACK
+
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-reserved.duckdb_extension',2)
+----
+reserved for DuckDB extensions
+
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__',2)
+----
+requires a new absolute reference path
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrites_v1
+----
+0
+
 query I
 SELECT revision FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn',getvariable('rewrite_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/rewrite-new.json',2)
 ----
