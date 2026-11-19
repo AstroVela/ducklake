@@ -101,10 +101,14 @@ string Where(const Policy &p) {
 	return " WHERE table_uuid=" + Quote(p.uuid) + " AND index_name=" + Quote(p.config.index);
 }
 
+bool HasPolicyTable(DuckLakeTransaction &transaction) {
+	auto &catalog = transaction.GetCatalog();
+	return bool(
+	    transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(), POLICIES));
+}
+
 void Initialized(Metadata &meta) {
-	auto &catalog = meta.transaction.GetCatalog();
-	if (!meta.transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
-	                                                POLICIES)) {
+	if (!HasPolicyTable(meta.transaction)) {
 		throw InvalidInputException("Vortex optimizer catalog is not initialized");
 	}
 }
@@ -360,8 +364,7 @@ DuckLakeTableEntry &Table(Metadata &meta, Policy &p) {
 	auto &catalog = meta.transaction.GetCatalog();
 	optional_ptr<CatalogEntry> entry;
 	if (p.uuid.empty()) {
-		entry = catalog.GetEntry(*meta.connection.context, CatalogType::TABLE_ENTRY, p.config.schema, p.config.table,
-		                         OnEntryNotFound::THROW_EXCEPTION);
+		entry = &catalog.GetEntry<TableCatalogEntry>(*meta.connection.context, p.config.schema, p.config.table);
 	} else {
 		auto snapshot = meta.transaction.GetSnapshot();
 		auto identity = meta.transaction.Query(
@@ -411,6 +414,12 @@ idx_t ReadyRevision(Metadata &meta, const Policy &p) {
 	auto result = meta.Query("SELECT revision FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1" + Where(p));
 	auto chunk = result->Fetch();
 	return chunk && chunk->size() ? chunk->GetValue(0, 0).GetValue<idx_t>() : 0;
+}
+
+void CheckIndexVectorSpecification(const Policy &p, const DuckLakeVortexIndex &index) {
+	if (index.dimension != p.config.dimension || index.field_id != p.field_id) {
+		throw InvalidInputException("Optimizer ready index vector specification changed");
+	}
 }
 
 vector<string> InlineSourceColumns(Metadata &meta, DuckLakeTableEntry &table, const DuckLakeInlinedTableInfo &source) {
@@ -671,9 +680,7 @@ void Probe(Metadata &meta, Policy &p, bool select_compaction = false,
 	p.merge_candidates.clear();
 	if (revision) {
 		index = make_uniq<DuckLakeVortexIndex>(VortexCatalog::Lookup(meta.transaction, table, p.config.index));
-		if (index->dimension != p.config.dimension || index->field_id != p.field_id) {
-			throw InvalidInputException("Optimizer ready index vector specification changed");
-		}
+		CheckIndexVectorSpecification(p, *index);
 		if (index->segments.size() == VortexCatalog::MAX_SEGMENTS) {
 			p.merge_candidates = index->SmallestSegments();
 		}
@@ -1817,18 +1824,48 @@ void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalo
 	}
 }
 
+void DuckLakeVortexOptimizer::CheckIndexDefinition(DuckLakeTransaction &transaction, const string &table_uuid,
+                                                   const DuckLakeVortexIndex &index) {
+	if (!HasPolicyTable(transaction)) {
+		return;
+	}
+	Policy p;
+	p.uuid = table_uuid;
+	p.config.index = index.name;
+	auto result =
+	    VortexCatalog::Query(transaction, "SELECT config FROM {METADATA_CATALOG}." + string(POLICIES) + Where(p));
+	auto chunk = result->Fetch();
+	if (chunk && chunk->size()) {
+		Decode(p, StringValue::Get(chunk->GetValue(0, 0)));
+		CheckIndexVectorSpecification(p, index);
+	}
+}
+
 void DuckLakeVortexOptimizer::Enable(ClientContext &context, const Config &config,
                                      const std::function<void(const string &)> &observe) {
+	auto identity = VortexCatalog::ResolveCatalog(context, config.catalog, true, "Vortex optimizer enable");
+	auto interrupt = [&] {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	};
 	auto owner = GetOwner(*context.db);
 	Policy p;
 	{
+		// Serialize the policy commit with creation of a same-name index definition.
+		auto publication = VortexCatalog::PublicationLock().GetSharedLock(interrupt);
 		std::lock_guard<std::mutex> guard(owner->runtime->io);
-		Metadata meta(*context.db, config.catalog);
+		interrupt();
+		Metadata meta(*context.db, config.catalog, true, &identity);
 		Initialized(meta);
 		p = Identify(meta, config.catalog, config.schema, config.table, config.index);
 		p.config = config;
 		Validate(p);
-		FlushConfiguration(*meta.connection.context, Table(meta, p));
+		auto &table = Table(meta, p);
+		FlushConfiguration(*meta.connection.context, table);
+		if (ReadyRevision(meta, p)) {
+			CheckIndexVectorSpecification(p, VortexCatalog::Lookup(meta.transaction, table, config.index));
+		}
 		auto root = Canonical(config.root);
 		auto &fs = FileSystem::GetFileSystem(context);
 		if (!fs.DirectoryExists(root)) {
@@ -1857,6 +1894,7 @@ void DuckLakeVortexOptimizer::Enable(ClientContext &context, const Config &confi
 		meta.Query("INSERT INTO {METADATA_CATALOG}." + string(POLICIES) + " VALUES(" + Quote(p.uuid) + "," +
 		           Quote(config.index) + "," + Quote(Encode(p)) +
 		           ",true,'idle','',0,'',0,'','',0,0,0,0,0,'none','[]','',0,0,'disabled')");
+		interrupt();
 		meta.Commit();
 		owner->runtime->Add(p, observe);
 	}

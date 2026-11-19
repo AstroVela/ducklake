@@ -54,6 +54,17 @@ DuckLakeVortexCollectionLock &DuckLakeVortexReadView::AdmissionLock() {
 	return lock;
 }
 
+const DuckLakeFieldId &DuckLakeVortexReadView::ResolveField(DuckLakeTableEntry &table, const string &name) {
+	auto &field = table.GetFieldId(vector<string> {name});
+	auto expected = name == "id"          ? LogicalType::BIGINT
+	                : name == "embedding" ? LogicalType::LIST(LogicalType::FLOAT)
+	                                      : LogicalType::VARCHAR;
+	if (field.Type() != expected) {
+		throw InvalidInputException("Native read view field type mismatch: %s", name);
+	}
+	return field;
+}
+
 static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVortexViewOptions &options,
                                           const std::function<void(const string &)> &observe,
                                           optional_ptr<ClientContext> owner, bool oracle_rows,
@@ -147,13 +158,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		json.Add(captured, "business_fields", business);
 		vector<pair<FieldIndex, LogicalType>> business_fields;
 		for (auto &name : {"id", "embedding", "category", "payload"}) {
-			auto &field = table.GetFieldId(vector<string> {name});
-			auto expected = string(name) == "id"          ? LogicalType::BIGINT
-			                : string(name) == "embedding" ? LogicalType::LIST(LogicalType::FLOAT)
-			                                              : LogicalType::VARCHAR;
-			if (field.Type() != expected) {
-				throw InvalidInputException("Native read view field type mismatch: %s", name);
-			}
+			auto &field = DuckLakeVortexReadView::ResolveField(table, name);
 			json.Number(string(name) == "embedding" ? captured : business,
 			            string(name) == "embedding" ? "field_id" : name, field.GetFieldIndex().index);
 			business_fields.emplace_back(field.GetFieldIndex(), field.Type());

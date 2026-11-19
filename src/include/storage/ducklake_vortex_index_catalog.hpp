@@ -102,6 +102,8 @@ struct DuckLakeVortexIndex {
 	static void Rollback(Connection &owner);
 	static void Initialized(DuckLakeTransaction &transaction);
 	static unique_ptr<QueryResult> Query(DuckLakeTransaction &transaction, const string &sql);
+	static DuckLakeVortexIndex Create(ClientContext &context, const string &catalog, const string &schema,
+	                                  const string &table, const string &name, const string &root, uint32_t dimension);
 	static void Initialize(Connection &owner, const string &catalog, ClientContext &caller);
 	static string CollectibleGenerationPredicate(idx_t max_artifact_bytes);
 	static DuckLakeVortexGCResult Collect(ClientContext &context, const string &catalog, idx_t max_generations,

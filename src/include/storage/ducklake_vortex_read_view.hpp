@@ -8,6 +8,7 @@
 
 namespace duckdb {
 
+class DuckLakeFieldId;
 class ExtensionLoader;
 void RegisterDuckLakeVortexReadView(ExtensionLoader &loader);
 
@@ -32,6 +33,7 @@ struct DuckLakeVortexSourceBuffer {
 
 struct DuckLakeVortexReadView {
 	static DuckLakeVortexCollectionLock &AdmissionLock();
+	static const DuckLakeFieldId &ResolveField(DuckLakeTableEntry &table, const string &name);
 	idx_t snapshot_id;
 	idx_t source_bytes = 0;
 	idx_t visible_rows = 0;

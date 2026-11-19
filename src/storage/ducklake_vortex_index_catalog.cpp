@@ -10,6 +10,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 #include "storage/ducklake_catalog.hpp"
@@ -21,6 +22,7 @@
 #include "storage/ducklake_vortex_query_ffi.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
+#include "storage/ducklake_vortex.hpp"
 #include "mbedtls_wrapper.hpp"
 
 #include <algorithm>
@@ -1505,6 +1507,91 @@ DuckLakeVortexCollectionLock &DuckLakeVortexIndex::PublicationLock() {
 DuckLakeVortexCollectionLock &DuckLakeVortexIndex::CollectionLock() {
 	static DuckLakeVortexCollectionLock lock;
 	return lock;
+}
+
+DuckLakeVortexIndex DuckLakeVortexIndex::Create(ClientContext &context, const string &catalog_name,
+                                                const string &schema, const string &table_name, const string &name,
+                                                const string &root, uint32_t dimension) {
+	Name(name);
+	if (!dimension || dimension > 4096 || root.empty() || root.size() > 65536 || root.find('\0') != string::npos) {
+		throw InvalidInputException("Invalid Vortex index definition dimension or root");
+	}
+	auto identity = ResolveCatalog(context, catalog_name, true, "Vortex index creation");
+	Connection owner(*context.db);
+	auto interrupt = [&] {
+		CheckInterrupted(owner, context);
+	};
+	auto publication = PublicationLock().GetExclusiveLock(interrupt);
+	try {
+		interrupt();
+		auto &transaction = Begin(owner, catalog_name, &identity);
+		Initialized(transaction);
+		auto &catalog = transaction.GetCatalog();
+		auto &table =
+		    catalog.GetEntry<TableCatalogEntry>(*owner.context, schema, table_name).Cast<DuckLakeTableEntry>();
+		DuckLakeVortex::ValidateTable(table);
+		if (DuckLakeVortex::GetFormat(*owner.context, table) != DataFileFormat::VORTEX ||
+		    table.GetColumns().PhysicalColumnCount() != 4 || table.GetColumns().LogicalColumnCount() != 4) {
+			throw InvalidInputException("Vortex index definition requires a Vortex table with four business columns");
+		}
+		for (auto name : {"id", "category", "payload"}) {
+			DuckLakeVortexReadView::ResolveField(table, name);
+		}
+		// QueryEnd releases schema pins. Own the field ID and UUID needed after the emptiness check.
+		auto field_id = DuckLakeVortexReadView::ResolveField(table, "embedding").GetFieldIndex().index;
+		auto uuid = table.GetTableUUID();
+		auto existing = Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
+		                                       " WHERE table_uuid=" + Value(uuid).ToSQLString() +
+		                                       " AND index_name=" + Value(name).ToSQLString());
+		if (existing->Fetch()->GetValue(0, 0).GetValue<idx_t>()) {
+			throw InvalidInputException("Vortex named index already exists");
+		}
+		auto qualified = KeywordHelper::WriteOptionallyQuoted(catalog_name) + "." +
+		                 KeywordHelper::WriteOptionallyQuoted(schema) + "." +
+		                 KeywordHelper::WriteOptionallyQuoted(table_name);
+		auto rows = owner.Query("SELECT 1 FROM " + qualified + " LIMIT 1");
+		if (rows->HasError()) {
+			rows->ThrowError();
+		}
+		if (rows->Fetch()) {
+			throw InvalidInputException(
+			    "Vortex index definition requires an empty table; build existing data explicitly");
+		}
+		auto &fs = FileSystem::GetFileSystem(context);
+		if (!fs.IsPathAbsolute(root)) {
+			throw InvalidInputException("Vortex index root must be absolute");
+		}
+		auto canonical_root = Canonical(root);
+		CheckBuildDirectoryAccess(context, canonical_root);
+		auto managed = fs.ExpandPath(catalog.DataPath());
+		while (managed.size() > 1 && managed.back() == '/') {
+			managed.pop_back();
+		}
+		if (!fs.IsPathAbsolute(managed)) {
+			throw InvalidInputException("Vortex index managed data path must be absolute");
+		}
+		if (!fs.DirectoryExists(managed)) {
+			fs.CreateDirectory(managed);
+		}
+		OutsideManagedDataPath(canonical_root, ResolveLocalPath(managed));
+		DuckLakeVortexIndex result;
+		result.name = name;
+		result.revision = 1;
+		result.field_id = field_id;
+		result.dimension = dimension;
+		result.root = canonical_root;
+		DuckLakeVortexOptimizer::CheckIndexDefinition(transaction, uuid, result);
+		Compose(result, {}, uuid);
+		Query(transaction, "INSERT INTO {METADATA_CATALOG}." + string(CATALOG_TABLE) + " VALUES(" +
+		                       Value(uuid).ToSQLString() + "," + Value(name).ToSQLString() + ",1," +
+		                       Value(result.root).ToSQLString() + "," + Value(result.reference).ToSQLString() + ")");
+		interrupt();
+		owner.Commit();
+		return result;
+	} catch (...) {
+		Rollback(owner);
+		throw;
+	}
 }
 
 void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog, ClientContext &caller) {
