@@ -2,14 +2,13 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/storage/storage_lock.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
 
 #include <functional>
 
 namespace duckdb {
 
 class ExtensionLoader;
-class StorageLock;
 void RegisterDuckLakeVortexReadView(ExtensionLoader &loader);
 
 struct DuckLakeVortexViewOptions {
@@ -32,7 +31,7 @@ struct DuckLakeVortexSourceBuffer {
 };
 
 struct DuckLakeVortexReadView {
-	static StorageLock &AdmissionLock();
+	static DuckLakeVortexCollectionLock &AdmissionLock();
 	idx_t snapshot_id;
 	idx_t source_bytes = 0;
 	idx_t visible_rows = 0;
@@ -42,7 +41,7 @@ struct DuckLakeVortexReadView {
 	string managed_data_path;
 	idx_t captured_business_rows = 0;
 	vector<DuckLakeVortexSourceBuffer> sources;
-	unique_ptr<StorageLockKey> generation_guard;
+	unique_ptr<DuckLakeVortexCollectionLock::Key> generation_guard;
 
 	static DuckLakeVortexReadView Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
 	                                      const std::function<void(const string &)> &observe = nullptr,
@@ -50,6 +49,10 @@ struct DuckLakeVortexReadView {
 	static DuckLakeVortexReadView AcquireQuery(Connection &reader, const DuckLakeVortexViewOptions &options,
 	                                           const std::function<void(const string &)> &observe = nullptr,
 	                                           optional_ptr<ClientContext> owner = nullptr);
+
+private:
+	friend struct DuckLakeVortexIndex;
+	// BuildAndPublish holds the collection guard from registration through publication or reconciliation.
 	static DuckLakeVortexReadView AcquireBuild(Connection &reader, const DuckLakeVortexViewOptions &options,
 	                                           const std::function<void(const string &)> &observe = nullptr,
 	                                           optional_ptr<ClientContext> owner = nullptr);

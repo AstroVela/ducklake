@@ -55,6 +55,19 @@ requires Vortex output and auto_compact=true
 statement ok
 CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
 
+statement ok
+COPY (SELECT 'optimizer directory validation') TO '__WORKING_DIRECTORY__/__TEST_DIR__/optimizer-root-file' (FORMAT CSV)
+
+statement error
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/optimizer-root-file',2,128,4194304,128,67108864)
+----
+must be an existing directory
+
+query I
+SELECT count(*) FROM ducklake_vortex_optimizer_status('lake')
+----
+0
+
 query T
 SELECT state FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,128,4194304,128,67108864)
 ----
