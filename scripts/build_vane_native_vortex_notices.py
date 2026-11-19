@@ -46,6 +46,22 @@ def main() -> None:
     sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
     shutil.copyfile(sysroot / "share/doc/rust/COPYRIGHT-library.html", output / "Rust-stdlib-licenses.html")
 
+    # The native wrapper's Rust sources declare Apache-2.0 in their SPDX headers.
+    # Its manifest omits the license field. Use the pinned checkout's Apache text.
+    config = wrapper / "about.toml"
+    vortex_config = output / "vortex-cargo-about.toml"
+    vortex_config.write_text(
+        config.read_text(encoding="utf-8")
+        + """
+[vortex-extension.clarify]
+license = "Apache-2.0"
+
+[[vortex-extension.clarify.files]]
+path = "../vortex-extension-vane/LICENSE"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+""",
+        encoding="utf-8",
+    )
     expressions = {
         "vortex": vortex.LICENSE_EXPRESSION,
         "ducklake": " AND ".join(
@@ -53,10 +69,10 @@ def main() -> None:
         ),
     }
     manifests = {
-        "vortex": wrapper / "vortex-extension/Cargo.toml",
-        "ducklake": source / "src/vortex_query/Cargo.toml",
+        "vortex": (wrapper / "vortex-extension/Cargo.toml", vortex_config),
+        "ducklake": (source / "src/vortex_query/Cargo.toml", config),
     }
-    for name, manifest in manifests.items():
+    for name, (manifest, crate_config) in manifests.items():
         notice = output / f"{name}-rust-licenses.txt"
         subprocess.run(
             [
@@ -66,7 +82,7 @@ def main() -> None:
                 "--locked",
                 "--fail",
                 "--config",
-                str(wrapper / "about.toml"),
+                str(crate_config),
                 "--manifest-path",
                 str(manifest),
                 "--output-file",
