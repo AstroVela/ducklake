@@ -3,6 +3,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 #include "storage/ducklake_catalog.hpp"
@@ -23,6 +24,23 @@ using namespace duckdb_yyjson;
 using namespace vortex_detail;
 
 namespace {
+
+constexpr const char *READ_CAPTURE = "ducklake_vortex_read_capture";
+
+struct ReadCaptureContext final : public ClientContextState {};
+
+struct ReadCaptureScope {
+	explicit ReadCaptureScope(ClientContext &context_p) : context(context_p) {
+		context.registered_state->GetOrCreate<ReadCaptureContext>(READ_CAPTURE);
+	}
+	~ReadCaptureScope() {
+		context.registered_state->Remove(READ_CAPTURE);
+	}
+	ReadCaptureScope(const ReadCaptureScope &) = delete;
+	ReadCaptureScope &operator=(const ReadCaptureScope &) = delete;
+
+	ClientContext &context;
+};
 
 yyjson_mut_val *Business(ViewJSON &json, const vector<Value> &values, uint32_t dimension) {
 	auto row = json.Object();
@@ -52,6 +70,10 @@ yyjson_mut_val *Business(ViewJSON &json, const vector<Value> &values, uint32_t d
 DuckLakeVortexCollectionLock &DuckLakeVortexReadView::AdmissionLock() {
 	static DuckLakeVortexCollectionLock lock;
 	return lock;
+}
+
+bool DuckLakeVortexReadView::IsCapturing(ClientContext &context) {
+	return bool(context.registered_state->Get<ReadCaptureContext>(READ_CAPTURE));
 }
 
 const DuckLakeFieldId &DuckLakeVortexReadView::ResolveField(DuckLakeTableEntry &table, const string &name) {
@@ -99,6 +121,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 	checkpoint("before_source_admission");
 	// BEGIN can start DuckLake transactions eagerly on every attached catalog.
 	auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
+	ReadCaptureScope capture(*reader.context);
 	try {
 		reader.BeginTransaction();
 		auto &resolved = Catalog::GetCatalog(*reader.context, options.catalog);
@@ -114,7 +137,6 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		}
 		auto &transaction = DuckLakeTransaction::Get(*reader.context, catalog);
 		DuckLakeVortexIndex::CheckCatalogIdentity(transaction, binding);
-		transaction.MarkVortexReadCapture();
 		auto snapshot = transaction.GetSnapshot();
 		checkpoint("after_snapshot");
 		auto entry = catalog.GetEntry(*reader.context, CatalogType::TABLE_ENTRY, options.schema, options.table,

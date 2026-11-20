@@ -211,9 +211,6 @@ public:
 	DuckLakeSnapshot GetSnapshot();
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	DuckLakeSnapshot RefreshVortexRewriteSnapshot();
-	void MarkVortexReadCapture() {
-		vortex_read_capture = true;
-	}
 	bool IsVortexReadCapture() const {
 		return vortex_read_capture;
 	}
@@ -389,7 +386,8 @@ private:
 	//! Set when this transaction inlines into a table that does not yet have an inlined-data table
 	atomic<bool> requires_new_inlined_table {false};
 #ifdef DUCKLAKE_ENABLE_VORTEX
-	atomic<bool> vortex_read_capture {false};
+	friend class DuckLakeTransactionManager;
+	bool vortex_read_capture = false;
 #endif
 	//! Per-transaction mutable change state (new/dropped/renamed entries, local file changes, flushed
 	//! inlined tables) and the Commit loop. Owns the data formerly held directly on the transaction.
