@@ -280,14 +280,15 @@ void PreparedNativeCleanup(Fixture &f) {
 
 void InlineOnlyRetention(Fixture &f) {
 	SQL(f.writer, "SELECT * FROM ducklake_initialize_vortex_indexes('lake');"
-	              "SELECT * FROM ducklake_initialize_vortex_optimizer('lake');"
-	              "INSERT INTO lake.items VALUES(1,[1,0],'A','inline')");
+	              "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
 	auto &fs = FileSystem::GetFileSystem(*f.writer.context);
 	Require(!fs.DirectoryExists(f.root + "/data"), "Inline-only fixture unexpectedly has a managed directory");
 	f.Policy();
 	auto result = f.Collect();
-	Require(result.expired && !result.files && f.Count("lake.items") == 1 && !fs.DirectoryExists(f.root + "/data"),
+	Require(result.expired && !result.files && f.Count("lake.items") == 0 && !fs.DirectoryExists(f.root + "/data"),
 	        "Metadata-only expiry required or created a managed directory");
+	SQL(f.writer, "INSERT INTO lake.items VALUES(1,[1,0],'A','inline')");
+	Require(f.Count("lake.items") == 1, "Metadata-only expiry changed the current table");
 }
 
 void CleanupInitializationOrder(Fixture &f) {
