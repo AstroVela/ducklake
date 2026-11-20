@@ -85,8 +85,14 @@ def exercise(root, report):
         connection.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
         retry_setting = query(connection, "SELECT current_setting('ducklake_max_retry_count') AS retries")
         original = rows(1000, 16)
+        literal_payload = "版本 {SNAPSHOT_ID} 路径 {DATA_PATH}"
+        original[2]["payload"] = literal_payload
         receipt = batch(connection, "first-'请求", original)
         require(receipt["row_count"] == 16 and count(connection) == 16, "Batch did not append all rows")
+        require(
+            query(connection, "SELECT payload FROM lake.items WHERE id=1002") == [{"payload": literal_payload}],
+            "Inline commit changed the hashed text",
+        )
         require(
             query(connection, "SELECT max(snapshot_id) AS snapshot_id FROM __ducklake_metadata_lake.ducklake_snapshot")
             == [{"snapshot_id": receipt["snapshot_id"]}],
@@ -178,6 +184,9 @@ def exercise(root, report):
             rejected(lambda: batch(connection, "outer-transaction", rows(9000, 1)), "autocommit")
         finally:
             connection.execute("ROLLBACK")
+        connection.execute("CREATE VIEW lake.item_view AS SELECT * FROM lake.items")
+        rejected(lambda: batch(connection, "view", rows(9000, 1), table="item_view"), "table")
+        check_no_request(connection, "view")
         require(count(connection) == 20, "Rejected input committed partial rows")
         checks.append(
             "canonical signed zero, NULL business values, Unicode/NUL text and atomic validation/size rejection"
@@ -248,6 +257,10 @@ def exercise(root, report):
 
         batch(connection, "for-index", rows(10000, 128))
         connection.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
+        require(
+            query(connection, "SELECT payload FROM lake.items WHERE id=1002") == [{"payload": literal_payload}],
+            "Flush changed the hashed text",
+        )
         phases.append(BASE.qualify(connection, "flushed-F", recalls))
         connection.execute(
             "SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn',"
@@ -264,13 +277,63 @@ def exercise(root, report):
     report.update(checks=checks, phases=phases, fixture_recalls=recalls, minimum_recall=min(recalls))
 
 
+def exercise_receipt_identity(root, report):
+    (root / "indexes").mkdir(parents=True)
+    connection = BASE.connect(root, create=True)
+    try:
+        connection.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
+        connection.execute("SET GLOBAL default_collation='nocase'")
+        original = rows(1, 1)
+        first = batch(connection, "Batch-A", original)
+        second = batch(connection, "batch-a", original)
+        require(first["snapshot_id"] != second["snapshot_id"] and count(connection) == 2, "IDs were conflated")
+        require(batch(connection, "Batch-A", original) == first, "Upper-case request returned the wrong receipt")
+        require(batch(connection, "batch-a", original) == second, "Lower-case request returned the wrong receipt")
+        require(
+            query(connection, "SELECT request_id FROM " + REQUESTS + " ORDER BY request_id COLLATE C")
+            == [{"request_id": "Batch-A"}, {"request_id": "batch-a"}],
+            "Stored identities did not match the request bytes",
+        )
+        connection.execute("RESET GLOBAL default_collation")
+        connection.execute("DELETE FROM lake.items")
+        connection.execute(
+            "INSERT INTO lake.items SELECT 100+i,[i::FLOAT,0::FLOAT],'A','replacement' FROM range(128)t(i)"
+        )
+        connection.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
+        require(
+            query(
+                connection,
+                "SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn',"
+                + quote(root / "indexes" / "replacement.json")
+                + ",2,1)",
+            )
+            == [{"revision": 2}],
+            "Full replacement did not publish the new dimension",
+        )
+        require(batch(connection, "Batch-A", original) == first, "Replacement hid the original receipt")
+        require(batch(connection, "batch-a", original) == second, "Replacement hid the second receipt")
+        rejected(lambda: batch(connection, "new-old-dimension", original), "dimension")
+        check_no_request(connection, "new-old-dimension")
+        require(count(connection) == 128, "Receipt replay reinserted a deleted row")
+        current = [{**original[0], "embedding": [1.0, 0.0]}]
+        require(batch(connection, "current-dimension", current)["row_count"] == 1, "New dimension did not append")
+    finally:
+        connection.close()
+    report["receipt_identity"] = ["bytewise identity under nocase", "receipt replay across full index replacement"]
+
+
 def crash_cases(driver, root, report):
     checks = []
-    for stage, committed in [("before_commit", False), ("after_commit", True)]:
-        case = root / stage
+    for mode, committed, file_backed in [
+        ("pause-before_commit", False, False),
+        ("pause-after_commit", True, False),
+        ("file-pause-before_commit", False, True),
+        ("file-pause-after_commit", True, True),
+    ]:
+        case = root / mode
         case.mkdir(mode=0o700)
         with (case / "driver.log").open("w") as log:
-            child = subprocess.Popen([str(driver), str(case), "pause-" + stage], stdout=log, stderr=subprocess.STDOUT)
+            child = subprocess.Popen([str(driver), str(case), mode], stdout=log, stderr=subprocess.STDOUT)
             try:
                 deadline = time.monotonic() + 60
                 while not (case / "checkpoint").exists():
@@ -280,6 +343,10 @@ def crash_cases(driver, root, report):
                     )
                     require(time.monotonic() < deadline, "Native writer did not reach checkpoint")
                     time.sleep(0.02)
+                require(
+                    bool(list((case / "data").rglob("*.vortex"))) == file_backed,
+                    "Crash boundary did not use the requested storage path",
+                )
                 if committed:
                     wal = case / "metadata.ducklake.wal"
                     require(wal.is_file() and wal.stat().st_size > 0, "Committed recovery case has no metadata WAL")
@@ -294,6 +361,16 @@ def crash_cases(driver, root, report):
         try:
             expected = 2 if committed else 0
             require(count(connection) == expected, "SIGKILL recovered a partial or missing batch")
+            require(
+                query(connection, "SELECT id,embedding,category,payload FROM lake.items ORDER BY id")
+                == (DRIVER_ROWS if committed else []),
+                "Recovered data did not match the original typed rows",
+            )
+            recovered = BASE.raw(connection)
+            require(
+                len(recovered) == expected and all(("file_id" in row) == file_backed for row in recovered),
+                "Recovery selected the wrong row storage path",
+            )
             require(
                 query(connection, "SELECT count(*) AS n FROM " + REQUESTS) == [{"n": 1 if committed else 0}],
                 "SIGKILL separated request identity from data",
@@ -315,8 +392,17 @@ def crash_cases(driver, root, report):
             )
         finally:
             connection.close()
-        checks.append(stage + ": SIGKILL, installed-provider recovery, atomic receipt/data and safe request retry")
-    for mode in ["fail-after_lookup", "fail-before_commit", "fail-after_commit", "cancel", "conflict"]:
+        checks.append(mode + ": SIGKILL, installed-provider recovery, atomic receipt/data and safe request retry")
+    for mode in [
+        "fail-after_lookup",
+        "fail-before_commit",
+        "fail-after_commit",
+        "cancel",
+        "conflict",
+        "queued-cancel",
+        "cancel-init",
+        "rebind",
+    ]:
         case = root / mode
         case.mkdir(mode=0o700)
         with (case / "driver.log").open("w") as log:
@@ -337,6 +423,7 @@ def main():
     started = time.monotonic()
     try:
         exercise(root, report)
+        exercise_receipt_identity(root / "receipt-identity", report)
         crash_cases(args.driver.resolve(), root, report)
         report["status"] = "passed"
     except Exception as error:

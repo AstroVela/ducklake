@@ -366,7 +366,17 @@ void DuckLakeUtil::ValidateNoInlinedSystemColumns(const ColumnList &columns, con
 }
 
 string DuckLakeUtil::ReplaceSkippingQuotes(const string &sql, const string &from, const string &to) {
-	if (from.empty()) {
+	return ReplaceSkippingQuotes(sql, {{from, to}});
+}
+
+string DuckLakeUtil::ReplaceSkippingQuotes(const string &sql, const vector<pair<string, string>> &replacements) {
+	string prefixes;
+	for (auto &entry : replacements) {
+		if (!entry.first.empty() && prefixes.find(entry.first.front()) == string::npos) {
+			prefixes += entry.first.front();
+		}
+	}
+	if (sql.find_first_of(prefixes) == string::npos) {
 		return sql;
 	}
 
@@ -406,10 +416,22 @@ string DuckLakeUtil::ReplaceSkippingQuotes(const string &sql, const string &from
 			continue;
 		}
 
-		// If not inside a quoted range, check for a match of `from`
-		if (sql.compare(pos, from.size(), from) == 0) {
-			result += to;
-			pos += from.size();
+		auto next_quote = range_idx < no_replace_ranges.size() ? no_replace_ranges[range_idx].first : sql.size();
+		auto next_prefix = sql.find_first_of(prefixes, pos);
+		if (next_prefix >= next_quote) {
+			result.append(sql, pos, next_quote - pos);
+			pos = next_quote;
+			continue;
+		}
+		result.append(sql, pos, next_prefix - pos);
+		pos = next_prefix;
+		auto replacement =
+		    std::find_if(replacements.begin(), replacements.end(), [&](const pair<string, string> &entry) {
+			    return !entry.first.empty() && sql.compare(pos, entry.first.size(), entry.first) == 0;
+		    });
+		if (replacement != replacements.end()) {
+			result += replacement->second;
+			pos += replacement->first.size();
 			continue;
 		}
 

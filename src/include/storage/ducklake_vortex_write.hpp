@@ -13,11 +13,11 @@ struct DuckLakeVortexWriteResult {
 
 struct DuckLakeVortexWriteBatch {
 	static LogicalType RowsType();
-	static void Initialize(Connection &owner, const string &catalog);
-	static DuckLakeVortexWriteResult Append(Connection &owner, const string &catalog, const string &schema,
-	                                        const string &table, const string &index, const string &request_id,
-	                                        const Value &rows, const std::function<void(const string &)> &observe = {},
-	                                        optional_ptr<ClientContext> caller = nullptr);
+	static void Initialize(Connection &owner, ClientContext &caller, const string &catalog);
+	static DuckLakeVortexWriteResult Append(Connection &owner, ClientContext &caller, const string &catalog,
+	                                        const string &schema, const string &table, const string &index,
+	                                        const string &request_id, const Value &rows,
+	                                        const std::function<void(const string &)> &observe = {});
 };
 
 void RegisterDuckLakeVortexWrite(ExtensionLoader &loader);
