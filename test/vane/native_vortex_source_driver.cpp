@@ -32,7 +32,8 @@ struct Fixture {
 	DuckDB database;
 	Connection writer;
 	DuckLakeVortexIndex index;
-	Fixture(const string &root_p, const string &data_path) : root(root_p), database(nullptr), writer(database) {
+	Fixture(const string &root_p, const string &data_path, bool initialize)
+	    : root(root_p), database(nullptr), writer(database) {
 		database.LoadStaticExtension<DucklakeExtension>();
 		database.LoadStaticExtension<VortexExtension>();
 		SQL(writer, "SET threads=2; LOAD parquet; ATTACH " +
@@ -40,8 +41,13 @@ struct Fixture {
 		                Value(data_path).ToSQLString() + ",DATA_INLINING_ROW_LIMIT 1000)");
 		FileSystem::GetFileSystem(*writer.context).CreateDirectory(root + "/indexes");
 		SQL(writer, "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
-		            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
-		            "SELECT * FROM ducklake_initialize_vortex_indexes('lake');"
+		            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')");
+		if (initialize) {
+			Initialize();
+		}
+	}
+	void Initialize() {
+		SQL(writer, "SELECT * FROM ducklake_initialize_vortex_indexes('lake');"
 		            "SELECT * FROM ducklake_initialize_vortex_optimizer('lake');"
 		            "SELECT * FROM ducklake_initialize_vortex_writes('lake');"
 		            "SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn'," +
@@ -197,6 +203,53 @@ void SharedSource(Fixture &f) {
 	        "One shared source consumed more than one file from the budget");
 }
 
+void LinkedNativeCleanup(Fixture &f) {
+	auto real = f.root + "/data/real";
+	auto alias = f.root + "/data/alias";
+	auto path = real + "/shared.parquet";
+	FileSystem::GetFileSystem(*f.writer.context).CreateDirectory(real);
+	Require(symlink(real.c_str(), alias.c_str()) == 0, "Could not create a shared directory alias");
+	SQL(f.writer, "CREATE TABLE lake.shared_first(i BIGINT); CREATE TABLE lake.shared_last(i BIGINT)");
+	SQL(f.writer, "COPY (SELECT 7::BIGINT AS i) TO " + Value(path).ToSQLString() + " (FORMAT PARQUET)");
+	SQL(f.writer,
+	    "CALL ducklake_add_data_files('lake','shared_first'," + Value(alias + "/shared.parquet").ToSQLString() + ")");
+	SQL(f.writer, "CALL ducklake_add_data_files('lake','shared_last'," + Value(path).ToSQLString() + ")");
+	SQL(f.writer, "DROP TABLE lake.shared_first");
+	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
+	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+	        "The native cleanup fixture did not queue the shared alias");
+	SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)");
+	SQL(f.writer, "CALL ducklake_delete_orphaned_files('lake',cleanup_all=>true)");
+	Require(f.Count("lake.shared_last") == 1 && Read(path).size() > 0,
+	        "Native cleanup removed a file through an alias of its parent directory");
+	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+	        "Native cleanup acknowledged a shared directory alias");
+}
+
+void PreparedNativeCleanup(Fixture &f) {
+	auto path = AddParquet(f, "shared_first", "shared.parquet");
+	SQL(f.writer, "CREATE TABLE lake.shared_last(i BIGINT)");
+	SQL(f.writer, "CALL ducklake_add_data_files('lake','shared_last'," + Value(path).ToSQLString() + ")");
+	SQL(f.writer, "DROP TABLE lake.shared_first");
+	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
+	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+	        "The prepared cleanup fixture did not queue a shared file");
+	SQL(f.writer, "PREPARE prune_old AS SELECT * FROM ducklake_cleanup_old_files('lake',cleanup_all=>true)");
+	f.Initialize();
+	SQL(f.writer, "EXECUTE prune_old");
+	Require(f.Count("lake.shared_last") == 1 && Read(path).size() > 0,
+	        "Prepared cleanup skipped the newly initialized source guard");
+
+	auto ordinary = AddParquet(f, "timestamped", "data-12:30.parquet");
+	SQL(f.writer, "DROP TABLE lake.timestamped");
+	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
+	SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)");
+	Require(!FileSystem::GetFileSystem(*f.writer.context).FileExists(ordinary),
+	        "Native cleanup rejected an ordinary POSIX filename");
+	Require(f.Count("lake.shared_last") == 1 && Read(path).size() > 0,
+	        "Native cleanup of an ordinary file removed a shared source");
+}
+
 void MixedSizes(Fixture &f) {
 	auto small = AddParquet(f, "small_source", "small.parquet");
 	SQL(f.writer, "DROP TABLE lake.small_source");
@@ -318,9 +371,18 @@ int main(int argc, char **argv) {
 	try {
 		Require(argc == 3, "Usage: ducklake_vortex_source_driver ROOT MODE");
 		string root = argv[1], mode = argv[2];
-		Fixture f(root, mode == "shared-source" ? root + "//./data" : root + "/data");
+		Fixture f(root, mode == "shared-source" ? root + "//./data" : root + "/data",
+		          mode != "prepared-native-cleanup");
 		if (mode == "shared-source") {
 			SharedSource(f);
+			return 0;
+		}
+		if (mode == "linked-native-cleanup") {
+			LinkedNativeCleanup(f);
+			return 0;
+		}
+		if (mode == "prepared-native-cleanup") {
+			PreparedNativeCleanup(f);
 			return 0;
 		}
 		f.Seed();
@@ -470,8 +532,9 @@ int main(int argc, char **argv) {
 			}
 			SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)");
 			Require(f.Count("__ducklake_metadata_lake.ducklake_vortex_source_deletions_v1") == 1 &&
-			            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 0,
-			        "Native cleanup did not leave the expected independent intent acknowledgement");
+			            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1 &&
+			            FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source),
+			        "Native cleanup crossed durable source deletion ownership");
 			f.Drain();
 			f.CheckReclaimed();
 			return 0;
@@ -503,6 +566,9 @@ int main(int argc, char **argv) {
 			}
 			Require(changed && failed && Read(root + "/victim") == "keep-me", "Changed source was not rejected safely");
 			if (mode == "checksum") {
+				auto changed_bytes = Read(f.old_source);
+				SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)");
+				Require(Read(f.old_source) == changed_bytes, "Native cleanup removed a changed intent-owned source");
 				std::ofstream output(f.old_source, std::ios::binary);
 				output << original;
 			} else {

@@ -86,8 +86,8 @@ When resuming after unlink, the collector syncs the parent directory before
 acknowledging the intent. If the parent is gone, it syncs its nearest existing
 ancestor under the managed root.
 Changed files fail explicitly. A missing source is accepted only for a committed
-intent. Independent native cleanup can finish an already registered deletion;
-the collector subsequently acknowledges its remaining intent.
+intent. The source collector owns registered intents through acknowledgement.
+Native cleanup leaves those files and queue entries for the source collector.
 
 Cancellation preserves any committed intent. A crash before or after unlink
 continues from the same native metadata WAL after explicit resume. Request

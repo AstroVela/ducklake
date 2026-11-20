@@ -239,6 +239,8 @@ def native_cases(driver, root, report):
         "budget",
         "mixed-size",
         "shared-source",
+        "linked-native-cleanup",
+        "prepared-native-cleanup",
         "immediate",
         "permissions",
         "detach",

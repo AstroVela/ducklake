@@ -35,24 +35,26 @@ string AbsoluteLocalPath(FileSystem &fs, const string &path) {
 	return local;
 }
 
+static string ResolveSourcePath(ClientContext &context, const string &local) {
+	auto &fs = FileSystem::GetFileSystem(context).Cast<OpenerFileSystem>();
+	fs.VerifyCanAccessFile(local);
+	std::unique_ptr<char, decltype(&free)> resolved(realpath(local.c_str(), nullptr), free);
+	if (!resolved) {
+		if (errno == ENOENT || errno == ENOTDIR) {
+			return {};
+		}
+		throw IOException("Cannot resolve native Vortex source reference: %s", local);
+	}
+	return resolved.get();
+}
+
 bool MatchesSourcePath(ClientContext &context, const string &reference, const string &path) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (fs.IsRemoteFile(reference) && !StringUtil::StartsWith(reference, "file:/")) {
 		return false;
 	}
 	auto local = AbsoluteLocalPath(fs, reference);
-	if (local == path) {
-		return true;
-	}
-	fs.Cast<OpenerFileSystem>().VerifyCanAccessFile(local);
-	std::unique_ptr<char, decltype(&free)> resolved(realpath(local.c_str(), nullptr), free);
-	if (!resolved) {
-		if (errno == ENOENT || errno == ENOTDIR) {
-			return false;
-		}
-		throw IOException("Cannot resolve native Vortex source reference: %s", local);
-	}
-	return resolved.get() == path;
+	return local == path || ResolveSourcePath(context, local) == path;
 }
 } // namespace vortex_detail
 
@@ -298,10 +300,8 @@ void DuckLakeVortexSourceRetention::Initialize(DuckLakeTransaction &transaction)
 	                                    "digest VARCHAR NOT NULL,PRIMARY KEY(data_file_id,path,path_is_relative))");
 }
 
-bool DuckLakeVortexSourceRetention::IsInitialized(DuckLakeTransaction &transaction) {
-	auto &catalog = transaction.GetCatalog();
-	return (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb") &&
-	       transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(), POLICY);
+bool DuckLakeVortexSourceRetention::IsInitialized(Connection &connection, const DuckLakeCatalog &catalog) {
+	return connection.TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(), POLICY) != nullptr;
 }
 
 void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &transaction, CleanupType type,
@@ -310,7 +310,25 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 	auto &fs = FileSystem::GetFileSystem(context);
 	const auto include_scheduled = type == CleanupType::ORPHANED_FILES;
 	auto &metadata = transaction.GetMetadataManager();
+	auto physical_path = [&](const string &path) {
+		auto local = AbsoluteLocalPath(fs, path);
+		auto resolved = ResolveSourcePath(context, local);
+		if (resolved.empty()) {
+			return fs.FileSystem::CanonicalizePath(local);
+		}
+		fs.Cast<OpenerFileSystem>().VerifyCanAccessFile(resolved);
+		return resolved;
+	};
 	unordered_set<string> pending_paths;
+	auto intents =
+	    VortexIndex::Query(transaction, "SELECT path,path_is_relative FROM {METADATA_CATALOG}." + string(DELETIONS));
+	for (auto &intent : *intents) {
+		auto path = intent.GetValue<string>(0);
+		if (intent.GetValue<bool>(1)) {
+			path = fs.JoinPath(transaction.GetCatalog().DataPath(), path);
+		}
+		pending_paths.insert(physical_path(path));
+	}
 	if (!include_scheduled) {
 		unordered_set<idx_t> selected;
 		for (auto &file : files) {
@@ -319,7 +337,7 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		// An age-filtered native cleanup must leave shared paths whose other keys are still pending.
 		for (auto &entry : metadata.GetFilesForCleanup("", CleanupType::OLD_FILES, "/")) {
 			if (!selected.count(entry.id.index) && !fs.IsRemoteFile(entry.path)) {
-				pending_paths.insert(NormalizeManagedPath(AbsoluteLocalPath(fs, entry.path)));
+				pending_paths.insert(physical_path(entry.path));
 			}
 		}
 	}
@@ -328,7 +346,7 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		                           if (fs.IsRemoteFile(file.path)) {
 			                           return false;
 		                           }
-		                           auto path = NormalizeManagedPath(AbsoluteLocalPath(fs, file.path));
+		                           auto path = physical_path(file.path);
 		                           return pending_paths.count(path) ||
 		                                  metadata.HasFileReference(path, "/", include_scheduled) ||
 		                                  VortexIndex::ReferencesSource(transaction, path);

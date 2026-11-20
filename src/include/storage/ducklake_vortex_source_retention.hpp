@@ -6,6 +6,8 @@
 
 namespace duckdb {
 class ClientContext;
+class Connection;
+class DuckLakeCatalog;
 class DuckLakeTransaction;
 class DuckLakeVortexCollectionLock;
 struct DuckLakeVortexCatalogIdentity;
@@ -22,7 +24,7 @@ public:
 	static DuckLakeVortexCollectionLock &TransactionGate();
 	static bool IsCollector(ClientContext &context);
 	static void Initialize(DuckLakeTransaction &transaction);
-	static bool IsInitialized(DuckLakeTransaction &transaction);
+	static bool IsInitialized(Connection &connection, const DuckLakeCatalog &catalog);
 	static void ProtectCleanupFiles(DuckLakeTransaction &transaction, CleanupType type,
 	                                vector<DuckLakeFileForCleanup> &files);
 	static void Configure(ClientContext &context, const string &catalog, bool enabled, idx_t keep_snapshots,
