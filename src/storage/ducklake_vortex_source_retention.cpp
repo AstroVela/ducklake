@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <set>
 
 namespace duckdb {
 namespace vortex_detail {
@@ -41,7 +42,7 @@ static string ResolveSourcePath(ClientContext &context, const string &local) {
 	std::unique_ptr<char, decltype(&free)> resolved(realpath(local.c_str(), nullptr), free);
 	if (!resolved) {
 		if (errno == ENOENT || errno == ENOTDIR) {
-			return {};
+			return fs.CanonicalizePath(local);
 		}
 		throw IOException("Cannot resolve native Vortex source reference: %s", local);
 	}
@@ -305,7 +306,7 @@ bool DuckLakeVortexSourceRetention::IsInitialized(Connection &connection, const 
 }
 
 void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &transaction, CleanupType type,
-                                                        vector<DuckLakeFileForCleanup> &files) {
+                                                        const string &filter, vector<DuckLakeFileForCleanup> &files) {
 	auto &context = *transaction.GetConnection().context;
 	auto &fs = FileSystem::GetFileSystem(context);
 	const auto include_scheduled = type == CleanupType::ORPHANED_FILES;
@@ -313,9 +314,6 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 	auto physical_path = [&](const string &path) {
 		auto local = AbsoluteLocalPath(fs, path);
 		auto resolved = ResolveSourcePath(context, local);
-		if (resolved.empty()) {
-			return fs.FileSystem::CanonicalizePath(local);
-		}
 		fs.Cast<OpenerFileSystem>().VerifyCanAccessFile(resolved);
 		return resolved;
 	};
@@ -329,20 +327,32 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		}
 		pending_paths.insert(physical_path(path));
 	}
+	std::set<std::pair<idx_t, string>> eligible_keys;
 	if (!include_scheduled) {
-		unordered_set<idx_t> selected;
+		auto scheduled = metadata.GetFilesForCleanup("", CleanupType::OLD_FILES, "/");
+		auto filtered =
+		    filter.empty() ? vector<DuckLakeFileForCleanup>() : metadata.GetFilesForCleanup(filter, type, "/");
+		for (auto &entry : filter.empty() ? scheduled : filtered) {
+			eligible_keys.emplace(entry.id.index, entry.path);
+		}
+		std::set<std::pair<idx_t, string>> selected;
 		for (auto &file : files) {
-			selected.insert(file.id.index);
+			if (eligible_keys.count({file.id.index, file.path})) {
+				selected.emplace(file.id.index, file.path);
+			}
 		}
 		// An age-filtered native cleanup must leave shared paths whose other keys are still pending.
-		for (auto &entry : metadata.GetFilesForCleanup("", CleanupType::OLD_FILES, "/")) {
-			if (!selected.count(entry.id.index) && !fs.IsRemoteFile(entry.path)) {
+		for (auto &entry : scheduled) {
+			if (!selected.count({entry.id.index, entry.path}) && !fs.IsRemoteFile(entry.path)) {
 				pending_paths.insert(physical_path(entry.path));
 			}
 		}
 	}
 	files.erase(std::remove_if(files.begin(), files.end(),
 	                           [&](const DuckLakeFileForCleanup &file) {
+		                           if (!include_scheduled && !eligible_keys.count({file.id.index, file.path})) {
+			                           return true;
+		                           }
 		                           if (fs.IsRemoteFile(file.path)) {
 			                           return false;
 		                           }

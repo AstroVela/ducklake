@@ -241,6 +241,7 @@ def native_cases(driver, root, report):
         "shared-source",
         "linked-native-cleanup",
         "prepared-native-cleanup",
+        "cleanup-init-order",
         "immediate",
         "permissions",
         "detach",

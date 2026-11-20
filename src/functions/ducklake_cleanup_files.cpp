@@ -48,7 +48,7 @@ struct CleanupBindData : public TableFunctionData {
 	vector<DuckLakeFileForCleanup> files;
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	string native_catalog;
-	optional_idx native_oid;
+	unique_ptr<DuckLakeVortexCatalogIdentity> native_identity;
 #endif
 	//! If we are going to delete the files for real or not
 	bool dry_run = false;
@@ -109,7 +109,8 @@ static unique_ptr<FunctionData> CleanupBind(ClientContext &context, TableFunctio
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	if (ducklake_catalog.MetadataType().empty() || ducklake_catalog.MetadataType() == "duckdb") {
 		result->native_catalog = catalog.GetName();
-		result->native_oid = catalog.GetAttached().oid;
+		result->native_identity = make_uniq<DuckLakeVortexCatalogIdentity>(
+		    DuckLakeVortexIndex::ResolveCatalog(context, result->native_catalog, false, "DuckLake cleanup"));
 	}
 #endif
 
@@ -155,32 +156,37 @@ void DuckLakeCleanupExecute(ClientContext &context, TableFunctionInput &data_p, 
 			}
 		};
 		unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard, admission_guard;
+		auto &manager = DatabaseManager::Get(context);
+		shared_ptr<AttachedDatabase> lake, metadata;
+		string metadata_name;
 		unique_ptr<Connection> fresh;
 		bool protect_sources = false;
-		if (data.native_oid.IsValid()) {
-			auto attached = DatabaseManager::Get(context).GetDatabase(data.native_catalog);
-			if (!attached || attached->oid != data.native_oid.GetIndex()) {
+		if (data.native_identity) {
+			publication_guard = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock(interrupt);
+			lake = manager.GetDatabase(data.native_catalog);
+			if (!lake || lake->oid != data.native_identity->lake_oid) {
 				throw TransactionException("DuckLake cleanup catalog attachment changed");
 			}
+			auto &catalog = lake->GetCatalog().Cast<DuckLakeCatalog>();
+			metadata_name = catalog.MetadataDatabaseName();
+			metadata = manager.GetDatabase(metadata_name);
+			if (!metadata || metadata->oid != data.native_identity->metadata_oid) {
+				throw TransactionException("DuckLake cleanup metadata attachment changed");
+			}
 			fresh = make_uniq<Connection>(*context.db);
-			protect_sources =
-			    DuckLakeVortexSourceRetention::IsInitialized(*fresh, attached->GetCatalog().Cast<DuckLakeCatalog>());
+			protect_sources = DuckLakeVortexSourceRetention::IsInitialized(*fresh, catalog);
 		}
-		if (protect_sources) {
-			publication_guard = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock(interrupt);
-		}
-		if (!data.dry_run || protect_sources) {
+		if (!data.dry_run) {
 			admission_guard = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock(interrupt);
 		}
 		if (protect_sources) {
-			auto identity =
-			    DuckLakeVortexIndex::ResolveCatalog(context, data.native_catalog, false, "Vortex source cleanup");
-			if (identity.lake_oid != data.native_oid.GetIndex()) {
-				throw TransactionException("Vortex source cleanup catalog attachment changed");
-			}
-			auto &transaction = DuckLakeVortexIndex::Begin(*fresh, data.native_catalog, &identity);
-			DuckLakeVortexSourceRetention::ProtectCleanupFiles(transaction, data.type, state.files);
-			interrupt();
+			auto &transaction = DuckLakeVortexIndex::Begin(*fresh, data.native_catalog, data.native_identity.get());
+			DuckLakeVortexSourceRetention::ProtectCleanupFiles(transaction, data.type, data.GetFilter(), state.files);
+		}
+		interrupt();
+		if (data.native_identity &&
+		    (manager.GetDatabase(data.native_catalog) != lake || manager.GetDatabase(metadata_name) != metadata)) {
+			throw TransactionException("DuckLake cleanup attachment changed");
 		}
 #endif
 		if (!data.dry_run && !state.files.empty()) {

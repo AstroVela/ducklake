@@ -1807,11 +1807,13 @@ void DuckLakeVortexOptimizer::Initialize(Connection &owner, const string &catalo
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex optimizer catalog requires an idle dedicated connection");
 	}
-	auto admission = WriteAdmissionLock(*owner.context->db).GetExclusiveLock([&] {
+	auto interrupt = [&] {
 		if (owner.context->IsInterrupted()) {
 			throw InterruptException();
 		}
-	});
+	};
+	auto admission = WriteAdmissionLock(*owner.context->db).GetExclusiveLock(interrupt);
+	auto publication = VortexCatalog::PublicationLock().GetExclusiveLock(interrupt);
 	try {
 		auto &transaction = VortexCatalog::Begin(owner, catalog);
 		VortexCatalog::Initialized(transaction);

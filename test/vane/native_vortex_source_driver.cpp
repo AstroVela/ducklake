@@ -249,6 +249,73 @@ void PreparedNativeCleanup(Fixture &f) {
 	        "Native cleanup rejected an ordinary POSIX filename");
 	Require(f.Count("lake.shared_last") == 1 && Read(path).size() > 0,
 	        "Native cleanup of an ordinary file removed a shared source");
+
+	auto reusable = AddParquet(f, "reusable", "reusable.parquet");
+	SQL(f.writer, "DROP TABLE lake.reusable");
+	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
+	SQL(f.writer, "PREPARE stale_cleanup AS SELECT * FROM ducklake_cleanup_old_files('lake',cleanup_all=>true)");
+	f.Policy();
+	f.Drain();
+	Require(!FileSystem::GetFileSystem(*f.writer.context).FileExists(reusable),
+	        "Source GC did not retire the prepared cleanup candidate");
+	Write(reusable, "unregistered replacement");
+	SQL(f.writer, "EXECUTE stale_cleanup");
+	Require(Read(reusable) == "unregistered replacement", "Prepared cleanup used an expired queue identity");
+
+	auto rebound = AddParquet(f, "rebound", "rebound.parquet");
+	SQL(f.writer, "DROP TABLE lake.rebound");
+	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
+	SQL(f.writer, "PREPARE rebound_cleanup AS SELECT * FROM ducklake_cleanup_old_files('lake',cleanup_all=>true)");
+	Connection control(f.database);
+	SQL(control, "DETACH __ducklake_metadata_lake");
+	SQL(control, "ATTACH ':memory:' AS __ducklake_metadata_lake");
+	bool rejected = false;
+	try {
+		SQL(f.writer, "EXECUTE rebound_cleanup");
+	} catch (const std::exception &) {
+		rejected = true;
+	}
+	Require(rejected && Read(rebound).size() > 0, "Prepared cleanup continued across a metadata reattachment");
+}
+
+void CleanupInitializationOrder(Fixture &f) {
+	FileSystem::GetFileSystem(*f.writer.context).CreateDirectory(f.root + "/data");
+	auto path = AddParquet(f, "expired", "expired.parquet");
+	SQL(f.writer, "DROP TABLE lake.expired");
+	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
+	SQL(f.writer, "SELECT * FROM ducklake_initialize_vortex_indexes('lake')");
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	auto &publication = VortexIndex::PublicationLock();
+	auto held = admission.GetSharedLock([] {});
+	Connection cleaner(f.database), initializer(f.database);
+	auto waiting_cleanup = admission.WaitingWriterCount();
+	auto cleanup = std::async(std::launch::async,
+	                          [&] { SQL(cleaner, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)"); });
+	std::future<void> initialization;
+	try {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+		while (admission.WaitingWriterCount() == waiting_cleanup) {
+			Require(std::chrono::steady_clock::now() < deadline, "Cleanup did not reach ReadView admission");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		auto waiting_init = publication.WaitingWriterCount();
+		initialization =
+		    std::async(std::launch::async, [&] { DuckLakeVortexOptimizer::Initialize(initializer, "lake"); });
+		while (publication.WaitingWriterCount() == waiting_init) {
+			Require(std::chrono::steady_clock::now() < deadline,
+			        "Source policy initialization did not wait for cleanup");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		held.reset();
+		cleanup.get();
+		initialization.get();
+	} catch (...) {
+		held.reset();
+		throw;
+	}
+	Require(!FileSystem::GetFileSystem(*f.writer.context).FileExists(path) &&
+	            !Source::Status(*f.writer.context, "lake")[0][0].GetValue<bool>(),
+	        "Ordinary cleanup and source policy initialization did not both finish");
 }
 
 void MixedSizes(Fixture &f) {
@@ -373,7 +440,7 @@ int main(int argc, char **argv) {
 		Require(argc == 3, "Usage: ducklake_vortex_source_driver ROOT MODE");
 		string root = argv[1], mode = argv[2];
 		Fixture f(root, mode == "shared-source" ? root + "//./data" : root + "/data",
-		          mode != "prepared-native-cleanup");
+		          mode != "prepared-native-cleanup" && mode != "cleanup-init-order");
 		if (mode == "shared-source") {
 			SharedSource(f);
 			return 0;
@@ -384,6 +451,10 @@ int main(int argc, char **argv) {
 		}
 		if (mode == "prepared-native-cleanup") {
 			PreparedNativeCleanup(f);
+			return 0;
+		}
+		if (mode == "cleanup-init-order") {
+			CleanupInitializationOrder(f);
 			return 0;
 		}
 		f.Seed();

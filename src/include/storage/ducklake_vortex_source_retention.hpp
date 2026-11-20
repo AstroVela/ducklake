@@ -25,7 +25,7 @@ public:
 	static bool IsCollector(ClientContext &context);
 	static void Initialize(DuckLakeTransaction &transaction);
 	static bool IsInitialized(Connection &connection, const DuckLakeCatalog &catalog);
-	static void ProtectCleanupFiles(DuckLakeTransaction &transaction, CleanupType type,
+	static void ProtectCleanupFiles(DuckLakeTransaction &transaction, CleanupType type, const string &filter,
 	                                vector<DuckLakeFileForCleanup> &files);
 	static void Configure(ClientContext &context, const string &catalog, bool enabled, idx_t keep_snapshots,
 	                      idx_t min_age_seconds);
