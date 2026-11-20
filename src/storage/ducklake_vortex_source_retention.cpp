@@ -311,6 +311,10 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 	auto &context = *transaction.GetConnection().context;
 	auto &fs = FileSystem::GetFileSystem(context);
 	const auto include_scheduled = type == CleanupType::ORPHANED_FILES;
+	auto managed = !include_scheduled && Load(transaction).enabled ? Root(transaction) : string();
+	if (!managed.empty() && managed.back() != '/') {
+		managed += "/";
+	}
 	auto &metadata = transaction.GetMetadataManager();
 	auto physical_path = [&](const string &path) {
 		auto local = AbsoluteLocalPath(fs, path);
@@ -358,7 +362,8 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 			                           return false;
 		                           }
 		                           auto path = physical_path(file.path);
-		                           return pending_paths.count(path) ||
+		                           return (!managed.empty() && StringUtil::StartsWith(path, managed)) ||
+		                                  pending_paths.count(path) ||
 		                                  metadata.HasFileReference(path, "/", include_scheduled) ||
 		                                  VortexIndex::ReferencesSource(transaction, path);
 	                           }),
@@ -391,24 +396,34 @@ bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, 
 	if (Count(transaction, "SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy))) {
 		return true;
 	}
-	auto root = Root(transaction);
-	auto files = Candidates(transaction, root);
-	if (files.empty()) {
-		return false;
-	}
-	auto &context = *transaction.GetConnection().context;
-	auto directory = OpenManagedRoot(context, root);
-	for (auto &file : files) {
-		if (Referenced(transaction, file)) {
-			continue;
+	try {
+		auto root = Root(transaction);
+		auto files = Candidates(transaction, root);
+		if (files.empty()) {
+			return false;
 		}
-		auto parent = OpenParent(directory->fd, file.relative, file.registered, PathKind::SOURCE);
-		Inspect(parent, file, false);
-		if (file.bytes <= max_bytes) {
+		auto &context = *transaction.GetConnection().context;
+		auto directory = OpenManagedRoot(context, root);
+		for (auto &file : files) {
+			if (Referenced(transaction, file)) {
+				continue;
+			}
+			auto parent = OpenParent(directory->fd, file.relative, file.registered, PathKind::SOURCE);
+			Inspect(parent, file, false);
+			if (file.bytes <= max_bytes) {
+				return true;
+			}
+		}
+		return false;
+	} catch (const Exception &failure) {
+		// The queue snapshot can precede native cleanup or a file change. The bounded collector
+		// rechecks it under ownership and records any real filesystem failure in maintenance.
+		const auto type = ErrorData(failure).Type();
+		if (type == ExceptionType::IO || type == ExceptionType::PERMISSION || type == ExceptionType::INVALID_INPUT) {
 			return true;
 		}
+		throw;
 	}
-	return false;
 }
 
 vector<vector<Value>> DuckLakeVortexSourceRetention::Status(ClientContext &context, const string &catalog) {

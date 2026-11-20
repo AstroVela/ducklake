@@ -2094,6 +2094,11 @@ void DuckLakeVortexOptimizer::CancelMaintenance(ClientContext &context, const st
 void DuckLakeVortexOptimizer::ConfigureSourceRetention(ClientContext &context, const string &catalog, bool enabled,
                                                        idx_t keep_snapshots, idx_t min_age_seconds) {
 	auto owner = GetOwner(*context.db);
+	auto publication = VortexCatalog::PublicationLock().GetExclusiveLock([&] {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
 	std::lock_guard<std::mutex> guard(owner->runtime->io);
 	DuckLakeVortexSourceRetention::Configure(context, catalog, enabled, keep_snapshots, min_age_seconds);
 	owner->runtime->changed.notify_all();

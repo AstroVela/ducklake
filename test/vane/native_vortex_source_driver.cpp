@@ -606,8 +606,40 @@ int main(int argc, char **argv) {
 			f.CheckReclaimed();
 			return 0;
 		}
+		if (mode == "readiness-error") {
+			f.Collect();
+			auto backup = root + "/retired-source.backup";
+			Require(std::rename(f.old_source.c_str(), backup.c_str()) == 0, "Could not park the expired fixture file");
+			DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+			while (true) {
+				auto now = DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, "lake")[0];
+				if (StringValue::Get(now[0]) == "failed" && !now[2].GetValue<bool>()) {
+					break;
+				}
+				Require(std::chrono::steady_clock::now() < deadline, "Missing-source failure was not reported");
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			}
+			Require(
+			    f.Count(
+			        "__ducklake_metadata_lake.ducklake_vortex_maintenance_v1 WHERE NOT enabled AND state='failed'") ==
+			        1,
+			    "Missing-source failure was not persisted");
+			Require(std::rename(backup.c_str(), f.old_source.c_str()) == 0,
+			        "Could not restore the expired fixture file");
+			f.Drain();
+			f.CheckReclaimed();
+			return 0;
+		}
 		if (mode == "manual") {
 			f.Collect();
+			SQL(f.writer, "BEGIN");
+			Require(SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)")->RowCount() == 0,
+			        "Native cleanup attempted a managed source deletion");
+			SQL(f.writer, "ROLLBACK");
+			Require(FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source) &&
+			            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+			        "Rollback left a managed source missing without a committed intent");
 			bool stopped = false;
 			try {
 				f.Collect(16, 64 * 1024 * 1024, [&](const string &stage) {

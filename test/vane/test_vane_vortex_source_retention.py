@@ -250,6 +250,7 @@ def native_cases(driver, root, report):
         "gate",
         "checksum",
         "symlink",
+        "readiness-error",
         "manual",
         "cancel",
         "concurrent",

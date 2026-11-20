@@ -76,6 +76,9 @@ native or index reference resolves to the same local path. The final deletion
 acknowledges all the queue entries for that file.
 The native old-file and orphan cleanup functions also check live references
 for a catalog initialized for source retention.
+With retention enabled, the source collector owns deletion of scheduled
+managed files. Native old-file cleanup leaves that work in the queue for the
+worker or an explicit bounded source pass.
 
 Before unlink, a native transaction commits a deletion intent containing the
 exact queue key, file size, device, inode and SHA-256 digest. Descriptor-relative
