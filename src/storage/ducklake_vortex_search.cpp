@@ -79,6 +79,7 @@ DuckLakeVortexSearchResult DuckLakeVortexSearch::Execute(ClientContext &context,
 	vortex_detail::ViewJSON json;
 	auto details = yyjson_val_mut_copy(json.doc.get(), yyjson_doc_get_root(parsed.get()));
 	auto capture = json.Object();
+	json.Number(capture, "snapshot_id", view.snapshot_id);
 	json.Number(capture, "source_bytes", view.source_bytes);
 	json.Number(capture, "visible_rows", view.visible_rows);
 	json.Number(capture, "inline_rows", view.inline_rows);

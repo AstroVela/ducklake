@@ -864,6 +864,11 @@ Connection &DuckLakeTransaction::GetConnection() {
 		// set max error reporting to 0 so that during error reporting we don't traverse other schemas / catalogs
 		auto &client_config = ClientConfig::GetConfig(*connection->context);
 		client_config.user_settings.SetUserSetting(CatalogErrorMaxSchemasSetting::SettingIndex, Value::UBIGINT(0));
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		// This connection owns the metadata transaction. Start it on the first metadata access.
+		client_config.user_settings.SetUserSetting(ImmediateTransactionModeSetting::SettingIndex,
+		                                           Value::BOOLEAN(false));
+#endif
 		connection->BeginTransaction();
 	}
 	return *connection;

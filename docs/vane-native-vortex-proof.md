@@ -9,6 +9,8 @@ identity checks.
 
 For bounded append with concurrent request identity and safe client retries,
 see the [native WriteBatch API](native-vortex-write-batch.md).
+For explicit snapshot retention and background source reclamation, see
+[source retention](native-vortex-source-retention.md).
 
 ## Fixed inputs and packaging
 

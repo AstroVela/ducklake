@@ -1,3 +1,7 @@
+#ifdef DUCKLAKE_ENABLE_VORTEX
+#include "common/ducklake_vortex_gc_io.hpp"
+#endif
+
 #include "storage/ducklake_metadata_manager.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -4711,8 +4715,8 @@ FROM {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion
 	return result;
 }
 
-string DuckLakeMetadataManager::GetKnownFilesForCleanupQuery(const string &separator) const {
-	auto query = R"(SELECT REPLACE(
+string DuckLakeMetadataManager::GetKnownFilesForCleanupQuery(const string &separator, bool include_scheduled) const {
+	string query = R"(SELECT REPLACE(
            CASE
                WHEN NOT file_relative THEN file_path
                ELSE CASE
@@ -4736,7 +4740,9 @@ FROM
   ) AS f
    JOIN {METADATA_CATALOG}.ducklake_table t ON f.table_id = t.table_id
    JOIN {METADATA_CATALOG}.ducklake_schema s ON t.schema_id = s.schema_id) AS r
-UNION ALL
+)";
+	if (include_scheduled) {
+		query += R"(UNION ALL
 SELECT REPLACE(
     CASE
         WHEN NOT f.path_is_relative THEN f.path
@@ -4747,8 +4753,28 @@ SELECT REPLACE(
 ) AS full_path
 FROM {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion f
 )";
+	}
 	return StringUtil::Replace(query, "{SEPARATOR}", separator);
 }
+
+#ifdef DUCKLAKE_ENABLE_VORTEX
+bool DuckLakeMetadataManager::HasFileReference(const string &path, const string &separator, bool include_scheduled) {
+	auto result = transaction.Query(GetKnownFilesForCleanupQuery(separator, include_scheduled));
+	if (result->HasError()) {
+		result->ThrowError();
+	}
+	auto &context = *transaction.GetConnection().context;
+	auto key = vortex_detail::SourcePathIdentity(context, path);
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			if (vortex_detail::MatchesSourcePath(context, StringValue::Get(chunk->GetValue(0, row)), key)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+#endif
 
 vector<DuckLakeFileForCleanup> DuckLakeMetadataManager::GetOrphanFilesForCleanup(const string &filter,
                                                                                  const string &separator) {
