@@ -1,11 +1,10 @@
 # Explicit sparse-B compaction to bounded F
 
 This validation follows [DuckLake #49](https://github.com/AstroVela/ducklake/pull/49).
-An indexed B with only 1–64 visible rows can release its deleted physical rows
-by rewriting its complete source inventory into an explicit F plan. It creates
-no replacement SPFresh generation. The existing fixed 64-head build options
-still need at least 65 physical rows; that constraint does not force a sparse B
-to retain its entire original physical inventory.
+An indexed B with 1–64 visible rows can reclaim its original source files by
+rewriting its complete source inventory into an explicit F plan. An indexed
+replacement uses the [static SPFresh builder](native-vortex-posting-coverage.md)
+and requires at least 65 physical rows.
 
 For larger B whose deletions affect only whole files, see the subsequent
 [atomic empty-file pruning proof](native-vortex-prune-files-proof.md).
