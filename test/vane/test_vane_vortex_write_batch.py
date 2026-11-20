@@ -296,10 +296,10 @@ def exercise_receipt_identity(root, report):
         )
         connection.execute("RESET GLOBAL default_collation")
         connection.execute("DELETE FROM lake.items")
+        connection.execute("CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items')")
         connection.execute(
             "INSERT INTO lake.items SELECT 100+i,[i::FLOAT,0::FLOAT],'A','replacement' FROM range(128)t(i)"
         )
-        connection.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
         require(
             query(
                 connection,

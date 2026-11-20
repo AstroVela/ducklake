@@ -410,24 +410,24 @@ string DuckLakeUtil::ReplaceSkippingQuotes(const string &sql, const vector<pair<
 		// If inside a quoted range, copy verbatim to its end
 		if (range_idx < no_replace_ranges.size() && pos >= no_replace_ranges[range_idx].first) {
 			idx_t end = no_replace_ranges[range_idx].second;
-			result += sql.substr(pos, end - pos);
+			result.append(sql, pos, end - pos);
 			pos = end;
 			range_idx++;
 			continue;
 		}
 
 		auto next_quote = range_idx < no_replace_ranges.size() ? no_replace_ranges[range_idx].first : sql.size();
-		auto next_prefix = sql.find_first_of(prefixes, pos);
-		if (next_prefix >= next_quote) {
-			result.append(sql, pos, next_quote - pos);
-			pos = next_quote;
-			continue;
-		}
+		auto prefix = std::find_first_of(sql.begin() + pos, sql.begin() + next_quote, prefixes.begin(), prefixes.end());
+		auto next_prefix = static_cast<idx_t>(prefix - sql.begin());
 		result.append(sql, pos, next_prefix - pos);
 		pos = next_prefix;
+		if (pos == next_quote) {
+			continue;
+		}
 		auto replacement =
 		    std::find_if(replacements.begin(), replacements.end(), [&](const pair<string, string> &entry) {
-			    return !entry.first.empty() && sql.compare(pos, entry.first.size(), entry.first) == 0;
+			    return !entry.first.empty() && entry.first.size() <= next_quote - pos &&
+			           sql.compare(pos, entry.first.size(), entry.first) == 0;
 		    });
 		if (replacement != replacements.end()) {
 			result += replacement->second;
