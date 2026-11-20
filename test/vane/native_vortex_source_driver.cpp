@@ -227,6 +227,7 @@ void LinkedNativeCleanup(Fixture &f) {
 }
 
 void PreparedNativeCleanup(Fixture &f) {
+	FileSystem::GetFileSystem(*f.writer.context).CreateDirectory(f.root + "/data");
 	auto path = AddParquet(f, "shared_first", "shared.parquet");
 	SQL(f.writer, "CREATE TABLE lake.shared_last(i BIGINT)");
 	SQL(f.writer, "CALL ducklake_add_data_files('lake','shared_last'," + Value(path).ToSQLString() + ")");
