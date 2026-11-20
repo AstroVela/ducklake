@@ -273,20 +273,23 @@ void SeparateLeafLinks(Fixture &f) {
 	bool stopped = false;
 	try {
 		f.Collect(1, 64 * 1024 * 1024, [&](const string &stage) {
-			if (stage == "source_after_unlink") {
+			if (stage == "source_delete_intent_committed") {
 				stopped = true;
-				throw IOException("Pause before acknowledgement of the regular entry");
+				throw IOException("Pause before unlink of the regular entry");
 			}
 		});
 	} catch (const IOException &) {
 		Require(stopped, "Could not reach the regular entry's acknowledgement");
 	}
-	Require(stopped && !FileSystem::GetFileSystem(*f.writer.context).FileExists(path),
-	        "The collector did not unlink the queued regular file");
+	auto &fs = FileSystem::GetFileSystem(*f.writer.context);
+	Require(stopped && fs.FileExists(path) && fs.FileExists(alias),
+	        "The recorded intent did not preserve both leaves before retry");
 	Require(f.Collect(1).files == 1, "The collector did not acknowledge the regular entry");
 	struct stat info;
-	Require(!lstat(alias.c_str(), &info) && S_ISLNK(info.st_mode) &&
-	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+	Require(!fs.FileExists(path) && !lstat(alias.c_str(), &info) && S_ISLNK(info.st_mode) &&
+	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1 &&
+	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion WHERE "
+	                    "suffix(path,'leaf-link.parquet')") == 1,
 	        "The collector conflated a symlink with its target's directory entry");
 }
 
