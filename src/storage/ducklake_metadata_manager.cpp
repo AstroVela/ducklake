@@ -2428,6 +2428,18 @@ string DuckLakeMetadataManager::DropViews(const set<TableIndex> &ids, bool renam
 	return batch_query;
 }
 
+static void ExpandMetadataTemplate(const DuckLakeCatalog &catalog, string &query,
+                                   const vector<pair<string, string>> &replacements) {
+	if (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb") {
+		// Native commit templates contain serialized SQL values. Keep quoted data and identifiers intact.
+		query = DuckLakeUtil::ReplaceSkippingQuotes(query, replacements);
+		return;
+	}
+	for (auto &entry : replacements) {
+		query = StringUtil::Replace(query, entry.first, entry.second);
+	}
+}
+
 void DuckLakeMetadataManager::SubstituteCatalogPlaceholders(string &query) const {
 	auto &ducklake_catalog = transaction.GetCatalog();
 	auto catalog_identifier = DuckLakeUtil::SQLIdentifierToString(ducklake_catalog.MetadataDatabaseName());
@@ -2438,24 +2450,26 @@ void DuckLakeMetadataManager::SubstituteCatalogPlaceholders(string &query) const
 	auto metadata_path = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataPath());
 	auto data_path = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.DataPath());
 
-	query = StringUtil::Replace(query, "{METADATA_CATALOG_NAME_LITERAL}", catalog_literal);
-	query = StringUtil::Replace(query, "{METADATA_CATALOG_NAME_IDENTIFIER}", catalog_identifier);
-	query = StringUtil::Replace(query, "{METADATA_SCHEMA_NAME_LITERAL}", schema_literal);
-	query = StringUtil::Replace(query, "{METADATA_CATALOG}", catalog_identifier + "." + schema_identifier);
-	query = StringUtil::Replace(query, "{METADATA_SCHEMA_ESCAPED}", schema_identifier_escaped);
-	query = StringUtil::Replace(query, "{METADATA_PATH}", metadata_path);
-	query = StringUtil::Replace(query, "{DATA_PATH}", data_path);
+	ExpandMetadataTemplate(ducklake_catalog, query,
+	                       {{"{METADATA_CATALOG_NAME_LITERAL}", catalog_literal},
+	                        {"{METADATA_CATALOG_NAME_IDENTIFIER}", catalog_identifier},
+	                        {"{METADATA_SCHEMA_NAME_LITERAL}", schema_literal},
+	                        {"{METADATA_CATALOG}", catalog_identifier + "." + schema_identifier},
+	                        {"{METADATA_SCHEMA_ESCAPED}", schema_identifier_escaped},
+	                        {"{METADATA_PATH}", metadata_path},
+	                        {"{DATA_PATH}", data_path}});
 }
 
 void DuckLakeMetadataManager::SubstituteSnapshotPlaceholders(DuckLakeSnapshot snapshot, string &query) const {
 	auto &commit_info = transaction.GetCommitInfo();
-	query = StringUtil::Replace(query, "{SNAPSHOT_ID}", to_string(snapshot.snapshot_id));
-	query = StringUtil::Replace(query, "{SCHEMA_VERSION}", to_string(snapshot.schema_version));
-	query = StringUtil::Replace(query, "{NEXT_CATALOG_ID}", to_string(snapshot.next_catalog_id));
-	query = StringUtil::Replace(query, "{NEXT_FILE_ID}", to_string(snapshot.next_file_id));
-	query = StringUtil::Replace(query, "{AUTHOR}", commit_info.author.ToSQLString());
-	query = StringUtil::Replace(query, "{COMMIT_MESSAGE}", commit_info.commit_message.ToSQLString());
-	query = StringUtil::Replace(query, "{COMMIT_EXTRA_INFO}", commit_info.commit_extra_info.ToSQLString());
+	ExpandMetadataTemplate(transaction.GetCatalog(), query,
+	                       {{"{SNAPSHOT_ID}", to_string(snapshot.snapshot_id)},
+	                        {"{SCHEMA_VERSION}", to_string(snapshot.schema_version)},
+	                        {"{NEXT_CATALOG_ID}", to_string(snapshot.next_catalog_id)},
+	                        {"{NEXT_FILE_ID}", to_string(snapshot.next_file_id)},
+	                        {"{AUTHOR}", commit_info.author.ToSQLString()},
+	                        {"{COMMIT_MESSAGE}", commit_info.commit_message.ToSQLString()},
+	                        {"{COMMIT_EXTRA_INFO}", commit_info.commit_extra_info.ToSQLString()}});
 }
 
 unique_ptr<QueryResult> DuckLakeMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {

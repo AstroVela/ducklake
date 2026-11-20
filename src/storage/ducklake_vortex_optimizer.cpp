@@ -9,6 +9,7 @@
 #include "storage/ducklake_metadata_manager.hpp"
 #include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_vortex.hpp"
+#include "storage/ducklake_vortex_write.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -1658,8 +1659,10 @@ unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
                                     unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard) {
 	auto rewrite = DuckLakeVortexRewriteState::Get(context);
+	auto write_batch = DuckLakeVortexWriteBatchState::Get(context);
 	auto interrupt = [&] {
-		if (context.IsInterrupted() || (rewrite && rewrite->caller->IsInterrupted())) {
+		if (context.IsInterrupted() || (rewrite && rewrite->caller->IsInterrupted()) ||
+		    (write_batch && write_batch->caller.IsInterrupted())) {
 			throw InterruptException();
 		}
 	};
@@ -1679,9 +1682,18 @@ DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientCont
 	if (!admission) {
 		return nullptr;
 	}
-	Metadata meta(*context.db, rewrite ? rewrite->catalog : catalog.GetName(), false,
-	              rewrite ? &rewrite->identity : nullptr);
+	optional_ptr<const DuckLakeVortexCatalogIdentity> identity;
+	if (rewrite) {
+		identity = &rewrite->identity;
+	} else if (write_batch) {
+		identity = &write_batch->identity;
+	}
+	Metadata meta(*context.db, rewrite ? rewrite->catalog : catalog.GetName(), false, identity);
 	try {
+		if (write_batch) {
+			// Index replacement can commit without advancing the writer's DuckLake snapshot.
+			write_batch->CheckCurrentIndex(meta.transaction);
+		}
 		if (HasWriteBudgetTable(meta)) {
 			for (auto &entry : transaction.GetLocalChanges().Changes()) {
 				auto &changes = entry.GetTableChanges();
