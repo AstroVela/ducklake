@@ -104,10 +104,9 @@ write-budget rejection. The runtime uses zero implicit commit retries for
 these mutations. Unexpected errors fail the probe.
 
 The default Python run covers 20 public phases, a frozen tie fixture and six
-native and recovery cases. The native workflow runs the SQL checks separately
-and also runs the managed-write, append and source-retention proofs. It retains
-the validation report, native driver logs and recovery evidence for the tested
-commit.
+native and recovery cases. The Vane native Vortex providers workflow runs
+this proof alongside managed-write, append and source-retention proofs. It
+retains the report, driver logs and recovery evidence for the tested commit.
 
 ## Physical footprint and limits
 
@@ -129,6 +128,5 @@ writer fencing.
 
 `test/sql/vortex/native_vortex_automatic_flow.test` covers the public
 configuration, current T query and exact retry without timing-dependent waits.
-The Vane native workflow runs the complete installed proof and retains its
-report, native driver logs and recovery logs. It reuses the pinned
-Vane/Vortex/SPFresh closure and signed provider build.
+The Native Vortex validation workflow runs this SQL fixture. The installed
+proof uses the pinned Vane/Vortex/SPFresh closure and signed provider build.

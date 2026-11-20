@@ -428,6 +428,7 @@ struct AutomaticFixture {
 	}
 	float Validate(const vector<AutomaticObservation> &observations) {
 		float minimum = 1;
+		const auto embedding_type = LogicalType::LIST(LogicalType::FLOAT);
 		for (auto &query : observations) {
 			auto state = models.upper_bound(query.snapshot);
 			Require(state != models.begin(), "Missing exact snapshot oracle");
@@ -452,19 +453,25 @@ struct AutomaticFixture {
 			        "Automatic query returned an invalid number of hits");
 			double previous = -1;
 			for (auto &values : query.result.rows) {
-				Require(values.size() == 5 && !values[0].IsNull(), "Automatic query changed its typed result shape");
+				Require(values.size() == 5 && values[0].type() == LogicalType::BIGINT &&
+				            values[1].type() == embedding_type && values[2].type() == LogicalType::VARCHAR &&
+				            values[3].type() == LogicalType::VARCHAR && values[4].type() == LogicalType::FLOAT,
+				        "Automatic query changed its typed result shape");
+				for (auto &value : values) {
+					Require(!value.IsNull(), "Automatic query returned NULL for a non-NULL fixture field");
+				}
 				auto id = values[0].GetValue<int64_t>();
 				auto row = expected.find(id);
 				Require(row != expected.end() && found.insert(id).second,
 				        "Automatic query returned an invisible or duplicate key");
 				auto &value = row->second;
 				auto &embedding = ListValue::GetChildren(values[1]);
-				Require(embedding.size() == 2 && embedding[0].GetValue<float>() == value.x &&
-				            embedding[1].GetValue<float>() == value.y &&
+				Require(embedding.size() == 2 && !embedding[0].IsNull() && !embedding[1].IsNull() &&
+				            embedding[0].GetValue<float>() == value.x && embedding[1].GetValue<float>() == value.y &&
 				            StringValue::Get(values[2]) == value.category &&
 				            StringValue::Get(values[3]) == value.payload && (!query.filtered || value.category == "B"),
 				        "Automatic query mixed row versions or filters");
-				auto distance = values[4].GetValue<double>();
+				auto distance = static_cast<double>(values[4].GetValue<float>());
 				auto exact = static_cast<double>(Distance(value));
 				auto tolerance = MaxValue(1e-4, 1e-5 * MaxValue(std::fabs(distance), std::fabs(exact)));
 				Require(std::isfinite(distance) && distance > previous && std::fabs(distance - exact) <= tolerance,
@@ -496,15 +503,18 @@ struct AutomaticFixture {
 		auto wrong_key = query;
 		auto &outside = model.at(10);
 		auto replacement = StructValue::GetChildren(outside.ToValue());
-		replacement.push_back(Value::DOUBLE(Distance(outside)));
+		replacement.push_back(Value::FLOAT(Distance(outside)));
 		wrong_key.result.rows.back() = std::move(replacement);
 		rejected(wrong_key, "route's fixture gate");
 		auto infinite = query;
-		infinite.result.rows.back()[4] = Value::DOUBLE(std::numeric_limits<double>::infinity());
+		infinite.result.rows.back()[4] = Value::FLOAT(std::numeric_limits<float>::infinity());
 		rejected(infinite, "changed distance or order");
 		auto truncated = query;
 		truncated.result.rows.back()[1] = Value::LIST(LogicalType::FLOAT, {Value::FLOAT(9)});
 		rejected(truncated, "mixed row versions or filters");
+		auto fractional_key = query;
+		fractional_key.result.rows.back()[0] = Value::DOUBLE(9.25);
+		rejected(fractional_key, "changed its typed result shape");
 	}
 };
 
