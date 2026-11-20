@@ -1,7 +1,6 @@
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_source_retention.hpp"
-#include "storage/ducklake_vortex_write.hpp"
 #include "common/ducklake_vortex_json.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete_filter.hpp"
@@ -1706,13 +1705,17 @@ DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientCont
 	if (!admission) {
 		return nullptr;
 	}
-	optional_ptr<const DuckLakeVortexCatalogIdentity> identity;
+	DuckLakeVortexCatalogIdentity identity;
 	if (rewrite) {
-		identity = &rewrite->identity;
+		identity = rewrite->identity;
 	} else if (write_batch) {
-		identity = &write_batch->identity;
+		identity = write_batch->identity;
+	} else {
+		// Read the pinned metadata attachment of this writer, even if the alias was reused.
+		auto &metadata = Catalog::GetCatalog(*transaction.GetConnection().context, catalog.MetadataDatabaseName());
+		identity = {catalog.GetAttached().oid, metadata.GetAttached().oid};
 	}
-	Metadata meta(*context.db, rewrite ? rewrite->catalog : catalog.GetName(), false, identity);
+	Metadata meta(*context.db, rewrite ? rewrite->catalog : catalog.GetName(), false, &identity);
 	try {
 		DuckLakeVortexWriteBatch::CheckManagedWrites(meta.transaction, logical, context);
 		if (write_batch) {

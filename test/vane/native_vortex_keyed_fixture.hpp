@@ -58,6 +58,13 @@ struct KeyedFixture {
 		return DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "change", rows,
 		                                        deletes, observe);
 	}
+	DuckLakeVortexWriteResult DeleteMissing(Connection &owner, ClientContext &caller,
+	                                        const std::function<void(const string &)> &observe = {}) {
+		return DuckLakeVortexWriteBatch::Mutate(
+		    owner, caller, "lake", "main", "items", "knn", "absent",
+		    Value::LIST(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), {}),
+		    Value::LIST(LogicalType::BIGINT, {Value::BIGINT(99999)}), observe);
+	}
 	DuckLakeVortexSearchResult Search(Connection &reader, const std::function<void(const string &)> &observe = {}) {
 		DuckLakeVortexViewOptions options {};
 		options.catalog = "lake";
@@ -91,8 +98,81 @@ struct KeyedFixture {
 	}
 };
 
+inline void CheckKeyedRebind(KeyedFixture &fixture, bool receipt_only) {
+	fixture.Manage();
+	auto &setup = fixture.setup;
+	auto attach = [&](const string &file, const string &data) {
+		SQL(setup, "DETACH lake; ATTACH " + Value("ducklake:" + fixture.root + "/" + file).ToSQLString() +
+		               " AS lake(DATA_PATH " + Value(fixture.root + "/" + data).ToSQLString() +
+		               ",DATA_INLINING_ROW_LIMIT 1000)");
+	};
+	bool switched = false;
+	auto switch_catalog = [&] {
+		attach("replacement.ducklake", "replacement-data");
+		switched = true;
+	};
+	bool rejected = false;
+	{
+		Connection writer(fixture.database);
+		try {
+			if (receipt_only) {
+				fixture.DeleteMissing(writer, *setup.context, [&](const string &stage) {
+					if (stage == "before_commit") {
+						switch_catalog();
+					}
+				});
+			} else {
+				writer.BeginTransaction();
+				SQL(writer, "INSERT INTO lake.items VALUES(7,[7,0],'A','stale')");
+				switch_catalog();
+				writer.Commit();
+			}
+		} catch (const std::exception &error) {
+			Require(StringUtil::Contains(error.what(), "attachment changed"), error.what());
+			rejected = true;
+		}
+	}
+	Require(switched && rejected, "A stale attachment committed managed rows or a receipt");
+	attach("metadata.ducklake", "data");
+	Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 0,
+	        "Stale ordinary writer changed managed rows");
+	Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1")
+	                ->GetValue(0, 0)
+	                .GetValue<idx_t>() == 0,
+	        "Stale missing-key delete committed a request receipt");
+}
+
 inline void RunKeyedFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
 	KeyedFixture f(database, setup, root);
+	if (mode == "keyed-rebind-ordinary" || mode == "keyed-rebind-noop") {
+		CheckKeyedRebind(f, mode == "keyed-rebind-noop");
+		return;
+	}
+	if (mode == "keyed-enroll-with-segment") {
+		DuckLakeVortexIndex::Create(*setup.context, "lake", "main", "items", "empty", root + "/indexes", 2);
+		SQL(setup, "INSERT INTO lake.items SELECT i,[i::FLOAT,0],'A','seed' FROM range(256)t(i);"
+		           "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");
+		auto indexed = DuckLakeVortexIndex::BuildAndPublish(*setup.context, "lake", "main", "items", "knn",
+		                                                    root + "/indexes/primary.json", 2, 1, nullptr, "", {},
+		                                                    DuckLakeVortexIndexOperation::APPEND);
+		Require(indexed.segments.size() == 1, "Fixture did not publish B in the original index");
+		SQL(setup, "DELETE FROM lake.items WHERE id>=0");
+		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 0,
+		        "Fixture still has live rows");
+		Connection enrollment(database);
+		bool rejected = false;
+		try {
+			DuckLakeVortexWriteBatch::Manage(enrollment, *setup.context, "lake", "main", "items", "empty");
+		} catch (const InvalidInputException &error) {
+			Require(StringUtil::Contains(error.what(), "without prior batches or B segments"), error.what());
+			rejected = true;
+		}
+		Require(rejected && SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_keyed_tables_v1")
+		                            ->GetValue(0, 0)
+		                            .GetValue<idx_t>() == 0,
+		        "Enrollment ignored another index's B segment");
+		return;
+	}
 	if (mode == "keyed-preexisting") {
 		Connection stale(database);
 		stale.BeginTransaction();

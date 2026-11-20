@@ -256,7 +256,8 @@ void DuckLakeVortexWriteBatch::Manage(Connection &owner, ClientContext &caller, 
 		auto requests =
 		    DuckLakeVortexIndex::Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(REQUESTS) +
 		                                                " WHERE table_uuid COLLATE C=" + Value(uuid).ToSQLString());
-		if (rows->Fetch() || !index.segments.empty() || requests->Fetch()->GetValue(0, 0).GetValue<idx_t>()) {
+		if (rows->Fetch() || requests->Fetch()->GetValue(0, 0).GetValue<idx_t>() ||
+		    DuckLakeVortexIndex::HasSegments(transaction, uuid)) {
 			throw InvalidInputException(
 			    "Vortex managed writes require an empty table without prior batches or B segments");
 		}

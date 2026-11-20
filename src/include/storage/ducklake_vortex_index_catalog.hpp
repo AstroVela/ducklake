@@ -121,6 +121,7 @@ struct DuckLakeVortexIndex {
 	              optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);
 	static DuckLakeVortexIndex ParseSegments(const string &reference, const string &table_uuid, idx_t field_id);
 	static bool ReferencesSource(DuckLakeTransaction &transaction, const string &path);
+	static bool HasSegments(DuckLakeTransaction &transaction, const string &table_uuid);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static bool CoversFile(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, idx_t file_id);
 	static void CheckFileRetirements(ClientContext &context, DuckLakeTransaction &transaction);

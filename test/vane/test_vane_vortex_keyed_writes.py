@@ -49,6 +49,47 @@ def source_idle(connection):
         time.sleep(0.02)
 
 
+def business_rows(connection):
+    return query(connection, "SELECT id,embedding,category,payload FROM lake.items ORDER BY id")
+
+
+def qualify_flushed_mutation(connection, phases, recalls):
+    before = WRITE.rows(700000, 2)
+    inserted = mutate(connection, "for-unindexed-F", before)
+    connection.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
+    flushed = BASE.raw(connection)
+    require(
+        len(flushed) == 2
+        and all("file_id" in row for row in flushed)
+        and flushed[0]["file_id"] == flushed[1]["file_id"]
+        and not BASE.head(connection)["reference"]["segments"],
+        "Fixture did not flush both original keys into one unindexed file",
+    )
+    phases.append(BASE.qualify(connection, "unindexed-F", recalls))
+
+    reader = connection.cursor()
+    replacement = dict(before[0], payload="替换未索引文件")
+    try:
+        reader.execute("BEGIN")
+        require(business_rows(reader) == before, "Historic fixture did not read the flushed source")
+        receipt = mutate(connection, "replace-unindexed-F", [replacement], [before[1]["id"]])
+        require(business_rows(reader) == before, "Mutation changed the old native snapshot")
+        require(business_rows(connection) == [replacement], "Full-file replacement lost or duplicated a current key")
+        reader.execute("COMMIT")
+    finally:
+        reader.close()
+
+    require("file_id" not in BASE.raw(connection)[0], "Replacement did not commit in T")
+    require(
+        mutate(connection, "replace-unindexed-F", [replacement], [before[1]["id"]]) == receipt
+        and mutate(connection, "for-unindexed-F", before) == inserted
+        and business_rows(connection) == [replacement],
+        "Replaying either request changed the fresh T replacement",
+    )
+    phases.append(BASE.qualify(connection, "unindexed-F-replaced-by-T", recalls))
+    mutate(connection, "remove-unindexed-F-fixture", [], [before[0]["id"]])
+
+
 def exercise(root, report):
     (root / "indexes").mkdir()
     connection = BASE.connect(root, root / "extensions", create=True)
@@ -58,6 +99,8 @@ def exercise(root, report):
         WRITE.rejected(lambda: mutate(connection, "unmanaged", WRITE.rows(0, 1)), "managed write mode")
         manage(connection)
         connection.execute("PREPARE nearest AS " + BASE.SEARCH.search_sql(BASE.VECTOR))
+        qualify_flushed_mutation(connection, phases, recalls)
+        checks.append("whole-file F replacement publishes T atomically and preserves the reader's old snapshot")
         seed = WRITE.rows(0, 256)
         original = mutate(connection, "seed-'请求", seed)
         require(mutate(connection, "seed-'请求", seed) == original, "A seed retry changed its receipt")
@@ -74,7 +117,7 @@ def exercise(root, report):
             WRITE.rejected(lambda sql=sql: connection.execute(sql), "Managed Vortex tables require")
         WRITE.rejected(lambda: connection.execute("ALTER TABLE lake.items ADD COLUMN extra BIGINT"), "fixed schema")
         WRITE.rejected(lambda: WRITE.batch(connection, "append", WRITE.rows(900, 1)), "managed write mode")
-        require(BASE.raw(connection) == seed, "An uncoordinated write changed managed rows")
+        require(business_rows(connection) == seed, "An uncoordinated write changed managed rows")
         connection.execute("CREATE TABLE lake.unmanaged(id BIGINT); INSERT INTO lake.unmanaged VALUES(1)")
         checks.append(
             "explicit empty-table ownership rejects ordinary DML/schema changes and append; unrelated SQL remains usable"
@@ -126,7 +169,7 @@ def exercise(root, report):
         )
         WRITE.rejected(lambda: mutate(connection, "quota", WRITE.rows(10, 2), [12]), "RESOURCE_EXHAUSTED")
         WRITE.check_no_request(connection, "quota")
-        require(BASE.raw(connection) == seed, "Admission rollback lost the rows deleted by upsert")
+        require(business_rows(connection) == seed, "Admission rollback lost the rows deleted by upsert")
         connection.execute(
             "SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',1000,4194304,4096,67108864)"
         )
@@ -138,10 +181,10 @@ def exercise(root, report):
         reader = connection.cursor()
         try:
             reader.execute("BEGIN")
-            old_rows = BASE.raw(reader)
+            old_rows = business_rows(reader)
             receipt = mutate(connection, "replace", replacement, [1, 99999])
             require(
-                receipt["row_count"] == 4 and BASE.raw(reader) == old_rows,
+                receipt["row_count"] == 4 and business_rows(reader) == old_rows,
                 "Atomic mutation changed an old native transaction",
             )
             reader.execute("COMMIT")
@@ -337,6 +380,10 @@ def native_cases(driver, root, report):
     for mode in [
         "keyed-ok",
         "keyed-preexisting",
+        "keyed-rebind-ordinary",
+        "keyed-rebind-noop",
+        "keyed-noop-cancel-commit-wait",
+        "keyed-enroll-with-segment",
         "keyed-held",
         "keyed-fail-after_delete",
         "keyed-fail-after_write",

@@ -2022,14 +2022,29 @@ bool DuckLakeVortexIndex::ReferencesSource(DuckLakeTransaction &transaction, con
 	return false;
 }
 
+bool DuckLakeVortexIndex::HasSegments(DuckLakeTransaction &transaction, const string &table_uuid) {
+	auto result = Query(transaction, "SELECT reference FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
+	                                     " WHERE table_uuid COLLATE C=" + Value(table_uuid).ToSQLString());
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			auto reference = StringValue::Get(chunk->GetValue(0, row));
+			if (!ParseCatalogReference(reference, table_uuid, optional_idx()).segments.empty()) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 DuckLakeVortexIndex DuckLakeVortexIndex::Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table,
                                                 const string &name) {
 	Name(name);
 	Initialized(transaction);
-	auto result = Query(transaction,
-	                    "SELECT revision,index_root,reference FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1 "
-	                    "WHERE table_uuid=" +
-	                        Value(table.GetTableUUID()).ToSQLString() + " AND index_name=" + Value(name).ToSQLString());
+	auto result =
+	    Query(transaction, "SELECT revision,index_root,reference FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1 "
+	                       "WHERE table_uuid COLLATE C=" +
+	                           Value(table.GetTableUUID()).ToSQLString() +
+	                           " AND index_name COLLATE C=" + Value(name).ToSQLString());
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() != 1) {
 		throw InvalidInputException("No published Vortex index with the requested name");

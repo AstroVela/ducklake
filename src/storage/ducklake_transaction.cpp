@@ -796,14 +796,22 @@ void DuckLakeTransaction::Start() {
 
 void DuckLakeTransaction::Commit() {
 	try {
-		if (ChangesMade()) {
+		const auto changes_made = ChangesMade();
 #ifdef DUCKLAKE_ENABLE_VORTEX
-			unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard;
-			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock(), publication_guard);
-			if (DuckLakeVortexRewriteState::Get(*context.lock())) {
-				DuckLakeVortexIndex::CheckRewriteCommit(*context.lock(), *this);
+		unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard, write_admission;
+		auto client = context.lock();
+		// A complete delete of a freshly flushed file can leave only staged metadata changes.
+		// A missing-key mutation also commits its receipt without adding a snapshot.
+		if (changes_made || !state->local_file_deletes.empty() || DuckLakeVortexWriteBatchState::Get(*client)) {
+			write_admission = DuckLakeVortexOptimizer::AdmitWrite(*this, *client, publication_guard);
+		}
+#endif
+		if (changes_made) {
+#ifdef DUCKLAKE_ENABLE_VORTEX
+			if (DuckLakeVortexRewriteState::Get(*client)) {
+				DuckLakeVortexIndex::CheckRewriteCommit(*client, *this);
 			} else {
-				DuckLakeVortexIndex::CheckFileRetirements(*context.lock(), *this);
+				DuckLakeVortexIndex::CheckFileRetirements(*client, *this);
 			}
 #endif
 			FlushChanges();
@@ -1067,6 +1075,9 @@ TransactionChangeInformation DuckLakeTransaction::GetTransactionChanges() const 
 set<TableIndex> DuckLakeTransaction::GetLogicalWriteTables() const {
 	auto changes = GetTransactionChanges();
 	set<TableIndex> result = state->tables_deleted_from;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	result.insert(state->local_file_deletes.begin(), state->local_file_deletes.end());
+#endif
 	for (auto tables : {&changes.altered_tables, &changes.dropped_tables}) {
 		result.insert(tables->begin(), tables->end());
 	}
@@ -1840,6 +1851,9 @@ shared_ptr<DuckLakeInlinedData> DuckLakeTransaction::GetTransactionLocalInlinedD
 void DuckLakeTransaction::DropTransactionLocalFile(TableIndex table_id, const string &path) {
 	auto context_ref = context.lock();
 	state->local_changes.DropTransactionLocalFile(*context_ref, table_id, path);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	state->local_file_deletes.insert(table_id);
+#endif
 }
 
 void DuckLakeTransaction::AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files) {
@@ -1951,6 +1965,9 @@ void DuckLakeTransaction::TransactionLocalDelete(TableIndex table_id, const stri
                                                  DuckLakeDeleteFile delete_file) {
 	auto context_ref = context.lock();
 	state->local_changes.TransactionLocalDelete(*context_ref, table_id, data_file_path, std::move(delete_file));
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	state->local_file_deletes.insert(table_id);
+#endif
 }
 
 DuckLakeTransaction &DuckLakeTransaction::Get(ClientContext &context, Catalog &catalog) {
