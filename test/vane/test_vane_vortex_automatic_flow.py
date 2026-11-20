@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -250,7 +251,9 @@ def covered_files(head):
 def pending_intents(connection):
     return query(
         connection,
-        "SELECT data_file_id,path,path_is_relative,file_bytes FROM " + META + "ducklake_vortex_source_deletions_v1",
+        "SELECT data_file_id,path,path_is_relative,file_bytes,device,inode,digest FROM "
+        + META
+        + "ducklake_vortex_source_deletions_v1",
     )
 
 
@@ -470,9 +473,16 @@ def recover(case, stage):
             pending_file = Path(intent["path"])
             if intent["path_is_relative"]:
                 pending_file = case / "data" / pending_file
+            require(pending_file.is_file(), "The file recorded at the source deletion checkpoint is missing")
+            stat = pending_file.stat()
+            checksum = hashlib.sha256()
+            with pending_file.open("rb") as source:
+                for block in iter(lambda: source.read(128 * 1024), b""):
+                    checksum.update(block)
+            digest = "sha256:" + checksum.hexdigest()
             require(
-                pending_file.is_file()
-                and pending_file.stat().st_size == intent["file_bytes"]
+                (stat.st_dev, stat.st_ino, stat.st_size, digest)
+                == (intent["device"], intent["inode"], intent["file_bytes"], intent["digest"])
                 and intent["data_file_id"] not in covered_files(before),
                 "The durable source intent does not identify an existing retired file",
             )

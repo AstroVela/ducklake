@@ -72,6 +72,7 @@ the four named and prepared searches against captured physical addresses
 only when the snapshot and index revision stay fixed across the sample.
 A separate frozen fixture checks strict B/F/T order for equal Float32 scores,
 including when the tie crosses top-k. The ANN recall gate remains 0.8.
+Exact scans must return the full expected top-k.
 Visibility, typed rows, uniqueness, filters, distance and ordering are checked
 independently. A child process bounds the public proof, including teardown.
 
@@ -102,10 +103,10 @@ The client may explicitly resubmit the same request on a native conflict or
 write-budget rejection. The runtime uses zero implicit commit retries for
 these mutations. Unexpected errors fail the probe.
 
-The default run covers 20 public phases, a frozen tie fixture, six native
-and recovery cases, and the SQL checks. The native workflow also runs the
-related managed-write, append and source-retention proofs. It retains the
-validation report, native driver logs and recovery evidence for the tested
+The default Python run covers 20 public phases, a frozen tie fixture and six
+native and recovery cases. The native workflow runs the SQL checks separately
+and also runs the managed-write, append and source-retention proofs. It retains
+the validation report, native driver logs and recovery evidence for the tested
 commit.
 
 ## Physical footprint and limits

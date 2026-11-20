@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <thread>
 
@@ -77,7 +78,7 @@ inline void SaveAutomaticCheckpoint(DuckDB &database, const string &root) {
 	}
 	auto index = SQL(reader, "SELECT revision,reference FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1");
 	Require(index->RowCount() == 1, "Checkpoint requires one named index");
-	auto deletions = SQL(reader, "SELECT data_file_id,path,path_is_relative,file_bytes FROM "
+	auto deletions = SQL(reader, "SELECT data_file_id,path,path_is_relative,file_bytes,device,inode,digest FROM "
 	                             "__ducklake_metadata_lake.ducklake_vortex_source_deletions_v1");
 	reader.Commit();
 	vortex_detail::ViewJSON json;
@@ -92,6 +93,9 @@ inline void SaveAutomaticCheckpoint(DuckDB &database, const string &root) {
 		json.Text(intent, "path", row.GetValue<string>(1));
 		json.Add(intent, "path_is_relative", duckdb_yyjson::yyjson_mut_bool(json.doc.get(), row.GetValue<bool>(2)));
 		json.Number(intent, "file_bytes", row.GetValue<idx_t>(3));
+		json.Number(intent, "device", row.GetValue<idx_t>(4));
+		json.Number(intent, "inode", row.GetValue<idx_t>(5));
+		json.Text(intent, "digest", row.GetValue<string>(6));
 		duckdb_yyjson::yyjson_mut_arr_append(pending, intent);
 	}
 	json.Add(body, "source_intents", pending);
@@ -448,20 +452,22 @@ struct AutomaticFixture {
 			        "Automatic query returned an invalid number of hits");
 			double previous = -1;
 			for (auto &values : query.result.rows) {
+				Require(values.size() == 5 && !values[0].IsNull(), "Automatic query changed its typed result shape");
 				auto id = values[0].GetValue<int64_t>();
 				auto row = expected.find(id);
 				Require(row != expected.end() && found.insert(id).second,
 				        "Automatic query returned an invisible or duplicate key");
 				auto &value = row->second;
 				auto &embedding = ListValue::GetChildren(values[1]);
-				Require(embedding[0].GetValue<float>() == value.x && embedding[1].GetValue<float>() == value.y &&
+				Require(embedding.size() == 2 && embedding[0].GetValue<float>() == value.x &&
+				            embedding[1].GetValue<float>() == value.y &&
 				            StringValue::Get(values[2]) == value.category &&
 				            StringValue::Get(values[3]) == value.payload && (!query.filtered || value.category == "B"),
 				        "Automatic query mixed row versions or filters");
 				auto distance = values[4].GetValue<double>();
 				auto exact = static_cast<double>(Distance(value));
 				auto tolerance = MaxValue(1e-4, 1e-5 * MaxValue(std::fabs(distance), std::fabs(exact)));
-				Require(distance > previous && std::fabs(distance - exact) <= tolerance,
+				Require(std::isfinite(distance) && distance > previous && std::fabs(distance - exact) <= tolerance,
 				        "Automatic query changed distance or order");
 				previous = distance;
 			}
@@ -470,10 +476,35 @@ struct AutomaticFixture {
 				hits += wanted.count(id);
 			}
 			auto recall = count ? float(hits) / count : 1.0f;
-			Require(recall >= 0.8f, "Automatic query recall fell below the unchanged fixture gate");
+			const auto recall_gate = query.ann_calls ? 0.8f : 1.0f;
+			Require(recall >= recall_gate, "Automatic query recall fell below its route's fixture gate");
 			minimum = MinValue(minimum, recall);
 		}
 		return minimum;
+	}
+	void CheckExactOracle(const AutomaticObservation &query) {
+		auto rejected = [&](const AutomaticObservation &bad, const string &reason) {
+			try {
+				Validate({bad});
+			} catch (const InvalidInputException &error) {
+				Require(StringUtil::Contains(error.what(), reason), error.what());
+				return;
+			}
+			throw InvalidInputException("Automatic oracle accepted an invalid exact result");
+		};
+		Require(query.result.rows.size() == 10, "Exact oracle fixture requires ten results");
+		auto wrong_key = query;
+		auto &outside = model.at(10);
+		auto replacement = StructValue::GetChildren(outside.ToValue());
+		replacement.push_back(Value::DOUBLE(Distance(outside)));
+		wrong_key.result.rows.back() = std::move(replacement);
+		rejected(wrong_key, "route's fixture gate");
+		auto infinite = query;
+		infinite.result.rows.back()[4] = Value::DOUBLE(std::numeric_limits<double>::infinity());
+		rejected(infinite, "changed distance or order");
+		auto truncated = query;
+		truncated.result.rows.back()[1] = Value::LIST(LogicalType::FLOAT, {Value::FLOAT(9)});
+		rejected(truncated, "mixed row versions or filters");
 	}
 };
 
@@ -610,6 +641,7 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		auto t = f.Observe(route_reader, false);
 		Require(t.snapshot == first && t.inline_rows == 128 && !t.indexed_files && !t.scan_files && !t.ann_calls,
 		        "Automatic query did not see the committed T view");
+		f.CheckExactOracle(t);
 		before_flush->Release();
 		before_build->Wait();
 		auto unindexed = f.Observe(route_reader, false);
