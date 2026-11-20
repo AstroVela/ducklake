@@ -140,6 +140,21 @@ def bootstrap(root, count, dimension, fixture):
     return connection
 
 
+def verify_write_budget(connection, count, dimension, fixture):
+    before = AUTO.current_stamp(connection)
+    try:
+        KEYED.mutate(connection, "budget-preflight", [row(count + i, 0, dimension, fixture) for i in range(257)])
+    except Exception as error:
+        require("RESOURCE_EXHAUSTED: Vortex write inline rows budget exceeded" in str(error), str(error))
+    else:
+        raise AssertionError("A 257-row mutation crossed the configured 256-row T budget")
+    AUTO.WRITE.check_no_request(connection, "budget-preflight")
+    require(
+        AUTO.WRITE.count(connection) == count and AUTO.current_stamp(connection) == before,
+        "Rejected preflight mutation changed the committed state",
+    )
+
+
 def worker(args):
     import vane
 
@@ -162,14 +177,7 @@ def worker(args):
             return dict(counters(), event_pipe_bytes=emitted, time_ns=time.monotonic_ns())
 
     connection = bootstrap(root, count, dimension, fixture)
-    try:
-        KEYED.mutate(connection, "budget-preflight", [row(count + i, 0, dimension, fixture) for i in range(257)])
-    except Exception as error:
-        require("RESOURCE_EXHAUSTED: Vortex write inline rows budget exceeded" in str(error), str(error))
-    else:
-        raise AssertionError("A 257-row mutation crossed the configured 256-row T budget")
-    AUTO.WRITE.check_no_request(connection, "budget-preflight")
-    require(AUTO.WRITE.count(connection) == count, "Rejected preflight mutation changed the live row count")
+    verify_write_budget(connection, count, dimension, fixture)
     emit(
         "ready",
         version=vane.__version__,

@@ -226,7 +226,7 @@ processes, with 15 optional-dependency skips. Formatting and Vane source/native
 copyleft checks passed. Replaying the retained query trace with a missing-hit
 canary or an invalid typed payload also produced the required nonzero exit.
 
-The [posting-coverage follow-up](native-vortex-posting-coverage.md) resolves the
-mapped-ID failures in this matrix. The [source-drain follow-up](native-vortex-source-gc-drain.md)
-qualifies the bounded 32,768-row / 128D reclamation cases. Broader recall,
-long-run liveness and SPFresh native online updates remain separate work.
+The [posting-coverage follow-up](native-vortex-posting-coverage.md) resolved the
+mapped-ID failures in this matrix. The original [source-drain follow-up](native-vortex-source-gc-drain.md)
+reported bounded completion for both 32,768-row / 128D reclamation cases.
+Broader recall, long-run liveness and SPFresh native online updates remain separate work.

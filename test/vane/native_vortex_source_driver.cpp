@@ -584,18 +584,27 @@ int main(int argc, char **argv) {
 		}
 		f.Rewrite();
 		f.Policy();
-		if (mode == "source-only") {
+		const bool blocked_generation = mode == "source-only-blocked-generation";
+		if (mode == "source-only" || blocked_generation) {
+			auto &fs = FileSystem::GetFileSystem(*f.writer.context);
+			const idx_t expected_retired = blocked_generation ? 1 : 0;
+			auto byte_budget = blocked_generation ? fs.OpenFile(f.old_source, FileFlags::FILE_FLAGS_READ)->GetFileSize()
+			                                      : 64 * 1024 * 1024;
+			const string retired =
+			    "__ducklake_metadata_lake.ducklake_vortex_generations_v1 WHERE state IN ('retired','deleting')";
 			VortexIndex::CollectBuilds(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
-			VortexIndex::Collect(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+			VortexIndex::Collect(*f.writer.context, "lake", 16, byte_budget);
 			Require(f.Count("__ducklake_metadata_lake.ducklake_vortex_builds_v1") == 0,
 			        "Source-only fixture retained build work");
+			Require(f.Count(retired) == expected_retired &&
+			            f.Count(retired + " AND artifact_bytes>" + to_string(byte_budget)) == expected_retired,
+			        "Source-only fixture has unexpected generation work");
 			auto generations = VortexIndex::CollectionLock().GetExclusiveLock([] {});
 			auto empty_phases = std::make_shared<std::atomic<idx_t>>(0);
 			auto completed = std::make_shared<std::atomic<bool>>(false);
-			auto database = &f.database;
+			auto database = f.database.instance.get();
 			DuckLakeVortexOptimizer::EnableMaintenance(
-			    *f.writer.context, "lake", 2, 64 * 1024 * 1024,
-			    [empty_phases, completed, database](const string &stage) {
+			    *f.writer.context, "lake", 2, byte_budget, [empty_phases, completed, database](const string &stage) {
 				    if (stage == "build_recovery_waiting" || stage == "build_gc_waiting" || stage == "gc_waiting") {
 					    ++*empty_phases;
 				    }
@@ -612,6 +621,7 @@ int main(int argc, char **argv) {
 			while (!*completed && std::chrono::steady_clock::now() < deadline) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(5));
 			}
+			const bool finished_while_held = *completed && *empty_phases == 0;
 			generations.reset();
 			DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
 			deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -619,7 +629,8 @@ int main(int argc, char **argv) {
 				Require(std::chrono::steady_clock::now() < deadline, "Source-only worker did not stop");
 				std::this_thread::sleep_for(std::chrono::milliseconds(5));
 			}
-			Require(*completed && *empty_phases == 0, "Source-only maintenance waited on empty index collection");
+			Require(finished_while_held, "Source-only maintenance waited on empty index collection");
+			Require(f.Count(retired) == expected_retired, "Source-only maintenance changed the blocked generation");
 			f.CheckReclaimed();
 			return 0;
 		}
