@@ -144,6 +144,67 @@ idx_t DiskBytes(FileSystem &fs, const string &path) {
 	return bytes;
 }
 
+string AddParquet(Fixture &f, const string &table, const string &name) {
+	auto path = f.root + "/data/" + name;
+	SQL(f.writer, "CREATE TABLE lake." + table + "(i BIGINT)");
+	SQL(f.writer, "COPY (SELECT 7::BIGINT AS i) TO " + Value(path).ToSQLString() + " (FORMAT PARQUET)");
+	SQL(f.writer,
+	    "CALL ducklake_add_data_files('lake'," + Value(table).ToSQLString() + "," + Value(path).ToSQLString() + ")");
+	return path;
+}
+
+void SharedSource(Fixture &f) {
+	auto path = AddParquet(f, "shared_first", "shared.parquet");
+	SQL(f.writer, "CREATE TABLE lake.shared_last(i BIGINT)");
+	SQL(f.writer, "CALL ducklake_add_data_files('lake','shared_last'," + Value("file://" + path).ToSQLString() + ")");
+	f.Policy();
+	SQL(f.writer, "DROP TABLE lake.shared_first");
+	f.Drain();
+	Require(Read(path).size() > 0 && f.Count("lake.shared_last") == 1,
+	        "Expiry removed a file with another live registration");
+	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+	        "Shared source was acknowledged while still referenced");
+
+	SQL(f.writer, "DROP TABLE lake.shared_last");
+	f.Drain(1);
+	Require(!FileSystem::GetFileSystem(*f.writer.context).FileExists(path), "Last registration left a shared source");
+	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 0 &&
+	            f.Count("__ducklake_metadata_lake.ducklake_vortex_source_deletions_v1") == 0,
+	        "Shared source left duplicate deletion work");
+	Require(Source::Status(*f.writer.context, "lake")[0][4].GetValue<idx_t>() == 1,
+	        "One shared source consumed more than one file from the budget");
+}
+
+void MixedSizes(Fixture &f) {
+	auto small = AddParquet(f, "small_source", "small.parquet");
+	SQL(f.writer, "DROP TABLE lake.small_source");
+	f.Collect();
+	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 2,
+	        "Mixed-size fixture did not queue both expired files");
+	{
+		std::fstream oversized(f.old_source, std::ios::binary | std::ios::in | std::ios::out);
+		oversized.seekp(64 * 1024 * 1024);
+		oversized.put(' ');
+		Require(bool(oversized), "Could not make an oversized expired source");
+	}
+	DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 1, 64 * 1024 * 1024);
+	auto &fs = FileSystem::GetFileSystem(*f.writer.context);
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+	while (true) {
+		auto status = DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, "lake")[0];
+		Require(StringValue::Get(status[0]) != "failed", status.back().ToString());
+		if (!status[2].GetValue<bool>() && !fs.FileExists(small)) {
+			break;
+		}
+		Require(std::chrono::steady_clock::now() < deadline, "Oversized source blocked a file that fits the budget");
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+	Require(fs.FileExists(f.old_source) &&
+	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+	        "Oversized source did not remain pending");
+}
+
 void Concurrent(Fixture &f) {
 	auto seed = f.WriteBatch(0, "seed");
 	f.Policy(2);
@@ -241,6 +302,10 @@ int main(int argc, char **argv) {
 			Concurrent(f);
 			return 0;
 		}
+		if (mode == "shared-source") {
+			SharedSource(f);
+			return 0;
+		}
 		if (mode == "held" || mode == "admission") {
 			Pause pause;
 			Connection reader(f.database);
@@ -283,6 +348,48 @@ int main(int argc, char **argv) {
 			f.CheckReclaimed();
 			return 0;
 		}
+		if (mode == "mixed-size") {
+			MixedSizes(f);
+			return 0;
+		}
+		if (mode == "immediate") {
+			SQL(f.writer, "SET GLOBAL immediate_transaction_mode=true");
+			f.Drain();
+			f.CheckReclaimed();
+			return 0;
+		}
+		if (mode == "permissions") {
+			f.Collect();
+			auto contents = Read(f.old_source);
+			SQL(f.writer, "SET allowed_directories=[" + Value(f.root + "/indexes").ToSQLString() + "]");
+			SQL(f.writer, "SET enable_external_access=false");
+			bool denied = false;
+			try {
+				f.Collect();
+			} catch (const PermissionException &) {
+				denied = true;
+			}
+			Require(denied && Read(f.old_source) == contents, "Restricted managed directory was not protected");
+			return 0;
+		}
+		if (mode == "detach") {
+			f.Collect();
+			bool detached = false, rejected = false;
+			try {
+				f.Collect(16, 64 * 1024 * 1024, [&](const string &stage) {
+					if (stage == "source_before_unlink" && !detached) {
+						Connection control(f.database);
+						SQL(control, "DETACH lake");
+						detached = true;
+					}
+				});
+			} catch (const std::exception &) {
+				rejected = true;
+			}
+			Require(detached && rejected && FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source),
+			        "Collection lost attachment ownership before unlink");
+			return 0;
+		}
 		if (mode == "age") {
 			f.Policy(1, 315360000);
 			Require(f.Collect().expired == 0, "Age policy expired retained snapshots");
@@ -295,13 +402,7 @@ int main(int argc, char **argv) {
 			auto file = f.index.files[0];
 			SQL(f.writer, "INSERT INTO __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion VALUES(" +
 			                  to_string(file.id) + "," + Value(file.uri).ToSQLString() + ",false,now())");
-			bool failed = false;
-			try {
-				f.Collect();
-			} catch (std::exception &) {
-				failed = true;
-			}
-			Require(failed && FileSystem::GetFileSystem(*f.writer.context).FileExists(file.uri),
+			Require(f.Collect().files == 0 && FileSystem::GetFileSystem(*f.writer.context).FileExists(file.uri),
 			        "Live source was deleted");
 			SQL(f.writer,
 			    "DELETE FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion WHERE data_file_id=" +
@@ -388,10 +489,17 @@ int main(int argc, char **argv) {
 			ReleasePause release {pause};
 			pause.Wait();
 			Connection cancellation(f.database);
+			auto &gate = Source::TransactionGate();
+			const auto waits = gate.SharedWaitCount();
 			auto cancelled = std::async(
 			    std::launch::async, [&] { DuckLakeVortexOptimizer::CancelMaintenance(*cancellation.context, "lake"); });
-			Require(cancelled.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
-			        "Cancellation crossed an active source deletion transaction");
+			ReleasePause release_on_error {pause};
+			auto waiting_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+			while (gate.SharedWaitCount() == waits) {
+				Require(std::chrono::steady_clock::now() < waiting_deadline &&
+				            cancelled.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready,
+				        "Cancellation did not reach transaction admission");
+			}
 			pause.Release();
 			cancelled.get();
 			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);

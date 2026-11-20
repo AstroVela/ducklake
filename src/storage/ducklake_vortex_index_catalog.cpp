@@ -44,6 +44,26 @@ namespace duckdb {
 using namespace duckdb_yyjson;
 using namespace vortex_detail;
 
+namespace vortex_detail {
+bool CheckDirectoryAccess(ClientContext &context, const string &root) {
+	auto &config = DBConfig::GetConfig(context);
+	if (!Settings::Get<EnableExternalAccessSetting>(config)) {
+		auto directory = config.SanitizeAllowedPath(root);
+		if (!StringUtil::EndsWith(directory, "/")) {
+			directory += "/";
+		}
+		// Native construction and collection access descendants through the qualified directory.
+		auto allowed = std::any_of(config.options.allowed_directories.begin(), config.options.allowed_directories.end(),
+		                           [&](const string &prefix) { return StringUtil::StartsWith(directory, prefix); });
+		if (!allowed) {
+			throw PermissionException("Vortex cannot access directory \"%s\"", root);
+		}
+	}
+	return FileSystem::GetFileSystem(context).DirectoryExists(root);
+}
+
+} // namespace vortex_detail
+
 struct DuckLakeVortexCollectionLock::State {
 	std::mutex lock;
 	std::condition_variable changed;
@@ -239,26 +259,6 @@ void CheckInterrupted(ClientContext &context) {
 	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
-}
-
-bool CheckDirectoryAccess(ClientContext &context, const string &root) {
-	auto &fs = FileSystem::GetFileSystem(context);
-	const bool exists = fs.DirectoryExists(root);
-	auto &config = DBConfig::GetConfig(context);
-	if (Settings::Get<EnableExternalAccessSetting>(config)) {
-		return exists;
-	}
-	auto directory = config.SanitizeAllowedPath(root);
-	if (!StringUtil::EndsWith(directory, "/")) {
-		directory += "/";
-	}
-	// Native construction and collection access descendants through the qualified directory.
-	auto allowed = std::any_of(config.options.allowed_directories.begin(), config.options.allowed_directories.end(),
-	                           [&](const string &prefix) { return StringUtil::StartsWith(directory, prefix); });
-	if (!allowed) {
-		throw PermissionException("Vortex index cannot access directory \"%s\"", root);
-	}
-	return exists;
 }
 
 void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
@@ -2008,7 +2008,7 @@ bool DuckLakeVortexIndex::ReferencesSource(DuckLakeTransaction &transaction, con
 			auto index =
 			    ParseSegments(reference, StringValue::Get(chunk->GetValue(0, row)), Number(parsed.Root(), "field_id"));
 			for (auto &file : index.files) {
-				if (file.uri == path) {
+				if (MatchesSourcePath(*transaction.GetConnection().context, file.uri, path)) {
 					return true;
 				}
 			}

@@ -1,3 +1,7 @@
+#ifdef DUCKLAKE_ENABLE_VORTEX
+#include "common/ducklake_vortex_gc_io.hpp"
+#endif
+
 #include "storage/ducklake_metadata_manager.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -4753,21 +4757,23 @@ FROM {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion f
 	return StringUtil::Replace(query, "{SEPARATOR}", separator);
 }
 
+#ifdef DUCKLAKE_ENABLE_VORTEX
 bool DuckLakeMetadataManager::HasFileReference(const string &path, const string &separator) {
 	auto result = transaction.Query(GetKnownFilesForCleanupQuery(separator, false));
 	if (result->HasError()) {
 		result->ThrowError();
 	}
-	auto &fs = FileSystem::GetFileSystem(*transaction.GetConnection().context);
+	auto &context = *transaction.GetConnection().context;
 	while (auto chunk = result->Fetch()) {
 		for (idx_t row = 0; row < chunk->size(); row++) {
-			if (fs.FileSystem::CanonicalizePath(StringValue::Get(chunk->GetValue(0, row))) == path) {
+			if (vortex_detail::MatchesSourcePath(context, StringValue::Get(chunk->GetValue(0, row)), path)) {
 				return true;
 			}
 		}
 	}
 	return false;
 }
+#endif
 
 vector<DuckLakeFileForCleanup> DuckLakeMetadataManager::GetOrphanFilesForCleanup(const string &filter,
                                                                                  const string &separator) {

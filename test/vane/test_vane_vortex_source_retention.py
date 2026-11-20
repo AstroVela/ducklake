@@ -90,7 +90,8 @@ def exercise(root, report):
 
         reader = connection.cursor()
         reader.execute("BEGIN")
-        old_rows = BASE.raw(reader)
+        old_sql = "SELECT id,embedding,category,payload FROM lake.items ORDER BY id"
+        old_rows = query(reader, old_sql)
         WRITE.batch(
             connection, "new-T", [{"id": 90000, "embedding": BASE.VECTOR, "category": "A", "payload": "新实时"}]
         )
@@ -106,7 +107,9 @@ def exercise(root, report):
         )
         policy(connection)
         require(collect(connection)["blocked_by_transactions"], "An active native reader did not defer collection")
-        require(BASE.raw(reader) == old_rows and old_source.is_file(), "An old native transaction lost its source")
+        require(
+            query(reader, old_sql) == old_rows and old_source.is_file(), "An old native transaction lost its source"
+        )
         connection.execute("SELECT * FROM ducklake_enable_vortex_maintenance('lake',2,67108864)")
         deadline = time.monotonic() + 30
         while True:
@@ -234,6 +237,11 @@ def native_cases(driver, root, report):
         "held",
         "admission",
         "budget",
+        "mixed-size",
+        "shared-source",
+        "immediate",
+        "permissions",
+        "detach",
         "live",
         "gate",
         "checksum",
@@ -243,6 +251,7 @@ def native_cases(driver, root, report):
         "concurrent",
         "fail-source_expiry_committed",
         "fail-source_delete_intent_committed",
+        "fail-source_unlinked_before_sync",
         "fail-source_after_unlink",
         "fail-source_delete_completed",
     ]:
@@ -256,6 +265,7 @@ def native_cases(driver, root, report):
     for mode in [
         "background-pause-source_expiry_committed",
         "background-pause-source_delete_intent_committed",
+        "background-pause-source_unlinked_before_sync",
         "background-pause-source_after_unlink",
         "background-pause-source_delete_completed",
     ]:

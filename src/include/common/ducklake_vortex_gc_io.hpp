@@ -3,6 +3,17 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
+namespace duckdb {
+class ClientContext;
+class FileSystem;
+
+namespace vortex_detail {
+bool CheckDirectoryAccess(ClientContext &context, const string &root);
+string AbsoluteLocalPath(FileSystem &fs, const string &path);
+bool MatchesSourcePath(ClientContext &context, const string &reference, const string &path);
+} // namespace vortex_detail
+} // namespace duckdb
+
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>
@@ -63,6 +74,7 @@ inline unique_ptr<Descriptor> OpenRoot(const string &path, bool missing) {
 struct Parent {
 	unique_ptr<Descriptor> directory;
 	string name;
+	unique_ptr<Descriptor> missing_parent;
 };
 
 inline Parent OpenParent(int32_t root, const string &path, bool missing) {
@@ -74,12 +86,13 @@ inline Parent OpenParent(int32_t root, const string &path, bool missing) {
 	}
 	auto directory = make_uniq<Descriptor>(fd);
 	for (idx_t i = 0; i + 1 < parts.size(); i++) {
-		directory = OpenDirectory(directory->fd, parts[i], missing);
-		if (!directory) {
-			break;
+		auto child = OpenDirectory(directory->fd, parts[i], missing);
+		if (!child) {
+			return {nullptr, parts.back(), std::move(directory)};
 		}
+		directory = std::move(child);
 	}
-	return {std::move(directory), parts.back()};
+	return {std::move(directory), parts.back(), nullptr};
 }
 
 inline void SyncDirectory(int32_t fd) {

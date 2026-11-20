@@ -949,6 +949,13 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			throw InterruptException();
 		}
 	}
+	void InterruptActiveMaintenance(const MaintenanceId &id) {
+		std::lock_guard<std::mutex> guard(lock);
+		if (active_maintenance && active_maintenance->catalog.Id() == id) {
+			maintenance_cancelled.insert(id);
+			context->Interrupt();
+		}
+	}
 	void CancelMaintenance(const MaintenanceId &id) {
 		std::lock_guard<std::mutex> guard(lock);
 		if (maintenance.count(id)) {
@@ -2071,6 +2078,8 @@ void DuckLakeVortexOptimizer::ResumeMaintenance(ClientContext &context, const st
 void DuckLakeVortexOptimizer::CancelMaintenance(ClientContext &context, const string &catalog) {
 	auto binding = ResolveMaintenanceCatalog(context, catalog, true);
 	auto owner = GetOwner(*context.db);
+	// Source collection owns transaction admission. Signal its bound run before entering metadata.
+	owner->runtime->InterruptActiveMaintenance(binding.Id());
 	std::lock_guard<std::mutex> guard(owner->runtime->io);
 	Metadata meta(*context.db, catalog, true, &binding.identity);
 	auto m = LoadMaintenance(meta);
