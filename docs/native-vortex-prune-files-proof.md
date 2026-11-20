@@ -14,9 +14,11 @@ SELECT * FROM ducklake_prune_vortex_index_segment(
     '/absolute/index-root/new-reference.json',<expected_revision>);
 ```
 
-The operation requires one named index and its installed write budget. Native
-snapshot visibility must confirm at least one empty member, fully visible
-retained members, and at least 65 retained rows. Partially deleted retained
+The operation binds the writable autocommit caller and its DuckLake and
+metadata attachments. It requires one named index and its installed write
+budget. The union of inline and external delete positions is computed by
+file ID at the native snapshot. At least one member must be empty and each
+retained member fully visible, with at least 65 retained rows altogether. Partially deleted retained
 members require the existing indexed data rewrite. An entirely empty B uses
 retirement; a 1–64-row remainder uses the explicit bounded F rewrite.
 
@@ -30,8 +32,11 @@ build stops the task. No alternate mode is selected after failure.
 
 The operation reuses registered build/workspace ownership and the static
 vortex-index/SPFresh builder. Its input contains only retained native file
-IDs, URIs, SHA-256 identities and row counts. It creates no replacement Vortex
-data file and no source-output intent. Healthy source bytes, mtimes, native
+IDs, URIs, SHA-256 identities and row counts. The sealed descriptor must
+match the registered generation and every retained file identity. The commit
+uses that captured descriptor and the optimizer records the same registered
+generation. The prune creates only index artifacts and a new reference.
+Healthy source bytes, mtimes, native
 row positions and begin snapshots are preserved.
 
 The source transaction stages native drops for the empty members. Under the
@@ -39,15 +44,19 @@ existing write reservation and exclusive publication lock, final validation
 checks the exact index descriptor, schema, all selected data/delete identities
 and native visibility. Independent committed T/F appends are accepted by
 rebasing to the fresh native snapshot. No new source file ID needs binding.
-Retiring the empty source inventory and publishing the new selected B happen
-in the same metadata transaction. Coverage and artifact limits are verified
-before that transaction commits.
+The metadata transaction retires the empty sources, marks their physical
+retirement, ends their active external masks and publishes the selected B.
+Coverage and artifact limits are verified before the commit. Change feeds
+retain the original logical deletes and return zero events at the prune
+snapshot. Snapshot expiry reclaims the retired source markers and masks.
 
-The task's run UUID is also the manifest publication identity. Reconciliation
-requires both this UUID and the candidate generation at the expected revision.
-Publishing the same sealed raw candidate independently can replace the index
-without retiring native source files; that publication cannot acknowledge the
-interrupted atomic prune task.
+The task's run UUID is also the manifest publication identity. The existing
+optimizer receipt records the run, candidate generation and published revision
+in the same metadata transaction as retirement and index publication.
+Resume can recover that receipt after a later publication advances the index.
+The receipt identifies the task that committed both the data-source retirement
+and the generation publication, including when a separate publisher uses the
+same sealed generation.
 
 Cancellation, input/index conflicts and native errors stop scheduling. A
 post-commit acknowledgement failure is recognized from committed ownership.
@@ -98,19 +107,28 @@ initially reject another T row. Pruning releases exactly 2,048 slots, leaves
 deleted, 64-row retained and entirely empty inputs reject explicit pruning
 before allocation.
 
-The main proof passed 21 checks including six SIGKILL boundaries, cancellation,
-metadata-stage failure, acknowledgement loss, input changes and publication
-races. A separate seventh SIGKILL case verifies durable recovery after another
-publisher reuses the exact sealed generation without source retirement. All
-84 gated search comparisons across these cases had minimum fixture recall
-1.0. These are fixture checks, not a general recall guarantee.
+## Local verification against #50
 
-All 20 preceding native process proofs passed on the same catalog driver.
-ON passed 21 Vortex SQL cases / 809 assertions, including the new 47-assertion
-public operation case, plus Vortex recovery. ON/OFF each passed 86 base cases /
-3,582 assertions with 13 optional-extension skips, and Parquet recovery. OFF
-does not expose the prune API. Four isolated cost cases passed nine queries
-each with minimum recall 1.0; timing measurements are informational.
+DuckLake `b591a3da` incorporates #50 at `50273e90`. The native builds
+use DuckDB `d8cdaa33`, Vortex `b20e34c2`, and the
+DuckDB Vortex wrapper `84cef204`.
+
+Pruning passed 24 checks and 88 gated query
+comparisons with minimum fixture recall 1.0 in 55.31
+seconds within the 180-second budget. The SIGKILL cases include resume after
+an independent append advances the revision. The public SQL case passed
+73 assertions, including writable caller checks,
+the zero-change prune snapshot and exact earlier delete events.
+
+All 21 native process proofs passed. ON passed 30
+Vortex SQL cases and 1367 assertions. ON and OFF passed
+86 base cases and 3582 assertions each with
+13 optional-extension skips per configuration. The complete
+DELETE and table-change suites, Vortex and Parquet recovery and cleanup,
+32 ABI cases, isolated cost checks, formatting, Clippy and Rust workspace
+tests passed. OFF metadata expiry reclaimed the prune source marker and masks
+and preserved the healthy file.
+The prune_files, rewrite_append fixture ran again within its original budget.
 
 The qualified catalog driver SHA-256 is
-`6a6de41eafd10e3e87d9447fb6b8602f5974953861e178597c442b298232c80c`.
+`fd1b696739b6db29b8ae9dd7a3f361f789b43cfb5510c4430a5e79abaf2b98fb`.

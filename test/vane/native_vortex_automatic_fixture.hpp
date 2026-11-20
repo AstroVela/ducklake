@@ -85,7 +85,7 @@ struct AutomaticFixture {
 	void Configure(const std::function<void(const string &)> &observe, idx_t inline_limit = 256) {
 		SQL(setup, "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
 		Connection owner(database);
-		DuckLakeVortexWriteBatch::Manage(owner, "lake", "main", "items", "knn");
+		DuckLakeVortexWriteBatch::Manage(owner, *setup.context, "lake", "main", "items", "knn");
 		DuckLakeVortexOptimizerConfig c;
 		c.catalog = "lake";
 		c.schema = "main";
@@ -163,8 +163,8 @@ struct AutomaticFixture {
 			Connection owner(database);
 			try {
 				pending.receipt =
-				    DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", request, Rows(pending.rows),
-				                                     Deletes(pending.deletes), observe);
+				    DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", request,
+				                                     Rows(pending.rows), Deletes(pending.deletes), observe);
 				break;
 			} catch (std::exception &error) {
 				auto message = StringUtil::Lower(error.what());
@@ -315,8 +315,8 @@ struct AutomaticFixture {
 	void Replay() {
 		for (auto &plan : plans) {
 			Connection owner(database);
-			auto result = DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", plan.request,
-			                                               Rows(plan.rows), Deletes(plan.deletes));
+			auto result = DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn",
+			                                               plan.request, Rows(plan.rows), Deletes(plan.deletes));
 			Require(result.snapshot_id == plan.receipt.snapshot_id && result.payload_hash == plan.receipt.payload_hash,
 			        "Old automatic-flow request changed its receipt");
 		}
@@ -405,7 +405,7 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		Connection owner(database);
 		bool rejected = false;
 		try {
-			DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "blocked",
+			DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "blocked",
 			                                 f.Rows({f.Row(10000, 1)}), f.Deletes({}));
 		} catch (std::exception &error) {
 			rejected = string(error.what()).find("RESOURCE_EXHAUSTED") != string::npos;

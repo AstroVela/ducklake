@@ -180,13 +180,16 @@ def submit(connection, request, rows, deletes, retries):
 
 
 def qualify(connection, model, label, recalls):
-    require(BASE.raw(connection) == [model[key] for key in sorted(model)], f"Current logical state diverged: {label}")
+    require(
+        KEYED.business_rows(connection) == [model[key] for key in sorted(model)],
+        f"Current logical state diverged: {label}",
+    )
     return BASE.qualify(connection, label, recalls)
 
 
 def exercise(root, rounds, report):
     (root / "indexes").mkdir()
-    connection = BASE.connect(root, create=True)
+    connection = BASE.connect(root, root / "extensions", create=True)
     model, receipts, recalls, phases, samples, retries = {}, [], [], [], [], []
     try:
         configure(connection, root)
@@ -251,13 +254,13 @@ def exercise(root, rounds, report):
             samples.append(dict(phase=request, **sample))
             print(f"Automatic wave settled: {wave + 1}/{rounds}", flush=True)
 
-        before = BASE.raw(connection)
+        before = KEYED.business_rows(connection)
         for request, rows, deletes, receipt in receipts:
             require(
                 KEYED.mutate(connection, request, rows, deletes) == receipt,
                 "Old automatic-flow request changed its receipt",
             )
-        require(BASE.raw(connection) == before, "Replaying old automatic-flow requests changed current rows")
+        require(KEYED.business_rows(connection) == before, "Replaying old automatic-flow requests changed current rows")
         require(
             query(
                 connection,
@@ -281,7 +284,7 @@ def exercise(root, rounds, report):
 
 
 def recover(case, stage):
-    connection = BASE.connect(case)
+    connection = BASE.connect(case, case.parent / "extensions")
     try:
         plans = {entry["request_id"]: entry for entry in json.loads((case / "plans.json").read_text())}
         recorded = query(connection, "SELECT * FROM " + WRITE.REQUESTS + " ORDER BY snapshot_id")
@@ -293,7 +296,7 @@ def recover(case, stage):
                 model.pop(key, None)
             model.update((entry["id"], entry) for entry in plan["rows"])
         require(
-            BASE.raw(connection) == [model[key] for key in sorted(model)],
+            KEYED.business_rows(connection) == [model[key] for key in sorted(model)],
             "SIGKILL separated committed receipts and logical versions",
         )
         before = BASE.head(connection)
@@ -305,7 +308,10 @@ def recover(case, stage):
         connection.execute("SELECT * FROM ducklake_resume_vortex_maintenance('lake')")
         connection.execute("SELECT * FROM ducklake_resume_vortex_optimizer('lake','main','items','knn')")
         after, _, _ = settle(connection, case, max(2, before["revision"]))
-        require(BASE.raw(connection) == [model[key] for key in sorted(model)], "Resume changed committed logical state")
+        require(
+            KEYED.business_rows(connection) == [model[key] for key in sorted(model)],
+            "Resume changed committed logical state",
+        )
         if stage == "after_commit":
             require(after == before, "Committed index publication was rebuilt after lost acknowledgement")
         for receipt in recorded:
@@ -315,7 +321,7 @@ def recover(case, stage):
                 "Recovered request retry changed its receipt",
             )
         require(
-            BASE.raw(connection) == [model[key] for key in sorted(model)],
+            KEYED.business_rows(connection) == [model[key] for key in sorted(model)],
             "Recovered request retry reapplied an old version",
         )
         BASE.SEARCH.qualify(

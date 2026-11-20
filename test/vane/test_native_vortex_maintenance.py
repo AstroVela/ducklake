@@ -19,8 +19,8 @@ require = BASE.require
 LIMIT = 64 * 1024 * 1024
 
 
-def status(native):
-    rows = native.call("maintenance-status")
+def status(native, catalog="lake"):
+    rows = native.call("maintenance-status", catalog)
     require(len(rows) == 1, f"Expected a single catalog maintenance policy: {rows}")
     return rows[0]
 
@@ -42,7 +42,14 @@ def drain(native):
         row = status(native)
         require(row["state"] != "failed", f"Background cleanup failed: {row}")
         if not row["running"] and row["state"] == "idle" and not BG.status(native) and not GC.retired(native):
-            return row
+            row = status(native)
+            if (
+                not row["running"]
+                and row["state"] == "idle"
+                and not row["remaining_builds"]
+                and not row["remaining_generations"]
+            ):
+                return row
         require(time.monotonic() < deadline, f"Background cleanup did not drain: {row}")
         time.sleep(0.02)
 
@@ -262,14 +269,15 @@ def budgets(driver, root, checks):
         before = drain(native)
         native.call("maintenance-cancel")
         native.call("build", "knn", artifacts / "replacement.json", 1)
-        native.call("maintenance-resume", "maintenance_after_build_gc", "pause")
+        native.call("maintenance-resume", "maintenance_complete", "pause")
         native.call("optimizer-wait")
         during = status(native)
         require(
-            during["collected_builds"] == before["collected_builds"] + 1
+            during["run_count"] == before["run_count"] + 1
+            and during["collected_builds"] == before["collected_builds"] + 1
             and during["collected_generations"] == before["collected_generations"]
             and len(GC.retired(native)) == 1,
-            "Build and generation cleanup did not share the count budget",
+            "Build and generation cleanup exceeded the count budget in one completed pass",
         )
         native.call("optimizer-release")
         drain(native)
@@ -296,9 +304,169 @@ def budgets(driver, root, checks):
         native.call("maintenance-cancel")
         native.finish()
         checks.append(
-            "one shared object/byte budget bounds both collectors; cancellation of a 65 MiB partial file persists deletion and requires explicit resume"
+            "one completed pass shares the object budget; cancellation of a 65 MiB partial file persists deletion and requires explicit resume"
         )
         return {"fixture_recalls": recalls}
+    finally:
+        M.stop(native)
+
+
+def shared_bytes(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, _, _ = SEG.setup(native, root)
+        native.call("build-gc", 16, LIMIT)
+        native.call("build", "knn", artifacts / "replacement.json", 1)
+        candidate = BG.candidate(native)
+        workspace = Path(candidate["workspace"])
+        (workspace / "budget.partial").write_bytes(b"p")
+        scratch = sum(path.stat().st_size for path in workspace.rglob("*") if path.is_file())
+        pending = GC.retired(native)
+        require(len(pending) == 1 and 0 < scratch < pending[0]["artifact_bytes"], "Invalid shared byte fixture")
+        budget = pending[0]["artifact_bytes"]
+        native.call("optimizer-init")
+        native.call("maintenance-enable", 16, budget, "maintenance_complete", "pause")
+        native.call("optimizer-wait")
+        first = status(native)
+        require(
+            first["run_count"] == 1
+            and first["collected_builds"] == 1
+            and first["collected_generations"] == 0
+            and first["collected_bytes"] == scratch
+            and GC.retired(native) == pending,
+            "Both collectors did not share the byte budget in one completed pass",
+        )
+        native.call("optimizer-release")
+        final = drain(native)
+        require(
+            final["run_count"] == 2
+            and final["collected_generations"] == 1
+            and final["collected_bytes"] == scratch + budget,
+            "The generation did not fit in a fresh pass",
+        )
+        BG.gone(candidate)
+        native.call("maintenance-cancel")
+        native.finish()
+        checks.append("one completed pass shares bytes across both collectors and the next pass can use the full limit")
+        return {"budget": budget, "first_pass_bytes": first["collected_bytes"], "total_bytes": final["collected_bytes"]}
+    finally:
+        M.stop(native)
+
+
+def blocked_budget(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, _, first, _, _ = M.setup(native, root)
+        native.call("build", "knn", artifacts / "replacement.json", 3)
+        native.call("build-gc", 16, LIMIT)
+        pending = GC.retired(native)
+        require(len(pending) == 3 and pending[0]["generation"] == M.generation(first), "Invalid GC ordering fixture")
+        budget = max(row["artifact_bytes"] for row in pending[1:])
+        require(pending[0]["artifact_bytes"] > budget > 0, "Expected the first generation to exceed the budget")
+        native.call("optimizer-init")
+        native.call("maintenance-enable", 16, budget)
+        blocked = wait(native, lambda row: row["state"] == "blocked" and not row["running"], "blocked generation")
+        require(
+            blocked["remaining_generations"] == 1
+            and blocked["collected_generations"] == 2
+            and GC.retired(native) == pending[:1]
+            and "byte budget" in blocked["error"],
+            "An oversized first generation hid eligible later entries",
+        )
+        steady(native)
+        manual = native.call("gc", 1, LIMIT)
+        require(manual["collected_generations"] == 1, "Explicit collection could not clear the blocked generation")
+        final = drain(native)
+        require(final["run_count"] == blocked["run_count"] and not final["error"], "Blocked backlog caused a dry run")
+        native.call("maintenance-cancel")
+        native.finish()
+        checks.append(
+            "eligible generations advance past oversized entries and a wholly blocked backlog creates no runs"
+        )
+        return {"budget": budget, "blocked_artifact_bytes": pending[0]["artifact_bytes"], "runs": final["run_count"]}
+    finally:
+        M.stop(native)
+
+
+def attachment_binding(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        SEG.setup(native, root)
+        build = BG.candidate(native)
+        native.call("optimizer-init")
+        native.call("maintenance-enable", 16, LIMIT, "build_gc_waiting", "pause")
+        native.call("optimizer-wait")
+        original = status(native)
+        require(original["running"] and original["state"] == "collecting_builds", "GC did not reach its lock boundary")
+        retained = native.call("maintenance-reattach")
+        require(
+            retained == {"retained_status_rejected": True, "retained_resume_rejected": True},
+            "A caller retaining the old attachment could inspect or resume its replacement",
+        )
+        require(not status(native)["running"], "The new attachment inherited the old running registration")
+        native.call("maintenance-resume", "maintenance_before_recovery", "pause")
+        native.call("optimizer-wait")
+        resumed = status(native)
+        require(
+            resumed["run_count"] == original["run_count"] + 1
+            and BG.candidate(native) == build
+            and Path(build["workspace"]).is_dir(),
+            "The previous attachment's collector reached the newly attached workspace",
+        )
+        native.call("optimizer-release")
+        final = drain(native)
+        require(final["collected_builds"] == original["collected_builds"] + 1, "Explicit resume did not collect")
+        BG.gone(build)
+        native.call("maintenance-cancel")
+        native.finish()
+        checks.append("reattaching a lake while GC waits requires a new explicit registration before cleanup")
+        return {"old_run": original["run_id"], "new_run": resumed["run_id"], **retained}
+    finally:
+        M.stop(native)
+
+
+def control_ordering(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, _, _ = SEG.setup(native, root)
+        native.call("optimizer-init")
+        native.call("maintenance-enable", 16, LIMIT, "maintenance_after_generation_gc", "pause")
+        native.call("optimizer-wait")
+        active = status(native)
+        require(active["running"] and status(native, "LAKE") == active, "Catalog case changed task identity")
+        native.call("maintenance-resume", "LAKE", expected="maintenance is still running")
+        native.call("maintenance-cancel", "LAKE")
+        require(status(native)["state"] == "cancelling", "Cancellation lost the active completion boundary")
+        native.call("optimizer-release")
+        cancelled = wait(
+            native, lambda row: row["state"] == "cancelled" and not row["running"], "terminal cancellation"
+        )
+        require(
+            cancelled["run_count"] == active["run_count"] and not cancelled["enabled"], "Cancellation was not durable"
+        )
+
+        BG.failed(native, artifacts / "before-completion.json")
+        native.call("maintenance-resume", "maintenance_complete", "fail-after-release")
+        native.call("optimizer-wait")
+        complete = status(native)
+        require(complete["state"] == "idle" and not complete["running"], "Completed run still appeared active")
+        native.call("maintenance-cancel", "LAKE")
+        require(status(native)["state"] == "cancelled", "Completed run left a pending cancellation")
+        native.call("maintenance-resume", "LAKE")
+        build = BG.failed(native, artifacts / "after-resume.json")
+        native.call("optimizer-release")
+        final = drain(native)
+        require(
+            final["enabled"] and not final["error"] and final["run_count"] == complete["run_count"] + 1,
+            "An old completion error overwrote the resumed policy",
+        )
+        BG.gone(build)
+        native.call("maintenance-cancel")
+        native.finish()
+        checks.append(
+            "maintenance controls serialize cancellation and completion across spellings and fence old callbacks"
+        )
+        return {"cancelled_run": cancelled["run_id"], "resumed_run": final["run_id"]}
     finally:
         M.stop(native)
 
@@ -372,7 +540,30 @@ def gc_crash(driver, root, stage, checks):
             not reopened["running"] and reopened["run_count"] == durable["run_count"], "Restart implicitly resumed GC"
         )
         steady(native)
+        if stage == "maintenance_after_generation_gc":
+            require(
+                (reopened["remaining_builds"] or reopened["remaining_generations"])
+                and not BG.status(native)
+                and not GC.retired(native),
+                "The stopped run did not leave stale backlog counts",
+            )
+            native.call("optimizer-enable", merged, 100000, 4194304, 128, LIMIT, "optimizer_before_build", "pause")
+            SEG.add_f(native, 8000)
+            native.call("optimizer-wait")
         native.call("maintenance-resume")
+        if stage == "maintenance_after_generation_gc":
+            resumed = status(native)
+            require(
+                resumed["state"] == "idle"
+                and not resumed["running"]
+                and resumed["run_count"] == reopened["run_count"]
+                and not resumed["remaining_builds"]
+                and not resumed["remaining_generations"],
+                "Explicit resume did not refresh stale counts while the worker was occupied",
+            )
+            native.call("optimizer-cancel")
+            native.call("optimizer-release")
+            checks.append("explicit resume refreshes stale backlog with the worker occupied and creates no extra run")
         recovered = drain(native)
         require(
             not recovered["remaining_builds"] and not recovered["remaining_generations"],
@@ -424,6 +615,10 @@ def main():
             ("cancelled-build", lambda d, r, c: build_error(d, r, True, c)),
             ("maintenance-failure", maintenance_error),
             ("budgets", budgets),
+            ("shared-bytes", shared_bytes),
+            ("blocked-budget", blocked_budget),
+            ("attachment-binding", attachment_binding),
+            ("control-ordering", control_ordering),
         ]
         for stage in ["before_commit", "after_commit"]:
             cases.append((stage, lambda d, r, c, s=stage: publication_crash(d, r, s, c)))
