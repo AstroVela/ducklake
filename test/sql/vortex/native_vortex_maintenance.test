@@ -52,6 +52,22 @@ SELECT * FROM ducklake_enable_vortex_maintenance('lake',NULL,67108864)
 ----
 cannot be NULL
 
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT * FROM ducklake_enable_vortex_maintenance('lake',1,67108864)
+----
+maintenance controls require autocommit
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM ducklake_vortex_maintenance_status('lake')
+----
+0
+
 query T
 SELECT * FROM ducklake_enable_vortex_maintenance('lake',1,67108864)
 ----
@@ -67,10 +83,42 @@ SELECT * FROM ducklake_enable_vortex_maintenance('lake',1,67108864)
 ----
 Duplicate key
 
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT * FROM ducklake_cancel_vortex_maintenance('LAKE')
+----
+maintenance controls require autocommit
+
+statement ok
+ROLLBACK
+
+query TII
+SELECT state,enabled,running FROM ducklake_vortex_maintenance_status('lake')
+----
+idle	true	false
+
 query T
-SELECT * FROM ducklake_cancel_vortex_maintenance('lake')
+SELECT * FROM ducklake_cancel_vortex_maintenance('LAKE')
 ----
 cancellation_requested
+
+query TII
+SELECT state,enabled,running FROM ducklake_vortex_maintenance_status('lake')
+----
+cancelled	false	false
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT * FROM ducklake_resume_vortex_maintenance('lake')
+----
+maintenance controls require autocommit
+
+statement ok
+ROLLBACK
 
 query TII
 SELECT state,enabled,running FROM ducklake_vortex_maintenance_status('lake')
@@ -89,6 +137,22 @@ idle	true	0	0
 
 statement ok
 SELECT * FROM ducklake_cancel_vortex_maintenance('lake')
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_maintenance.ducklake' AS lake (READ_ONLY)
+
+query TII
+SELECT state,enabled,running FROM ducklake_vortex_maintenance_status('lake')
+----
+cancelled	false	false
+
+statement error
+SELECT * FROM ducklake_resume_vortex_maintenance('lake')
+----
+maintenance controls require a writable DuckLake attachment
 
 statement ok
 DETACH lake
