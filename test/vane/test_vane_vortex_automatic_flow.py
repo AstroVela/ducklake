@@ -534,6 +534,7 @@ def native_cases(driver, root, report):
         "automatic-reject-rebound-catalog",
         "automatic-reject-rebound-build",
         "automatic-reject-rebound-publication",
+        "automatic-reject-nonlake-capture",
     ]:
         case = root / mode
         case.mkdir(mode=0o700)

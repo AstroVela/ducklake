@@ -562,7 +562,8 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 			before_build->Stop();
 		}
 		if ((mode == "automatic-reject-rebound-build" && stage == "before_build") ||
-		    (mode == "automatic-reject-rebound-publication" && stage == "before_build_publish")) {
+		    (mode == "automatic-reject-rebound-publication" && stage == "before_build_publish") ||
+		    (mode == "automatic-reject-nonlake-capture" && stage == "before_build_capture")) {
 			before_build->Stop();
 		}
 		if (mode == "automatic-rewrite-serialization" && stage == "rewrite_candidate_ready") {
@@ -574,7 +575,9 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 	};
 	f.Configure(observe, mode == "automatic-backpressure" ? 128 : 256);
 	const bool rebound_waiter = mode == "automatic-reject-rebound-catalog";
-	if (rebound_waiter || mode == "automatic-reject-rebound-build" || mode == "automatic-reject-rebound-publication") {
+	const bool nonlake_capture = mode == "automatic-reject-nonlake-capture";
+	if (rebound_waiter || mode == "automatic-reject-rebound-build" || mode == "automatic-reject-rebound-publication" ||
+	    nonlake_capture) {
 		*pause_physical = rebound_waiter;
 		f.Grow(0);
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -595,6 +598,22 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		    "SELECT build_id,state,keep_generation FROM __ducklake_metadata_lake.ducklake_vortex_builds_v1 ORDER BY 1";
 		auto before = SQL(setup, builds)->ToString();
 		SQL(setup, "DETACH lake");
+		if (nonlake_capture) {
+			SQL(setup, "ATTACH ':memory:' AS lake");
+			before_build->Release();
+			while (true) {
+				{
+					std::lock_guard<std::mutex> guard(events->lock);
+					if (events->stages["optimizer_before_error"]) {
+						break;
+					}
+				}
+				Require(std::chrono::steady_clock::now() < deadline,
+				        "Build capture accepted a non-DuckLake attachment");
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			SQL(setup, "DETACH lake");
+		}
 		Attach(setup, root);
 		before_build->Release();
 		writer.reset();

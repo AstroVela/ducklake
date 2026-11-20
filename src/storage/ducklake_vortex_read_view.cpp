@@ -95,7 +95,14 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 	}
 	reader.BeginTransaction();
 	try {
-		auto &catalog = Catalog::GetCatalog(*reader.context, options.catalog).Cast<DuckLakeCatalog>();
+		auto &resolved = Catalog::GetCatalog(*reader.context, options.catalog);
+		if (identity && resolved.GetAttached().oid != identity->lake_oid) {
+			throw TransactionException("Vortex catalog attachment changed");
+		}
+		if (resolved.GetCatalogType() != "ducklake") {
+			throw InvalidInputException("Native Vortex read views require an attached DuckLake catalog");
+		}
+		auto &catalog = resolved.Cast<DuckLakeCatalog>();
 		if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 			throw InvalidInputException("Native Vortex read views require DuckDB metadata");
 		}

@@ -2403,6 +2403,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		options.merge_generations = merge_generations;
 		options.expected_table_uuid = table_uuid;
 		options.expected_field_id = expected_field_id;
+		check("before_build_capture");
 		auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, check, &context, identity);
 		BuildNative(context, view, reference_path, generation, workspace, check);
 		check("before_build_publish");
