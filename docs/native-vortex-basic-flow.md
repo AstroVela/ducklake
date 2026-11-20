@@ -8,10 +8,13 @@ For the installed `vane.connect()` entry and matching optional providers, see
 [Vane native realtime vector flow](vane-native-vortex-proof.md).
 
 `ducklake_create_vortex_index` publishes a typed zero-B definition at revision
-1. It requires an empty, fixed-schema Vortex table, dimension 1–4096 and an
-existing absolute index directory outside managed data. It does not invoke
-SPFresh or allocate a build/generation. Duplicate names and nonempty tables
-fail explicitly; existing data can use the explicit build operation.
+1. Use a writable DuckLake attachment in autocommit mode, an empty,
+fixed-schema Vortex table, dimension 1–4096 and an existing absolute index
+directory outside managed data. Creation checks the committed table format
+and can be canceled before publication. Creation and optimizer enable both
+require matching field IDs and dimensions whenever the other definition
+already exists. Duplicate names and nonempty tables fail explicitly.
+Use the explicit build operation for existing data.
 
 ## Run locally
 
@@ -112,25 +115,14 @@ The proof exercises 11 stages: empty, committed T, hidden uncommitted writes,
 atomic update/delete/insert, small F, F during first build, concurrent F/T,
 first B/F/T, mutations beside B, second independent B, and reopen after SIGKILL
 with nonempty metadata WAL. An old T view preserves original typed versions
-through flush, indexing and restart. Native row IDs survive materialization;
-the second B leaves the first descriptor and artifact signature unchanged.
+through flush, indexing and restart. The proof compares typed SQL rows and
+native row IDs across materialization and restart. The second B preserves the
+first descriptor and artifact signature.
 
-All 44 gated search comparisons passed with fixture minimum recall 1.0.
-`native_vortex_basic_flow.test` additionally exercises the public SQL APIs,
-prepared queries across T/F/B, argument/duplicate/root checks, dimension
-admission, native row-ID preservation and catalog reopen. The existing strict
-manifest-v3 zero-B representation, query path, budgets and pinned native
-dependencies are reused. No compatibility decoder, implicit fallback or
-SPFresh online update API is added.
-
-The guide's SQL was also run in a fresh catalog through the qualified CLI:
-background publication reached revision 2, then a new T merged into B results
-as IDs `[0,10000,1,2,3]`. The process proof additionally passed with apostrophes
-in its working path. All 21 preceding process proofs passed on the same driver.
-ON passed 22 Vortex SQL cases / 865 assertions, including the new 56-assertion
-public SQL case, plus Vortex recovery. ON/OFF each passed 86 base cases / 3,582
-assertions with 13 optional-extension skips and Parquet recovery; OFF exposes
-no create-index entry. Formatting and diff checks passed.
-
-Qualified catalog driver SHA-256:
-`6ba3eefea1099f867fbdaaf187ba29261202264ffb17ca53ce57c0199e7342fa`.
+The process proof also cancels a create while it is waiting for the
+publication lock, then checks the catalog before creating the index.
+`native_vortex_basic_flow.test` covers writable autocommit admission,
+format rollback, table type, directory validation, dimension conflicts in
+both setup orders, prepared queries across T/F/B, and row IDs across flush. The proof
+uses the existing manifest-v3 representation, query tolerances and
+write and maintenance budgets.

@@ -144,6 +144,25 @@ def exercise(proof, native, root, checks, workers):
     core, rows = qualify(native, "two-B", recalls, two=True)
     routes = core["diagnostics"]["routes"]
     require(routes["scan_files"] and routes["inline_rows"], "Two-B query omitted remaining F or T")
+    phase_checks = []
+    for phase in ["ann_us", "rerank_us"]:
+        observation = native.call("timed-core-search", phase, 2)
+        timed = json.loads(observation["query_json"])
+        measured = timed["diagnostics"]["cost"]["phases_us"][phase]
+        require(
+            observation["ann_calls"] == 2 and observation["observed_delay_us"] > 0,
+            "Timing fixture did not observe both segments",
+        )
+        require(
+            measured >= observation["observed_delay_us"],
+            f"{phase} omitted a segment or charged its controlled delay to another phase",
+        )
+        require(timed["rows"] == core["rows"], "Phase instrumentation changed the two-segment result")
+        recalls.append(SEARCH.qualify(timed, rows, VECTOR))
+        phase_checks.append(
+            {"phase": phase, "observed_delay_us": observation["observed_delay_us"], "reported_us": measured}
+        )
+    checks.append("per-segment ANN/rerank phases accumulate both observed delays without a stable-load speed assertion")
     checks.append(
         "B2 covers only the 128 new F rows; B1 descriptor, generation, artifact bytes and write times remain unchanged"
     )
@@ -222,6 +241,7 @@ def exercise(proof, native, root, checks, workers):
     )
     return {
         "fixture_recalls": recalls,
+        "phase_checks": phase_checks,
         "first_generation": generation(first),
         "second_generation": second["generation"]["generation"],
         "first_artifact_signature": frozen,
@@ -281,7 +301,7 @@ def aggregate_rows(driver, root, checks):
             "CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items');"
             "INSERT INTO lake.items VALUES(9999,[0,0,0,0,0,0,0,0],'A','small-F')"
         )
-        native.call("append", "knn", artifacts / "small.json", 1, expected="requires at least 64 rows")
+        native.call("append", "knn", artifacts / "small.json", 1, expected="requires 65..=100000 physical rows")
         unchanged(native, first, frozen)
         native.sql(
             "INSERT INTO lake.items SELECT 10000+i,[i::FLOAT,0,0,0,0,0,0,0],'A','global-cap' FROM range(95904)t(i)"

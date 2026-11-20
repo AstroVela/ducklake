@@ -25,17 +25,24 @@ assert SPEC is not None and SPEC.loader is not None
 AUTO = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(AUTO)
 BASE, KEYED = AUTO.BASE, AUTO.KEYED
+MIXED = BASE.SEARCH.CAT.MIXED
 query, require, quote = AUTO.query, AUTO.require, AUTO.quote
 REQUESTS = AUTO.WRITE.REQUESTS
 PHASES = [("paced", 1.0), ("burst", 0.0), ("recovery", 1.0)]
+SEARCH_COLUMNS = [
+    ("id", "BIGINT"),
+    ("embedding", "FLOAT[]"),
+    ("category", "VARCHAR"),
+    ("payload", "VARCHAR"),
+    ("distance", "FLOAT"),
+]
 
 
 def row(key, epoch, dimension, fixture):
     result = AUTO.row(key, epoch)
     if fixture == "cost":
-        result["embedding"] = [float(key) + (epoch % 3) / 64] + [
-            float((key * (i + 3)) % (i + 11)) for i in range(1, dimension)
-        ]
+        first = MIXED.BASE.float32_vector([float(key) + (epoch % 3) / 64])[0]
+        result["embedding"] = [first] + [float((key * (i + 3)) % (i + 11)) for i in range(1, dimension)]
     else:
         result["embedding"].extend(((key * (i + 1)) % 17) / 16 for i in range(8, dimension))
     return result
@@ -67,6 +74,13 @@ def watermark(connection):
     )[0]["n"]
 
 
+def healthy(connection):
+    optimizer, maintenance = AUTO.healthy(connection)
+    require(not optimizer["error"], f"Optimizer reported an error: {optimizer}")
+    require(not maintenance["error"], f"Maintenance reported an error: {maintenance}")
+    return optimizer, maintenance
+
+
 def counters():
     values = {}
     for filename, keys in [
@@ -83,7 +97,7 @@ def counters():
 
 
 def bootstrap(root, count, dimension, fixture):
-    connection = BASE.connect(root)
+    connection = BASE.connect(root, root / "extensions")
     (root / "indexes").mkdir()
     for sql in [
         "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)",
@@ -172,7 +186,7 @@ def worker(args):
     )
     keys, epoch = list(range(count)), 1
     pending_started = None
-    errors = []
+    errors, acknowledged = [], []
     cursors = [connection.cursor() for _ in range(args.readers + 1)]
     baseline = usage()
 
@@ -187,6 +201,7 @@ def worker(args):
     def reader(index):
         cursor = cursors[index]
         serial = index
+        checked_schema = False
         while not stopped.is_set():
             serial += args.readers
             canary = index == 0
@@ -206,6 +221,11 @@ def worker(args):
             started = time.monotonic_ns()
             hits = query(cursor, BASE.SEARCH.search_sql(vector, category=category))
             finished = time.monotonic_ns()
+            if not checked_schema:
+                require(
+                    [(col[0], str(col[1])) for col in cursor.description] == SEARCH_COLUMNS, "Search schema changed"
+                )
+                checked_schema = True
             after = watermark(cursor)
             emit(
                 "query",
@@ -225,7 +245,7 @@ def worker(args):
     def monitor():
         cursor = cursors[-1]
         while not stopped.is_set():
-            optimizer, maintenance = AUTO.healthy(cursor)
+            optimizer, maintenance = healthy(cursor)
             source = query(cursor, "SELECT * FROM ducklake_vortex_source_retention_status('lake')")[0]
             emit("sample", phase=phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
             stopped.wait(0.25)
@@ -277,6 +297,7 @@ def worker(args):
                         elapsed_ms=(finished - started) / 1e6,
                         input_bytes=canonical_bytes(rows, deletes, dimension),
                     )
+                    acknowledged.append(receipt)
                     for slot, key in changes:
                         keys[slot] = key
                     epoch += 1
@@ -308,29 +329,7 @@ def worker(args):
                 cursor.close()
     emit("measured", begin=baseline, end=usage())
     try:
-        require(not errors, str(errors))
-        emit("final_rows", rows=BASE.raw(connection))
-        recorded = query(
-            connection,
-            "SELECT request_id,snapshot_id FROM "
-            + REQUESTS
-            + " WHERE starts_with(request_id,'steady-') ORDER BY snapshot_id",
-        )
-        require(len(recorded) == epoch - 1, "Rejected attempts left receipts or successful writes lost receipts")
-        for entry in recorded[:1] + recorded[-1:]:
-            # Retry checks run outside the measured workload.
-            number = int(entry["request_id"].split("-")[-1])
-            old_keys = list(range(count))
-            for n in range(1, number + 1):
-                rows, deletes, changes = plan(old_keys, n, dimension, fixture)
-                for slot, key in changes:
-                    old_keys[slot] = key
-            require(
-                KEYED.mutate(connection, entry["request_id"], rows, deletes)["snapshot_id"] == entry["snapshot_id"],
-                "Retry changed its receipt",
-            )
-        emit("retry_rows", rows=BASE.raw(connection))
-    finally:
+        healthy(connection)
         connection.execute("SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')")
         connection.execute("SELECT * FROM ducklake_cancel_vortex_maintenance('lake')")
         deadline = time.monotonic() + 30
@@ -340,6 +339,39 @@ def worker(args):
         ):
             require(time.monotonic() < deadline, "Workers did not stop at load teardown")
             time.sleep(0.01)
+        require(not errors, str(errors))
+        final_rows = KEYED.business_rows(connection)
+        emit("final_rows", rows=final_rows)
+        recorded = query(
+            connection,
+            "SELECT table_uuid,request_id,payload_hash,row_count,snapshot_id FROM "
+            + REQUESTS
+            + " WHERE starts_with(request_id,'steady-') ORDER BY snapshot_id",
+        )
+        require(recorded == acknowledged, "Durable mutation receipts diverged from successful acknowledgements")
+        if pending_started is not None:
+            request = f"steady-{epoch}"
+            AUTO.WRITE.check_no_request(connection, request)
+            emit("unadmitted", request_id=request, started_ns=pending_started)
+        stamp = AUTO.current_stamp(connection)
+        for entry in recorded[:1] + recorded[-1:]:
+            # Retry checks run outside the measured workload.
+            number = int(entry["request_id"].split("-")[-1])
+            old_keys = list(range(count))
+            for n in range(1, number + 1):
+                rows, deletes, changes = plan(old_keys, n, dimension, fixture)
+                for slot, key in changes:
+                    old_keys[slot] = key
+            require(
+                KEYED.mutate(connection, entry["request_id"], rows, deletes) == entry,
+                "Retry changed its receipt",
+            )
+            require(
+                AUTO.current_stamp(connection) == stamp and KEYED.business_rows(connection) == final_rows,
+                "Retry changed the snapshot, index or current rows",
+            )
+        emit("retry_rows", rows=KEYED.business_rows(connection))
+    finally:
         connection.close()
         pipe.close()
 
@@ -365,29 +397,68 @@ def valid_hits(sample, model):
     rows = sample["rows"]
     if len(rows) > 10 or len({entry["id"] for entry in rows}) != len(rows):
         return None
-    previous = -1
-    point = sample["vector"]
-    for entry in rows:
-        expected = model.get(entry["id"])
-        if expected is None or any(entry[key] != expected[key] for key in ["embedding", "category", "payload"]):
-            return None
-        if sample["category"] is not None and entry["category"] != sample["category"]:
-            return None
-        exact = sum((a - b) ** 2 for a, b in zip(entry["embedding"], point))
-        if entry["distance"] < previous or not math.isclose(entry["distance"], exact, rel_tol=1e-5, abs_tol=1e-4):
-            return None
-        previous = entry["distance"]
     eligible = [
         entry for entry in model.values() if sample["category"] is None or entry["category"] == sample["category"]
     ]
     if not eligible:
         return 1.0 if not rows else None
-    vectors = np.asarray([entry["embedding"] for entry in eligible], dtype=np.float64)
-    distances = np.sum((vectors - np.asarray(point)) ** 2, axis=1)
-    ranked = sorted(zip(distances.tolist(), [entry["id"] for entry in eligible]))[:10]
-    wanted = {key for _, key in ranked}
-    recall = len(wanted & {entry["id"] for entry in rows}) / len(wanted)
-    return recall
+    point = np.asarray(sample["vector"], dtype=np.float32)
+    vectors = np.asarray([entry["embedding"] for entry in eligible], dtype=np.float32)
+    require(vectors.shape == (len(eligible), len(point)), "Oracle vector dimension mismatch")
+    # Rounding each coordinate and addition matches the native Float32 distance.
+    distances = np.zeros(len(eligible), dtype=np.float32)
+    for coordinate in range(len(point)):
+        difference = vectors[:, coordinate] - point[coordinate]
+        distances += difference * difference
+    scores = {entry["id"]: score for entry, score in zip(eligible, distances.tolist())}
+    previous = 0.0
+    for entry in rows:
+        key = entry["id"]
+        if type(key) is not int or key not in scores:
+            return None
+        expected = model[key]
+        if any(entry[field] != expected[field] for field in ("embedding", "category", "payload")):
+            return None
+        distance = entry["distance"]
+        if not math.isfinite(distance) or distance < previous:
+            return None
+        if not math.isclose(distance, scores[key], rel_tol=1e-5, abs_tol=1e-4):
+            return None
+        previous = distance
+
+    # Public search omits physical addresses. At the cutoff, assume that omitted
+    # equal-score rows precede returned rows. The frozen proof checks exact tie order.
+    k = min(10, len(scores))
+    cutoff = sorted(distances.tolist())[k - 1]
+    nearer = sum(score < cutoff for score in scores.values())
+    found_nearer = sum(scores[entry["id"]] < cutoff for entry in rows)
+    found_tied = sum(scores[entry["id"]] == cutoff for entry in rows)
+    tied = sum(score == cutoff for score in scores.values())
+    return (found_nearer + max(0, k - nearer - (tied - found_tied))) / k
+
+
+def check_oracle():
+    point = [0.0, 0.0, 0.0]
+    model = {key: dict(id=key, embedding=[float(key), 0.0, 0.0], category="B", payload=None) for key in range(8)}
+    tied_vectors = ([4096.0, 1.0, 1.0], [4096.0, 0.0, 0.0], [4096.0, 1.0, 0.0], [4096.0, 0.0, 1.0])
+    for key, vector in enumerate(tied_vectors, 8):
+        model[key] = dict(id=key, embedding=vector, category="B", payload=None)
+    rows = [dict(model[key], distance=MIXED.float32_squared_l2(point, model[key]["embedding"])) for key in range(10)]
+    sample = dict(rows=rows, vector=point, category="B")
+    require(valid_hits(sample, model) == 0.8, "Oracle treated a Float32 cutoff tie as a known physical order")
+    for bad in (
+        dict(rows[9], id=float(rows[9]["id"])),
+        dict(rows[9], embedding=[4096.0]),
+        dict(rows[9], distance=float("inf")),
+        dict(rows[9], category="A"),
+    ):
+        require(valid_hits(dict(sample, rows=rows[:-1] + [bad]), model) is None, "Oracle accepted an invalid hit")
+    require(valid_hits(dict(sample, rows=rows[::-1]), model) is None, "Oracle accepted unordered distances")
+    require(
+        valid_hits(dict(sample, rows=[dict(rows[0], distance=-0.00005)]), model) is None,
+        "Oracle accepted a negative squared distance",
+    )
+    require(row(262144, 8065, 8, "cost")["embedding"][0] == 262144.0, "Cost model lost native Float32 rounding")
 
 
 def validate(events, count, dimension, fixture):
@@ -433,12 +504,12 @@ def validate(events, count, dimension, fixture):
             if recall is not None:
                 compatible_recalls.append(recall)
         require(compatible_recalls, "Query matches no single committed state inside its read window")
-        best = min(compatible_recalls)
+        lower_bound = min(compatible_recalls)
         if sample["canary"]:
-            canary_recalls.append(best)
+            canary_recalls.append(lower_bound)
         else:
-            exploration_recalls.append(best)
-        recalls.append(best)
+            exploration_recalls.append(lower_bound)
+        recalls.append(lower_bound)
         overlapping += upper > lower
     for change in changes[position:]:
         apply(model, change)
@@ -504,6 +575,9 @@ def summarize(events):
     return dict(
         phases=result,
         burst_reached_write_budget=result["burst"]["backpressure_rejections"] > 0,
+        terminal_unadmitted_request=next(
+            (entry["request_id"] for entry in events if entry["kind"] == "unadmitted"), None
+        ),
         drain=delta(drain["begin"], drain["end"]),
         footprint=drain["footprint"],
         sampled_peak_rss_kib=max(entry["usage"]["VmRSS"] for entry in samples),
@@ -612,6 +686,7 @@ def main():
         )
         worker(args)
         return
+    check_oracle()
     root = args.output_dir.resolve()
     root.mkdir(mode=0o700, parents=True)
     report = dict(
