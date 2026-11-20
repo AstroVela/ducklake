@@ -51,7 +51,7 @@ def source_idle(connection):
 
 def exercise(root, report):
     (root / "indexes").mkdir()
-    connection = BASE.connect(root, create=True)
+    connection = BASE.connect(root, root / "extensions", create=True)
     recalls, phases, checks = [], [], []
     try:
         connection.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
@@ -299,7 +299,7 @@ DRIVER_ROWS = [
 
 
 def recover(case, committed):
-    connection = BASE.connect(case)
+    connection = BASE.connect(case, case.parent / "extensions")
     try:
         expected = "更新" if committed else "seed-0"
         require(

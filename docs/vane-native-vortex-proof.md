@@ -21,15 +21,22 @@ For table-owned, retryable whole-row upsert and deletion by business id, see
 | Input | Revision |
 | --- | --- |
 | Vane | `e14bf92d4053141697a59dcbd6098677cbddb80a` |
-| duckdb-vortex | `b819cc031be61efabeedd6ded0a814984dc56d86` |
-| Vortex | `65dab44f86495d35bb46f69c8ec5cfc7a3544c1b` |
+| duckdb-vortex | `84cef20459d15a2e950dee3e6b91e2804d729ec9` |
+| Vortex | `b20e34c2abe63dd8f1b886b370d060b0b1ce499b` |
 | SPFresh | `5893eb61ee3b18610b6b00f1939be7dae1af8904` with the existing static-only patch |
 | LLVM OpenMP | `18.1.8`, source archives verified by SHA-256 |
+| DuckLake vcpkg | `84bab45d415d22042bd0b9081aea57f362da3f35` |
+| Vane vcpkg | `44819aa2a6c10e56065e2b0330e7d6c89d1d2574` |
 
 The providers compile against that Vane source tree and remain separate from
 the runtime's usual six linked extensions. `extension_config_vane_native_vortex.cmake`
 requires `VANE_LOADABLE_EXTENSIONS=vortex;ducklake`, native DuckLake execution
-and the qualified static SDK. `DUCKLAKE_VANE_NATIVE` explicitly selects the
+and the qualified static SDK. Configuration checks the registered DuckLake
+and Vortex source paths and the SDK's Vortex revision. The Vane and DuckLake
+vcpkg installs use separate roots. This profile requires the static native
+Vortex wrapper with its default Rust features. Configuration rejects cached
+wrapper options that select a different manifest, linkage or features.
+`DUCKLAKE_VANE_NATIVE` selects the
 Vane engine's context-taking MERGE planner constructors, shared with its
 distributed build. It enables no distributed callbacks. The existing
 distributed profile remains a separate build entry.
@@ -47,7 +54,9 @@ contains the complete source checkout, dependency build, wheel build and
 qualification commands. It uses the existing Vane wheel builder and local
 provider loader. The runtime explicitly enables the existing public CI test
 key, and the two providers are signed with its matching repository fixture
-before packaging. Signature verification and `allow_unsigned_extensions=false`
+before packaging under the `vane-ci-test-key` identity. Each wheel includes
+the static DuckDB and Rust notices for its build, and the DuckLake wheel
+also includes notices from its vcpkg prefix. Signature verification and `allow_unsigned_extensions=false`
 remain enabled. The generated provider wheels are marked test-only and must
 not be published. The validation uses the host's honest
 `manylinux_2_39_x86_64` baseline; it does not qualify a lower glibc baseline.
@@ -132,20 +141,17 @@ VANE_RUNNER=local-fast python -I test/vane/test_vane_native_vortex.py \
 The probe requires Vane from the invoking environment's installed wheel. It
 loads DuckLake and its Vortex dependency from installed providers, exercises
 empty/T/F/B/F/T queries and prepared statements, then tests MERGE insert/update/delete,
-stable row IDs across flush, an old native transaction snapshot, and a second
-B with unchanged B1 artifacts. A subprocess commits another T, is killed with
+stable row IDs across flush, an old native transaction snapshot, and a
+second B with unchanged B1 artifacts. The search oracle uses snapshot-qualified
+file IDs and offsets or logical inline row IDs to resolve equal distances. A subprocess commits another T, is killed with
 SIGKILL while metadata WAL is nonempty, and is reopened through `vane.connect()`.
 The recovered typed rows and native row IDs must match the committed batch.
+The index must recover the same revision, both segment descriptors and the
+same hashes for both sets of sealed artifacts.
 
-Local qualification on Linux x86-64 with Python 3.12 and the fixed Vane
-`0.3.0.dev1` wheel passed all eight phases and 32 oracle comparisons, with
-minimum fixture recall 1.0. The engine reported
-`v1.5.5-vane.e14bf92d40` / source ID `e957000277`. Both the probe and the
-Python example above ran from installed wheels with `VORTEX_SPFRESH_NATIVE`
-unset. The SDK's four native tests and PIC check passed; the two providers
-passed wheel platform checks and had no unresolved runtime symbols or
-OpenMP/zstd shared-library dependencies. These are bounded local fixtures,
-not a throughput or production-scale qualification.
+The report records the runtime engine identity, all eight phases, 32 search
+comparisons, and the recovered two-segment revision. Run the probe from
+the installed wheels with `VORTEX_SPFRESH_NATIVE` unset.
 
 The profile retains the native DuckDB metadata, fixed four-column schema and
 existing three-B/row/byte/write budgets. SQL transactions remain the write

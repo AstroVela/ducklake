@@ -27,7 +27,7 @@ struct KeyedFixture {
 	}
 	void Manage() {
 		Connection owner(database);
-		DuckLakeVortexWriteBatch::Manage(owner, "lake", "main", "items", "knn");
+		DuckLakeVortexWriteBatch::Manage(owner, *setup.context, "lake", "main", "items", "knn");
 	}
 	void Seed() {
 		Manage();
@@ -36,7 +36,7 @@ struct KeyedFixture {
 		                       "'category':'A'::VARCHAR,'payload':'seed-'||i}) FROM range(256)t(i)")
 		                ->GetValue(0, 0);
 		Connection owner(database);
-		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "seed", seed,
+		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "seed", seed,
 		                                 Value::LIST(LogicalType::BIGINT, {}));
 		SQL(setup, "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");
 		index = DuckLakeVortexIndex::BuildAndPublish(*setup.context, "lake", "main", "items", "knn",
@@ -55,8 +55,8 @@ struct KeyedFixture {
 		}
 	}
 	DuckLakeVortexWriteResult Mutate(Connection &owner, const std::function<void(const string &)> &observe = {}) {
-		return DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "change", rows, deletes,
-		                                        observe);
+		return DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "change", rows,
+		                                        deletes, observe);
 	}
 	DuckLakeVortexSearchResult Search(Connection &reader, const std::function<void(const string &)> &observe = {}) {
 		DuckLakeVortexViewOptions options {};

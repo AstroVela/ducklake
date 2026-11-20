@@ -29,7 +29,7 @@ def query(connection, sql):
     return [dict(zip(names, row)) for row in result.fetchall()]
 
 
-def connect(root, create=False):
+def connect(root, extension_directory, create=False):
     import vane
 
     connection = vane.connect(
@@ -38,14 +38,20 @@ def connect(root, create=False):
             "threads": "2",
             "autoinstall_known_extensions": "false",
             "autoload_known_extensions": "false",
-            "extension_directory": str(root / "extensions"),
+            "extension_directory": str(extension_directory),
         },
     )
     connection.execute("LOAD parquet")
-    vane.load_installed_extension("ducklake", connection=connection)
+    ducklake = vane.load_installed_extension("ducklake", connection=connection)
     for name in ["vortex", "ducklake"]:
         installed = query(connection, "SELECT loaded FROM duckdb_extensions() WHERE extension_name=" + quote(name))
         require(installed == [{"loaded": True}], f"Installed provider did not load {name}")
+    vortex = vane.load_installed_extension("vortex", connection=connection)
+    require(
+        [dependency.identity for dependency in ducklake.descriptor.dependencies] == [vortex.identity]
+        and ducklake.descriptor.trust_identity == vortex.descriptor.trust_identity == "vane-ci-test-key",
+        "The installed DuckLake/Vortex closure must match the CI test signing identity",
+    )
     connection.execute(
         "ATTACH "
         + quote("ducklake:" + str(root / "metadata.ducklake"))
@@ -67,7 +73,11 @@ def connect(root, create=False):
 
 
 def raw(connection):
-    return query(connection, "SELECT id,embedding,category,payload FROM lake.items ORDER BY id")
+    [capture] = query(
+        connection,
+        "SELECT admission,rows FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)",
+    )
+    return SEARCH.CAT.ADMIT.capture_rows(json.loads(capture["admission"]), json.loads(capture["rows"]))
 
 
 def head(connection):
@@ -119,7 +129,7 @@ def qualify(connection, label, recalls):
 
 
 def crash_writer(root):
-    connection = connect(root)
+    connection = connect(root, root / "extensions")
     connection.execute("INSERT INTO lake.items VALUES(900000,[133.000001,4,2,0,1,8,7,16],NULL,'崩溃后可见')")
     expected = query(connection, "SELECT rowid,id,embedding,category,payload FROM lake.items ORDER BY id")
     (root / "committed.json").write_text(json.dumps(expected, ensure_ascii=False))
@@ -141,7 +151,7 @@ def exercise(root, report):
     require(runners.get_or_infer_runner_type() == "local-fast", "Native Vane runner was not selected")
     report.update(vane_version=importlib.metadata.version("vane-ai"), vane_path=str(Path(vane.__file__).resolve()))
     (root / "indexes").mkdir()
-    connection = connect(root, create=True)
+    connection = connect(root, root / "extensions", create=True)
     reader = None
     recalls, phases = [], []
     try:
@@ -220,6 +230,13 @@ def exercise(root, report):
         )
         connection.execute("INSERT INTO lake.items VALUES(400000,[133.00001,4,2,0,1,8,7,16],NULL,'最终实时')")
         phases.append(qualify(connection, "second-B-plus-T", recalls))
+        expected_head = head(connection)
+        require(
+            expected_head["revision"] == 3 and expected_head["reference"]["segments"] == segments,
+            "Final T changed the two-segment publication",
+        )
+        expected_artifacts = [signature(segment) for segment in segments]
+        require(all(expected_artifacts), "A published segment has no sealed artifacts")
         require(
             query(reader, "SELECT rowid,id,embedding,category,payload FROM lake.items ORDER BY id") == original,
             "Flush/index publication invalidated an old native transaction snapshot",
@@ -252,7 +269,7 @@ def exercise(root, report):
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=10)
-    connection = connect(root)
+    connection = connect(root, root / "extensions")
     try:
         connection.execute("PREPARE nearest AS " + SEARCH.search_sql(VECTOR))
         require(
@@ -260,11 +277,19 @@ def exercise(root, report):
             == json.loads((root / "committed.json").read_text()),
             "Recovery changed committed row values or native row IDs",
         )
-        require(not status(connection)["running"], "Restart implicitly replayed optimizer work")
-        phases.append(qualify(connection, "SIGKILL-reopen", recalls))
+        recovered_policy = status(connection)
         require(
-            head(connection)["reference"]["segments"][0] == first and signature(first) == frozen, "Recovery changed B1"
+            not recovered_policy["enabled"] and not recovered_policy["running"],
+            "Recovery changed the canceled optimizer state",
         )
+        recovered_head = head(connection)
+        require(recovered_head == expected_head, "WAL recovery changed the revision or ANN descriptors")
+        require(
+            [signature(segment) for segment in recovered_head["reference"]["segments"]] == expected_artifacts,
+            "WAL recovery changed an ANN artifact",
+        )
+        phases.append(qualify(connection, "SIGKILL-reopen", recalls))
+        report["recovered_index"] = {"revision": recovered_head["revision"], "segments": len(expected_artifacts)}
     finally:
         connection.close()
     report.update(phases=phases, fixture_recalls=recalls, minimum_recall=min(recalls))

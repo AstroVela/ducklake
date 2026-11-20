@@ -23,7 +23,7 @@ public:
 	DuckLakeCompaction(PhysicalPlan &physical_plan, const vector<LogicalType> &types, DuckLakeTableEntry &table,
 	                   vector<DuckLakeCompactionFileEntry> source_files_p, string encryption_key,
 	                   optional_idx partition_id, vector<Value> partition_values, optional_idx row_id_start,
-	                   PhysicalOperator &child, CompactionType type);
+	                   PhysicalOperator &child, CompactionType type, DataFileFormat file_format);
 
 	DuckLakeTableEntry &table;
 	vector<DuckLakeCompactionFileEntry> source_files;
@@ -32,6 +32,7 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
+	DataFileFormat file_format;
 
 public:
 	// // Source interface
