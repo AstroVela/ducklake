@@ -55,7 +55,8 @@ struct Fixture {
 	}
 	DuckLakeVortexWriteResult WriteBatch(idx_t first, const string &request) {
 		Connection owner(database);
-		return DuckLakeVortexWriteBatch::Append(owner, "lake", "main", "items", "knn", request, Rows(first));
+		return DuckLakeVortexWriteBatch::Append(owner, *writer.context, "lake", "main", "items", "knn", request,
+		                                       Rows(first));
 	}
 	void Build(idx_t revision, const string &name) {
 		SQL(writer, "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");

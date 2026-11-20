@@ -51,7 +51,7 @@ def idle(connection):
 
 def exercise(root, report):
     (root / "indexes").mkdir()
-    connection = BASE.connect(root, create=True)
+    connection = BASE.connect(root, root / "extensions", create=True)
     recalls, phases, checks = [], [], []
     reader = None
     try:
@@ -210,7 +210,7 @@ def exercise(root, report):
 
 
 def recover(case):
-    connection = BASE.connect(case)
+    connection = BASE.connect(case, case / "extensions")
     try:
         maintenance = query(connection, "SELECT * FROM ducklake_vortex_maintenance_status('lake')")[0]
         require(not maintenance["running"], "Restart automatically resumed source cleanup")

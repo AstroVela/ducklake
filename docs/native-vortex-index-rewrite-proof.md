@@ -1,6 +1,6 @@
 # Indexed Vortex source rewrite and atomic handoff
 
-This validation draft follows [DuckLake #45](https://github.com/AstroVela/ducklake/pull/45).
+The rewrite operation extends the maintenance work in [DuckLake #45](https://github.com/AstroVela/ducklake/pull/45).
 It rewrites deleted rows out of one explicitly selected B segment, builds its
 replacement ANN generation privately, and commits file replacement and index
 publication in the same native DuckDB metadata transaction. Unselected B
@@ -14,8 +14,11 @@ SELECT * FROM ducklake_rewrite_vortex_index_segment(
     '/absolute/existing/index-root/replacement.json',3);
 ```
 
-The operation requires the native four-column Vortex table, an installed write
-budget selecting this index, and exactly one named index for the table. It
+The operation requires autocommit on a writable DuckLake attachment with native
+DuckDB metadata, the native four-column Vortex table, an installed write
+budget selecting this index, and exactly one named index for the table. The
+caller-bound DuckLake and metadata attachments are checked in the dedicated
+transactions used for registration, publication and recovery. It
 supports one nonempty compaction output and one schema/partition group under
 the existing unpartitioned, unencrypted native Vortex writer. Its selected
 segment must have deletions eligible for DuckLake's existing rewrite operator.
@@ -39,7 +42,8 @@ including at least 65 physical rows. Index/source/vector budgets and write quota
 do not expand. The data directory and private workspace must share a filesystem;
 the final source link is exclusive and does not overwrite an existing file.
 An existing destination causes an explicit error and remains protected from
-the registered build collector.
+the registered build collector. Reference names are checked with DuckDB's
+extension-filename write rule before registration.
 
 ## Private construction and one metadata commit
 
@@ -48,15 +52,22 @@ the other required index tables. It records a build ID, table UUID, planned
 managed source root/path, capture snapshot, new file ID and retained-file flag.
 Registration commits with the existing build ownership record before any output.
 
-DuckLake's existing compactor filters candidates to the selected B and writes
-the private Vortex file inside that registered build workspace. It preserves
-logical row IDs while physically removing deleted versions. The existing native
-SPFresh builder receives owned buffers for the prospective file inventory and
-binds its row map to the planned stable file ID. It uses the normal registered
+Registration uses the publication lock and existing namespace checks before
+creating the workspace. The compactor filters candidates to the selected B and
+scans private copies of the selected files. Each copy is checked against the
+sealed descriptor's URI, physical row count and content hash. The compactor
+writes the output inside the workspace and preserves logical row IDs while
+removing deleted versions. Staging reserves one entry each for the workspace
+and output within the existing 4,096-entry collection limit. After compaction
+the operation removes the staged inputs and syncs the workspace directory
+before the native builder creates scratch and generation artifacts. SPFresh
+receives owned buffers and binds its row map to the planned stable file ID. It uses the normal registered
 generation, scratch, sealing, verification and reference-writing path.
 
-After construction, the operation fsyncs and exclusively links the output into
-the registered managed path. The final commit takes the publication guard,
+After construction, the operation fsyncs the private output and its directory,
+then exclusively links the output into the registered managed path. It keeps
+the private link as durable ownership evidence for recovery. The final commit
+takes the exclusive publication guard during write admission,
 rechecks the capture and index against fresh metadata, validates the projected
 write budget, and uses DuckLake's normal compaction commit. Before that metadata
 connection commits, the index hook checks actual output IDs, coverage and hashes,
@@ -71,20 +82,22 @@ inspection; it never turns committed data into an abandoned candidate.
 
 ## Collection and readers
 
-The existing build collector owns an unpublished prospective managed file only
-through its matching rewrite registration. Before deletion it rechecks retained
-index/build ownership and native file metadata, including historical file rows.
-Published or otherwise registered source paths are retained. Only an explicitly
-abandoned, unreferenced planned path can be removed, using POSIX descriptors and
-the same shared byte budget and bounded truncation rules. Completion removes
-rewrite and build ownership rows together. Published data remains under normal
-DuckLake snapshot retention and source-file cleanup.
+The registered build collector rechecks index/build ownership and native file
+metadata, including historical file rows. A managed link can be removed after
+abandonment if it is unreferenced and matches the live private file by device
+and inode. Directory access is checked before opening and removing the managed
+link. The collector holds source admission across the link-count check and
+private unlink, serializing with the native old-file collector. It removes
+an abandoned managed link first and charges bytes when it releases the last
+link in the workspace. The shared budget and bounded
+truncation rules also apply to staged inputs. Completion removes both registry
+rows together.
 
-Unpublished Vortex outputs use registered ownership rather than directory scans.
-The existing generic orphan cleanup targets Parquet files and does not own these
-prospective Vortex paths. A prepared cleanup during the linked-output window must
-leave them untouched. Normal old-file cleanup retains its existing admission
-guard and native snapshot-retention rules.
+Rewrite sources use the reserved `ducklake-vortex-rewrite-` file prefix.
+Generic orphan cleanup excludes this namespace during candidate binding, so a
+prepared cleanup can span publication safely. The build collector handles
+abandoned rewrite output and the existing snapshot-based old-file cleanup
+handles published sources.
 
 Active captures retain the collection/admission guards until source/index leases
 are private. Already opened views can search and fetch after replacement, ANN GC,
@@ -111,7 +124,10 @@ and after rewrite; search budgets and the existing post-rewrite recall gate stay
 unchanged.
 
 Failure and cancellation cover allocation, private copy, native build/seal,
-reference staging, final source link and both sides of metadata staging. SIGKILL
+reference staging, final source link, metadata staging and the final commit
+boundary. A failure before COMMIT reports an abort. Regressions observe
+cancellation during collection, write-admission and publication lock waits,
+and order private-witness collection against native old-file cleanup. SIGKILL
 covers registered allocation, private copy, sealing, linked source, staged atomic
 metadata and committed publication. Recovery remains explicit through catalog
 maintenance. Concurrent writes cause inspectable conflicts; reader admission and
@@ -123,28 +139,37 @@ Qualification remains one local metadata owner on POSIX with exclusively managed
 artifact/source namespaces. It adds no automatic data-compaction policy, native
 SPFresh online update calls, dependency-pin changes or total-capacity increase.
 
-### Local result (2026-10-29)
+### Local qualification (2026-11-18)
 
-These results record the original #46 qualification.
+These results record the qualification of #46 before the late-binding follow-up.
 
-The new process proof passed 18 checks and 88 gated query comparisons with
-minimum fixture recall 1.0. Five rewrites advanced revision 3 to 8 and reduced
-current physical source rows from 4,352 to 383 while preserving both unselected
-B generations. At the unchanged 100,000-row ceiling, rewriting the selected
-4,096-row B to 128 rows released 3,968 row slots; the 95,904-row F stayed intact
-and the next inline write succeeded. The separate deletion-dense sample measured
-recall 0.2 before rewrite and 1.0 afterward; the pre-rewrite observation remains
-visible and is not substituted for the post-rewrite gate.
+Linux used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`, the native
+wrapper `84cef204` and the static SPFresh SDK qualified by #45. The rewrite
+proof at `5a56aeb8` passed 21 checks in
+62.2 seconds within the 180-second budget. All 88
+gated fixture queries attained recall 1.0.
+Five rewrites advanced revision 3 to 8 and reduced current physical rows
+from 4,352 to 383 while preserving both unselected B generations.
 
-- All 15 existing native process proofs passed.
-- ON passed 17 Vortex SQL cases / 627 assertions, including the new 32-assertion
-  SQL case. ON and OFF each passed 86 base cases / 3,582 assertions with 13
-  optional-extension skips, plus Parquet recovery; ON also passed Vortex recovery.
-- Native audit passed 122 assertions. Rewrite/orphan regression groups passed
-  16 cases / 854 assertions with two ICU-dependent skips.
-- Four isolated cost cases passed nine queries each with minimum recall 1.0;
-  their timings remain informational. Formatting, Rust formatting and diff checks
-  passed; this change modifies neither Rust sources nor dependency pins.
+At the 100,000-row ceiling, rewriting the selected 4,096-row B to 128 rows
+released 3,968 row slots. The 95,904-row F stayed intact and the next inline
+write succeeded. The separate deletion-dense sample measured recall
+0.2 before rewrite and passed the post-rewrite gate.
 
-The qualified catalog driver SHA-256 is
-`65489efd7cf9e9209242e02451b1428978d3db3864caaacf5ddc911ab3ccdbe4`.
+All 16 native process suites and 19 functional gates passed.
+Native ON passed 26 Vortex SQL cases with 1,028 assertions.
+The rewrite/orphan SQL groups passed 17 cases with
+881 assertions and 2 optional skips.
+ON and OFF each passed 86 base cases with 3,582 assertions and 13 optional
+skips. All 32 ABI checks and four isolated query-cost cases passed.
+Rust formatting, Clippy, workspace tests, changed-file formatting and diff
+checks passed. The catalog driver SHA-256 was
+`6d1bdafbb4166c1f1a8aaf7545ce9089f90a5da7524b9bc09f11e20c78ef3aa3`.
+
+The first run of this matrix reached the existing 60-second call limit during
+the initial B1 build in the generation GC suite's source pin cancellation fixture.
+The native workspace existed and the new generation's artifact directory was
+empty. The first isolated run reached the same limit while
+constructing a merge candidate in a later fixture. The cause is undetermined. The same binary passed the isolated suite
+in 71.0 seconds and the complete matrix replay
+passed it in 70.8 seconds under the same limits.

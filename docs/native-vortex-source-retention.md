@@ -51,12 +51,13 @@ ordinary native transactions currently defer collection.
 
 ## Readers and deletion ownership
 
-The collector first takes publication ownership, then the transaction admission
-gate. If any ordinary DuckLake transaction remains active, the pass returns
+The collector takes publication ownership, ReadView admission and the
+transaction admission gate in that order. If any ordinary DuckLake transaction
+remains active, the pass returns
 `blocked_by_transactions=true`. New native transactions cannot register while
-expiration or deletion owns the gate. The collector then takes the existing
-ReadView admission lock. It obtains its private native metadata snapshot only
-after these checks, avoiding a plan captured before a concurrent write commits.
+expiration or deletion owns the gate. The collector obtains its private native
+metadata snapshot after these checks so the cleanup plan includes concurrent
+writes that finished before collection.
 
 Existing native transactions keep their original source snapshot. An admitted
 ReadView has private copies of its required source and index data, so delayed
