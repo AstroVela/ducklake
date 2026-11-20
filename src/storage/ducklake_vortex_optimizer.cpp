@@ -1679,9 +1679,10 @@ DuckLakeVortexCollectionLock &DuckLakeVortexOptimizer::WriteAdmissionLock(Databa
 unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
                                     unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard) {
+	auto &catalog = transaction.GetCatalog();
 	auto logical = transaction.GetLogicalWriteTables();
 	auto rewrite = DuckLakeVortexRewriteState::Get(context);
-	auto write_batch = DuckLakeVortexWriteBatchState::Get(context);
+	auto write_batch = DuckLakeVortexWriteBatchState::Get(context, catalog);
 	auto interrupt = [&] {
 		if (context.IsInterrupted() || (rewrite && rewrite->caller->IsInterrupted()) ||
 		    (write_batch && write_batch->caller.IsInterrupted())) {
@@ -1693,7 +1694,6 @@ DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientCont
 	for (auto &entry : transaction.GetLocalChanges().Changes()) {
 		grows |= Grows(entry.GetTableChanges());
 	}
-	auto &catalog = transaction.GetCatalog();
 	unique_ptr<DuckLakeVortexCollectionLock::Key> admission;
 	if ((grows || !logical.empty() || write_batch) &&
 	    (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb")) {
@@ -1711,9 +1711,7 @@ DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientCont
 	} else if (write_batch) {
 		identity = write_batch->identity;
 	} else {
-		// Read the pinned metadata attachment of this writer, even if the alias was reused.
-		auto &metadata = Catalog::GetCatalog(*transaction.GetConnection().context, catalog.MetadataDatabaseName());
-		identity = {catalog.GetAttached().oid, metadata.GetAttached().oid};
+		identity = VortexCatalog::BoundCatalogIdentity(transaction);
 	}
 	Metadata meta(*context.db, rewrite ? rewrite->catalog : catalog.GetName(), false, &identity);
 	try {

@@ -1366,15 +1366,20 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 	plan->check(plan->retire ? "retire_after_stage" : "rewrite_after_stage");
 }
 
+DuckLakeVortexCatalogIdentity DuckLakeVortexIndex::BoundCatalogIdentity(DuckLakeTransaction &transaction) {
+	auto &catalog = transaction.GetCatalog();
+	// Use the attachment pinned by this transaction's metadata connection.
+	auto &metadata = Catalog::GetCatalog(*transaction.GetConnection().context, catalog.MetadataDatabaseName());
+	return {catalog.GetAttached().oid, metadata.GetAttached().oid};
+}
+
 void DuckLakeVortexIndex::CheckCatalogIdentity(DuckLakeTransaction &transaction,
                                                const DuckLakeVortexCatalogIdentity &identity) {
 	auto &catalog = transaction.GetCatalog();
 	if (catalog.GetAttached().oid != identity.lake_oid) {
 		throw TransactionException("Vortex catalog attachment changed");
 	}
-	// Pin the selected attachment on the connection that will execute the metadata statements.
-	auto &metadata = Catalog::GetCatalog(*transaction.GetConnection().context, catalog.MetadataDatabaseName());
-	if (metadata.GetAttached().oid != identity.metadata_oid) {
+	if (BoundCatalogIdentity(transaction).metadata_oid != identity.metadata_oid) {
 		throw TransactionException("Vortex metadata attachment changed");
 	}
 }

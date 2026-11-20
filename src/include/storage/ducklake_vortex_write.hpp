@@ -8,6 +8,7 @@
 namespace duckdb {
 class ExtensionLoader;
 class DuckLakeTransaction;
+class DuckLakeCatalog;
 
 struct DuckLakeVortexWriteResult {
 	string table_uuid, request_id, payload_hash;
@@ -17,7 +18,7 @@ struct DuckLakeVortexWriteResult {
 struct DuckLakeVortexWriteBatchState : public ClientContextState {
 	DuckLakeVortexWriteBatchState(ClientContext &caller, DuckLakeVortexCatalogIdentity identity, idx_t table_id,
 	                              const string &table_uuid, const DuckLakeVortexIndex &index, bool keyed);
-	static shared_ptr<DuckLakeVortexWriteBatchState> Get(ClientContext &context);
+	static shared_ptr<DuckLakeVortexWriteBatchState> Get(ClientContext &context, const DuckLakeCatalog &catalog);
 	void CheckCurrentIndex(DuckLakeTransaction &transaction) const;
 
 	ClientContext &caller;

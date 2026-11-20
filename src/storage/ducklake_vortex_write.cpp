@@ -3,6 +3,7 @@
 #include "common/ducklake_vortex_json.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -178,8 +179,10 @@ DuckLakeVortexWriteBatchState::DuckLakeVortexWriteBatchState(ClientContext &call
       index_name(index.name), dimension(index.dimension), keyed(keyed) {
 }
 
-shared_ptr<DuckLakeVortexWriteBatchState> DuckLakeVortexWriteBatchState::Get(ClientContext &context) {
-	return context.registered_state->Get<DuckLakeVortexWriteBatchState>(WRITE_STATE);
+shared_ptr<DuckLakeVortexWriteBatchState> DuckLakeVortexWriteBatchState::Get(ClientContext &context,
+                                                                             const DuckLakeCatalog &catalog) {
+	auto state = context.registered_state->Get<DuckLakeVortexWriteBatchState>(WRITE_STATE);
+	return state && state->identity.lake_oid == catalog.GetAttached().oid ? state : nullptr;
 }
 
 void DuckLakeVortexWriteBatchState::CheckCurrentIndex(DuckLakeTransaction &transaction) const {
@@ -280,7 +283,7 @@ void DuckLakeVortexWriteBatch::CheckManagedWrites(DuckLakeTransaction &fresh, co
 	    !fresh.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(), MANAGED)) {
 		return;
 	}
-	auto owner = DuckLakeVortexWriteBatchState::Get(context);
+	auto owner = DuckLakeVortexWriteBatchState::Get(context, catalog);
 	auto rewrite = DuckLakeVortexRewriteState::Get(context);
 	for (auto &id : tables) {
 		auto result = DuckLakeVortexIndex::Query(fresh, "SELECT table_uuid FROM {METADATA_CATALOG}." + string(MANAGED) +

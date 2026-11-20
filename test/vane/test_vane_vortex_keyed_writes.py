@@ -66,6 +66,11 @@ def qualify_flushed_mutation(connection, phases, recalls):
         "Fixture did not flush both original keys into one unindexed file",
     )
     phases.append(BASE.qualify(connection, "unindexed-F", recalls))
+    list_files = "SELECT data_file FROM ducklake_list_files('lake','items')"
+    files = query(connection, list_files)
+    require(len(files) == 1, "Fixture did not publish exactly one F file")
+    # Two deleted rows retire F while the one-row replacement still fits in T.
+    connection.execute("CALL ducklake_set_option('lake','data_inlining_row_limit',1,table_name=>'items')")
 
     reader = connection.cursor()
     replacement = dict(before[0], payload="替换未索引文件")
@@ -73,7 +78,11 @@ def qualify_flushed_mutation(connection, phases, recalls):
         reader.execute("BEGIN")
         require(business_rows(reader) == before, "Historic fixture did not read the flushed source")
         receipt = mutate(connection, "replace-unindexed-F", [replacement], [before[1]["id"]])
-        require(business_rows(reader) == before, "Mutation changed the old native snapshot")
+        require(query(connection, list_files) == [], "Full-file mutation kept the original F file current")
+        require(
+            business_rows(reader) == before and query(reader, list_files) == files,
+            "Mutation changed the old native snapshot or its F file",
+        )
         require(business_rows(connection) == [replacement], "Full-file replacement lost or duplicated a current key")
         reader.execute("COMMIT")
     finally:
@@ -88,6 +97,7 @@ def qualify_flushed_mutation(connection, phases, recalls):
     )
     phases.append(BASE.qualify(connection, "unindexed-F-replaced-by-T", recalls))
     mutate(connection, "remove-unindexed-F-fixture", [], [before[0]["id"]])
+    connection.execute("CALL ducklake_set_option('lake','data_inlining_row_limit',1000,table_name=>'items')")
 
 
 def exercise(root, report):
@@ -384,6 +394,9 @@ def native_cases(driver, root, report):
         "keyed-rebind-noop",
         "keyed-noop-cancel-commit-wait",
         "keyed-enroll-with-segment",
+        "keyed-immediate-attachments",
+        "keyed-retry-ordinary",
+        "keyed-retry-rebind",
         "keyed-held",
         "keyed-fail-after_delete",
         "keyed-fail-after_write",

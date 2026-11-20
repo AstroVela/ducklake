@@ -96,6 +96,7 @@ struct DuckLakeVortexIndex {
 	static DuckLakeVortexCollectionLock &CollectionLock();
 	static DuckLakeVortexCatalogIdentity ResolveCatalog(ClientContext &context, const string &name, bool write,
 	                                                    const char *operation);
+	static DuckLakeVortexCatalogIdentity BoundCatalogIdentity(DuckLakeTransaction &transaction);
 	static void CheckCatalogIdentity(DuckLakeTransaction &transaction, const DuckLakeVortexCatalogIdentity &identity);
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog,
 	                                  optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);

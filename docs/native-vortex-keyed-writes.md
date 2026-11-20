@@ -44,9 +44,10 @@ The commit check reads current managed ownership while holding the existing
 write-admission reservation through commit. Registration takes that same
 reservation. An ordinary transaction started before opt-in is therefore still
 rejected if it tries to commit after ownership is registered. Admission checks
-the writer's original catalog and metadata attachments. Mutation authority is
-private to the dedicated native connection and is cleared on every return or
-failure. There is no SQL setting to bypass it.
+the writer's original catalog and metadata attachments. Ordinary native commit
+retries verify those same attachments before staging another attempt. Mutation
+authority is private to the dedicated native connection and is cleared on every
+return or failure. There is no SQL setting to bypass it.
 
 ## Batch and retry semantics
 
@@ -71,8 +72,8 @@ Here `row_count` counts requested upserts plus deletes, including missing-key
 deletes. `snapshot_id` identifies the actual native snapshot: when a missing-key
 delete creates no data change it reports the existing snapshot. Its receipt
 still commits durably after the same admission, attachment, index and
-cancellation checks. The request catalog keeps its existing 100,000-record limit
-and never automatically expires records.
+cancellation checks for the bound lake. The request catalog keeps its existing
+100,000-record limit and never automatically expires records.
 
 Identity remains `(table_uuid, request_id)`. An exact retry returns its original
 receipt without repeating any mutation. Changed content fails. Replaying an old
@@ -115,17 +116,20 @@ VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_keyed_writes.py \
 ```
 
 The installed-provider probe covers managed ownership, batch validation, write
-admission rollback after staged deletes, replacement of a committed unindexed
-file, immutable B, T replacement, old request replay, concurrent same-key writes,
-table-scoped identity, independent B2, rewrite and source expiry. Queries compare
+admission rollback after staged deletes, retirement of a committed unindexed
+file with an active historical reader, immutable B, T replacement, old request
+replay, concurrent same-key writes, table-scoped identity, independent B2,
+rewrite and source expiry. Queries compare
 typed rows and distances against the visible-row oracle using the existing
 recall gate.
 
 The native write driver covers pre-enrollment transactions, catalog reattachment,
 enrollment with a B segment under another index name, missing-key cancellation
-while waiting for publication, a held ReadView through rewrite and GC, failures
-around commit, cancellation and native conflict. Three SIGKILL boundaries recover
-through installed Vane in fresh Python processes with a nonempty metadata WAL.
+while waiting for publication, writes with multiple attached lakes in immediate
+transaction mode, commit retries with stable and replaced attachments, a held
+ReadView through rewrite and GC, failures around commit, cancellation and native
+conflict. Three SIGKILL boundaries recover through installed Vane in fresh
+Python processes with a nonempty metadata WAL.
 The SQL fixture in `test/sql/vortex/native_vortex_keyed_writes.test` covers the
 independent digest vector, enrollment under a changed default collation, and
 rollback of partial and full deletes against transaction-local flush output.
