@@ -13,6 +13,7 @@
 #include <iostream>
 #include <map>
 #include <thread>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace duckdb;
@@ -260,6 +261,35 @@ void LinkedNativeCleanup(Fixture &f) {
 	        "Native cleanup conflated independent hard links");
 }
 
+void SeparateLeafLinks(Fixture &f) {
+	auto path = AddParquet(f, "regular_source", "regular-source.parquet");
+	auto alias = f.root + "/data/leaf-link.parquet";
+	Require(symlink(path.c_str(), alias.c_str()) == 0, "Could not create the leaf-link fixture");
+	SQL(f.writer, "CREATE TABLE lake.leaf_source(i BIGINT)");
+	SQL(f.writer, "CALL ducklake_add_data_files('lake','leaf_source'," + Value(alias).ToSQLString() + ")");
+	SQL(f.writer, "DROP TABLE lake.regular_source; DROP TABLE lake.leaf_source");
+	f.Policy();
+	Require(f.Collect().expired, "Leaf-link fixture did not expire the old snapshots");
+	bool stopped = false;
+	try {
+		f.Collect(1, 64 * 1024 * 1024, [&](const string &stage) {
+			if (stage == "source_after_unlink") {
+				stopped = true;
+				throw IOException("Pause before acknowledgement of the regular entry");
+			}
+		});
+	} catch (const IOException &) {
+		Require(stopped, "Could not reach the regular entry's acknowledgement");
+	}
+	Require(stopped && !FileSystem::GetFileSystem(*f.writer.context).FileExists(path),
+	        "The collector did not unlink the queued regular file");
+	Require(f.Collect(1).files == 1, "The collector did not acknowledge the regular entry");
+	struct stat info;
+	Require(!lstat(alias.c_str(), &info) && S_ISLNK(info.st_mode) &&
+	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+	        "The collector conflated a symlink with its target's directory entry");
+}
+
 void PreparedNativeCleanup(Fixture &f) {
 	FileSystem::GetFileSystem(*f.writer.context).CreateDirectory(f.root + "/data");
 	auto path = AddParquet(f, "shared_first", "shared.parquet");
@@ -494,6 +524,10 @@ int main(int argc, char **argv) {
 		}
 		if (mode == "linked-native-cleanup") {
 			LinkedNativeCleanup(f);
+			return 0;
+		}
+		if (mode == "leaf-link") {
+			SeparateLeafLinks(f);
 			return 0;
 		}
 		if (mode == "prepared-native-cleanup") {

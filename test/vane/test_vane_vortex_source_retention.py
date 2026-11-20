@@ -240,6 +240,7 @@ def native_cases(driver, root, report):
         "mixed-size",
         "shared-source",
         "linked-native-cleanup",
+        "leaf-link",
         "prepared-native-cleanup",
         "cleanup-init-order",
         "inline-only",

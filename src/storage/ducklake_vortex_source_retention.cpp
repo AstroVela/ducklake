@@ -213,7 +213,9 @@ vector<File> Candidates(DuckLakeTransaction &transaction, const string &root) {
 			if (path == root || !StringUtil::StartsWith(path, prefix)) {
 				throw InvalidInputException("Vortex source cleanup path is outside managed data");
 			}
-			auto position = positions.emplace(SourcePathIdentity(context, path), files.size());
+			fs.Cast<OpenerFileSystem>().VerifyCanAccessFile(path);
+			// The queue owns directory entries. Keep the leaf spelling for no-follow deletion.
+			auto position = positions.emplace(DirectoryEntryKey(path), files.size());
 			if (position.second) {
 				File file;
 				file.path = path;
