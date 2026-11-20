@@ -9,34 +9,37 @@ That original stop remains unresolved.
 
 ## Diagnostic boundary
 
-The installed load probe now accepts `--capture-stalls`. This Linux diagnostic
-requires GDB explicitly. The worker permits only its test parent and that
-parent's descendants to attach; it does not change system ptrace policy. It
-also registers a Python stack-dump signal for that worker.
+The installed load probe accepts `--capture-stalls`. This Linux diagnostic
+requires GDB. The worker grants tracing permission to its test parent and
+that parent's descendants and registers a Python stack-dump signal. It then
+emits `diagnostics_ready`. The parent waits for this event before tracing or
+sending the signal. During Python shutdown, removing the handler returns
+`SIGUSR2` to an ignored disposition. The parent leaves the worker PID reserved
+until the capture and watchdog threads have finished.
 
-The parent tracks completed queries separately from other events. Thirty
-seconds without a completed query triggers capture even if metadata heartbeats
-continue. Thirty seconds without any events, or reaching 25 seconds before the
-existing watchdog, also triggers capture. Each case captures at most once.
-Query-progress checks stop after the worker emits its measured-phase completion.
+During the measured workload, thirty seconds without any events records a
+silent worker. Thirty seconds without a completed query while other events
+continue records a query stall. A case can also trigger capture 25 seconds
+before the watchdog deadline, including during startup. Each case makes one
+capture attempt at most.
 
-Capture records the latest task/source status, the last completed query's read
-window and vector, and pending build-directory names in `stall.json`. GDB
-records all native thread stacks in `native-stacks.log`; after detaching, the
-worker writes its Python stacks to `worker.log`. GDB has a 20-second limit.
-Capture failures remain visible in those files. The watchdog still terminates
-at `3 * seconds_per_phase + 300`; capture does not extend that deadline.
+`stall.json` records the trigger, latest task/source status, last completed
+query's read window and vector, pending build-directory names, and the capture
+outcomes. GDB has 20 seconds to record native thread stacks in
+`native-stacks.log`. The parent then requests Python stacks in `worker.log`
+if the worker is still running, including when GDB fails or times out. The
+watchdog terminates the worker at `3 * seconds_per_phase + 300`.
 
-Failure messages now include the worker exit status and whether the watchdog
-expired. A successful report records whether a stack capture occurred. Captured
-runs require separate consideration before using their timings as performance
-measurements. This adds no execution retry, compatibility branch, fallback,
-larger production budget or relaxed recall/drain gate.
+The case report marks a diagnostic attempt with `stall_capture_attempted`.
+Failure messages include the worker exit status, whether the watchdog stopped
+it, and any malformed event. The original bytes from a truncated record are
+available in `events.jsonl`. Review captures when comparing workload timings.
 
-The controlled waiting-worker proof checks that both native and Python stacks
-are present and that diagnostic capture leaves the worker alive. CI runs that
-proof, enables capture in its existing four load cases, and retains both the
-controlled proof and any failure captures.
+The controlled proof verifies both kinds of stack, clean worker exit, the
+startup deadline, capture failure, late signal handling, worker exit during
+capture, diagnostic thread startup failure, and disabled capture. The workflow
+runs that proof, enables capture in its four load cases, and retains the
+reports and capture files.
 
 ```sh
 python -I test/vane/test_vane_vortex_stall_capture.py \
@@ -47,7 +50,7 @@ VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
     --output-dir /tmp/vane-vortex-stall-repro
 ```
 
-## Investigation evidence
+## Investigation at `bb21bf8e`
 
 The unchanged 512-row workload completed six diagnostic-enabled repetitions,
 five repetitions using the preceding worker source with tracing permission set
@@ -81,7 +84,7 @@ environment for continued reproduction while subsequent changes are developed.
 A root-cause fix still requires a failed-execution stack or a deterministic
 regression; repeated successful runs alone are insufficient.
 
-## Qualification and maintenance-budget proof
+## Qualification at `bb21bf8e`
 
 The controlled stack-capture proof passed. With capture enabled, all four
 existing CI load combinations completed 1,075 typed query checks and the
