@@ -366,8 +366,8 @@ int main(int argc, char **argv) {
 			bool denied = false;
 			try {
 				f.Collect();
-			} catch (const PermissionException &) {
-				denied = true;
+			} catch (const PermissionException &error) {
+				denied = string(error.what()).find("disabled by configuration") != string::npos;
 			}
 			Require(denied && Read(f.old_source) == contents, "Restricted managed directory was not protected");
 			return 0;

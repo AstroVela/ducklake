@@ -22,14 +22,14 @@ bool MatchesSourcePath(ClientContext &context, const string &reference, const st
 
 namespace duckdb {
 namespace vortex_detail {
-inline void CheckRelative(const string &path, bool component) {
+inline void CheckRelative(const string &path, bool component, const char *kind = "index artifact") {
 	if (path.empty() || path[0] == '/' || path.find('\\') != string::npos || path.find(':') != string::npos ||
 	    path.find('\0') != string::npos || (component && path.find('/') != string::npos)) {
-		throw InvalidInputException("Invalid local Vortex path");
+		throw InvalidInputException("Invalid local %s path", kind);
 	}
 	for (auto &part : StringUtil::Split(path, '/')) {
 		if (part.empty() || part == "." || part == "..") {
-			throw InvalidInputException("Invalid local Vortex path component");
+			throw InvalidInputException("Invalid local %s path component", kind);
 		}
 	}
 }
@@ -54,14 +54,14 @@ inline unique_ptr<Descriptor> OpenDirectory(int32_t parent, const string &name, 
 	return make_uniq<Descriptor>(fd);
 }
 
-inline unique_ptr<Descriptor> OpenRoot(const string &path, bool missing) {
+inline unique_ptr<Descriptor> OpenRoot(const string &path, bool missing, const char *kind = "index artifact") {
 	if (path.empty() || path[0] != '/' || path.find('\0') != string::npos) {
 		throw InvalidInputException("Invalid registered Vortex root");
 	}
 	auto result = OpenDirectory(AT_FDCWD, "/", false);
 	for (auto &part : StringUtil::Split(path, '/')) {
 		if (!part.empty()) {
-			CheckRelative(part, true);
+			CheckRelative(part, true, kind);
 			result = OpenDirectory(result->fd, part, missing);
 			if (!result) {
 				return nullptr;
@@ -77,8 +77,8 @@ struct Parent {
 	unique_ptr<Descriptor> missing_parent;
 };
 
-inline Parent OpenParent(int32_t root, const string &path, bool missing) {
-	CheckRelative(path, false);
+inline Parent OpenParent(int32_t root, const string &path, bool missing, const char *kind = "index artifact") {
+	CheckRelative(path, false, kind);
 	auto parts = StringUtil::Split(path, '/');
 	auto fd = dup(root);
 	if (fd < 0) {

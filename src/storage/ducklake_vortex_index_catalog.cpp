@@ -46,20 +46,23 @@ using namespace vortex_detail;
 
 namespace vortex_detail {
 bool CheckDirectoryAccess(ClientContext &context, const string &root) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	const bool exists = fs.DirectoryExists(root);
 	auto &config = DBConfig::GetConfig(context);
-	if (!Settings::Get<EnableExternalAccessSetting>(config)) {
-		auto directory = config.SanitizeAllowedPath(root);
-		if (!StringUtil::EndsWith(directory, "/")) {
-			directory += "/";
-		}
-		// Native construction and collection access descendants through the qualified directory.
-		auto allowed = std::any_of(config.options.allowed_directories.begin(), config.options.allowed_directories.end(),
-		                           [&](const string &prefix) { return StringUtil::StartsWith(directory, prefix); });
-		if (!allowed) {
-			throw PermissionException("Vortex cannot access directory \"%s\"", root);
-		}
+	if (Settings::Get<EnableExternalAccessSetting>(config)) {
+		return exists;
 	}
-	return FileSystem::GetFileSystem(context).DirectoryExists(root);
+	auto directory = config.SanitizeAllowedPath(root);
+	if (!StringUtil::EndsWith(directory, "/")) {
+		directory += "/";
+	}
+	// Native construction and collection access descendants through the qualified directory.
+	auto allowed = std::any_of(config.options.allowed_directories.begin(), config.options.allowed_directories.end(),
+	                           [&](const string &prefix) { return StringUtil::StartsWith(directory, prefix); });
+	if (!allowed) {
+		throw PermissionException("Vortex index cannot access directory \"%s\"", root);
+	}
+	return exists;
 }
 
 } // namespace vortex_detail
