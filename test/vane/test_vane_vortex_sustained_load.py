@@ -74,6 +74,13 @@ def watermark(connection):
     )[0]["n"]
 
 
+def healthy(connection):
+    optimizer, maintenance = AUTO.healthy(connection)
+    require(not optimizer["error"], f"Optimizer reported an error: {optimizer}")
+    require(not maintenance["error"], f"Maintenance reported an error: {maintenance}")
+    return optimizer, maintenance
+
+
 def counters():
     values = {}
     for filename, keys in [
@@ -229,7 +236,7 @@ def worker(args):
     def monitor():
         cursor = cursors[-1]
         while not stopped.is_set():
-            optimizer, maintenance = AUTO.healthy(cursor)
+            optimizer, maintenance = healthy(cursor)
             source = query(cursor, "SELECT * FROM ducklake_vortex_source_retention_status('lake')")[0]
             emit("sample", phase=phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
             stopped.wait(0.25)
@@ -313,6 +320,7 @@ def worker(args):
                 cursor.close()
     emit("measured", begin=baseline, end=usage())
     try:
+        healthy(connection)
         connection.execute("SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')")
         connection.execute("SELECT * FROM ducklake_cancel_vortex_maintenance('lake')")
         deadline = time.monotonic() + 30
