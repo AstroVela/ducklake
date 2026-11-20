@@ -569,6 +569,9 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		if (mode == "automatic-rewrite-serialization" && stage == "rewrite_candidate_ready") {
 			before_flush->Stop();
 		}
+		if (mode == "automatic-planning-serialization" && stage == "optimizer_before_rewrite") {
+			before_flush->Stop();
+		}
 		if (mode == "automatic-pause-" + stage) {
 			wait_for_kill(stage);
 		}
@@ -690,11 +693,27 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		std::cout << mode << ": managed deletion crossed the rewrite-to-retire boundary" << std::endl;
 		return;
 	}
-	if (mode == "automatic-flush-serialization" || mode == "automatic-rewrite-serialization") {
+	const bool planning_case = mode == "automatic-planning-serialization";
+	if (mode == "automatic-flush-serialization" || mode == "automatic-rewrite-serialization" || planning_case) {
 		bool flush_case = mode == "automatic-flush-serialization";
 		idx_t expected_revision = 3;
 		if (flush_case) {
 			f.Grow(0);
+		} else if (planning_case) {
+			vector<AutomaticRow> seed;
+			vector<int64_t> first_deletes;
+			for (int64_t id = 0; id < 256; id++) {
+				seed.push_back(f.Row(id, 0));
+				if (id >= 128) {
+					first_deletes.push_back(id);
+				}
+			}
+			f.Submit("planning-seed", std::move(seed));
+			f.Wait(2);
+			auto index = f.Index();
+			Require(index.segments.size() == 1 && index.files.size() == 1 && index.files[0].row_count == 256,
+			        "Planning fixture requires one 256-row source file");
+			f.Submit("planning-first-delete", {}, std::move(first_deletes));
 		} else {
 			for (idx_t wave = 0; wave < 4; wave++) {
 				auto before = f.Index().revision;
@@ -710,12 +729,15 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		std::promise<void> acquired;
 		auto acquired_event = acquired.get_future();
 		vector<AutomaticRow> rows;
+		vector<int64_t> deletes;
 		if (flush_case) {
 			for (idx_t id = 128; id < 256; id++) {
 				rows.push_back(f.Row(id, 0));
 			}
 		} else {
-			auto selected = DuckLakeVortexOptimizer::Status(*setup.context, "lake")[0][26].ToString();
+			auto policy = DuckLakeVortexOptimizer::Status(*setup.context, "lake")[0];
+			Require(!planning_case || policy[21].ToString() == "rewrite", "Planning fixture chose a different task");
+			auto selected = policy[26].ToString();
 			set<string> paths;
 			for (auto &segment : f.Index().segments) {
 				if (segment.generation == selected) {
@@ -726,16 +748,26 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 			}
 			auto live = SQL(setup, "SELECT id,filename FROM lake.items ORDER BY id");
 			for (auto &entry : *live) {
-				if (paths.count(entry.GetValue<string>(1)) && rows.size() < 128) {
-					rows.push_back(f.Row(entry.GetValue<int64_t>(0), 99));
+				if (paths.count(entry.GetValue<string>(1))) {
+					if (planning_case) {
+						deletes.push_back(entry.GetValue<int64_t>(0));
+					} else if (rows.size() < 128) {
+						rows.push_back(f.Row(entry.GetValue<int64_t>(0), 99));
+					}
 				}
 			}
-			Require(rows.size() == 128, "Serialization fixture lost its live rewrite input");
+			Require(planning_case ? deletes.size() == 128 : rows.size() == 128,
+			        "Serialization fixture lost its live rewrite input");
 		}
 		auto writer = std::async(std::launch::async, [&] {
 			bool notified = false;
-			return f.Submit("serialized", rows, {}, [&](const string &stage) {
+			return f.Submit("serialized", rows, deletes, [&](const string &stage) {
 				if (stage == "acquired" && !notified) {
+					if (planning_case) {
+						std::lock_guard<std::mutex> guard(events->lock);
+						Require(events->stages["rewrite_after_commit"] == 1,
+						        "Managed writer entered before the selected rewrite committed");
+					}
 					notified = true;
 					acquired.set_value();
 				}
@@ -768,9 +800,19 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 			        "A managed writer starting after native build capture could not commit");
 			during_build.get();
 		}
-		f.Validate({before, f.Observe(reader, false), f.Observe(reader, true)});
+		auto after = f.Observe(reader, false);
+		Require(!planning_case || (!before.result.rows.empty() && after.result.rows.empty()),
+		        "Planning query did not observe the committed deletion");
+		f.Validate({before, after, f.Observe(reader, true)});
 		before_build->Release();
-		f.Wait(expected_revision);
+		f.Wait(expected_revision + (planning_case ? 1 : 0));
+		if (planning_case) {
+			auto index = f.Index();
+			std::lock_guard<std::mutex> guard(events->lock);
+			Require(index.revision == expected_revision + 1 && index.segments.empty() &&
+			            events->stages["retire_after_commit"] == 1,
+			        "Fresh plan did not retire the emptied segment");
+		}
 		f.Stop();
 		f.Replay();
 		std::cout << mode << ": physical changes serialize managed commits; captured queries remain valid" << std::endl;
