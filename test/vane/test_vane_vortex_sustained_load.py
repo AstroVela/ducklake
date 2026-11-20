@@ -39,17 +39,22 @@ SEARCH_COLUMNS = [
     ("distance", "FLOAT"),
 ]
 PR_SET_PTRACER = 0x59616D61
+EXIT_AFTER_EOF_SECONDS = 30
 
 
-def enable_stall_capture():
+def enable_stall_capture(launcher_pid):
     import ctypes
     import faulthandler
 
+    libc = ctypes.CDLL(None, use_errno=True)
+    require(os.getppid() == launcher_pid, "Stall diagnostics launcher changed")
+    require(libc.prctl(PR_SET_PTRACER, launcher_pid, 0, 0, 0) == 0, f"PR_SET_PTRACER failed: {ctypes.get_errno()}")
+    if os.getppid() != launcher_pid:
+        libc.prctl(PR_SET_PTRACER, 0, 0, 0, 0)
+        raise AssertionError("Stall diagnostics launcher changed")
     # Python restores the previous disposition before native teardown finishes.
     signal.signal(signal.SIGUSR2, signal.SIG_IGN)
     faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
-    libc = ctypes.CDLL(None, use_errno=True)
-    require(libc.prctl(PR_SET_PTRACER, os.getppid(), 0, 0, 0) == 0, f"PR_SET_PTRACER failed: {ctypes.get_errno()}")
 
 
 def worker_exited(child):
@@ -242,7 +247,7 @@ def worker(args):
             return dict(counters(), event_pipe_bytes=emitted, time_ns=time.monotonic_ns())
 
     if args.capture_stalls:
-        enable_stall_capture()
+        enable_stall_capture(args.diagnostics_parent_pid)
         emit("diagnostics_ready")
     import vane
 
@@ -678,6 +683,9 @@ def stall_reason(progress, now, deadline):
             return "no_events_30_seconds"
         if now - progress["query_time"] >= 30:
             return "queries_stalled_30_seconds"
+    exit_deadline = progress.get("exit_deadline")
+    if exit_deadline is not None and exit_deadline < deadline and exit_deadline - now <= 25:
+        return "event_pipe_exit_deadline"
     if deadline - now <= 25:
         return "watchdog_deadline"
     return None
@@ -685,6 +693,7 @@ def stall_reason(progress, now, deadline):
 
 def collect_worker_events(child, case, pipe, budget, capture_stalls):
     events, malformed = [], None
+    exit_timed_out = False
     expired, stopped = threading.Event(), threading.Event()
     progress_lock = threading.Lock()
     now = time.monotonic()
@@ -750,9 +759,14 @@ def collect_worker_events(child, case, pipe, budget, capture_stalls):
                             progress["sample"] = event
                         elif kind == "measured":
                             progress["ready"] = False
-        exit_deadline = time.monotonic() + 30
+        exit_deadline = time.monotonic() + EXIT_AFTER_EOF_SECONDS
+        if capture_stalls:
+            with progress_lock:
+                progress["exit_deadline"] = exit_deadline
         while not worker_exited(child):
-            require(time.monotonic() < exit_deadline, "Load worker kept running after closing its event pipe")
+            if time.monotonic() >= exit_deadline:
+                exit_timed_out = True
+                break
             time.sleep(0.01)
     finally:
         stopped.set()
@@ -766,9 +780,11 @@ def collect_worker_events(child, case, pipe, budget, capture_stalls):
             diagnostics.join()
         child.wait(timeout=10)
 
-    if child.returncode != 0:
+    if child.returncode != 0 or exit_timed_out:
         watchdog_expired = expired.is_set() and child.returncode == -signal.SIGKILL
         error = f"Load worker failed (exit {child.returncode}, watchdog_expired={watchdog_expired}). "
+        if exit_timed_out:
+            error += f"Worker kept running after closing its event pipe for {EXIT_AFTER_EOF_SECONDS} seconds. "
         if malformed:
             error += f"Malformed event in events.jsonl. {malformed}. "
         raise AssertionError(error + (case / "worker.log").read_text(errors="replace")[-6000:])
@@ -804,7 +820,7 @@ def run_case(args, root, count, dimension, fixture):
         str(args.recovery_query_pause),
     ]
     if args.capture_stalls:
-        command.append("--capture-stalls")
+        command.extend(["--capture-stalls", "--diagnostics-parent-pid", str(os.getpid())])
     with (
         os.fdopen(read_fd, "rb") as pipe,
         os.fdopen(write_fd, "wb") as event_writer,
@@ -836,6 +852,7 @@ def main():
     destination.add_argument("--output-dir", type=Path)
     destination.add_argument("--worker-case", type=Path)
     parser.add_argument("--events-fd", type=int)
+    parser.add_argument("--diagnostics-parent-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--fixtures", choices=["cost", "automatic"], nargs="+", default=["automatic"])
     parser.add_argument("--rows", type=int, nargs="+", default=[4096])
     parser.add_argument("--dimensions", type=int, nargs="+", default=[8])
@@ -863,6 +880,8 @@ def main():
             args.events_fd is not None and len(args.rows) == len(args.dimensions) == len(args.fixtures) == 1,
             "Worker requires one case and its event pipe",
         )
+        if args.capture_stalls:
+            require(args.diagnostics_parent_pid is not None and args.diagnostics_parent_pid > 0, "Missing launcher PID")
         worker(args)
         return
     check_oracle()

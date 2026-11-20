@@ -10,9 +10,11 @@ That original stop remains unresolved.
 ## Diagnostic boundary
 
 The installed load probe accepts `--capture-stalls`. This Linux diagnostic
-requires GDB. The worker grants tracing permission to its test parent and
-that parent's descendants and registers a Python stack-dump signal. It then
-emits `diagnostics_ready`. The parent waits for this event before tracing or
+requires GDB. The launcher passes its PID to the worker. The worker checks
+its current parent before and after granting tracing permission to the
+launcher and its descendants. A worker whose parent changes stops setup.
+The worker registers a Python stack-dump signal and then emits
+`diagnostics_ready`. The parent waits for this event before tracing or
 sending the signal. During Python shutdown, removing the handler returns
 `SIGUSR2` to an ignored disposition. The parent leaves the worker PID reserved
 until the capture and watchdog threads have finished.
@@ -20,8 +22,10 @@ until the capture and watchdog threads have finished.
 During the measured workload, thirty seconds without any events records a
 silent worker. Thirty seconds without a completed query while other events
 continue records a query stall. A case can also trigger capture 25 seconds
-before the watchdog deadline, including during startup. Each case makes one
-capture attempt at most.
+before the watchdog deadline, including during startup. The event pipe
+closing starts a 30-second exit deadline. If that deadline comes first, it
+triggers capture with 25 seconds left. Each case makes one capture attempt
+at most.
 
 `stall.json` records the trigger, latest task/source status, last completed
 query's read window and vector, pending build-directory names, and the capture
@@ -32,14 +36,16 @@ watchdog terminates the worker at `3 * seconds_per_phase + 300`.
 
 The case report marks a diagnostic attempt with `stall_capture_attempted`.
 Failure messages include the worker exit status, whether the watchdog stopped
-it, and any malformed event. The original bytes from a truncated record are
-available in `events.jsonl`. Review captures when comparing workload timings.
+it, an expired exit deadline after the event pipe closes, and any malformed
+event. The original bytes from a truncated record are available in
+`events.jsonl`. Review captures when comparing workload timings.
 
-The controlled proof verifies both kinds of stack, clean worker exit, the
-startup deadline, capture failure, late signal handling, worker exit during
-capture, diagnostic thread startup failure, and disabled capture. The workflow
-runs that proof, enables capture in its four load cases, and retains the
-reports and capture files.
+The controlled proof verifies both kinds of stack, clean worker exit,
+launcher identity, the startup deadline, capture failure, late signal
+handling, worker exit during capture, a timeout after the event pipe closes,
+diagnostic thread startup failure, and disabled capture. The workflow runs
+that proof, enables capture in its four load cases, and retains the reports
+and capture files.
 
 ```sh
 python -I test/vane/test_vane_vortex_stall_capture.py \
