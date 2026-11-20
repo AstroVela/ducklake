@@ -242,6 +242,7 @@ def native_cases(driver, root, report):
         "linked-native-cleanup",
         "prepared-native-cleanup",
         "cleanup-init-order",
+        "inline-only",
         "immediate",
         "permissions",
         "detach",

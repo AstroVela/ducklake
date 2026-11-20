@@ -250,7 +250,7 @@ void PreparedNativeCleanup(Fixture &f) {
 	Require(f.Count("lake.shared_last") == 1 && Read(path).size() > 0,
 	        "Native cleanup of an ordinary file removed a shared source");
 
-	auto reusable = AddParquet(f, "reusable", "reusable.parquet");
+	auto reusable = AddParquet(f, "reusable", "managed-12:31.parquet");
 	SQL(f.writer, "DROP TABLE lake.reusable");
 	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
 	SQL(f.writer, "PREPARE stale_cleanup AS SELECT * FROM ducklake_cleanup_old_files('lake',cleanup_all=>true)");
@@ -276,6 +276,18 @@ void PreparedNativeCleanup(Fixture &f) {
 		rejected = true;
 	}
 	Require(rejected && Read(rebound).size() > 0, "Prepared cleanup continued across a metadata reattachment");
+}
+
+void InlineOnlyRetention(Fixture &f) {
+	SQL(f.writer, "SELECT * FROM ducklake_initialize_vortex_indexes('lake');"
+	              "SELECT * FROM ducklake_initialize_vortex_optimizer('lake');"
+	              "INSERT INTO lake.items VALUES(1,[1,0],'A','inline')");
+	auto &fs = FileSystem::GetFileSystem(*f.writer.context);
+	Require(!fs.DirectoryExists(f.root + "/data"), "Inline-only fixture unexpectedly has a managed directory");
+	f.Policy();
+	auto result = f.Collect();
+	Require(result.expired && !result.files && f.Count("lake.items") == 1 && !fs.DirectoryExists(f.root + "/data"),
+	        "Metadata-only expiry required or created a managed directory");
 }
 
 void CleanupInitializationOrder(Fixture &f) {
@@ -440,7 +452,7 @@ int main(int argc, char **argv) {
 		Require(argc == 3, "Usage: ducklake_vortex_source_driver ROOT MODE");
 		string root = argv[1], mode = argv[2];
 		Fixture f(root, mode == "shared-source" ? root + "//./data" : root + "/data",
-		          mode != "prepared-native-cleanup" && mode != "cleanup-init-order");
+		          mode != "prepared-native-cleanup" && mode != "cleanup-init-order" && mode != "inline-only");
 		if (mode == "shared-source") {
 			SharedSource(f);
 			return 0;
@@ -455,6 +467,10 @@ int main(int argc, char **argv) {
 		}
 		if (mode == "cleanup-init-order") {
 			CleanupInitializationOrder(f);
+			return 0;
+		}
+		if (mode == "inline-only") {
+			InlineOnlyRetention(f);
 			return 0;
 		}
 		f.Seed();

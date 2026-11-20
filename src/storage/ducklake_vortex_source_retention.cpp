@@ -27,18 +27,19 @@ string AbsoluteLocalPath(FileSystem &fs, const string &path) {
 		throw InvalidInputException("Invalid Vortex source path");
 	}
 	auto local = fs.ExpandPath(path);
-	if (local.find("://") != string::npos || fs.IsRemoteFile(local)) {
+	const bool absolute = !local.empty() && local[0] == '/';
+	if (fs.IsRemoteFile(local) || (!absolute && local.find("://") != string::npos)) {
 		throw InvalidInputException("Vortex source collection requires local paths");
 	}
-	if (!fs.IsPathAbsolute(local)) {
+	if (!absolute) {
 		local = fs.JoinPath(fs.GetWorkingDirectory(), local);
 	}
 	return local;
 }
 
 static string ResolveSourcePath(ClientContext &context, const string &local) {
-	auto &fs = FileSystem::GetFileSystem(context).Cast<OpenerFileSystem>();
-	fs.VerifyCanAccessFile(local);
+	auto &fs = FileSystem::GetFileSystem(context);
+	fs.Cast<OpenerFileSystem>().VerifyCanAccessFile(local);
 	std::unique_ptr<char, decltype(&free)> resolved(realpath(local.c_str(), nullptr), free);
 	if (!resolved) {
 		if (errno == ENOENT || errno == ENOTDIR) {
@@ -143,7 +144,7 @@ string NormalizeManagedPath(const string &absolute) {
 		if (part.empty() || part == ".") {
 			continue;
 		}
-		CheckRelative(part, true, "Vortex source");
+		CheckRelative(part, true, PathKind::SOURCE);
 		if (path.size() > 1) {
 			path += "/";
 		}
@@ -157,9 +158,9 @@ string Root(DuckLakeTransaction &transaction) {
 	return NormalizeManagedPath(AbsoluteLocalPath(fs, transaction.GetCatalog().DataPath()));
 }
 
-unique_ptr<Descriptor> OpenManagedRoot(ClientContext &context, const string &root) {
+unique_ptr<Descriptor> OpenManagedRoot(ClientContext &context, const string &root, bool missing = false) {
 	CheckDirectoryAccess(context, root);
-	return OpenRoot(root, false, "Vortex source");
+	return OpenRoot(root, missing, PathKind::SOURCE);
 }
 
 vector<File> Candidates(DuckLakeTransaction &transaction, const string &root) {
@@ -192,7 +193,7 @@ vector<File> Candidates(DuckLakeTransaction &transaction, const string &root) {
 				File file;
 				file.path = path;
 				file.relative = path.substr(prefix.size());
-				CheckRelative(file.relative, false, "Vortex source");
+				CheckRelative(file.relative, false, PathKind::SOURCE);
 				files.push_back(std::move(file));
 			}
 			auto &file = files[position.first->second];
@@ -373,7 +374,7 @@ void DuckLakeVortexSourceRetention::Configure(ClientContext &context, const stri
 	Owner owner(context, catalog, identity);
 	Load(owner.transaction);
 	if (enabled) {
-		OpenManagedRoot(context, Root(owner.transaction));
+		OpenManagedRoot(context, Root(owner.transaction), true);
 	}
 	VortexIndex::Query(owner.transaction, "UPDATE {METADATA_CATALOG}." + string(POLICY) +
 	                                          " SET enabled=" + string(enabled ? "true" : "false") +
@@ -401,7 +402,7 @@ bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, 
 		if (Referenced(transaction, file)) {
 			continue;
 		}
-		auto parent = OpenParent(directory->fd, file.relative, file.registered, "Vortex source");
+		auto parent = OpenParent(directory->fd, file.relative, file.registered, PathKind::SOURCE);
 		Inspect(parent, file, false);
 		if (file.bytes <= max_bytes) {
 			return true;
@@ -486,8 +487,8 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 			return result;
 		}
 		auto root = Root(transaction);
-		auto directory = OpenManagedRoot(context, root);
 		auto files = Candidates(transaction, root);
+		auto directory = files.empty() ? nullptr : OpenManagedRoot(context, root);
 		owner.Commit();
 		for (auto &file : files) {
 			if (result.files == max_objects) {
@@ -499,7 +500,7 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 				owner.Commit();
 				continue;
 			}
-			auto parent = OpenParent(directory->fd, file.relative, file.registered, "Vortex source");
+			auto parent = OpenParent(directory->fd, file.relative, file.registered, PathKind::SOURCE);
 			Inspect(parent, file, false);
 			if (file.bytes > max_bytes - result.bytes) {
 				owner.Commit();
@@ -531,7 +532,7 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 				throw InvalidInputException("Registered Vortex source changed ownership");
 			}
 			auto unlink_root = OpenManagedRoot(context, root);
-			parent = OpenParent(unlink_root->fd, file.relative, true, "Vortex source");
+			parent = OpenParent(unlink_root->fd, file.relative, true, PathKind::SOURCE);
 			const auto present = Inspect(parent, file, true);
 			interrupt();
 			check_attachments();

@@ -22,14 +22,19 @@ bool MatchesSourcePath(ClientContext &context, const string &reference, const st
 
 namespace duckdb {
 namespace vortex_detail {
-inline void CheckRelative(const string &path, bool component, const char *kind = "index") {
-	if (path.empty() || path[0] == '/' || path.find('\\') != string::npos || path.find(':') != string::npos ||
-	    path.find('\0') != string::npos || (component && path.find('/') != string::npos)) {
-		throw InvalidInputException("Invalid local %s path", string(kind) == "index" ? "index artifact" : kind);
+enum class PathKind { INDEX, SOURCE };
+
+inline void CheckRelative(const string &path, bool component, PathKind kind = PathKind::INDEX) {
+	const bool index = kind == PathKind::INDEX;
+	if (path.empty() || path[0] == '/' || path.find('\0') != string::npos ||
+	    (component && path.find('/') != string::npos) ||
+	    (index && (path.find('\\') != string::npos || path.find(':') != string::npos))) {
+		throw InvalidInputException(index ? "Invalid local index artifact path" : "Invalid local Vortex source path");
 	}
 	for (auto &part : StringUtil::Split(path, '/')) {
 		if (part.empty() || part == "." || part == "..") {
-			throw InvalidInputException("Invalid local %s path component", kind);
+			throw InvalidInputException(index ? "Invalid local index path component"
+			                                  : "Invalid local Vortex source path component");
 		}
 	}
 }
@@ -54,7 +59,7 @@ inline unique_ptr<Descriptor> OpenDirectory(int32_t parent, const string &name, 
 	return make_uniq<Descriptor>(fd);
 }
 
-inline unique_ptr<Descriptor> OpenRoot(const string &path, bool missing, const char *kind = "index") {
+inline unique_ptr<Descriptor> OpenRoot(const string &path, bool missing, PathKind kind = PathKind::INDEX) {
 	if (path.empty() || path[0] != '/' || path.find('\0') != string::npos) {
 		throw InvalidInputException("Invalid registered Vortex root");
 	}
@@ -77,7 +82,7 @@ struct Parent {
 	unique_ptr<Descriptor> missing_parent;
 };
 
-inline Parent OpenParent(int32_t root, const string &path, bool missing, const char *kind = "index") {
+inline Parent OpenParent(int32_t root, const string &path, bool missing, PathKind kind = PathKind::INDEX) {
 	CheckRelative(path, false, kind);
 	auto parts = StringUtil::Split(path, '/');
 	auto fd = dup(root);
