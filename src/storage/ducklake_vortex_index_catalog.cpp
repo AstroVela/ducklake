@@ -2276,7 +2276,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
     ClientContext &context, const string &catalog_name, const string &schema, const string &table_name,
     const string &name, const string &reference_path, uint32_t dimension, idx_t expected_revision,
     const std::function<void(const string &)> &observe, const string &expected_table_uuid,
-    optional_idx expected_field_id, DuckLakeVortexIndexOperation operation, const vector<string> &merge_generations) {
+    optional_idx expected_field_id, DuckLakeVortexIndexOperation operation, const vector<string> &merge_generations,
+    optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog) {
 	Name(name);
 	const bool merge = operation == DuckLakeVortexIndexOperation::MERGE;
 	const bool select_index = operation != DuckLakeVortexIndexOperation::REPLACE;
@@ -2299,9 +2300,10 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 	auto generation = "generation-" + id;
 	string root, workspace;
 	bool registered = false;
+	DuckLakeVortexCatalogIdentity identity {};
 	std::function<void(const string &)> check = [&](const string &stage) {
 		if (registered && stage == "generation_sealed") {
-			BuildState(owner, catalog_name, id, "sealed");
+			BuildState(owner, catalog_name, id, "sealed", &identity);
 		}
 		if (observe) {
 			observe(stage);
@@ -2314,7 +2316,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 	try {
 		// Take the metadata snapshot after all preceding namespace claims have committed.
 		auto registration = PublicationLock().GetExclusiveLock(interrupt);
-		auto &transaction = Begin(owner, catalog_name);
+		auto &transaction = Begin(owner, catalog_name, expected_catalog);
+		identity = BoundCatalogIdentity(transaction);
 		Initialized(transaction);
 		auto &catalog = transaction.GetCatalog();
 		auto entry = catalog.GetEntry(*owner.context, CatalogType::TABLE_ENTRY, schema, table_name,
@@ -2388,7 +2391,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		directory.reset();
 #endif
 		check("build_workspace_created");
-		BuildState(owner, catalog_name, id, "building");
+		BuildState(owner, catalog_name, id, "building", &identity);
 		DuckLakeVortexViewOptions options {catalog_name,
 		                                   schema,
 		                                   table_name,
@@ -2400,17 +2403,17 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		options.merge_generations = merge_generations;
 		options.expected_table_uuid = table_uuid;
 		options.expected_field_id = expected_field_id;
-		auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, check, &context);
+		auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, check, &context, identity);
 		BuildNative(context, view, reference_path, generation, workspace, check);
 		check("before_build_publish");
 		return Publish(owner, catalog_name, schema, table_name, name, reference_path, expected_revision, context, check,
-		               operation, merge_generations);
+		               operation, merge_generations, &identity);
 	} catch (...) {
 		auto error = std::current_exception();
 		Rollback(owner);
 		if (registered) {
 			try {
-				ReconcileBuild(owner, catalog_name, id);
+				ReconcileBuild(owner, catalog_name, id, &identity);
 			} catch (const std::exception &failure) {
 				throw IOException(
 				    "Native Vortex build failed and ownership reconciliation failed: %s; inspect build status",
@@ -2811,13 +2814,11 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 	}
 }
 
-DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string &catalog_name, const string &schema,
-                                                 const string &table_name, const string &name,
-                                                 const string &reference_path, idx_t expected_revision,
-                                                 ClientContext &caller,
-                                                 const std::function<void(const string &)> &observe,
-                                                 DuckLakeVortexIndexOperation operation,
-                                                 const vector<string> &merge_generations) {
+DuckLakeVortexIndex DuckLakeVortexIndex::Publish(
+    Connection &owner, const string &catalog_name, const string &schema, const string &table_name, const string &name,
+    const string &reference_path, idx_t expected_revision, ClientContext &caller,
+    const std::function<void(const string &)> &observe, DuckLakeVortexIndexOperation operation,
+    const vector<string> &merge_generations, optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog) {
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex index publication requires an idle dedicated connection");
 	}
@@ -2831,7 +2832,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string
 		if (operation != DuckLakeVortexIndexOperation::MERGE && !merge_generations.empty()) {
 			throw InvalidInputException("Only a Vortex merge can select generations");
 		}
-		auto &transaction = Begin(owner, catalog_name);
+		auto &transaction = Begin(owner, catalog_name, expected_catalog);
 		Initialized(transaction);
 		auto &catalog = transaction.GetCatalog();
 		auto entry = catalog.GetEntry(*owner.context, CatalogType::TABLE_ENTRY, schema, table_name,

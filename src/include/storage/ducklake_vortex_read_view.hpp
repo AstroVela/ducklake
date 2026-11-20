@@ -56,8 +56,9 @@ private:
 	friend struct DuckLakeVortexIndex;
 	// BuildAndPublish holds the collection guard from registration through publication or reconciliation.
 	static DuckLakeVortexReadView AcquireBuild(Connection &reader, const DuckLakeVortexViewOptions &options,
-	                                           const std::function<void(const string &)> &observe = nullptr,
-	                                           optional_ptr<ClientContext> owner = nullptr);
+	                                           const std::function<void(const string &)> &observe,
+	                                           optional_ptr<ClientContext> owner,
+	                                           const DuckLakeVortexCatalogIdentity &identity);
 };
 
 } // namespace duckdb

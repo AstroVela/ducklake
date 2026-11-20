@@ -561,6 +561,10 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		if (mode == "automatic-flush-serialization" && stage == "build_started") {
 			before_build->Stop();
 		}
+		if ((mode == "automatic-reject-rebound-build" && stage == "before_build") ||
+		    (mode == "automatic-reject-rebound-publication" && stage == "before_build_publish")) {
+			before_build->Stop();
+		}
 		if (mode == "automatic-rewrite-serialization" && stage == "rewrite_candidate_ready") {
 			before_flush->Stop();
 		}
@@ -569,26 +573,37 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		}
 	};
 	f.Configure(observe, mode == "automatic-backpressure" ? 128 : 256);
-	if (mode == "automatic-reject-rebound-catalog") {
-		*pause_physical = true;
+	const bool rebound_waiter = mode == "automatic-reject-rebound-catalog";
+	if (rebound_waiter || mode == "automatic-reject-rebound-build" || mode == "automatic-reject-rebound-publication") {
+		*pause_physical = rebound_waiter;
 		f.Grow(0);
-		physical_lock->Wait();
-		auto &lock = DuckLakeVortexWriteBatch::WriterLock();
-		auto writer = lock.GetExclusiveLock([] {});
-		physical_lock->Release();
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-		while (!lock.WaitingWriterCount()) {
-			Require(std::chrono::steady_clock::now() < deadline, "Optimizer did not wait before catalog rebound");
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		unique_ptr<DuckLakeVortexCollectionLock::Key> writer;
+		if (rebound_waiter) {
+			physical_lock->Wait();
+			auto &lock = DuckLakeVortexWriteBatch::WriterLock();
+			writer = lock.GetExclusiveLock([] {});
+			physical_lock->Release();
+			while (!lock.WaitingWriterCount()) {
+				Require(std::chrono::steady_clock::now() < deadline, "Optimizer did not wait before catalog rebound");
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+		} else {
+			before_build->Wait();
 		}
+		const string builds =
+		    "SELECT build_id,state,keep_generation FROM __ducklake_metadata_lake.ducklake_vortex_builds_v1 ORDER BY 1";
+		auto before = SQL(setup, builds)->ToString();
 		SQL(setup, "DETACH lake");
 		Attach(setup, root);
+		before_build->Release();
 		writer.reset();
 		while (true) {
 			auto p = DuckLakeVortexOptimizer::Status(*setup.context, "lake")[0];
 			if (StringUtil::Contains(p[14].ToString(), "catalog attachment changed")) {
-				Require(!p[16].GetValue<bool>() && p[15].GetValue<idx_t>() == 0 && f.Index().revision == 1,
-				        "Stale optimizer recorded work in the rebound catalog");
+				Require(!p[16].GetValue<bool>() && p[15].GetValue<idx_t>() == (rebound_waiter ? 0 : 1) &&
+				            f.Index().revision == 1 && SQL(setup, builds)->ToString() == before,
+				        "Stale optimizer claimed, reconciled or published a build in the rebound catalog");
 				break;
 			}
 			Require(std::chrono::steady_clock::now() < deadline, "Stale optimizer did not reject the rebound catalog");

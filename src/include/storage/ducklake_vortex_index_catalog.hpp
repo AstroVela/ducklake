@@ -137,14 +137,16 @@ struct DuckLakeVortexIndex {
 	                                   idx_t expected_revision, ClientContext &caller,
 	                                   const std::function<void(const string &)> &observe = nullptr,
 	                                   DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
-	                                   const vector<string> &merge_generations = {});
+	                                   const vector<string> &merge_generations = {},
+	                                   optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog = nullptr);
 	static DuckLakeVortexIndex
 	BuildAndPublish(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                const string &name, const string &reference, uint32_t dimension, idx_t expected_revision,
 	                const std::function<void(const string &)> &observe = nullptr,
 	                const string &expected_table_uuid = "", optional_idx expected_field_id = optional_idx(),
 	                DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
-	                const vector<string> &merge_generations = {});
+	                const vector<string> &merge_generations = {},
+	                optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog = nullptr);
 	static DuckLakeVortexIndex Rewrite(ClientContext &context, const string &catalog, const string &schema,
 	                                   const string &table, const string &index, const string &generation,
 	                                   const string &reference, idx_t expected_revision,

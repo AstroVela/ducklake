@@ -25,6 +25,7 @@ assert SPEC is not None and SPEC.loader is not None
 AUTO = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(AUTO)
 BASE, KEYED = AUTO.BASE, AUTO.KEYED
+MIXED = BASE.SEARCH.CAT.MIXED
 query, require, quote = AUTO.query, AUTO.require, AUTO.quote
 REQUESTS = AUTO.WRITE.REQUESTS
 PHASES = [("paced", 1.0), ("burst", 0.0), ("recovery", 1.0)]
@@ -40,9 +41,8 @@ SEARCH_COLUMNS = [
 def row(key, epoch, dimension, fixture):
     result = AUTO.row(key, epoch)
     if fixture == "cost":
-        result["embedding"] = [float(key) + (epoch % 3) / 64] + [
-            float((key * (i + 3)) % (i + 11)) for i in range(1, dimension)
-        ]
+        first = MIXED.BASE.float32_vector([float(key) + (epoch % 3) / 64])[0]
+        result["embedding"] = [first] + [float((key * (i + 3)) % (i + 11)) for i in range(1, dimension)]
     else:
         result["embedding"].extend(((key * (i + 1)) % 17) / 16 for i in range(8, dimension))
     return result
@@ -394,7 +394,7 @@ def valid_hits(sample, model):
         difference = vectors[:, coordinate] - point[coordinate]
         distances += difference * difference
     scores = {entry["id"]: score for entry, score in zip(eligible, distances.tolist())}
-    previous = -1.0
+    previous = 0.0
     for entry in rows:
         key = entry["id"]
         if type(key) is not int or key not in scores:
@@ -426,10 +426,7 @@ def check_oracle():
     tied_vectors = ([4096.0, 1.0, 1.0], [4096.0, 0.0, 0.0], [4096.0, 1.0, 0.0], [4096.0, 0.0, 1.0])
     for key, vector in enumerate(tied_vectors, 8):
         model[key] = dict(id=key, embedding=vector, category="B", payload=None)
-    rows = [
-        dict(model[key], distance=BASE.SEARCH.CAT.MIXED.float32_squared_l2(point, model[key]["embedding"]))
-        for key in range(10)
-    ]
+    rows = [dict(model[key], distance=MIXED.float32_squared_l2(point, model[key]["embedding"])) for key in range(10)]
     sample = dict(rows=rows, vector=point, category="B")
     require(valid_hits(sample, model) == 0.8, "Oracle treated a Float32 cutoff tie as a known physical order")
     for bad in (
@@ -440,6 +437,11 @@ def check_oracle():
     ):
         require(valid_hits(dict(sample, rows=rows[:-1] + [bad]), model) is None, "Oracle accepted an invalid hit")
     require(valid_hits(dict(sample, rows=rows[::-1]), model) is None, "Oracle accepted unordered distances")
+    require(
+        valid_hits(dict(sample, rows=[dict(rows[0], distance=-0.00005)]), model) is None,
+        "Oracle accepted a negative squared distance",
+    )
+    require(row(262144, 8065, 8, "cost")["embedding"][0] == 262144.0, "Cost model lost native Float32 rounding")
 
 
 def validate(events, count, dimension, fixture):

@@ -532,6 +532,8 @@ def native_cases(driver, root, report):
         "automatic-replan-after-writer",
         "automatic-cancel-writer-wait",
         "automatic-reject-rebound-catalog",
+        "automatic-reject-rebound-build",
+        "automatic-reject-rebound-publication",
     ]:
         case = root / mode
         case.mkdir(mode=0o700)

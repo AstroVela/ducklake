@@ -831,6 +831,7 @@ string Candidate(Connection &connection, const string &path) {
 
 struct Pending {
 	Policy policy;
+	DuckLakeVortexCatalogIdentity identity;
 	std::function<void(const string &)> observe;
 };
 
@@ -875,12 +876,13 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			finished.wait(guard, [&] { return done; });
 		}
 	}
-	void Add(const Policy &p, const std::function<void(const string &)> &observe) {
+	void Add(const Policy &p, const DuckLakeVortexCatalogIdentity &identity,
+	         const std::function<void(const string &)> &observe) {
 		std::lock_guard<std::mutex> guard(lock);
 		if (policies.size() >= 16 && !policies.count(p.Id())) {
 			throw InvalidInputException("Optimizer policy limit exceeded");
 		}
-		policies[p.Id()] = std::make_shared<Pending>(Pending {p, observe});
+		policies[p.Id()] = std::make_shared<Pending>(Pending {p, identity, observe});
 		cancelled.erase(p.Id());
 		errors.erase(p.Id());
 		changed.notify_all();
@@ -890,7 +892,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		auto found = policies.find(p.Id());
 		if (found != policies.end()) {
 			// Invalidate an in-flight probe, even when the thresholds return to earlier values.
-			found->second = std::make_shared<Pending>(Pending {p, found->second->observe});
+			found->second = std::make_shared<Pending>(Pending {p, found->second->identity, found->second->observe});
 		}
 		changed.notify_all();
 	}
@@ -1198,15 +1200,14 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	}
 	void Run(DatabaseInstance &db, const std::shared_ptr<Pending> &pending) {
 		Policy p;
-		DuckLakeVortexCatalogIdentity identity {};
+		auto &identity = pending->identity;
 		{
 			std::lock_guard<std::mutex> guard(io);
 			if (!IsCurrent(pending)) {
 				return;
 			}
-			Metadata meta(db, pending->policy.config.catalog);
+			Metadata meta(db, pending->policy.config.catalog, true, &identity);
 			p = Load(meta, pending->policy);
-			identity = VortexCatalog::BoundCatalogIdentity(meta.transaction);
 			meta.Commit();
 		}
 		if (!p.enabled) {
@@ -1368,15 +1369,13 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 						p = current;
 					}
 					stage(p.kind == "merge" ? "optimizer_before_merge" : "optimizer_before_build");
-					VortexCatalog::ResolveCatalog(*job.context, p.config.catalog, true, "Vortex optimizer build",
-					                              &identity);
 					VortexCatalog::BuildAndPublish(*job.context, p.config.catalog, p.config.schema, p.config.table,
 					                               p.config.index, p.reference, p.config.dimension, p.expected, stage,
 					                               p.uuid, optional_idx(p.field_id),
 					                               p.kind == "merge" ? DuckLakeVortexIndexOperation::MERGE
 					                               : p.expected      ? DuckLakeVortexIndexOperation::APPEND
 					                                                 : DuckLakeVortexIndexOperation::REPLACE,
-					                               p.selected);
+					                               p.selected, &identity);
 				}
 			}
 			Finish(db, pending, p, build || rewrite ? "published" : "flushed", "", true, identity);
@@ -1967,7 +1966,7 @@ void DuckLakeVortexOptimizer::Enable(ClientContext &context, const Config &confi
 		           ",true,'idle','',0,'',0,'','',0,0,0,0,0,'none','[]','',0,0,'disabled')");
 		interrupt();
 		meta.Commit();
-		owner->runtime->Add(p, observe);
+		owner->runtime->Add(p, identity, observe);
 	}
 	owner->runtime->Start(*context.db);
 }
@@ -2001,7 +2000,7 @@ string DuckLakeVortexOptimizer::Resume(ClientContext &context, const string &cat
 		}
 		p.enabled = true;
 		Save(meta, p, p.run);
-		owner->runtime->Add(p, observe);
+		owner->runtime->Add(p, binding, observe);
 	}
 	owner->runtime->Start(*context.db);
 	return p.state;
