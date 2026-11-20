@@ -24,13 +24,13 @@ SQL mutations are checked against the captured identity and snapshot.
 
 ## Regression coverage
 
-The native `automatic-planning-serialization` case pauses immediately after
-durable rewrite selection, before source capture. A managed mutation tries to
-delete every remaining row of that selected B. It must reach admission and
-remain blocked until the rewrite publishes. Queries captured before and after
-the mutation are checked against complete committed row versions. A subsequent
-fresh plan must retire the now fully masked segment, and exact receipt replay
-must preserve logical rows.
+The native `automatic-planning-serialization` case masks half of a single
+256-row source file and pauses after durable indexed rewrite selection, before
+source capture. A managed mutation reaches admission and waits to delete the
+remaining 128 rows. The test checks that the writer acquires the reservation
+after the rewrite commits and that the query results reflect the committed
+deletion. A subsequent plan retires the fully masked segment. Exact receipt
+replay checks the final logical rows.
 
 The same test against the preceding optimizer failed with `Managed writer
 entered a physical-maintenance snapshot`. It releases the paused worker before
