@@ -1057,20 +1057,20 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		}
 		return m.enabled;
 	}
-	void RunMaintenance(DatabaseInstance &db, const std::shared_ptr<PendingMaintenance> &pending) {
+	bool RunMaintenance(DatabaseInstance &db, const std::shared_ptr<PendingMaintenance> &pending) {
 		auto &catalog = pending->catalog;
 		Maintenance m;
 		unique_ptr<Connection> job;
 		{
 			std::lock_guard<std::mutex> guard(io);
 			if (!IsCurrentMaintenance(pending) || MaintenanceCancelled(catalog.Id())) {
-				return;
+				return false;
 			}
 			Metadata meta(db, catalog.name, true, &catalog.identity);
 			m = LoadMaintenance(meta);
 			if (!m.enabled) {
 				meta.Commit();
-				return;
+				return false;
 			}
 			auto builds = m.remaining_builds;
 			auto generations = m.remaining_generations;
@@ -1082,7 +1082,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				} else {
 					meta.Commit();
 				}
-				return;
+				return false;
 			}
 			CheckMaintenance(catalog.Id());
 			job = make_uniq<Connection>(db);
@@ -1097,6 +1097,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			context = job->context;
 		}
 		string error;
+		idx_t collected_objects = 0, collected_bytes = 0;
 		try {
 			auto check = [&](const string &stage) {
 				if (pending->observe) {
@@ -1120,8 +1121,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				m.bytes += builds.bytes;
 			}
 			check("maintenance_after_build_gc");
-			idx_t collected_objects = builds.builds;
-			idx_t collected_bytes = builds.bytes;
+			collected_objects = builds.builds;
+			collected_bytes = builds.bytes;
 			if (builds.builds < m.max_objects && builds.bytes < m.max_bytes && m.min_generation_bytes.IsValid() &&
 			    m.min_generation_bytes.GetIndex() <= m.max_bytes - builds.bytes) {
 				StoreMaintenance(db, catalog, m, "collecting_generations");
@@ -1140,17 +1141,24 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				    *job->context, catalog.name, m.max_objects - collected_objects, m.max_bytes - collected_bytes, check,
 				    &catalog.identity);
 				m.bytes += source.bytes;
+				collected_objects += source.expired + source.files;
+				collected_bytes += source.bytes;
 			}
 		} catch (const std::exception &failure) {
 			error = failure.what();
 		}
-		if (FinishMaintenance(db, pending, m, error) && pending->observe) {
+		if (!FinishMaintenance(db, pending, m, error)) {
+			return false;
+		}
+		if (pending->observe) {
 			try {
 				pending->observe("maintenance_complete");
 			} catch (const std::exception &failure) {
 				FinishMaintenance(db, pending, m, failure.what());
+				return false;
 			}
 		}
+		return collected_objects || collected_bytes;
 	}
 	void Stage(DatabaseInstance &db, const Pending &pending, Policy &p, const string &stage,
 	           const DuckLakeVortexCatalogIdentity &identity) {
@@ -1413,6 +1421,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		while (true) {
 			vector<std::shared_ptr<Pending>> work;
 			vector<std::shared_ptr<PendingMaintenance>> cleanup;
+			bool progressed = false;
 			{
 				std::lock_guard<std::mutex> guard(lock);
 				if (stopping) {
@@ -1458,7 +1467,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					break;
 				}
 				try {
-					RunMaintenance(*db, pending);
+					progressed |= RunMaintenance(*db, pending);
 				} catch (const std::exception &error) {
 					std::lock_guard<std::mutex> guard_io(io);
 					ClearMaintenance(pending);
@@ -1474,7 +1483,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			if (stopping || weak.expired()) {
 				break;
 			}
-			changed.wait_for(guard, std::chrono::milliseconds(100));
+			if (!progressed) {
+				changed.wait_for(guard, std::chrono::milliseconds(100));
+			}
 		}
 		{
 			std::lock_guard<std::mutex> guard(lock);

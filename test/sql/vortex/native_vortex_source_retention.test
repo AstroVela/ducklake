@@ -87,6 +87,11 @@ SELECT count(*) FROM lake.items
 ----
 2
 
+query I reader
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
+----
+2
+
 query I
 SELECT blocked_by_transactions::INTEGER FROM ducklake_collect_vortex_sources('lake',1,1)
 ----

@@ -453,6 +453,82 @@ void MixedSizes(Fixture &f) {
 	        "Oversized source did not remain pending");
 }
 
+void CaptureReadiness(Fixture &f, bool eager) {
+	const string catalog = eager ? "mirror" : "lake";
+	if (eager) {
+		SQL(f.writer, "ATTACH " + Value("ducklake:" + f.root + "/mirror.ducklake").ToSQLString() +
+		                  " AS mirror (DATA_PATH " + Value(f.root + "/mirror-data").ToSQLString() +
+		                  ");"
+		                  "CREATE TABLE mirror.items(id BIGINT); INSERT INTO mirror.items VALUES (7);"
+		                  "SELECT * FROM ducklake_initialize_vortex_indexes('mirror');"
+		                  "SELECT * FROM ducklake_initialize_vortex_optimizer('mirror');"
+		                  "SELECT * FROM ducklake_set_vortex_source_retention('mirror',true,1,0);"
+		                  "SET GLOBAL immediate_transaction_mode=true");
+	} else {
+		f.Policy();
+	}
+	Pause capture;
+	Connection reader(f.database);
+	auto pending = std::async(std::launch::async, [&] {
+		return f.Search(reader, [&](const string &stage) {
+			if (stage == "after_snapshot") {
+				capture.Stop();
+			}
+		});
+	});
+	ReleasePause release_capture {capture};
+	capture.Wait();
+
+	Connection held(f.database), owner(f.database);
+	held.BeginTransaction();
+	SQL(held, "SELECT count(*) FROM " + catalog + ".items");
+	Require(SQL(held, "SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)")
+	                ->GetValue(0, 0)
+	                .GetValue<int64_t>() == 0,
+	        "ANN from a held transaction changed its query winner");
+	auto &transaction = VortexIndex::Begin(owner, catalog);
+	Require(!Source::WorkReady(transaction, 64 * 1024 * 1024), "ANN reclassified its ordinary caller");
+	held.Commit();
+	Require(Source::WorkReady(transaction, 64 * 1024 * 1024), "Readiness ignored work during a finite capture");
+	owner.Commit();
+	const auto before = Source::Status(*f.writer.context, catalog).at(0);
+	Require(before.back().GetValue<bool>(), "Status did not count an active capture");
+
+	if (!eager) {
+		capture.Release();
+		Require(pending.get().rows.at(0).at(0).GetValue<int64_t>() == 0, "The paused capture lost its query winner");
+		return;
+	}
+
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	const auto previous_waiters = admission.WaitingWriterCount();
+	auto completed = std::make_shared<Pause>();
+	ReleasePause release_completed {*completed};
+	DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, catalog, 1, 64 * 1024 * 1024,
+	                                           [completed](const string &stage) {
+		                                           if (stage == "maintenance_complete") {
+			                                           completed->Stop();
+		                                           }
+	                                           });
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+	while (admission.WaitingWriterCount() == previous_waiters) {
+		Require(std::chrono::steady_clock::now() < deadline, "The other lake never reached capture admission");
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	auto queued = Source::Status(*f.writer.context, catalog).at(0);
+	Require(queued.back().GetValue<bool>() && queued[3] == before[3],
+	        "Maintenance expired snapshots before the other lake's capture completed");
+	capture.Release();
+	Require(pending.get().rows.at(0).at(0).GetValue<int64_t>() == 0, "The eager capture lost its query winner");
+	completed->Wait();
+	auto after = Source::Status(*f.writer.context, catalog).at(0);
+	auto maintenance = DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, catalog).at(0);
+	Require(after[3].GetValue<idx_t>() == before[3].GetValue<idx_t>() + 1 && maintenance[4].GetValue<idx_t>() == 1,
+	        "The first source pass did not expire one snapshot with an object budget of one");
+	DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, catalog);
+	completed->Release();
+}
+
 void CaptureGate(Fixture &f, bool cancel) {
 	f.Policy();
 	Connection caller(f.database);
@@ -663,6 +739,10 @@ int main(int argc, char **argv) {
 		f.Seed();
 		if (mode == "concurrent") {
 			Concurrent(f);
+			return 0;
+		}
+		if (mode == "capture-readiness" || mode == "capture-readiness-eager") {
+			CaptureReadiness(f, mode == "capture-readiness-eager");
 			return 0;
 		}
 		if (mode == "capture-gate" || mode == "cancel-capture-wait") {
