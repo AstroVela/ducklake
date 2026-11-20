@@ -10,27 +10,17 @@ masked the rest before the rewrite captured its input.
 
 ## Reservation scope
 
-The optimizer previously selected its rewrite plan before acquiring the
-existing managed-writer reservation. Moving that reservation before the
-planning probe keeps candidate selection, durable task selection, source
-capture and physical publication serialized with managed mutations. The
-planner's existing remaining-row checks can then select indexed rewrite,
-small-output rewrite to F, prune or empty-segment retirement against stable
-managed input.
+An initial probe determines whether there is physical work. When it finds a
+rewrite or flush, the optimizer acquires the existing managed-writer reservation
+and probes again before recording a task. The second probe accounts for managed
+writes that committed while the optimizer waited. The planner then selects
+indexed rewrite, small-output rewrite to F, prune or empty-segment retirement
+using the current row counts.
 
-The nonempty indexed-rewrite guard stays intact. There is no empty-index
-fallback, error-message retry, additional reservation, compatibility mode or
-budget change. Query snapshots retain their existing visibility and ownership
-rules. Ordinary SQL mutations outside the managed API retain the existing
-identity and snapshot checks.
-
-When no physical rewrite is selected, the worker releases the reservation
-after the probe. Flush keeps its existing reservation around the physical
-change; independent B construction and merge still run without the managed
-writer reservation. Every initial probe now holds the managed-writer
-reservation. A physical rewrite retains it from planning through publication, so
-foreground ACK latency includes that work. This change establishes input
-stability; it does not qualify production write latency.
+A physical task holds the reservation from the second probe through commit
+or rollback. Managed writers can commit during independent B construction and
+merge. The nonempty indexed-rewrite check applies during capture, and ordinary
+SQL mutations are checked against the captured identity and snapshot.
 
 ## Regression coverage
 
@@ -53,7 +43,10 @@ checks typed F/T results, retires the fully masked B, checks the historical
 snapshot, builds the new F as B, and replays the first receipt. It complements
 the native checkpoint test, which exercises the concurrent planning window.
 
-## Local qualification on 2026-11-03
+## Local qualification of the original PR on 2026-11-03
+
+The measurements and test counts below came from the original PR head
+`33a0a62c` with its planning and validation code.
 
 The new native checkpoint failed against the preceding `86435518` optimizer
 and passed after the reservation change. The signed DuckLake provider was
