@@ -1151,8 +1151,9 @@ void RemoveLinkedRewriteSource(ClientContext &context, int32_t root, const strin
 
 } // namespace
 
-DuckLakeVortexCatalogIdentity DuckLakeVortexIndex::ResolveCatalog(ClientContext &context, const string &name,
-                                                                  bool write, const char *operation) {
+DuckLakeVortexCatalogIdentity
+DuckLakeVortexIndex::ResolveCatalog(ClientContext &context, const string &name, bool write, const char *operation,
+                                    optional_ptr<const DuckLakeVortexCatalogIdentity> expected) {
 	auto &transaction = context.transaction;
 	const bool active_transaction = transaction.HasActiveTransaction();
 	if (write &&
@@ -1192,6 +1193,9 @@ DuckLakeVortexCatalogIdentity DuckLakeVortexIndex::ResolveCatalog(ClientContext 
 	}
 	if (write && (lake->IsReadOnly() || metadata->IsReadOnly())) {
 		throw TransactionException("%s controls require a writable DuckLake attachment", operation);
+	}
+	if (expected && (lake->oid != expected->lake_oid || metadata->oid != expected->metadata_oid)) {
+		throw TransactionException("%s catalog attachment changed", operation);
 	}
 	return {lake->oid, metadata->oid};
 }
@@ -2179,16 +2183,15 @@ string DuckLakeVortexIndex::Publication() const {
 	return Text(parsed.Root(), "publication");
 }
 
-DuckLakeVortexIndex DuckLakeVortexIndex::RetireEmpty(ClientContext &context, const string &catalog,
-                                                     const string &schema, const string &table_name, const string &name,
-                                                     const string &selected, idx_t expected_revision,
-                                                     const std::function<void(const string &)> &observe,
-                                                     const string &optimizer_run_id) {
+DuckLakeVortexIndex DuckLakeVortexIndex::RetireEmpty(
+    ClientContext &context, const string &catalog, const string &schema, const string &table_name, const string &name,
+    const string &selected, idx_t expected_revision, const std::function<void(const string &)> &observe,
+    const string &optimizer_run_id, optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog) {
 	Name(name);
 	if (selected.empty() || expected_revision >= idx_t(NumericLimits<int64_t>::Maximum())) {
 		throw InvalidInputException("Invalid Vortex retirement arguments");
 	}
-	auto identity = ResolveCatalog(context, catalog, true, "Vortex retirement");
+	auto identity = ResolveCatalog(context, catalog, true, "Vortex retirement", expected_catalog);
 	auto interrupt = [&] {
 		CheckInterrupted(context);
 	};
@@ -2423,7 +2426,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
                                                  const string &selected, const string &reference_path,
                                                  idx_t expected_revision,
                                                  const std::function<void(const string &)> &observe,
-                                                 const string &optimizer_run_id, DuckLakeVortexRewriteMode mode) {
+                                                 const string &optimizer_run_id, DuckLakeVortexRewriteMode mode,
+                                                 optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog) {
 	Name(name);
 	const bool to_f = mode == DuckLakeVortexRewriteMode::FILES;
 	const bool prune = mode == DuckLakeVortexRewriteMode::PRUNE;
@@ -2432,7 +2436,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 	    expected_revision >= idx_t(NumericLimits<int64_t>::Maximum())) {
 		throw InvalidInputException("Invalid Vortex rewrite arguments");
 	}
-	auto identity = ResolveCatalog(context, catalog_name, true, prune ? "Vortex prune" : "Vortex rewrite");
+	auto identity =
+	    ResolveCatalog(context, catalog_name, true, prune ? "Vortex prune" : "Vortex rewrite", expected_catalog);
 	auto interrupt = [&] {
 		CheckInterrupted(context);
 	};

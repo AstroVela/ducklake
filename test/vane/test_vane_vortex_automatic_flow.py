@@ -529,6 +529,9 @@ def native_cases(driver, root, report):
         "automatic-backpressure",
         "automatic-flush-serialization",
         "automatic-rewrite-serialization",
+        "automatic-replan-after-writer",
+        "automatic-cancel-writer-wait",
+        "automatic-reject-rebound-catalog",
     ]:
         case = root / mode
         case.mkdir(mode=0o700)

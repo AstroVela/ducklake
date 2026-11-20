@@ -521,8 +521,10 @@ struct AutomaticFixture {
 inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
 	auto before_flush = std::make_shared<Pause>();
 	auto before_build = std::make_shared<Pause>();
+	auto physical_lock = std::make_shared<Pause>();
+	auto pause_physical = std::make_shared<std::atomic<bool>>(false);
 	AutomaticFixture f(database, setup, root);
-	ReleasePause release_flush {*before_flush}, release_build {*before_build};
+	ReleasePause release_flush {*before_flush}, release_build {*before_build}, release_physical {*physical_lock};
 	auto wait_for_kill = [&database, root](const string &stage) {
 		SaveAutomaticCheckpoint(database, root);
 		Write(root + "/checkpoint", stage);
@@ -533,14 +535,22 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		throw IOException("Automatic checkpoint was not killed");
 	};
 	auto events = f.events;
-	auto observe = [events, before_flush, before_build, mode, wait_for_kill](const string &stage) {
+	auto observe = [events, before_flush, before_build, physical_lock, pause_physical, mode,
+	                wait_for_kill](const string &stage) {
 		{
 			std::lock_guard<std::mutex> guard(events->lock);
 			events->stages[stage]++;
 		}
-		if ((mode == "automatic-backpressure" || mode == "automatic-live" || mode == "automatic-pause-ack") &&
-		    stage == "optimizer_before_flush") {
+		if (mode == "automatic-live" && stage == "optimizer_before_flush") {
 			before_flush->Stop();
+		}
+		if (stage == "optimizer_before_writer_lock") {
+			if (mode == "automatic-backpressure") {
+				before_flush->Stop();
+			}
+			if (*pause_physical) {
+				physical_lock->Stop();
+			}
 		}
 		if (mode == "automatic-live" && stage == "optimizer_before_build") {
 			before_build->Stop();
@@ -548,7 +558,7 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		if (mode == "automatic-flush-serialization" && stage == "optimizer_flush_started") {
 			before_flush->Stop();
 		}
-		if (mode == "automatic-flush-serialization" && stage == "optimizer_before_build") {
+		if (mode == "automatic-flush-serialization" && stage == "build_started") {
 			before_build->Stop();
 		}
 		if (mode == "automatic-rewrite-serialization" && stage == "rewrite_candidate_ready") {
@@ -559,6 +569,93 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		}
 	};
 	f.Configure(observe, mode == "automatic-backpressure" ? 128 : 256);
+	if (mode == "automatic-reject-rebound-catalog") {
+		*pause_physical = true;
+		f.Grow(0);
+		physical_lock->Wait();
+		auto &lock = DuckLakeVortexWriteBatch::WriterLock();
+		auto writer = lock.GetExclusiveLock([] {});
+		physical_lock->Release();
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (!lock.WaitingWriterCount()) {
+			Require(std::chrono::steady_clock::now() < deadline, "Optimizer did not wait before catalog rebound");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		SQL(setup, "DETACH lake");
+		Attach(setup, root);
+		writer.reset();
+		while (true) {
+			auto p = DuckLakeVortexOptimizer::Status(*setup.context, "lake")[0];
+			if (StringUtil::Contains(p[14].ToString(), "catalog attachment changed")) {
+				Require(!p[16].GetValue<bool>() && p[15].GetValue<idx_t>() == 0 && f.Index().revision == 1,
+				        "Stale optimizer recorded work in the rebound catalog");
+				break;
+			}
+			Require(std::chrono::steady_clock::now() < deadline, "Stale optimizer did not reject the rebound catalog");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		f.Stop();
+		f.Replay();
+		std::cout << mode << ": optimizer rejected a new OID for the same bound metadata" << std::endl;
+		return;
+	}
+	if (mode == "automatic-replan-after-writer" || mode == "automatic-cancel-writer-wait") {
+		const bool cancel = mode == "automatic-cancel-writer-wait";
+		f.Grow(0);
+		f.Wait(2);
+		Require(f.Index().segments.size() == 1, "Replan fixture needs one sealed source");
+		*pause_physical = true;
+		vector<int64_t> first, remaining;
+		for (int64_t id = 0; id < 128; id++) {
+			(id < 64 ? first : remaining).push_back(id);
+		}
+		f.Submit("partial-delete", {}, first);
+		physical_lock->Wait();
+		Require(f.model.size() == 64, "The first probe must see a files-only rewrite candidate");
+		Pause before_commit;
+		auto &lock = DuckLakeVortexWriteBatch::WriterLock();
+		auto queued = lock.WaitingWriterCount();
+		auto writer = std::async(std::launch::async, [&] {
+			return f.Submit("last-delete", {}, remaining, [&](const string &stage) {
+				if (stage == "before_commit") {
+					before_commit.Stop();
+				}
+			});
+		});
+		ReleasePause unblock_writer {before_commit}, unblock_optimizer {*physical_lock};
+		before_commit.Wait();
+		physical_lock->Release();
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (lock.WaitingWriterCount() <= queued) {
+			Require(std::chrono::steady_clock::now() < deadline, "Optimizer never queued behind managed write");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		if (cancel) {
+			DuckLakeVortexOptimizer::Cancel(*setup.context, "lake", "main", "items", "knn");
+			while (lock.WaitingWriterCount() > queued) {
+				Require(std::chrono::steady_clock::now() < deadline, "Cancelled optimizer kept waiting for writer");
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+		}
+		before_commit.Release();
+		writer.get();
+		if (cancel) {
+			auto p = DuckLakeVortexOptimizer::Status(*setup.context, "lake")[0];
+			Require(!p[5].GetValue<bool>() && p[4].ToString() == "cancelled" && f.Index().revision == 2,
+			        "Cancelled optimizer published after its reservation wait");
+		} else {
+			f.Wait(3);
+			auto index = f.Index();
+			Require(index.revision == 3 && index.segments.empty(), "Reprobe did not retire the empty source");
+			std::lock_guard<std::mutex> guard(events->lock);
+			Require(events->stages["retire_candidate_ready"] == 1 && !events->stages["rewrite_candidate_ready"],
+			        "Optimizer ran the stale files-only rewrite");
+		}
+		f.Stop();
+		f.Replay();
+		std::cout << mode << ": managed deletion crossed the rewrite-to-retire boundary" << std::endl;
+		return;
+	}
 	if (mode == "automatic-flush-serialization" || mode == "automatic-rewrite-serialization") {
 		bool flush_case = mode == "automatic-flush-serialization";
 		idx_t expected_revision = 3;
@@ -629,6 +726,14 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		Require(writer.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
 		        "Index construction retained the flush writer reservation");
 		writer.get();
+		if (flush_case) {
+			auto during_build =
+			    std::async(std::launch::async, [&] { return f.Submit("during-build", {f.Row(64, 99)}); });
+			ReleasePause unblock_build {*before_build};
+			Require(during_build.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+			        "A managed writer starting after native build capture could not commit");
+			during_build.get();
+		}
 		f.Validate({before, f.Observe(reader, false), f.Observe(reader, true)});
 		before_build->Release();
 		f.Wait(expected_revision);
