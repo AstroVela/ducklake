@@ -58,7 +58,7 @@ def healthy(connection):
     return optimizer, maintenance
 
 
-def settle(connection, root, revision):
+def settle(connection, root, revision, max_retained_rows=2048):
     deadline = time.monotonic() + 90
     while True:
         optimizer, maintenance = healthy(connection)
@@ -95,7 +95,7 @@ def settle(connection, root, revision):
             and maintenance["remaining_builds"] == maintenance["remaining_generations"] == 0
             and source["eligible_snapshots"] == source["scheduled_files"] == source["pending_deletions"] == 0
         ):
-            return head, source, footprint(connection, root, head)
+            return head, source, footprint(connection, root, head, max_retained_rows)
         require(
             time.monotonic() < deadline,
             f"Automatic pipeline did not settle: {optimizer}, {maintenance}, {source}, inline={inline}, active={active}, covered={covered}",
@@ -103,7 +103,7 @@ def settle(connection, root, revision):
         time.sleep(0.03)
 
 
-def footprint(connection, root, head):
+def footprint(connection, root, head, max_retained_rows=2048):
     inventory = query(
         connection,
         "SELECT coalesce((SELECT sum(file_size_bytes) FROM "
@@ -146,7 +146,8 @@ def footprint(connection, root, head):
         0
     ]["n"]
     require(
-        retained_rows <= 2048, f"Retained physical source rows grew beyond the bounded fixture window: {retained_rows}"
+        retained_rows <= max_retained_rows,
+        f"Retained physical source rows grew beyond the bounded fixture window: {retained_rows}",
     )
     references = list((root / "indexes").glob("*.json"))
     return {
@@ -523,7 +524,18 @@ def recover(case, stage):
 
 def native_cases(driver, root, report):
     cases = []
-    for mode in ["automatic-live", "automatic-backpressure"]:
+    for mode in [
+        "automatic-live",
+        "automatic-backpressure",
+        "automatic-flush-serialization",
+        "automatic-rewrite-serialization",
+        "automatic-replan-after-writer",
+        "automatic-cancel-writer-wait",
+        "automatic-reject-rebound-catalog",
+        "automatic-reject-rebound-build",
+        "automatic-reject-rebound-publication",
+        "automatic-reject-nonlake-capture",
+    ]:
         case = root / mode
         case.mkdir(mode=0o700)
         with (case / "driver.log").open("w") as log:

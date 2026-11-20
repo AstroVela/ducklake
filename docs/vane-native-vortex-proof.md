@@ -15,6 +15,8 @@ For table-owned, retryable whole-row upsert and deletion by business id, see
 [managed writes](native-vortex-keyed-writes.md).
 For a workload that configures the workers once and then only mutates and
 queries, see [automatic flow](native-vortex-automatic-flow.md).
+For paced/burst/recovery measurements and concurrent SQL checks, see
+[sustained mixed load](native-vortex-sustained-load.md).
 
 ## Fixed inputs and packaging
 

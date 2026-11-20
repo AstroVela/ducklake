@@ -67,8 +67,8 @@ const DuckLakeFieldId &DuckLakeVortexReadView::ResolveField(DuckLakeTableEntry &
 
 static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVortexViewOptions &options,
                                           const std::function<void(const string &)> &observe,
-                                          optional_ptr<ClientContext> owner, bool oracle_rows,
-                                          bool build_files = false) {
+                                          optional_ptr<ClientContext> owner, bool oracle_rows, bool build_files = false,
+                                          optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr) {
 	const bool invalid_dimension =
 	    options.index_name.empty() ? options.dimension == 0 || options.dimension > 4096 : options.dimension != 0;
 	if (invalid_dimension || options.max_source_bytes == 0 || options.max_source_bytes > 64 * 1024 * 1024 ||
@@ -95,13 +95,23 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 	}
 	reader.BeginTransaction();
 	try {
-		auto &catalog = Catalog::GetCatalog(*reader.context, options.catalog).Cast<DuckLakeCatalog>();
+		auto &resolved = Catalog::GetCatalog(*reader.context, options.catalog);
+		if (identity && resolved.GetAttached().oid != identity->lake_oid) {
+			throw TransactionException("Vortex catalog attachment changed");
+		}
+		if (resolved.GetCatalogType() != "ducklake") {
+			throw InvalidInputException("Native Vortex read views require an attached DuckLake catalog");
+		}
+		auto &catalog = resolved.Cast<DuckLakeCatalog>();
 		if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 			throw InvalidInputException("Native Vortex read views require DuckDB metadata");
 		}
 		checkpoint("before_source_admission");
 		auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
 		auto &transaction = DuckLakeTransaction::Get(*reader.context, catalog);
+		if (identity) {
+			DuckLakeVortexIndex::CheckCatalogIdentity(transaction, *identity);
+		}
 		auto snapshot = transaction.GetSnapshot();
 		checkpoint("after_snapshot");
 		auto entry = catalog.GetEntry(*reader.context, CatalogType::TABLE_ENTRY, options.schema, options.table,
@@ -470,12 +480,13 @@ DuckLakeVortexReadView DuckLakeVortexReadView::AcquireQuery(Connection &reader,
 DuckLakeVortexReadView DuckLakeVortexReadView::AcquireBuild(Connection &reader,
                                                             const DuckLakeVortexViewOptions &options,
                                                             const std::function<void(const string &)> &observe,
-                                                            optional_ptr<ClientContext> owner) {
+                                                            optional_ptr<ClientContext> owner,
+                                                            const DuckLakeVortexCatalogIdentity &identity) {
 	if ((options.unindexed_only || !options.merge_generations.empty()) != !options.index_name.empty() ||
 	    (options.unindexed_only && !options.merge_generations.empty())) {
 		throw InvalidInputException("Incremental/merge build capture requires a published index and one selection");
 	}
-	return AcquireView(reader, options, observe, owner, false, true);
+	return AcquireView(reader, options, observe, owner, false, true, &identity);
 }
 
 } // namespace duckdb
