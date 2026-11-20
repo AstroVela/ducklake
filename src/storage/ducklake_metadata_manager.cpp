@@ -4764,9 +4764,10 @@ bool DuckLakeMetadataManager::HasFileReference(const string &path, const string 
 		result->ThrowError();
 	}
 	auto &context = *transaction.GetConnection().context;
+	auto key = vortex_detail::SourcePathIdentity(context, path);
 	while (auto chunk = result->Fetch()) {
 		for (idx_t row = 0; row < chunk->size(); row++) {
-			if (vortex_detail::MatchesSourcePath(context, StringValue::Get(chunk->GetValue(0, row)), path)) {
+			if (vortex_detail::MatchesSourcePath(context, StringValue::Get(chunk->GetValue(0, row)), key)) {
 				return true;
 			}
 		}

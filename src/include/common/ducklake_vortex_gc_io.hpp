@@ -3,6 +3,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include <tuple>
+
 namespace duckdb {
 class ClientContext;
 class FileSystem;
@@ -10,7 +12,9 @@ class FileSystem;
 namespace vortex_detail {
 bool CheckDirectoryAccess(ClientContext &context, const string &root);
 string AbsoluteLocalPath(FileSystem &fs, const string &path);
-bool MatchesSourcePath(ClientContext &context, const string &reference, const string &path);
+using SourcePathKey = std::tuple<idx_t, idx_t, string>;
+SourcePathKey SourcePathIdentity(ClientContext &context, const string &path);
+bool MatchesSourcePath(ClientContext &context, const string &reference, const SourcePathKey &path);
 } // namespace vortex_detail
 } // namespace duckdb
 

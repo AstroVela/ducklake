@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <set>
 
 namespace duckdb {
@@ -50,13 +51,36 @@ static string ResolveSourcePath(ClientContext &context, const string &local) {
 	return resolved.get();
 }
 
-bool MatchesSourcePath(ClientContext &context, const string &reference, const string &path) {
-	auto &fs = FileSystem::GetFileSystem(context);
-	if (fs.IsRemoteFile(reference) && !StringUtil::StartsWith(reference, "file:/")) {
-		return false;
+static SourcePathKey DirectoryEntryKey(const string &path) {
+	auto separator = path.find_last_of('/');
+	while (separator != string::npos) {
+		auto parent = separator ? path.substr(0, separator) : "/";
+		struct stat directory;
+		if (!stat(parent.c_str(), &directory)) {
+			if (!S_ISDIR(directory.st_mode)) {
+				throw IOException("Native Vortex source parent is not a directory: %s", parent);
+			}
+			return {idx_t(directory.st_dev), idx_t(directory.st_ino), path.substr(separator + 1)};
+		}
+		if (!separator || (errno != ENOENT && errno != ENOTDIR)) {
+			throw IOException("Cannot identify native Vortex source directory: %s", parent);
+		}
+		separator = path.find_last_of('/', separator - 1);
 	}
-	auto local = AbsoluteLocalPath(fs, reference);
-	return local == path || ResolveSourcePath(context, local) == path;
+	throw InvalidInputException("Vortex source identity requires an absolute path");
+}
+
+SourcePathKey SourcePathIdentity(ClientContext &context, const string &path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto local = AbsoluteLocalPath(fs, path);
+	auto resolved = ResolveSourcePath(context, local);
+	fs.Cast<OpenerFileSystem>().VerifyCanAccessFile(resolved);
+	return DirectoryEntryKey(resolved);
+}
+
+bool MatchesSourcePath(ClientContext &context, const string &reference, const SourcePathKey &path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	return !fs.IsRemoteFile(reference) && SourcePathIdentity(context, reference) == path;
 }
 } // namespace vortex_detail
 
@@ -173,9 +197,10 @@ vector<File> Candidates(DuckLakeTransaction &transaction, const string &root) {
 	                     "AND s.path_is_relative=d.path_is_relative ORDER BY d.digest IS NULL,"
 	                     "coalesce(s.data_file_id,d.data_file_id),coalesce(s.path,d.path),"
 	                     "coalesce(s.path_is_relative,d.path_is_relative)");
-	auto &fs = FileSystem::GetFileSystem(*transaction.GetConnection().context);
+	auto &context = *transaction.GetConnection().context;
+	auto &fs = FileSystem::GetFileSystem(context);
 	auto prefix = root == "/" ? root : root + "/";
-	unordered_map<string, idx_t> positions;
+	std::map<SourcePathKey, idx_t> positions;
 	vector<File> files;
 	while (auto chunk = result->Fetch()) {
 		for (idx_t row = 0; row < chunk->size(); row++) {
@@ -188,7 +213,7 @@ vector<File> Candidates(DuckLakeTransaction &transaction, const string &root) {
 			if (path == root || !StringUtil::StartsWith(path, prefix)) {
 				throw InvalidInputException("Vortex source cleanup path is outside managed data");
 			}
-			auto position = positions.emplace(path, files.size());
+			auto position = positions.emplace(SourcePathIdentity(context, path), files.size());
 			if (position.second) {
 				File file;
 				file.path = path;
@@ -330,7 +355,7 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		return StringUtil::StartsWith(local, managed) ||
 		       StringUtil::StartsWith(fs.FileSystem::CanonicalizePath(local), managed);
 	};
-	unordered_set<string> pending_paths;
+	std::set<SourcePathKey> pending_paths;
 	auto intents =
 	    VortexIndex::Query(transaction, "SELECT path,path_is_relative FROM {METADATA_CATALOG}." + string(DELETIONS));
 	for (auto &intent : *intents) {
@@ -338,7 +363,7 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		if (intent.GetValue<bool>(1)) {
 			path = fs.JoinPath(transaction.GetCatalog().DataPath(), path);
 		}
-		pending_paths.insert(physical_path(path));
+		pending_paths.insert(DirectoryEntryKey(physical_path(path)));
 	}
 	std::set<std::pair<idx_t, string>> eligible_keys;
 	if (!include_scheduled) {
@@ -358,7 +383,7 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		for (auto &entry : scheduled) {
 			if (!fs.IsRemoteFile(entry.path) &&
 			    (!selected.count({entry.id.index, entry.path}) || lexically_managed(entry.path))) {
-				pending_paths.insert(physical_path(entry.path));
+				pending_paths.insert(DirectoryEntryKey(physical_path(entry.path)));
 			}
 		}
 	}
@@ -375,7 +400,7 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		                           }
 		                           auto path = physical_path(file.path);
 		                           return (!managed.empty() && StringUtil::StartsWith(path, managed)) ||
-		                                  pending_paths.count(path) ||
+		                                  pending_paths.count(DirectoryEntryKey(path)) ||
 		                                  metadata.HasFileReference(path, "/", include_scheduled) ||
 		                                  VortexIndex::ReferencesSource(transaction, path);
 	                           }),

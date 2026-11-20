@@ -244,6 +244,20 @@ void LinkedNativeCleanup(Fixture &f) {
 	Require(Read(outside_file).size() > 0 &&
 	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 3,
 	        "Native cleanup changed a file or queue key owned by the managed namespace");
+
+	auto managed_link = AddParquet(f, "managed_link", "original-link.parquet");
+	auto independent_link = outside + "/independent-link.parquet";
+	Require(link(managed_link.c_str(), independent_link.c_str()) == 0,
+	        "Could not create an independent directory entry");
+	SQL(f.writer, "CREATE TABLE lake.external_link(i BIGINT)");
+	SQL(f.writer, "CALL ducklake_add_data_files('lake','external_link'," + Value(independent_link).ToSQLString() + ")");
+	SQL(f.writer, "DROP TABLE lake.managed_link; DROP TABLE lake.external_link");
+	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
+	SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)");
+	Require(FileSystem::GetFileSystem(*f.writer.context).FileExists(managed_link) &&
+	            !FileSystem::GetFileSystem(*f.writer.context).FileExists(independent_link) &&
+	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 4,
+	        "Native cleanup conflated independent hard links");
 }
 
 void PreparedNativeCleanup(Fixture &f) {

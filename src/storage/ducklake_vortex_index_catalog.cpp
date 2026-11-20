@@ -2004,6 +2004,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::ParseSegments(const string &reference, 
 
 bool DuckLakeVortexIndex::ReferencesSource(DuckLakeTransaction &transaction, const string &path) {
 	auto result = Query(transaction, "SELECT table_uuid,reference FROM {METADATA_CATALOG}.ducklake_vortex_indexes_v1");
+	auto &context = *transaction.GetConnection().context;
+	auto key = SourcePathIdentity(context, path);
 	while (auto chunk = result->Fetch()) {
 		for (idx_t row = 0; row < chunk->size(); row++) {
 			auto reference = StringValue::Get(chunk->GetValue(1, row));
@@ -2011,7 +2013,7 @@ bool DuckLakeVortexIndex::ReferencesSource(DuckLakeTransaction &transaction, con
 			auto index =
 			    ParseSegments(reference, StringValue::Get(chunk->GetValue(0, row)), Number(parsed.Root(), "field_id"));
 			for (auto &file : index.files) {
-				if (MatchesSourcePath(*transaction.GetConnection().context, file.uri, path)) {
+				if (MatchesSourcePath(context, file.uri, key)) {
 					return true;
 				}
 			}
