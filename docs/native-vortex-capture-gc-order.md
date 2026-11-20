@@ -6,40 +6,36 @@ continued querying but missed its historical-snapshot drain deadline.
 
 ## Lock order
 
-A native ReadView acquires shared capture admission before starting its DuckLake
-transaction. Starting that transaction briefly acquires the shared transaction
-gate. Previously source collection acquired the exclusive transaction gate,
-checked for active transactions, and then acquired exclusive capture admission.
-A query between admission and transaction registration could therefore wait on
-the gate while the collector waited on its admission lock. If the query had
-already registered, collection instead abandoned that pass immediately.
+A native ReadView acquires shared capture admission before starting its
+DuckLake catalog transaction. Starting that transaction briefly acquires the
+shared transaction gate. The original collector acquired the exclusive
+transaction gate before acquiring exclusive capture admission. A query between
+admission and transaction registration could wait on the gate while the
+collector waited on its admission lock. The synced #62 collector avoids that
+cycle by deferring when capture admission is busy.
 
-Source collection now acquires publication, capture admission and transaction
-entry in that order. Existing captures finish with transaction entry available;
-new captures wait outside admission. Once admission is closed, the collector
-freezes transaction starts and checks for other active DuckLake transactions.
-An ordinary held transaction still causes a deferred collection result. The
-collector does not wait for that ordinary transaction to end.
-
-The change preserves the same snapshot/file ownership checks, private ReadView
-copies, deletion intent, crash checkpoints and shared object/byte budgets. It
-adds no alternate query path, compatibility branch, retry or fallback.
+Source collection acquires publication and then waits interruptibly for
+exclusive capture admission. Existing captures can still enter transactions
+and finish. Once admission closes, collection tries to freeze new transaction
+starts and checks for active DuckLake transactions. A busy transaction gate or
+an ordinary held transaction defers collection. The same snapshot and file
+ownership checks, private copies, deletion intent, crash checkpoints and
+shared object and byte budgets protect the collection.
 
 ## Regression
 
-The existing native admission case pauses a real ANN query after its snapshot
-is captured. Collection must wait, leave the transaction gate available, and
-then expire eligible snapshots in the same pass after capture is released. The
-query must still return its original winner. The preceding implementation fails
-this fixture because it abandons the pass while capture is active.
+The native admission case pauses a real ANN query after it captures a
+snapshot. The fixture observes collection waiting for admission and checks
+that the transaction gate remains available. After capture resumes, the
+query returns its original winner and collection expires eligible snapshots in
+the same pass.
 
-A second native case holds capture admission before transaction registration,
-starts source collection, and enters a real DuckLake query while admission is
-still held. Transaction entry must complete before admission is released; then
-collection must progress. The preceding library fails this case because its
-collector holds the transaction gate while waiting for admission. Both cases
-release their held admission before reporting a failure, leaving no stuck
-fixture worker.
+A second native case holds capture admission before transaction registration.
+After collection reaches its admission wait, a real DuckLake query completes
+while admission is still held. Collection advances when the fixture releases
+admission. A third case interrupts the waiting collector, verifies the locks
+become available and snapshots remain intact, and completes a fresh collection
+after releasing admission.
 
 A minimal SQL regression holds an ordinary DuckLake reader in a second
 connection, verifies collection reports transaction deferral, commits the reader
@@ -51,7 +47,7 @@ This removes a specific lock-order cycle. The original silent execution had no
 usable stack; this change alone does not establish its root cause. Qualification
 of the longer drain failure is recorded separately below.
 
-## Qualification so far
+## Qualification recorded at `6e05e831`
 
 Both new native assertions fail against the frozen preceding library and pass
 against the rebuilt library. The complete installed source-retention proof
