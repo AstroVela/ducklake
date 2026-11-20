@@ -4758,8 +4758,8 @@ FROM {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion f
 }
 
 #ifdef DUCKLAKE_ENABLE_VORTEX
-bool DuckLakeMetadataManager::HasFileReference(const string &path, const string &separator) {
-	auto result = transaction.Query(GetKnownFilesForCleanupQuery(separator, false));
+bool DuckLakeMetadataManager::HasFileReference(const string &path, const string &separator, bool include_scheduled) {
+	auto result = transaction.Query(GetKnownFilesForCleanupQuery(separator, include_scheduled));
 	if (result->HasError()) {
 		result->ThrowError();
 	}

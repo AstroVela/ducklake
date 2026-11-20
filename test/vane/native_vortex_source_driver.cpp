@@ -32,12 +32,12 @@ struct Fixture {
 	DuckDB database;
 	Connection writer;
 	DuckLakeVortexIndex index;
-	Fixture(const string &root_p) : root(root_p), database(nullptr), writer(database) {
+	Fixture(const string &root_p, const string &data_path) : root(root_p), database(nullptr), writer(database) {
 		database.LoadStaticExtension<DucklakeExtension>();
 		database.LoadStaticExtension<VortexExtension>();
 		SQL(writer, "SET threads=2; LOAD parquet; ATTACH " +
 		                Value("ducklake:" + root + "/metadata.ducklake").ToSQLString() + " AS lake(DATA_PATH " +
-		                Value(root + "/data").ToSQLString() + ",DATA_INLINING_ROW_LIMIT 1000)");
+		                Value(data_path).ToSQLString() + ",DATA_INLINING_ROW_LIMIT 1000)");
 		FileSystem::GetFileSystem(*writer.context).CreateDirectory(root + "/indexes");
 		SQL(writer, "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
 		            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
@@ -154,9 +154,13 @@ string AddParquet(Fixture &f, const string &table, const string &name) {
 }
 
 void SharedSource(Fixture &f) {
-	auto path = AddParquet(f, "shared_first", "shared.parquet");
-	SQL(f.writer, "CREATE TABLE lake.shared_last(i BIGINT)");
-	SQL(f.writer, "CALL ducklake_add_data_files('lake','shared_last'," + Value("file://" + path).ToSQLString() + ")");
+	auto path = f.root + "/data/shared.parquet";
+	SQL(f.writer, "CREATE TABLE lake.shared_first(i BIGINT); CREATE TABLE lake.shared_last(i BIGINT)");
+	SQL(f.writer, "COPY (SELECT 7::BIGINT AS i) TO " + Value(path).ToSQLString() + " (FORMAT PARQUET)");
+	SQL(f.writer, "CALL ducklake_add_data_files('lake','shared_first'," +
+	                  Value("file://" + f.root + "/data//./shared.parquet").ToSQLString() + ")");
+	SQL(f.writer,
+	    "CALL ducklake_add_data_files('lake','shared_last'," + Value("file://localhost" + path).ToSQLString() + ")");
 	f.Policy();
 	SQL(f.writer, "DROP TABLE lake.shared_first");
 	f.Drain();
@@ -165,7 +169,25 @@ void SharedSource(Fixture &f) {
 	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
 	        "Shared source was acknowledged while still referenced");
 
+	Require(SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true,dry_run=>true)")->RowCount() == 0,
+	        "Native cleanup preview included a shared source");
+	SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)");
+	SQL(f.writer, "CALL ducklake_delete_orphaned_files('lake',cleanup_all=>true)");
+	Require(Read(path).size() > 0 && f.Count("lake.shared_last") == 1,
+	        "Native cleanup removed a file with another live registration");
+	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 1,
+	        "Native cleanup acknowledged a shared source");
+
 	SQL(f.writer, "DROP TABLE lake.shared_last");
+	f.Collect();
+	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 2,
+	        "The last expiry did not queue both registrations");
+	SQL(f.writer, "UPDATE __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion "
+	              "SET schedule_start=TIMESTAMPTZ '2000-01-01 00:00:00+00' WHERE data_file_id = ("
+	              "SELECT min(data_file_id) FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion)");
+	SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',older_than=>TIMESTAMPTZ '2010-01-01 00:00:00+00')");
+	Require(Read(path).size() > 0 && f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 2,
+	        "Age-filtered native cleanup partially removed a shared source");
 	f.Drain(1);
 	Require(!FileSystem::GetFileSystem(*f.writer.context).FileExists(path), "Last registration left a shared source");
 	Require(f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 0 &&
@@ -296,14 +318,14 @@ int main(int argc, char **argv) {
 	try {
 		Require(argc == 3, "Usage: ducklake_vortex_source_driver ROOT MODE");
 		string root = argv[1], mode = argv[2];
-		Fixture f(root);
+		Fixture f(root, mode == "shared-source" ? root + "//./data" : root + "/data");
+		if (mode == "shared-source") {
+			SharedSource(f);
+			return 0;
+		}
 		f.Seed();
 		if (mode == "concurrent") {
 			Concurrent(f);
-			return 0;
-		}
-		if (mode == "shared-source") {
-			SharedSource(f);
 			return 0;
 		}
 		if (mode == "held" || mode == "admission") {
@@ -354,7 +376,21 @@ int main(int argc, char **argv) {
 		}
 		if (mode == "immediate") {
 			SQL(f.writer, "SET GLOBAL immediate_transaction_mode=true");
-			f.Drain();
+			Require(f.Collect(1).expired == 1, "Explicit source expiry stalled in immediate transaction mode");
+			DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 1, 64 * 1024 * 1024);
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+			while (true) {
+				auto source = Source::Status(*f.writer.context, "lake")[0];
+				auto maintenance = DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, "lake")[0];
+				Require(StringValue::Get(maintenance[0]) != "failed", maintenance.back().ToString());
+				if (!source[6].GetValue<idx_t>() && !source[7].GetValue<idx_t>() && !maintenance[2].GetValue<bool>()) {
+					break;
+				}
+				Require(std::chrono::steady_clock::now() < deadline,
+				        "Source maintenance stalled in immediate transaction mode");
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			}
+			DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
 			f.CheckReclaimed();
 			return 0;
 		}
@@ -536,13 +572,25 @@ int main(int argc, char **argv) {
 			});
 			ReleasePause release {pause};
 			pause.Wait();
-			Connection reader(f.database);
-			auto reading = std::async(std::launch::async, [&] { return f.Search(reader); });
-			Require(reading.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout,
-			        "New query crossed source deletion admission");
+			Connection native(f.database), reader(f.database);
+			auto &gate = Source::TransactionGate();
+			auto &admission = DuckLakeVortexReadView::AdmissionLock();
+			const auto native_waits = gate.SharedWaitCount();
+			const auto view_waits = admission.SharedWaitCount();
+			auto native_read = std::async(std::launch::async, [&] {
+				return SQL(native, "SELECT min(id) FROM lake.items")->GetValue(0, 0).GetValue<int64_t>();
+			});
+			auto view = std::async(std::launch::async, [&] { return f.Search(reader); });
+			ReleasePause release_on_error {pause};
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+			while (gate.SharedWaitCount() == native_waits || admission.SharedWaitCount() == view_waits) {
+				Require(std::chrono::steady_clock::now() < deadline, "Readers did not reach their admission locks");
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
 			pause.Release();
 			collecting.get();
-			Require(reading.get().rows[0][0].GetValue<int64_t>() == 32, "New query lost current data after deletion");
+			Require(native_read.get() == 32 && view.get().rows[0][0].GetValue<int64_t>() == 32,
+			        "Readers lost current data after deletion");
 			f.Drain();
 			f.CheckReclaimed();
 			return 0;

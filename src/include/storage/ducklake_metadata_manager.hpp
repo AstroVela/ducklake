@@ -226,7 +226,7 @@ public:
 	static string GetTableColumnSchemaSql(TableIndex table_id);
 	static string GetInlinedTableNamesSql(TableIndex table_id);
 	virtual vector<DuckLakeFileForCleanup> GetOldFilesForCleanup(const string &filter);
-	bool HasFileReference(const string &path, const string &separator);
+	bool HasFileReference(const string &path, const string &separator, bool include_scheduled);
 	virtual vector<DuckLakeFileForCleanup> GetOrphanFilesForCleanup(const string &filter, const string &separator);
 	virtual vector<DuckLakeFileForCleanup> GetFilesForCleanup(const string &filter, CleanupType type,
 	                                                          const string &separator);

@@ -10,6 +10,7 @@
 #include "storage/ducklake_transaction.hpp"
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_read_view.hpp"
+#include "storage/ducklake_vortex_source_retention.hpp"
 #endif
 
 namespace duckdb {
@@ -45,6 +46,9 @@ struct CleanupBindData : public TableFunctionData {
 
 	Catalog &catalog;
 	vector<DuckLakeFileForCleanup> files;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	unique_ptr<DuckLakeVortexCatalogIdentity> source_identity;
+#endif
 	//! If we are going to delete the files for real or not
 	bool dry_run = false;
 
@@ -101,6 +105,12 @@ static unique_ptr<FunctionData> CleanupBind(ClientContext &context, TableFunctio
 	auto &transaction = DuckLakeTransaction::Get(context, catalog);
 	auto &metadata_manager = transaction.GetMetadataManager();
 	result->files = metadata_manager.GetFilesForCleanup(result->GetFilter(), type, ducklake_catalog.Separator());
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	if (!result->files.empty() && DuckLakeVortexSourceRetention::IsInitialized(transaction)) {
+		result->source_identity = make_uniq<DuckLakeVortexCatalogIdentity>(
+		    DuckLakeVortexIndex::ResolveCatalog(context, catalog.GetName(), false, "Vortex source cleanup"));
+	}
+#endif
 
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("path");
@@ -124,6 +134,7 @@ struct DuckLakeCleanupData : public GlobalTableFunctionState {
 
 	idx_t offset;
 	bool executed;
+	vector<DuckLakeFileForCleanup> files;
 };
 
 unique_ptr<GlobalTableFunctionState> DuckLakeCleanupInit(ClientContext &context, TableFunctionInitInput &input) {
@@ -134,36 +145,52 @@ unique_ptr<GlobalTableFunctionState> DuckLakeCleanupInit(ClientContext &context,
 void DuckLakeCleanupExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = data_p.bind_data->Cast<CleanupBindData>();
 	auto &state = data_p.global_state->Cast<DuckLakeCleanupData>();
-	if (state.offset >= data.files.size()) {
-		return;
-	}
-	if (!state.executed && !data.dry_run) {
+	if (!state.executed && !data.files.empty()) {
+		state.files = data.files;
 #ifdef DUCKLAKE_ENABLE_VORTEX
-		auto admission_guard = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock([&] {
+		auto interrupt = [&] {
 			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}
-		});
+		};
+		unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard, admission_guard;
+		unique_ptr<Connection> fresh;
+		if (data.source_identity) {
+			publication_guard = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock(interrupt);
+		}
+		if (!data.dry_run || data.source_identity) {
+			admission_guard = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock(interrupt);
+		}
+		if (data.source_identity) {
+			fresh = make_uniq<Connection>(*context.db);
+			auto &transaction = DuckLakeVortexIndex::Begin(*fresh, data.catalog.GetName(), data.source_identity.get());
+			DuckLakeVortexSourceRetention::ProtectCleanupFiles(transaction, data.type, state.files);
+			interrupt();
+		}
 #endif
-		// delete the files
-		auto &fs = FileSystem::GetFileSystem(context);
-		vector<string> paths;
-		paths.reserve(data.files.size());
-		for (const auto &file : data.files) {
-			paths.push_back(file.path);
+		if (!data.dry_run && !state.files.empty()) {
+			auto &fs = FileSystem::GetFileSystem(context);
+			vector<string> paths;
+			paths.reserve(state.files.size());
+			for (const auto &file : state.files) {
+				paths.push_back(file.path);
+			}
+			fs.RemoveFiles(paths);
+			if (data.type == CleanupType::OLD_FILES) {
+				auto &transaction = DuckLakeTransaction::Get(context, data.catalog);
+				transaction.GetMetadataManager().RemoveFilesScheduledForCleanup(state.files);
+			}
 		}
-		fs.RemoveFiles(paths);
-		if (data.type == CleanupType::OLD_FILES) {
-			// If we are removing old files, we need to remove them from the catalog
-			auto &transaction = DuckLakeTransaction::Get(context, data.catalog);
-			auto &metadata_manager = transaction.GetMetadataManager();
-			metadata_manager.RemoveFilesScheduledForCleanup(data.files);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (fresh) {
+			fresh->Commit();
 		}
+#endif
 		state.executed = true;
 	}
 	idx_t count = 0;
-	while (state.offset < data.files.size() && count < STANDARD_VECTOR_SIZE) {
-		auto &file = data.files[state.offset++];
+	while (state.offset < state.files.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &file = state.files[state.offset++];
 		output.SetValue(0, count, file.path);
 		count++;
 	}

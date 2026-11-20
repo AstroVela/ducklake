@@ -16,6 +16,7 @@
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace duckdb {
@@ -127,19 +128,30 @@ string Where(const File &file) {
 		if (!filter.empty()) {
 			filter += " OR ";
 		}
-		filter += "(data_file_id=" + to_string(key.id) + " AND path=" + Value(key.path).ToSQLString() +
+		filter += "(data_file_id=" + to_string(key.id) + " AND path COLLATE C=" + Value(key.path).ToSQLString() +
 		          " AND path_is_relative=" + string(key.is_relative ? "true)" : "false)");
 	}
 	return " WHERE (" + filter + ")";
 }
 
-string Root(DuckLakeTransaction &transaction) {
-	auto &fs = FileSystem::GetFileSystem(*transaction.GetConnection().context);
-	auto path = AbsoluteLocalPath(fs, transaction.GetCatalog().DataPath());
-	while (path.size() > 1 && path.back() == '/') {
-		path.pop_back();
+string NormalizeManagedPath(const string &absolute) {
+	string path = "/";
+	for (auto &part : StringUtil::Split(absolute, '/')) {
+		if (part.empty() || part == ".") {
+			continue;
+		}
+		CheckRelative(part, true, "Vortex source");
+		if (path.size() > 1) {
+			path += "/";
+		}
+		path += part;
 	}
 	return path;
+}
+
+string Root(DuckLakeTransaction &transaction) {
+	auto &fs = FileSystem::GetFileSystem(*transaction.GetConnection().context);
+	return NormalizeManagedPath(AbsoluteLocalPath(fs, transaction.GetCatalog().DataPath()));
 }
 
 unique_ptr<Descriptor> OpenManagedRoot(ClientContext &context, const string &root) {
@@ -153,7 +165,8 @@ vector<File> Candidates(DuckLakeTransaction &transaction, const string &root) {
 	                 "coalesce(s.path_is_relative,d.path_is_relative),d.file_bytes,d.device,d.inode,d.digest,"
 	                 "s.data_file_id IS NOT NULL FROM {METADATA_CATALOG}." +
 	                     string(SCHEDULED) + " s FULL OUTER JOIN {METADATA_CATALOG}." + DELETIONS +
-	                     " d USING(data_file_id,path,path_is_relative) ORDER BY d.digest IS NULL,"
+	                     " d ON s.data_file_id=d.data_file_id AND s.path COLLATE C=d.path COLLATE C "
+	                     "AND s.path_is_relative=d.path_is_relative ORDER BY d.digest IS NULL,"
 	                     "coalesce(s.data_file_id,d.data_file_id),coalesce(s.path,d.path),"
 	                     "coalesce(s.path_is_relative,d.path_is_relative)");
 	auto &fs = FileSystem::GetFileSystem(*transaction.GetConnection().context);
@@ -164,14 +177,11 @@ vector<File> Candidates(DuckLakeTransaction &transaction, const string &root) {
 		for (idx_t row = 0; row < chunk->size(); row++) {
 			FileKey key {chunk->GetValue(0, row).GetValue<idx_t>(), StringValue::Get(chunk->GetValue(1, row)),
 			             chunk->GetValue(2, row).GetValue<bool>()};
-			if (key.is_relative) {
-				CheckRelative(key.path, false, "Vortex source");
+			if (key.is_relative && (key.path.empty() || key.path[0] == '/')) {
+				throw InvalidInputException("Invalid relative Vortex source path");
 			}
-			auto path = key.is_relative ? prefix + key.path : AbsoluteLocalPath(fs, key.path);
-			while (path.find("//") != string::npos) {
-				path = StringUtil::Replace(path, "//", "/");
-			}
-			if (!StringUtil::StartsWith(path, prefix)) {
+			auto path = NormalizeManagedPath(key.is_relative ? prefix + key.path : AbsoluteLocalPath(fs, key.path));
+			if (path == root || !StringUtil::StartsWith(path, prefix)) {
 				throw InvalidInputException("Vortex source cleanup path is outside managed data");
 			}
 			auto position = positions.emplace(path, files.size());
@@ -253,7 +263,7 @@ bool Inspect(Parent &parent, File &file, bool contents) {
 }
 
 bool Referenced(DuckLakeTransaction &transaction, const File &file) {
-	return transaction.GetMetadataManager().HasFileReference(file.path, "/") ||
+	return transaction.GetMetadataManager().HasFileReference(file.path, "/", false) ||
 	       VortexIndex::ReferencesSource(transaction, file.path);
 }
 
@@ -286,6 +296,44 @@ void DuckLakeVortexSourceRetention::Initialize(DuckLakeTransaction &transaction)
 	                                    "(data_file_id BIGINT,path VARCHAR,path_is_relative BOOLEAN,"
 	                                    "file_bytes UBIGINT NOT NULL,device UBIGINT NOT NULL,inode UBIGINT NOT NULL,"
 	                                    "digest VARCHAR NOT NULL,PRIMARY KEY(data_file_id,path,path_is_relative))");
+}
+
+bool DuckLakeVortexSourceRetention::IsInitialized(DuckLakeTransaction &transaction) {
+	auto &catalog = transaction.GetCatalog();
+	return (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb") &&
+	       transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(), POLICY);
+}
+
+void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &transaction, CleanupType type,
+                                                        vector<DuckLakeFileForCleanup> &files) {
+	auto &context = *transaction.GetConnection().context;
+	auto &fs = FileSystem::GetFileSystem(context);
+	const auto include_scheduled = type == CleanupType::ORPHANED_FILES;
+	auto &metadata = transaction.GetMetadataManager();
+	unordered_set<string> pending_paths;
+	if (!include_scheduled) {
+		unordered_set<idx_t> selected;
+		for (auto &file : files) {
+			selected.insert(file.id.index);
+		}
+		// An age-filtered native cleanup must leave shared paths whose other keys are still pending.
+		for (auto &entry : metadata.GetFilesForCleanup("", CleanupType::OLD_FILES, "/")) {
+			if (!selected.count(entry.id.index) && !fs.IsRemoteFile(entry.path)) {
+				pending_paths.insert(NormalizeManagedPath(AbsoluteLocalPath(fs, entry.path)));
+			}
+		}
+	}
+	files.erase(std::remove_if(files.begin(), files.end(),
+	                           [&](const DuckLakeFileForCleanup &file) {
+		                           if (fs.IsRemoteFile(file.path)) {
+			                           return false;
+		                           }
+		                           auto path = NormalizeManagedPath(AbsoluteLocalPath(fs, file.path));
+		                           return pending_paths.count(path) ||
+		                                  metadata.HasFileReference(path, "/", include_scheduled) ||
+		                                  VortexIndex::ReferencesSource(transaction, path);
+	                           }),
+	            files.end());
 }
 
 void DuckLakeVortexSourceRetention::Configure(ClientContext &context, const string &catalog, bool enabled,
@@ -463,7 +511,7 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 				throw IOException("Cannot unlink registered Vortex source");
 			}
 			check("source_unlinked_before_sync");
-			SyncDirectory((parent.directory ? parent.directory : parent.missing_parent)->fd);
+			SyncDirectory((parent.directory ? parent.directory : parent.missing_parent)->fd, "Vortex source directory");
 			check("source_after_unlink");
 			VortexIndex::Query(finish, "DELETE FROM {METADATA_CATALOG}." + string(SCHEDULED) + Where(file));
 			VortexIndex::Query(finish, "DELETE FROM {METADATA_CATALOG}." + string(DELETIONS) + Where(file));

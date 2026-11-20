@@ -74,6 +74,8 @@ queue and its own durable intent records. It checks native and current named
 index references before deleting. Shared files stay pending while any retained
 native or index reference resolves to the same local path. The final deletion
 acknowledges all the queue entries for that file.
+The native old-file and orphan cleanup functions also check live references
+for a catalog initialized for source retention.
 
 Before unlink, a native transaction commits a deletion intent containing the
 exact queue key, file size, device, inode and SHA-256 digest. Descriptor-relative

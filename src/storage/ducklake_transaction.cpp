@@ -34,7 +34,6 @@
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
-#include "storage/ducklake_vortex_source_retention.hpp"
 #include "storage/ducklake_vortex_write.hpp"
 #endif
 
@@ -866,12 +865,9 @@ Connection &DuckLakeTransaction::GetConnection() {
 		auto &client_config = ClientConfig::GetConfig(*connection->context);
 		client_config.user_settings.SetUserSetting(CatalogErrorMaxSchemasSetting::SettingIndex, Value::UBIGINT(0));
 #ifdef DUCKLAKE_ENABLE_VORTEX
-		auto owner = context.lock();
-		if (owner && DuckLakeVortexSourceRetention::IsCollector(*owner)) {
-			// The internal connection accesses the pinned metadata database while the collector owns admission.
-			client_config.user_settings.SetUserSetting(ImmediateTransactionModeSetting::SettingIndex,
-			                                           Value::BOOLEAN(false));
-		}
+		// This connection owns the metadata transaction. Start it on the first metadata access.
+		client_config.user_settings.SetUserSetting(ImmediateTransactionModeSetting::SettingIndex,
+		                                           Value::BOOLEAN(false));
 #endif
 		connection->BeginTransaction();
 	}

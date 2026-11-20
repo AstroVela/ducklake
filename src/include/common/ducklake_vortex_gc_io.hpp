@@ -22,10 +22,10 @@ bool MatchesSourcePath(ClientContext &context, const string &reference, const st
 
 namespace duckdb {
 namespace vortex_detail {
-inline void CheckRelative(const string &path, bool component, const char *kind = "index artifact") {
+inline void CheckRelative(const string &path, bool component, const char *kind = "index") {
 	if (path.empty() || path[0] == '/' || path.find('\\') != string::npos || path.find(':') != string::npos ||
 	    path.find('\0') != string::npos || (component && path.find('/') != string::npos)) {
-		throw InvalidInputException("Invalid local %s path", kind);
+		throw InvalidInputException("Invalid local %s path", string(kind) == "index" ? "index artifact" : kind);
 	}
 	for (auto &part : StringUtil::Split(path, '/')) {
 		if (part.empty() || part == "." || part == "..") {
@@ -54,7 +54,7 @@ inline unique_ptr<Descriptor> OpenDirectory(int32_t parent, const string &name, 
 	return make_uniq<Descriptor>(fd);
 }
 
-inline unique_ptr<Descriptor> OpenRoot(const string &path, bool missing, const char *kind = "index artifact") {
+inline unique_ptr<Descriptor> OpenRoot(const string &path, bool missing, const char *kind = "index") {
 	if (path.empty() || path[0] != '/' || path.find('\0') != string::npos) {
 		throw InvalidInputException("Invalid registered Vortex root");
 	}
@@ -77,7 +77,7 @@ struct Parent {
 	unique_ptr<Descriptor> missing_parent;
 };
 
-inline Parent OpenParent(int32_t root, const string &path, bool missing, const char *kind = "index artifact") {
+inline Parent OpenParent(int32_t root, const string &path, bool missing, const char *kind = "index") {
 	CheckRelative(path, false, kind);
 	auto parts = StringUtil::Split(path, '/');
 	auto fd = dup(root);
@@ -95,9 +95,9 @@ inline Parent OpenParent(int32_t root, const string &path, bool missing, const c
 	return {std::move(directory), parts.back(), nullptr};
 }
 
-inline void SyncDirectory(int32_t fd) {
+inline void SyncDirectory(int32_t fd, const char *kind = "Vortex generation collection") {
 	if (fsync(fd)) {
-		throw IOException("Cannot sync Vortex collection directory");
+		throw IOException("Cannot sync %s", kind);
 	}
 }
 } // namespace vortex_detail
