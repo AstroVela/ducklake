@@ -96,6 +96,12 @@ snapshot conflict. That error propagates, and the caller explicitly resubmits
 the same request. A lost response or cancellation near commit is resolved
 the same way. The implementation adds no automatic retry or fallback.
 
+Before committing a new batch, native write admission checks the current
+embedding field and dimension while holding the publication guard. A
+concurrent publication with the same vector specification can proceed.
+A change to that specification rolls back the staged rows and receipt.
+The caller can interrupt both the queue and the commit admission wait.
+
 ## Verification
 
 ```sh
@@ -109,8 +115,9 @@ The installed-provider probe checks exact receipts, concurrent duplicate and
 conflicting payloads, case-sensitive identity under `nocase`, receipt replay
 after full index replacement, table scope, NULL and Unicode values, literal
 text after flush, canonical zero, input and write budgets, and T/F/B searches.
-A native fixture covers attachment replacement, cancellation while queued,
-initialization cancellation, snapshot conflict and pre/post-commit errors.
+A native fixture covers attachment replacement, cancellation while queued
+and during commit admission, initialization cancellation, snapshot conflict,
+index replacement with and without a dimension change, and pre/post-commit errors.
 The crash probe kills the writer at both commit boundaries for both inline
 rows and directly written Vortex files. It verifies the committed WAL,
 recovered typed rows, their physical storage path and the durable receipt.

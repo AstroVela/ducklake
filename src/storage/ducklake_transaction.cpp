@@ -34,6 +34,7 @@
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
+#include "storage/ducklake_vortex_write.hpp"
 #endif
 
 namespace duckdb {
@@ -1489,6 +1490,10 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		auto rewrite = DuckLakeVortexRewriteState::Get(*this->context.lock());
 		if (rewrite) {
 			rewrite->check("rewrite_before_native_commit");
+		}
+		auto write_batch = DuckLakeVortexWriteBatchState::Get(*this->context.lock());
+		if (write_batch && write_batch->caller.IsInterrupted()) {
+			throw InterruptException();
 		}
 #endif
 	};

@@ -403,6 +403,9 @@ def crash_cases(driver, root, report):
         "queued-cancel",
         "cancel-init",
         "rebind",
+        "replace-dimension",
+        "replace-same-dimension",
+        "cancel-commit-wait",
     ]:
         case = root / mode
         case.mkdir(mode=0o700)

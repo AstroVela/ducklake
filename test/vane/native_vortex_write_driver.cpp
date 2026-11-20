@@ -62,6 +62,36 @@ static void CheckQueuedCancellation(DuckDB &database, Connection &setup, const V
 	        "Canceled writer added a receipt");
 }
 
+static void CheckCommitWaitCancellation(DuckDB &database, Connection &setup, const Value &rows) {
+	Connection owner(database), caller(database);
+	auto &publication = DuckLakeVortexIndex::PublicationLock();
+	auto lock = publication.GetExclusiveLock([] {});
+	const auto initial_waits = publication.SharedWaitCount();
+	auto writer = std::async(std::launch::async, [&] {
+		try {
+			DuckLakeVortexWriteBatch::Append(owner, *caller.context, "lake", "main", "items", "knn", "waiting", rows);
+		} catch (const std::exception &error) {
+			Require(StringUtil::Contains(StringUtil::Lower(error.what()), "interrupt"), error.what());
+			return true;
+		}
+		return false;
+	});
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (publication.SharedWaitCount() == initial_waits && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	auto waited = publication.SharedWaitCount() > initial_waits;
+	caller.Interrupt();
+	auto finished_before_release = writer.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+	lock.reset();
+	Require(waited && finished_before_release && writer.get(), "Caller could not cancel the commit publication wait");
+	Require(SQL(setup, "SELECT (SELECT count(*) FROM lake.items) + "
+	                   "(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1)")
+	                ->GetValue(0, 0)
+	                .GetValue<idx_t>() == 0,
+	        "Canceled commit left data or a receipt");
+}
+
 int main(int argc, char **argv) {
 	try {
 		Require(argc == 3, "Usage: ducklake_vortex_write_driver ROOT MODE");
@@ -114,8 +144,31 @@ int main(int argc, char **argv) {
 			CheckQueuedCancellation(database, setup, rows);
 			return 0;
 		}
+		if (mode == "cancel-commit-wait") {
+			CheckCommitWaitCancellation(database, setup, rows);
+			return 0;
+		}
+		const bool replacement = mode == "replace-dimension" || mode == "replace-same-dimension";
+		const bool dimension_changed = mode == "replace-dimension";
+		if (replacement) {
+			auto embedding = dimension_changed ? "[i::FLOAT,0,0]" : "[i::FLOAT,0]";
+			SQL(setup, "CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items');"
+			           "INSERT INTO lake.items SELECT 100+i," +
+			               string(embedding) + ",'A','replacement' FROM range(128)t(i)");
+		}
 		bool observed = false, conflict = false;
 		auto observer = [&](const string &stage) {
+			if (replacement && stage == "after_lookup") {
+				auto snapshot = SQL(setup, "SELECT max(snapshot_id) FROM lake.snapshots()")->GetValue(0, 0);
+				auto revision = SQL(setup, "SELECT revision FROM ducklake_build_vortex_index('lake','main','items',"
+				                           "'knn'," +
+				                               Value(root + "/indexes/replacement.json").ToSQLString() + "," +
+				                               (dimension_changed ? "3,1)" : "2,1)"));
+				Require(revision->GetValue(0, 0).GetValue<idx_t>() == 2, "Replacement did not advance index revision");
+				Require(snapshot == SQL(setup, "SELECT max(snapshot_id) FROM lake.snapshots()")->GetValue(0, 0),
+				        "Replacement unexpectedly advanced the DuckLake snapshot");
+				observed = true;
+			}
 			if (mode == "rebind" && stage == "waiting") {
 				SQL(setup, "DETACH lake; ATTACH " + Value("ducklake:" + root + "/replacement.ducklake").ToSQLString() +
 				               " AS lake(DATA_PATH " + Value(root + "/replacement-data").ToSQLString() + ")");
@@ -146,6 +199,12 @@ int main(int argc, char **argv) {
 		try {
 			auto result = DuckLakeVortexWriteBatch::Append(owner, *setup.context, "lake", "main", "items", "knn",
 			                                               "request", rows, observer);
+			if (mode == "replace-same-dimension") {
+				Require(observed && result.row_count == 2, "Same-dimension publication interrupted a valid write");
+				Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 130,
+				        "Same-dimension publication changed the appended rows");
+				return 0;
+			}
 			Require(mode == "ok" || mode == "retry" || StringUtil::StartsWith(mode, "pause-"),
 			        "WriteBatch fault did not fire");
 			std::cout << result.request_id << " " << result.row_count << " " << result.snapshot_id << std::endl;
@@ -153,6 +212,21 @@ int main(int argc, char **argv) {
 			Require(observed, error.what());
 			if (mode == "rebind") {
 				Require(StringUtil::Contains(error.what(), "attachment changed"), error.what());
+				return 0;
+			}
+			if (mode == "replace-dimension") {
+				Require(StringUtil::Contains(error.what(), "index specification changed before commit"), error.what());
+				Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 128,
+				        "A stale-dimensional append changed committed rows");
+				Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1")
+				                ->GetValue(0, 0)
+				                .GetValue<idx_t>() == 0,
+				        "A stale-dimensional append left a receipt");
+				Require(SQL(setup, "SELECT count(*) FROM ducklake_vortex_search('lake','main','items','knn',"
+				                   "[0,0,0]::FLOAT[],5)")
+				                ->GetValue(0, 0)
+				                .GetValue<idx_t>() == 5,
+				        "The changed-dimensional index could not be queried");
 				return 0;
 			}
 			conflict = mode == "conflict";

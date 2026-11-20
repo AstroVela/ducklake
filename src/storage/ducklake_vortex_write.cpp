@@ -11,7 +11,6 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_vortex.hpp"
-#include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
 
 #include <cmath>
@@ -23,6 +22,7 @@ constexpr const char *REQUESTS = "ducklake_vortex_write_requests_v1";
 constexpr idx_t MAX_ROWS = 1000;
 constexpr idx_t MAX_BYTES = 4 * 1024 * 1024;
 constexpr idx_t MAX_REQUESTS = 100000;
+constexpr const char *WRITE_STATE = "ducklake_vortex_write_batch";
 
 DuckLakeVortexCollectionLock &WriteLock() {
 	static DuckLakeVortexCollectionLock lock;
@@ -121,6 +121,29 @@ void Initialized(DuckLakeTransaction &transaction) {
 	}
 }
 } // namespace
+
+DuckLakeVortexWriteBatchState::DuckLakeVortexWriteBatchState(ClientContext &caller,
+                                                             DuckLakeVortexCatalogIdentity identity, idx_t table_id,
+                                                             const string &table_uuid, const DuckLakeVortexIndex &index)
+    : caller(caller), identity(identity), table_id(table_id), field_id(index.field_id), table_uuid(table_uuid),
+      index_name(index.name), dimension(index.dimension) {
+}
+
+shared_ptr<DuckLakeVortexWriteBatchState> DuckLakeVortexWriteBatchState::Get(ClientContext &context) {
+	return context.registered_state->Get<DuckLakeVortexWriteBatchState>(WRITE_STATE);
+}
+
+void DuckLakeVortexWriteBatchState::CheckCurrentIndex(DuckLakeTransaction &transaction) const {
+	auto entry = transaction.GetCatalog().GetEntryById(transaction, transaction.GetSnapshot(), TableIndex(table_id));
+	if (!entry || entry->type != CatalogType::TABLE_ENTRY ||
+	    entry->Cast<DuckLakeTableEntry>().GetTableUUID() != table_uuid) {
+		throw TransactionException("Vortex WriteBatch table identity changed before commit");
+	}
+	auto current = DuckLakeVortexIndex::Lookup(transaction, entry->Cast<DuckLakeTableEntry>(), index_name);
+	if (current.dimension != dimension || current.field_id != field_id) {
+		throw TransactionException("Vortex WriteBatch index specification changed before commit");
+	}
+}
 
 LogicalType DuckLakeVortexWriteBatch::RowsType() {
 	return LogicalType::LIST(LogicalType::STRUCT({{"id", LogicalType::BIGINT},
@@ -222,6 +245,8 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Append(Connection &owner, Cl
 		if (dimension != index.dimension) {
 			throw InvalidInputException("Vortex WriteBatch vector dimension mismatch");
 		}
+		auto commit_state = make_shared_ptr<DuckLakeVortexWriteBatchState>(caller, identity, table.GetTableId().index,
+		                                                                   result.table_uuid, index);
 		auto count =
 		    DuckLakeVortexIndex::Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(REQUESTS));
 		if (count->Fetch()->GetValue(0, 0).GetValue<idx_t>() >= MAX_REQUESTS) {
@@ -250,10 +275,13 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Append(Connection &owner, Cl
 		                               "," + Value(result.payload_hash).ToSQLString() + "," +
 		                               to_string(result.row_count) + "," + to_string(result.snapshot_id) + ")");
 		check("before_commit");
+		owner.context->registered_state->Insert(WRITE_STATE, std::move(commit_state));
 		owner.Commit();
+		owner.context->registered_state->Remove(WRITE_STATE);
 		check("after_commit");
 		return result;
 	} catch (...) {
+		owner.context->registered_state->Remove(WRITE_STATE);
 		DuckLakeVortexIndex::Rollback(owner);
 		throw;
 	}
