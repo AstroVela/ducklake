@@ -17,9 +17,11 @@ SELECT * FROM ducklake_rewrite_vortex_index_segment_to_f(
     'lake','main','items','knn','generation-<uuid>',<expected_revision>);
 ```
 
-The operation requires an installed optimizer/write-budget policy for the same
-named index and exactly one named index for the table. Native visibility must
-confirm 1–64 selected rows. Empty B uses the existing retirement operation;
+The operation requires a writable autocommit caller. It binds both the
+DuckLake catalog and its metadata attachment to the writer and requires an
+installed optimizer/write-budget policy and one named index for the table.
+Visibility comes from the union of file and inline delete positions for each
+selected file ID. The complete B must have 1–64 visible rows. Empty B uses the existing retirement operation;
 larger B uses the indexed rewrite operation. The mode is selected explicitly
 before copying, and an ANN failure never selects the F path.
 
@@ -34,10 +36,8 @@ condition allows an enabled policy to plan fresh work.
 
 Preflight checks current F rows plus selected visible rows and uses selected
 input source sizes as a conservative byte estimate. A tight byte budget can
-therefore defer an output that might compress smaller. After encoding, write
-admission checks actual prospective file sizes, physical/vector limits, F/T
-quotas and retained inline versions. Final commit repeats admission against
-fresh committed state under the existing reservation. Concurrent growth or
+therefore defer an output that might compress smaller. Final write admission uses the encoded file size and fresh committed
+state to check physical/vector limits, F/T quotas and retained inline versions. Concurrent growth or
 input changes that invalidate prepared work stop the task; there is no
 unbudgeted publication or automatic failed-task replay.
 
@@ -67,10 +67,19 @@ the output ID, path, row count, size and SHA-256, retires all selected old files
 and removes that B from the typed catalog plan in one metadata transaction.
 Unselected B descriptors and artifact bytes remain unchanged.
 
+The commit marks the old source endings and the replacement file as physical.
+The change feeds report zero rows at the rewrite snapshot and retain the
+original insert and delete history. Adjacent-file merge carries those physical
+snapshot IDs with the replacement file. The insertion scan filters those row
+snapshots and retains real inserts in the same merged file. Time travel uses
+the original row snapshots. Later UPDATE and DELETE on F still emit logical
+changes. Snapshot expiry removes the markers with their file metadata.
+
 `rewrite_f` has no candidate ANN generation or reference JSON. Its durable run
-UUID is the plan publication identity, so restart/lost-ack reconciliation checks
-exact revision and UUID rather than attributing another publisher's work to the
-task. Cancellation, conflicts and errors stop scheduling. Restart starts no
+UUID is the plan publication identity. The same metadata commit records the
+optimizer run and its published revision. Recovery can reconcile that receipt
+after another publication advances the index. Cancellation, conflicts and
+errors stop scheduling. Restart starts no
 optimizer/maintenance work; explicit resume inspects committed work and plans
 fresh tasks only when necessary.
 
@@ -108,34 +117,36 @@ current/held query and typed-fetch parity, 0/1/64-row boundaries, undeleted sour
 members, admission deferral and a final admission race, later automatic first-B
 building, corrupt/foreign output protection, failure/cancel/input/publication
 races, committed acknowledgement loss and seven SIGKILL checkpoints. A public
-SQL case covers explicit admission, source/index publication, native snapshot
-parity, nullable/Unicode business rows and the final zero-B query plan.
+SQL case also checks caller rollback and read-only attachment guards, historical
+changes across mixed delete masks, two successive mixed-file merges, and UPDATE
+and DELETE after publication.
+After a commit-time crash, a separate append advances the index before resume.
 
-## Local result (2026-10-29)
+## Local verification against #49
 
-The process proof passed 29 checks and 104 gated query comparisons with minimum
-fixture recall 1.0. At the unchanged 100,000-row/vector ceiling, a 4,096-row B
-became a 32-row F, released 4,064 slots, retained 95,904 pre-existing F rows and
-admitted a new T. Independent T/flush/T commits consumed provisional file IDs;
-publication used the actual final ID and preserved both unselected generations.
-Old/new retained search and delayed typed fetch survived canonical index,
-workspace and explicit source GC.
+DuckLake `c6a47722` incorporates #49 at `d87d5481`. The native builds
+use DuckDB `d8cdaa33`, Vortex `b20e34c2`, and the
+DuckDB Vortex wrapper `84cef204`.
 
-All seven SIGKILL checkpoints, failure/cancel/input/budget/publication races,
-committed acknowledgement loss, corrupt-output verification and foreign-output
-preservation passed. Known F row/byte exhaustion deferred without allocation or
-repeated tasks. The native fixed-schema/partition DDL guards were reused and
-verified. Tiny F remained queryable at 32 and 64 physical rows with configured
-index threshold 1; a later batch automatically built the new first B.
+The sparse proof passed 31 checks and 108 gated
+query comparisons with minimum recall 0.9 in 60.12
+seconds within the 180-second budget. The recovery case with a later append
+reached the lowest recall and passed the existing 0.8 gate.
+A 4,096-row B became a 32-row F and released
+4,064 physical row slots. The public SQL case passed 123
+assertions. It verified rollback, read-only attachment rejection, zero changes
+at both rewrite snapshots, stable time travel after two adjacent-file merges,
+and exact logical inserts from the two appends.
 
-All 19 prior native process proofs passed. ON passed 20 Vortex SQL cases / 762
-assertions, including the new 56-assertion public-API case, plus Vortex recovery.
-ON/OFF each passed 86 base cases / 3,582 assertions with 13 optional-extension
-skips and Parquet recovery. OFF exposes no F rewrite API. Additional indexed
-rewrite/orphan/audit groups passed 17 cases / 976 assertions with two ICU skips.
-Four isolated cost cases passed nine queries each with minimum recall 1.0;
-timings remain informational. Formatting and diff checks passed. The global
-budgets, native dependencies and Rust query sources are unchanged.
+All 20 native process proofs passed. ON passed 29
+Vortex SQL cases and 1294 assertions. ON and OFF passed
+86 base cases and 3582 assertions each with
+13 optional-extension skips per configuration. The complete
+DELETE and table-change suites, Vortex and Parquet recovery and cleanup,
+32 ABI cases, isolated cost checks, formatting, Clippy and Rust workspace
+tests passed. The OFF metadata-only build removed the sparse file markers and
+retired mask history after expiry.
+Fixture retries passed within their original budgets for rewrite_append.
 
 The qualified catalog driver SHA-256 is
-`0fc56b71292a459be5bba2cc8fda0f3b59764155d1716c0933e65c1c660683b7`.
+`ca9d6481903ed99b9460130822cffbc0a97151d0ba802c32a27e1ef674d0f82b`.

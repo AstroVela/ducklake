@@ -83,7 +83,7 @@ def counters():
 
 
 def bootstrap(root, count, dimension, fixture):
-    connection = BASE.connect(root)
+    connection = BASE.connect(root, root / "extensions")
     (root / "indexes").mkdir()
     for sql in [
         "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)",

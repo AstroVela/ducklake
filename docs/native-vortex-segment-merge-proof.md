@@ -1,6 +1,6 @@
 # Selective native Vortex segment compaction
 
-This validation draft follows [DuckLake #41](https://github.com/AstroVela/ducklake/pull/41).
+This proof follows [DuckLake #41](https://github.com/AstroVela/ducklake/pull/41).
 It permits three B segments under the existing aggregate budgets and merges
 only a selected pair. For B1 + B2 + B3, merging B2/B3 publishes B1 + B23. B1's
 generation, descriptor, artifact bytes and modification times remain unchanged.
@@ -57,8 +57,13 @@ revision. A lost ACK or explicit resume after restart reconciles the exact
 successor generation. A committed merge is not rebuilt. An uncommitted merge
 is not replayed; a new task captures a fresh selection. Restart does not start
 workers implicitly. Cancellation remains cooperative at native checkpoints.
-Task claim reads the current policy registration under the scheduling lock, so
-an explicit resume cannot inherit callbacks copied by an earlier scheduling pass.
+The completed-merge notification runs after terminal state persistence and
+does not recheck cancellation. Cancellation at this boundary preserves the
+committed head and its disabled, error-free `cancelled` policy state through
+worker release and reopen. Task claim checks the current shared registration
+while holding the registration I/O lock, which resume also acquires. Completion and error paths ignore a
+superseded registration, so a resumed task cannot inherit an older scheduling
+pass's callbacks or terminal error.
 
 Index compaction keeps the source file layout and row addresses. It releases
 an active segment slot, not physical table capacity. Explicit full build remains
@@ -88,21 +93,48 @@ write quotas, terminal failure, lost ACK, same-process reopen and SIGKILL before
 and after commit. Old native and independent three-B views query after selective
 replacement and actual retirement of both canonical generations; delayed typed
 fetch checks old row versions, nulls, Unicode and duplicates. Strict database
-shutdown and empty private lease directories are required. SQL tests and the
+shutdown and empty private lease directories are required. Two- and three-segment
+phase checks accumulate ANN/rerank work across every segment. Their measured
+observer-delay lower bounds validate attribution without a stable-load speed
+comparison. SQL tests and the
 existing ON/OFF regression/recovery and process proofs remain in CI.
 
-Local qualification kept DuckDB v1.5.5 (`d8cdaa33`), Vortex `65dab44f`, the
-native wrapper `b819cc03` and the qualified static SPFresh SDK unchanged from
-#41. The final catalog driver SHA-256 was
-`a28b341ac3d86d8ec04b8796102a41564f91751c5a9da1966fc761fddcaf4458`.
-The merge proof passed 11 checks and 57 fixture queries with recall 1.0. Its
-background case completed four merge/append cycles at revision 11, with nine
-runs including the cancelled task, while preserving the unselected B1.
-ON passed 13 Vortex SQL cases (491 assertions) and Vortex crash recovery.
-ON/OFF each passed 86 base cases (3,582 assertions; 13 optional-dependency
-skips) and Parquet crash recovery. Audit passed 122 assertions. Existing index,
-read-view, mixed, admission, catalog, SQL search, build, optimizer, lifecycle,
-write-budget and independent-segment process proofs passed. The isolated cost
-proof passed four cases with nine queries each and recall 1.0; timings are
-informational. `make format-fix`, Rust formatting and workspace Clippy with
-all targets/features and warnings denied completed successfully.
+Local Linux qualification on 2026-11-17 used functional source `8e458899`,
+with reviewed #41 `32efc38c` merged in. DuckDB v1.5.5 (`d8cdaa33`), Vortex
+`b20e34c2`, codec `84cef204`, and SPFresh `5893eb61` with Vortex's pinned
+static-only patch were preserved. The final catalog driver SHA-256 was
+`058849f939e48525f213d91b700120f7f36eb2839053ab5f6bc90a402d060258`.
+
+The final merge proof passed 13 checks and 63 fixture queries at recall 1.0
+in 28.9 seconds under the existing 180-second outer budget. The two-segment
+proof passed 11 checks and 24 queries at recall 1.0. Both two- and three-segment
+ANN/rerank measurements covered their accumulated observer delays. The completed
+merge cancellation regression failed against the pre-fix driver and passed
+after the fix; it waits for the worker's database pin to be released before
+checking the durable terminal state, then checks that state again after reopen.
+
+ON passed 22 Vortex SQL cases / 864 assertions. ON and OFF each passed 86 base
+cases / 3,582 assertions with 13 optional-dependency skips. ON deletion inlining
+passed 18 cases / 1,099 assertions with two optional-dependency skips; audit
+passed 122 assertions. Native search/catalog/admission, retained and mixed views,
+Vortex/Parquet recovery, cleanup, build, optimizer, lifecycle and all 13
+write-budget cases passed. The 32-case ABI matrix passed. Query/probe Rust
+formatting, workspace Clippy with all targets/features and warnings denied,
+workspace tests and scoped pinned C++/Python formatting passed. Existing
+Float32 tolerances (`rel=1e-5`, `abs=1e-4`) and recall threshold 0.8 were retained.
+
+Seventeen ordinary functional gates kept 180-second budgets. The separate
+counter/recall gate retained its existing 600-second outer limit and completed
+in 14.9 seconds with four cases / 36 queries at recall 1.0. Native RPC and
+cleanup limits remain 60 and 30 seconds. Source, header, object, link and SDK
+identities qualify reused build inputs; the optimizer change was compiled and
+the native products relinked normally. These checks make no stable-load
+throughput or latency claim. CI was deferred.
+
+A supplementary pre-fix experiment merging nonadjacent B3+B1 (4,224 physical
+rows) exceeded the existing 60-second RPC deadline once. Its unfinished native
+artifacts and logs were retained. Four subsequent pre-fix runs and three fixed
+runs with the same SQL data passed, including reverse selection, two-to-one
+merge and fresh append. Fixture UUIDs/generations differ across runs. The
+initial timeout's root cause remains unconfirmed; passing reruns do not
+establish a fix for that anomaly.
