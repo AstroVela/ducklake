@@ -197,6 +197,10 @@ public:
 	set<TableIndex> dropped_views;
 	unordered_map<string, DataFileIndex> dropped_files;
 	set<TableIndex> tables_deleted_from;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	//! Logical deletes of local output must survive erasure of the staging file.
+	set<TableIndex> local_file_deletes;
+#endif
 	unique_ptr<DuckLakeCatalogSet> new_schemas;
 	map<SchemaIndex, reference<DuckLakeSchemaEntry>> dropped_schemas;
 	LocalTableChanges local_changes;

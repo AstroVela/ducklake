@@ -81,7 +81,15 @@ def raw(connection):
 
 
 def head(connection):
-    row = query(connection, "SELECT revision,reference FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1")[0]
+    [row] = query(
+        connection,
+        """SELECT v.revision,v.reference
+           FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1 AS v
+           JOIN __ducklake_metadata_lake.ducklake_table AS t ON t.table_uuid::VARCHAR=v.table_uuid
+           JOIN __ducklake_metadata_lake.ducklake_schema AS s USING (schema_id)
+           WHERE s.schema_name='main' AND t.table_name='items' AND v.index_name='knn'
+             AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL""",
+    )
     return {"revision": row["revision"], "reference": json.loads(row["reference"])}
 
 

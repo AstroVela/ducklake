@@ -3,7 +3,9 @@
 #include "common/ducklake_vortex_json.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 #include "mbedtls_wrapper.hpp"
@@ -11,6 +13,8 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_vortex.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
+#include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
 
 #include <cmath>
@@ -19,10 +23,16 @@
 namespace duckdb {
 namespace {
 constexpr const char *REQUESTS = "ducklake_vortex_write_requests_v1";
+constexpr const char *MANAGED = "ducklake_vortex_keyed_tables_v1";
 constexpr idx_t MAX_ROWS = 1000;
 constexpr idx_t MAX_BYTES = 4 * 1024 * 1024;
 constexpr idx_t MAX_REQUESTS = 100000;
 constexpr const char *WRITE_STATE = "ducklake_vortex_write_batch";
+
+string Qualified(const string &catalog, const string &schema, const string &table) {
+	return KeywordHelper::WriteOptionallyQuoted(catalog) + "." + KeywordHelper::WriteOptionallyQuoted(schema) + "." +
+	       KeywordHelper::WriteOptionallyQuoted(table);
+}
 
 DuckLakeVortexCollectionLock &WriteLock() {
 	static DuckLakeVortexCollectionLock lock;
@@ -53,24 +63,26 @@ void Nullable(string &bytes, const Value &value) {
 	Number(bytes, value.IsNull() ? 0 : 1, 1);
 }
 
-Value CanonicalRows(const Value &input, uint32_t &dimension, string &hash) {
+Value CanonicalRows(const Value &input, uint32_t &dimension, string &bytes, bool mutate) {
 	const auto &rows = ListValue::GetChildren(input);
-	if (rows.empty() || rows.size() > MAX_ROWS) {
+	if ((!mutate && rows.empty()) || rows.size() > MAX_ROWS) {
 		throw InvalidInputException("Vortex WriteBatch requires 1 to 1000 rows");
 	}
-	if (rows.front().IsNull()) {
-		throw InvalidInputException("Vortex WriteBatch row cannot be NULL");
+	if (!rows.empty()) {
+		if (rows.front().IsNull()) {
+			throw InvalidInputException("Vortex WriteBatch row cannot be NULL");
+		}
+		const auto &first_vector = StructValue::GetChildren(rows.front())[1];
+		if (first_vector.IsNull()) {
+			throw InvalidInputException("Vortex WriteBatch vector dimension or NULL list mismatch");
+		}
+		auto components = ListValue::GetChildren(first_vector).size();
+		if (!components || components > 4096) {
+			throw InvalidInputException("Vortex WriteBatch vector dimension must be 1 to 4096");
+		}
+		dimension = static_cast<uint32_t>(components);
 	}
-	const auto &first_vector = StructValue::GetChildren(rows.front())[1];
-	if (first_vector.IsNull()) {
-		throw InvalidInputException("Vortex WriteBatch vector dimension or NULL list mismatch");
-	}
-	auto components = ListValue::GetChildren(first_vector).size();
-	if (!components || components > 4096) {
-		throw InvalidInputException("Vortex WriteBatch vector dimension must be 1 to 4096");
-	}
-	dimension = static_cast<uint32_t>(components);
-	string bytes = "ducklake-vortex-write-v1";
+	bytes = mutate ? "ducklake-vortex-mutate-v1" : "ducklake-vortex-write-v1";
 	Number(bytes, dimension, 4);
 	Number(bytes, rows.size(), 8);
 	vector<Value> canonical;
@@ -109,28 +121,68 @@ Value CanonicalRows(const Value &input, uint32_t &dimension, string &hash) {
 		}
 		canonical.push_back(Value::STRUCT(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), fields));
 	}
-	hash = "sha256:" + vortex_detail::Hex(duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes));
 	return Value::LIST(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), std::move(canonical));
+}
+
+Value MutationKeys(const Value &rows, const Value &deletes, string &bytes) {
+	auto &upserts = ListValue::GetChildren(rows);
+	auto &removed = ListValue::GetChildren(deletes);
+	if (upserts.size() + removed.size() == 0 || upserts.size() + removed.size() > MAX_ROWS) {
+		throw InvalidInputException("Vortex mutation requires 1 to 1000 operations");
+	}
+	set<int64_t> seen;
+	vector<Value> keys;
+	auto key = [&](const Value &value) {
+		if (value.IsNull() || !seen.insert(value.GetValue<int64_t>()).second) {
+			throw InvalidInputException("Vortex mutation requires non-NULL unique ids across upserts and deletes");
+		}
+		keys.push_back(value);
+	};
+	for (auto &row : upserts) {
+		key(StructValue::GetChildren(row)[0]);
+	}
+	Number(bytes, removed.size(), 8);
+	for (auto &value : removed) {
+		key(value);
+		Number(bytes, uint64_t(value.GetValue<int64_t>()), 8);
+	}
+	return Value::LIST(LogicalType::BIGINT, std::move(keys));
+}
+
+void ValidateWriteTable(ClientContext &context, DuckLakeTableEntry &table) {
+	DuckLakeVortex::ValidateTable(table);
+	if (DuckLakeVortex::GetFormat(context, table) != DataFileFormat::VORTEX ||
+	    table.GetColumns().PhysicalColumnCount() != 4 || table.GetColumns().LogicalColumnCount() != 4) {
+		throw InvalidInputException("Vortex WriteBatch requires a four-column Vortex table");
+	}
+	for (auto name : {"id", "embedding", "category", "payload"}) {
+		DuckLakeVortexReadView::ResolveField(table, name);
+	}
 }
 
 void Initialized(DuckLakeTransaction &transaction) {
 	auto &catalog = transaction.GetCatalog();
-	if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
-	                                           REQUESTS)) {
-		throw InvalidInputException("Vortex WriteBatch catalog is not initialized");
+	for (auto name : {REQUESTS, MANAGED}) {
+		if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+		                                           name)) {
+			throw InvalidInputException("Vortex WriteBatch catalog is not initialized");
+		}
 	}
 }
 } // namespace
 
 DuckLakeVortexWriteBatchState::DuckLakeVortexWriteBatchState(ClientContext &caller,
                                                              DuckLakeVortexCatalogIdentity identity, idx_t table_id,
-                                                             const string &table_uuid, const DuckLakeVortexIndex &index)
+                                                             const string &table_uuid, const DuckLakeVortexIndex &index,
+                                                             bool keyed)
     : caller(caller), identity(identity), table_id(table_id), field_id(index.field_id), table_uuid(table_uuid),
-      index_name(index.name), dimension(index.dimension) {
+      index_name(index.name), dimension(index.dimension), keyed(keyed) {
 }
 
-shared_ptr<DuckLakeVortexWriteBatchState> DuckLakeVortexWriteBatchState::Get(ClientContext &context) {
-	return context.registered_state->Get<DuckLakeVortexWriteBatchState>(WRITE_STATE);
+shared_ptr<DuckLakeVortexWriteBatchState> DuckLakeVortexWriteBatchState::Get(ClientContext &context,
+                                                                             const DuckLakeCatalog &catalog) {
+	auto state = context.registered_state->Get<DuckLakeVortexWriteBatchState>(WRITE_STATE);
+	return state && state->identity.lake_oid == catalog.GetAttached().oid ? state : nullptr;
 }
 
 void DuckLakeVortexWriteBatchState::CheckCurrentIndex(DuckLakeTransaction &transaction) const {
@@ -167,6 +219,9 @@ void DuckLakeVortexWriteBatch::Initialize(Connection &owner, ClientContext &call
 		                                            "(table_uuid VARCHAR NOT NULL,request_id VARCHAR NOT NULL,"
 		                                            "payload_hash VARCHAR NOT NULL,row_count UBIGINT NOT NULL,"
 		                                            "snapshot_id UBIGINT NOT NULL,PRIMARY KEY(table_uuid,request_id))");
+		DuckLakeVortexIndex::Query(transaction, "CREATE TABLE {METADATA_CATALOG}." + string(MANAGED) +
+		                                            "(table_uuid VARCHAR PRIMARY KEY,table_id BIGINT UNIQUE NOT NULL,"
+		                                            "index_name VARCHAR NOT NULL,dimension UINTEGER NOT NULL)");
 		interrupt();
 		owner.Commit();
 	} catch (...) {
@@ -175,16 +230,103 @@ void DuckLakeVortexWriteBatch::Initialize(Connection &owner, ClientContext &call
 	}
 }
 
+void DuckLakeVortexWriteBatch::Manage(Connection &owner, ClientContext &caller, const string &catalog_name,
+                                      const string &schema, const string &table_name, const string &index_name) {
+	if (owner.context->transaction.HasActiveTransaction()) {
+		throw InvalidInputException("Vortex managed writes require an idle dedicated connection");
+	}
+	auto identity = DuckLakeVortexIndex::ResolveCatalog(caller, catalog_name, true, "Vortex managed writes");
+	auto interrupt = [&] {
+		CheckWriteInterrupted(owner, caller);
+	};
+	auto guard = WriteLock().GetExclusiveLock(interrupt);
+	auto admission = DuckLakeVortexOptimizer::WriteAdmissionLock(*owner.context->db).GetExclusiveLock(interrupt);
+	auto publication = DuckLakeVortexIndex::PublicationLock().GetSharedLock(interrupt);
+	try {
+		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog_name, &identity);
+		Initialized(transaction);
+		auto &table = transaction.GetCatalog()
+		                  .GetEntry<TableCatalogEntry>(*owner.context, schema, table_name)
+		                  .Cast<DuckLakeTableEntry>();
+		ValidateWriteTable(*owner.context, table);
+		auto uuid = table.GetTableUUID();
+		auto table_id = table.GetTableId();
+		auto index = DuckLakeVortexIndex::Lookup(transaction, table, index_name);
+		auto rows = owner.Query("SELECT 1 FROM " + Qualified(catalog_name, schema, table_name) + " LIMIT 1");
+		if (rows->HasError()) {
+			rows->ThrowError();
+		}
+		auto requests =
+		    DuckLakeVortexIndex::Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(REQUESTS) +
+		                                                " WHERE table_uuid COLLATE C=" + Value(uuid).ToSQLString());
+		if (rows->Fetch() || requests->Fetch()->GetValue(0, 0).GetValue<idx_t>() ||
+		    DuckLakeVortexIndex::HasSegments(transaction, uuid)) {
+			throw InvalidInputException(
+			    "Vortex managed writes require an empty table without prior batches or B segments");
+		}
+		DuckLakeVortexIndex::Query(transaction, "INSERT INTO {METADATA_CATALOG}." + string(MANAGED) + " VALUES(" +
+		                                            Value(uuid).ToSQLString() + "," + to_string(table_id.index) + "," +
+		                                            Value(index.name).ToSQLString() + "," + to_string(index.dimension) +
+		                                            ")");
+		interrupt();
+		owner.Commit();
+	} catch (...) {
+		DuckLakeVortexIndex::Rollback(owner);
+		throw;
+	}
+}
+
+void DuckLakeVortexWriteBatch::CheckManagedWrites(DuckLakeTransaction &fresh, const set<TableIndex> &tables,
+                                                  ClientContext &context) {
+	auto &catalog = fresh.GetCatalog();
+	if (tables.empty() ||
+	    !fresh.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(), MANAGED)) {
+		return;
+	}
+	auto owner = DuckLakeVortexWriteBatchState::Get(context, catalog);
+	auto rewrite = DuckLakeVortexRewriteState::Get(context);
+	for (auto &id : tables) {
+		auto result = DuckLakeVortexIndex::Query(fresh, "SELECT table_uuid FROM {METADATA_CATALOG}." + string(MANAGED) +
+		                                                    " WHERE table_id=" + to_string(id.index));
+		auto row = result->Fetch();
+		if (!row) {
+			continue;
+		}
+		auto uuid = StringValue::Get(row->GetValue(0, 0));
+		if ((!owner || !owner->keyed || owner->table_uuid != uuid) && (!rewrite || rewrite->table_uuid != uuid)) {
+			throw InvalidInputException(
+			    "Managed Vortex tables require ducklake_mutate_vortex_batch for logical writes and fixed schema");
+		}
+	}
+}
+
 DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Append(Connection &owner, ClientContext &caller,
                                                            const string &catalog_name, const string &schema,
                                                            const string &table_name, const string &index_name,
                                                            const string &request_id, const Value &rows,
                                                            const std::function<void(const string &)> &observe) {
+	return Write(owner, caller, catalog_name, schema, table_name, index_name, request_id, rows,
+	             Value::LIST(LogicalType::BIGINT, {}), false, observe);
+}
+
+DuckLakeVortexWriteResult
+DuckLakeVortexWriteBatch::Mutate(Connection &owner, ClientContext &caller, const string &catalog, const string &schema,
+                                 const string &table, const string &index, const string &request_id, const Value &rows,
+                                 const Value &deletes, const std::function<void(const string &)> &observe) {
+	return Write(owner, caller, catalog, schema, table, index, request_id, rows, deletes, true, observe);
+}
+
+DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Write(Connection &owner, ClientContext &caller,
+                                                          const string &catalog_name, const string &schema,
+                                                          const string &table_name, const string &index_name,
+                                                          const string &request_id, const Value &rows,
+                                                          const Value &deletes, bool mutate,
+                                                          const std::function<void(const string &)> &observe) {
 	if (owner.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Vortex WriteBatch requires an idle dedicated connection");
 	}
 	if (request_id.empty() || request_id.size() > 128 || request_id.find('\0') != string::npos || rows.IsNull() ||
-	    rows.type() != RowsType()) {
+	    rows.type() != RowsType() || deletes.IsNull() || deletes.type() != LogicalType::LIST(LogicalType::BIGINT)) {
 		throw InvalidInputException("Invalid Vortex WriteBatch request ID or typed rows");
 	}
 	auto identity = DuckLakeVortexIndex::ResolveCatalog(caller, catalog_name, true, "Vortex WriteBatch");
@@ -214,9 +356,24 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Append(Connection &owner, Cl
 		DuckLakeVortexWriteResult result;
 		result.table_uuid = table.GetTableUUID();
 		result.request_id = request_id;
-		uint32_t dimension;
-		auto canonical = CanonicalRows(rows, dimension, result.payload_hash);
+		auto managed = DuckLakeVortexIndex::Query(
+		                   transaction, "SELECT index_name,dimension FROM {METADATA_CATALOG}." + string(MANAGED) +
+		                                    " WHERE table_uuid COLLATE C=" + Value(result.table_uuid).ToSQLString())
+		                   ->Fetch();
+		if ((mutate && (!managed || StringValue::Get(managed->GetValue(0, 0)) != index_name)) || (!mutate && managed)) {
+			throw InvalidInputException(
+			    "Vortex batch operation does not match the table's explicitly managed write mode");
+		}
+		auto managed_dimension = managed ? managed->GetValue(1, 0).GetValue<uint32_t>() : 0;
+		auto dimension = managed_dimension;
+		string bytes;
+		auto canonical = CanonicalRows(rows, dimension, bytes, mutate);
+		auto keys = mutate ? MutationKeys(canonical, deletes, bytes) : Value::LIST(LogicalType::BIGINT, {});
+		result.payload_hash = "sha256:" + vortex_detail::Hex(duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes));
 		result.row_count = ListValue::GetChildren(canonical).size();
+		if (mutate) {
+			result.row_count += ListValue::GetChildren(deletes).size();
+		}
 		auto where = " WHERE table_uuid COLLATE C=" + Value(result.table_uuid).ToSQLString() +
 		             " AND request_id COLLATE C=" + Value(request_id).ToSQLString();
 		auto prior = DuckLakeVortexIndex::Query(transaction, "SELECT payload_hash,row_count,snapshot_id FROM "
@@ -233,42 +390,48 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Append(Connection &owner, Cl
 			owner.Commit();
 			return result;
 		}
-		DuckLakeVortex::ValidateTable(table);
-		if (DuckLakeVortex::GetFormat(*owner.context, table) != DataFileFormat::VORTEX ||
-		    table.GetColumns().PhysicalColumnCount() != 4 || table.GetColumns().LogicalColumnCount() != 4) {
-			throw InvalidInputException("Vortex WriteBatch requires a four-column Vortex table");
-		}
-		for (auto name : {"id", "embedding", "category", "payload"}) {
-			DuckLakeVortexReadView::ResolveField(table, name);
-		}
+		ValidateWriteTable(*owner.context, table);
 		auto index = DuckLakeVortexIndex::Lookup(transaction, table, index_name);
-		if (dimension != index.dimension) {
+		if (dimension != index.dimension || (mutate && managed_dimension != index.dimension)) {
 			throw InvalidInputException("Vortex WriteBatch vector dimension mismatch");
 		}
 		auto commit_state = make_shared_ptr<DuckLakeVortexWriteBatchState>(caller, identity, table.GetTableId().index,
-		                                                                   result.table_uuid, index);
+		                                                                   result.table_uuid, index, mutate);
 		auto count =
 		    DuckLakeVortexIndex::Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(REQUESTS));
 		if (count->Fetch()->GetValue(0, 0).GetValue<idx_t>() >= MAX_REQUESTS) {
 			throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex WriteBatch request catalog budget exceeded");
 		}
-		result.snapshot_id = transaction.GetSnapshot().snapshot_id + 1;
 		check("after_lookup");
-		auto qualified = KeywordHelper::WriteOptionallyQuoted(catalog_name) + "." +
-		                 KeywordHelper::WriteOptionallyQuoted(schema) + "." +
-		                 KeywordHelper::WriteOptionallyQuoted(table_name);
-		auto insert =
-		    owner.Prepare("INSERT INTO " + qualified +
-		                  "(id,embedding,category,payload) SELECT row.id,row.embedding,row.category,row.payload "
-		                  "FROM unnest($1) AS batch(row)");
-		if (insert->HasError()) {
-			insert->GetErrorObject().Throw();
+		auto qualified = Qualified(catalog_name, schema, table_name);
+		if (mutate) {
+			auto remove = owner.Prepare("DELETE FROM " + qualified + " WHERE id IN (SELECT unnest($1))");
+			if (remove->HasError()) {
+				remove->GetErrorObject().Throw();
+			}
+			vector<Value> parameters {std::move(keys)};
+			auto removed = remove->Execute(parameters, false);
+			if (removed->HasError()) {
+				removed->ThrowError();
+			}
+			check("after_delete");
 		}
-		vector<Value> parameters {std::move(canonical)};
-		auto appended = insert->Execute(parameters, false);
-		if (appended->HasError()) {
-			appended->ThrowError();
+		if (!ListValue::GetChildren(canonical).empty()) {
+			auto insert =
+			    owner.Prepare("INSERT INTO " + qualified +
+			                  "(id,embedding,category,payload) SELECT row.id,row.embedding,row.category,row.payload "
+			                  "FROM unnest($1) AS batch(row)");
+			if (insert->HasError()) {
+				insert->GetErrorObject().Throw();
+			}
+			vector<Value> parameters {std::move(canonical)};
+			auto appended = insert->Execute(parameters, false);
+			if (appended->HasError()) {
+				appended->ThrowError();
+			}
 		}
+		check("after_write");
+		result.snapshot_id = transaction.GetSnapshot().snapshot_id + (transaction.ChangesMade() ? 1 : 0);
 		DuckLakeVortexIndex::Query(transaction,
 		                           "INSERT INTO {METADATA_CATALOG}." + string(REQUESTS) + " VALUES(" +
 		                               Value(result.table_uuid).ToSQLString() + "," + Value(request_id).ToSQLString() +

@@ -312,6 +312,7 @@ public:
 	static string GenerateUUIDv7();
 
 	const LocalTableChanges &GetLocalChanges() const;
+	set<TableIndex> GetLogicalWriteTables() const;
 	const set<TableIndex> &GetDroppedTables();
 	const set<TableIndex> &GetDroppedViews();
 	const set<MacroIndex> &GetDroppedScalarMacros();
