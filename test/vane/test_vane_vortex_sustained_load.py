@@ -57,6 +57,12 @@ def enable_stall_capture(launcher_pid):
     faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
 
 
+def start_worker(command, **options):
+    # An explicitly ignored SIGCHLD makes Linux reap the child automatically.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    return subprocess.Popen(command, **options)
+
+
 def worker_exited(child):
     # Leave the PID reserved while the debugger and watchdog can still use it.
     return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
@@ -826,7 +832,7 @@ def run_case(args, root, count, dimension, fixture):
         os.fdopen(write_fd, "wb") as event_writer,
         (case / "worker.log").open("w") as log,
     ):
-        child = subprocess.Popen(command, pass_fds=(event_writer.fileno(),), stdout=log, stderr=subprocess.STDOUT)
+        child = start_worker(command, pass_fds=(event_writer.fileno(),), stdout=log, stderr=subprocess.STDOUT)
         event_writer.close()
         events = collect_worker_events(child, case, pipe, 3 * args.seconds + 300, args.capture_stalls)
     result = dict(

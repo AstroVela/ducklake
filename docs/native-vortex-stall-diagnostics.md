@@ -16,8 +16,9 @@ launcher and its descendants. A worker whose parent changes stops setup.
 The worker registers a Python stack-dump signal and then emits
 `diagnostics_ready`. The parent waits for this event before tracing or
 sending the signal. During Python shutdown, removing the handler returns
-`SIGUSR2` to an ignored disposition. The parent leaves the worker PID reserved
-until the capture and watchdog threads have finished.
+`SIGUSR2` to an ignored disposition. The launcher sets the default
+`SIGCHLD` disposition before starting a worker so it can retain the worker
+PID until the capture and watchdog threads have finished.
 
 During the measured workload, thirty seconds without any events records a
 silent worker. Thirty seconds without a completed query while other events
@@ -43,9 +44,9 @@ event. The original bytes from a truncated record are available in
 The controlled proof verifies both kinds of stack, clean worker exit,
 launcher identity, the startup deadline, capture failure, late signal
 handling, worker exit during capture, a timeout after the event pipe closes,
-diagnostic thread startup failure, and disabled capture. The workflow runs
-that proof, enables capture in its four load cases, and retains the reports
-and capture files.
+diagnostic thread startup failure, and disabled capture with either initial
+`SIGCHLD` disposition. The workflow runs that proof, enables capture in its
+four load cases, and retains the reports and capture files.
 
 ```sh
 python -I test/vane/test_vane_vortex_stall_capture.py \

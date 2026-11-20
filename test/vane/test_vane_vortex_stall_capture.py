@@ -43,7 +43,7 @@ def owned_worker(case, script, *arguments):
     case.mkdir(mode=0o700)
     with (
         (case / "worker.log").open("wb") as log,
-        subprocess.Popen(
+        LOAD.start_worker(
             [sys.executable, "-I", "-c", script, *arguments],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -241,6 +241,14 @@ def check_disabled(case):
     require(events == [{"kind": "ready"}] and not (case / "stall.json").exists(), "Disabled mode attempted capture")
 
 
+def check_waitable_worker(case):
+    disposition = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    try:
+        check_disabled(case)
+    finally:
+        signal.signal(signal.SIGCHLD, disposition)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -256,6 +264,7 @@ def main():
     check_exit_during_capture(root / "exit_during_capture")
     check_thread_start_failure(root / "thread_start_failure")
     check_disabled(root / "disabled")
+    check_waitable_worker(root / "waitable_worker")
     require(
         LOAD.stall_reason({"ready": True, "time": 0, "query_time": 0}, 31, 100) == "no_events_30_seconds"
         and LOAD.stall_reason({"ready": True, "time": 30, "query_time": 0}, 31, 100) == "queries_stalled_30_seconds",
@@ -275,6 +284,7 @@ def main():
             "exit_during_capture",
             "thread_start_failure",
             "disabled",
+            "waitable_worker",
             "stall_reason",
         ],
     )
