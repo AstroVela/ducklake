@@ -322,6 +322,14 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		fs.Cast<OpenerFileSystem>().VerifyCanAccessFile(resolved);
 		return resolved;
 	};
+	auto lexically_managed = [&](const string &path) {
+		if (managed.empty()) {
+			return false;
+		}
+		auto local = AbsoluteLocalPath(fs, path);
+		return StringUtil::StartsWith(local, managed) ||
+		       StringUtil::StartsWith(fs.FileSystem::CanonicalizePath(local), managed);
+	};
 	unordered_set<string> pending_paths;
 	auto intents =
 	    VortexIndex::Query(transaction, "SELECT path,path_is_relative FROM {METADATA_CATALOG}." + string(DELETIONS));
@@ -346,9 +354,10 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 				selected.emplace(file.id.index, file.path);
 			}
 		}
-		// An age-filtered native cleanup must leave shared paths whose other keys are still pending.
+		// Keep every alias of a source-owned path and paths whose other queue keys are still pending.
 		for (auto &entry : scheduled) {
-			if (!selected.count({entry.id.index, entry.path}) && !fs.IsRemoteFile(entry.path)) {
+			if (!fs.IsRemoteFile(entry.path) &&
+			    (!selected.count({entry.id.index, entry.path}) || lexically_managed(entry.path))) {
 				pending_paths.insert(physical_path(entry.path));
 			}
 		}
@@ -361,12 +370,8 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		                           if (fs.IsRemoteFile(file.path)) {
 			                           return false;
 		                           }
-		                           if (!managed.empty()) {
-			                           auto local = AbsoluteLocalPath(fs, file.path);
-			                           if (StringUtil::StartsWith(local, managed) ||
-			                               StringUtil::StartsWith(fs.FileSystem::CanonicalizePath(local), managed)) {
-				                           return true;
-			                           }
+		                           if (lexically_managed(file.path)) {
+			                           return true;
 		                           }
 		                           auto path = physical_path(file.path);
 		                           return (!managed.empty() && StringUtil::StartsWith(path, managed)) ||

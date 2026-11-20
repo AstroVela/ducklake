@@ -230,18 +230,19 @@ void LinkedNativeCleanup(Fixture &f) {
 	FileSystem::GetFileSystem(*f.writer.context).CreateDirectory(outside);
 	Require(symlink(outside.c_str(), managed_alias.c_str()) == 0, "Could not create the managed namespace fixture");
 	auto outside_file = outside + "/ordinary.parquet";
-	SQL(f.writer, "CREATE TABLE lake.expired_alias(i BIGINT)");
+	SQL(f.writer, "CREATE TABLE lake.expired_alias(i BIGINT); CREATE TABLE lake.expired_direct(i BIGINT)");
 	SQL(f.writer, "COPY (SELECT 9::BIGINT AS i) TO " + Value(outside_file).ToSQLString() + " (FORMAT PARQUET)");
 	SQL(f.writer, "CALL ducklake_add_data_files('lake','expired_alias'," +
 	                  Value(managed_alias + "/ordinary.parquet").ToSQLString() + ")");
-	SQL(f.writer, "DROP TABLE lake.expired_alias");
+	SQL(f.writer, "CALL ducklake_add_data_files('lake','expired_direct'," + Value(outside_file).ToSQLString() + ")");
+	SQL(f.writer, "DROP TABLE lake.expired_alias; DROP TABLE lake.expired_direct");
 	SQL(f.writer, "CALL ducklake_expire_snapshots('lake',older_than=>now())");
 	f.Policy();
 	Require(SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true,dry_run=>true)")->RowCount() == 0,
 	        "Native cleanup listed a queued file owned by the managed namespace");
 	SQL(f.writer, "CALL ducklake_cleanup_old_files('lake',cleanup_all=>true)");
 	Require(Read(outside_file).size() > 0 &&
-	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 2,
+	            f.Count("__ducklake_metadata_lake.ducklake_files_scheduled_for_deletion") == 3,
 	        "Native cleanup changed a file or queue key owned by the managed namespace");
 }
 
