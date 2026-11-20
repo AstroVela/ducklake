@@ -22,6 +22,21 @@ BASE = MIXED.BASE
 require = BASE.require
 
 
+def capture_rows(admission: dict, records: list[dict]) -> list[dict]:
+    captured = admission["capture"]["file_capture"]
+    files = {file["id"]: file["uri"] for file in captured["files"]}
+    rows = []
+    for record in records:
+        address = record["row_ref"]
+        row = dict(record["row"])
+        if address["kind"] == "file":
+            row.update(filename=files[address["file_id"]], file_id=address["file_id"], row_offset=address["row_offset"])
+        else:
+            row.update(filename=address["source"], logical_row_id=address["row_id"])
+        rows.append(row)
+    return rows
+
+
 class Native:
     def __init__(self, driver: Path, root: Path) -> None:
         self.root = root
@@ -57,20 +72,10 @@ class Native:
         return self.root / f"{name}.admitted.json"
 
     def rows(self, name: str) -> list[dict]:
-        captured = json.loads(self.capture(name).read_text())["capture"]["file_capture"]
-        files = {file["id"]: file["uri"] for file in captured["files"]}
-        result = []
-        for record in json.loads((self.root / f"{name}.rows.json").read_text()):
-            address = record["row_ref"]
-            row = dict(record["row"])
-            if address["kind"] == "file":
-                row.update(
-                    filename=files[address["file_id"]], file_id=address["file_id"], row_offset=address["row_offset"]
-                )
-            else:
-                row.update(filename=address["source"], logical_row_id=address["row_id"])
-            result.append(row)
-        return result
+        return capture_rows(
+            json.loads(self.capture(name).read_text()),
+            json.loads((self.root / f"{name}.rows.json").read_text()),
+        )
 
     def mixed(self, name: str) -> Path:
         return MIXED.write_json(self.root / f"{name}.mixed.json", json.loads(self.capture(name).read_text())["capture"])
