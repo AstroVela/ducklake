@@ -361,6 +361,13 @@ void DuckLakeVortexSourceRetention::ProtectCleanupFiles(DuckLakeTransaction &tra
 		                           if (fs.IsRemoteFile(file.path)) {
 			                           return false;
 		                           }
+		                           if (!managed.empty()) {
+			                           auto local = AbsoluteLocalPath(fs, file.path);
+			                           if (StringUtil::StartsWith(local, managed) ||
+			                               StringUtil::StartsWith(fs.FileSystem::CanonicalizePath(local), managed)) {
+				                           return true;
+			                           }
+		                           }
 		                           auto path = physical_path(file.path);
 		                           return (!managed.empty() && StringUtil::StartsWith(path, managed)) ||
 		                                  pending_paths.count(path) ||
