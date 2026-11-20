@@ -114,7 +114,8 @@ initialization cancellation, snapshot conflict and pre/post-commit errors.
 The crash probe kills the writer at both commit boundaries for both inline
 rows and directly written Vortex files. It verifies the committed WAL,
 recovered typed rows, their physical storage path and the durable receipt.
-The C++ fixture supplies the fault hooks.
+The installed probe uses one verified provider cache for its isolated
+databases. The C++ fixture supplies the fault hooks.
 
 The existing Vane native-provider workflow runs both the original basic flow
 and this probe. `test/sql/vortex/native_vortex_write_batch.test` supplies the

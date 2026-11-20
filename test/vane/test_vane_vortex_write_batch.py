@@ -78,7 +78,7 @@ def exercise(root, report):
     import vane
 
     (root / "indexes").mkdir()
-    connection = BASE.connect(root, create=True)
+    connection = BASE.connect(root, root / "extensions", create=True)
     recalls, phases, checks = [], [], []
     try:
         report.update(vane_version=vane.__version__, engine=query(connection, "PRAGMA version")[0])
@@ -277,9 +277,10 @@ def exercise(root, report):
     report.update(checks=checks, phases=phases, fixture_recalls=recalls, minimum_recall=min(recalls))
 
 
-def exercise_receipt_identity(root, report):
-    (root / "indexes").mkdir(parents=True)
-    connection = BASE.connect(root, create=True)
+def exercise_receipt_identity(root, extension_directory, report):
+    root.mkdir(mode=0o700)
+    (root / "indexes").mkdir()
+    connection = BASE.connect(root, extension_directory, create=True)
     try:
         connection.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
         connection.execute("SET GLOBAL default_collation='nocase'")
@@ -357,7 +358,7 @@ def crash_cases(driver, root, report):
                 if child.poll() is None:
                     child.kill()
                     child.wait(timeout=10)
-        connection = BASE.connect(case)
+        connection = BASE.connect(case, root / "extensions")
         try:
             expected = 2 if committed else 0
             require(count(connection) == expected, "SIGKILL recovered a partial or missing batch")
@@ -423,7 +424,7 @@ def main():
     started = time.monotonic()
     try:
         exercise(root, report)
-        exercise_receipt_identity(root / "receipt-identity", report)
+        exercise_receipt_identity(root / "receipt-identity", root / "extensions", report)
         crash_cases(args.driver.resolve(), root, report)
         report["status"] = "passed"
     except Exception as error:

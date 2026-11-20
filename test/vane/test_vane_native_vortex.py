@@ -29,7 +29,7 @@ def query(connection, sql):
     return [dict(zip(names, row)) for row in result.fetchall()]
 
 
-def connect(root, create=False):
+def connect(root, extension_directory, create=False):
     import vane
 
     connection = vane.connect(
@@ -38,7 +38,7 @@ def connect(root, create=False):
             "threads": "2",
             "autoinstall_known_extensions": "false",
             "autoload_known_extensions": "false",
-            "extension_directory": str(root / "extensions"),
+            "extension_directory": str(extension_directory),
         },
     )
     connection.execute("LOAD parquet")
@@ -129,7 +129,7 @@ def qualify(connection, label, recalls):
 
 
 def crash_writer(root):
-    connection = connect(root)
+    connection = connect(root, root / "extensions")
     connection.execute("INSERT INTO lake.items VALUES(900000,[133.000001,4,2,0,1,8,7,16],NULL,'崩溃后可见')")
     expected = query(connection, "SELECT rowid,id,embedding,category,payload FROM lake.items ORDER BY id")
     (root / "committed.json").write_text(json.dumps(expected, ensure_ascii=False))
@@ -151,7 +151,7 @@ def exercise(root, report):
     require(runners.get_or_infer_runner_type() == "local-fast", "Native Vane runner was not selected")
     report.update(vane_version=importlib.metadata.version("vane-ai"), vane_path=str(Path(vane.__file__).resolve()))
     (root / "indexes").mkdir()
-    connection = connect(root, create=True)
+    connection = connect(root, root / "extensions", create=True)
     reader = None
     recalls, phases = [], []
     try:
@@ -269,7 +269,7 @@ def exercise(root, report):
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=10)
-    connection = connect(root)
+    connection = connect(root, root / "extensions")
     try:
         connection.execute("PREPARE nearest AS " + SEARCH.search_sql(VECTOR))
         require(
