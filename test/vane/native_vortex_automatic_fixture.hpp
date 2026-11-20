@@ -18,6 +18,8 @@
 
 namespace duckdb {
 namespace vortex_test {
+constexpr float AUTOMATIC_QUERY_X = -1.0f;
+
 struct AutomaticRow {
 	int64_t id;
 	float x, y;
@@ -40,12 +42,61 @@ struct AutomaticObservation {
 	idx_t snapshot;
 	bool filtered;
 	DuckLakeVortexSearchResult result;
+	idx_t indexed_files, scan_files, inline_rows, scanned_rows, ann_calls;
 };
 
 struct AutomaticEvents {
 	std::mutex lock;
 	std::map<string, idx_t> stages;
 };
+
+inline duckdb_yyjson::yyjson_mut_val *AutomaticReceipts(vortex_detail::ViewJSON &json,
+                                                        const vector<DuckLakeVortexWriteResult> &receipts) {
+	auto list = json.Array();
+	for (auto &receipt : receipts) {
+		auto record = json.Object();
+		json.Text(record, "table_uuid", receipt.table_uuid);
+		json.Text(record, "request_id", receipt.request_id);
+		json.Text(record, "payload_hash", receipt.payload_hash);
+		json.Number(record, "row_count", receipt.row_count);
+		json.Number(record, "snapshot_id", receipt.snapshot_id);
+		duckdb_yyjson::yyjson_mut_arr_append(list, record);
+	}
+	return list;
+}
+
+inline void SaveAutomaticCheckpoint(DuckDB &database, const string &root) {
+	Connection reader(database);
+	reader.BeginTransaction();
+	auto recorded = SQL(reader, "SELECT table_uuid,request_id,payload_hash,row_count,snapshot_id FROM "
+	                            "__ducklake_metadata_lake.ducklake_vortex_write_requests_v1 ORDER BY snapshot_id");
+	vector<DuckLakeVortexWriteResult> receipts;
+	for (auto &row : *recorded) {
+		receipts.push_back({row.GetValue<string>(0), row.GetValue<string>(1), row.GetValue<string>(2),
+		                    row.GetValue<idx_t>(3), row.GetValue<idx_t>(4)});
+	}
+	auto index = SQL(reader, "SELECT revision,reference FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1");
+	Require(index->RowCount() == 1, "Checkpoint requires one named index");
+	auto deletions = SQL(reader, "SELECT data_file_id,path,path_is_relative,file_bytes FROM "
+	                             "__ducklake_metadata_lake.ducklake_vortex_source_deletions_v1");
+	reader.Commit();
+	vortex_detail::ViewJSON json;
+	auto body = json.Object();
+	json.Add(body, "receipts", AutomaticReceipts(json, receipts));
+	json.Number(body, "revision", index->GetValue(0, 0).GetValue<idx_t>());
+	json.Text(body, "reference", index->GetValue(1, 0).GetValue<string>());
+	auto pending = json.Array();
+	for (auto &row : *deletions) {
+		auto intent = json.Object();
+		json.Number(intent, "data_file_id", row.GetValue<idx_t>(0));
+		json.Text(intent, "path", row.GetValue<string>(1));
+		json.Add(intent, "path_is_relative", duckdb_yyjson::yyjson_mut_bool(json.doc.get(), row.GetValue<bool>(2)));
+		json.Number(intent, "file_bytes", row.GetValue<idx_t>(3));
+		duckdb_yyjson::yyjson_mut_arr_append(pending, intent);
+	}
+	json.Add(body, "source_intents", pending);
+	Write(root + "/checkpoint-state.json", json.Finish(body));
+}
 
 struct AutomaticFixture {
 	using Model = std::map<int64_t, AutomaticRow>;
@@ -55,12 +106,14 @@ struct AutomaticFixture {
 	Model model;
 	std::map<idx_t, Model> models;
 	vector<AutomaticPlan> plans;
+	vector<DuckLakeVortexWriteResult> acknowledged;
 	std::shared_ptr<AutomaticEvents> events = std::make_shared<AutomaticEvents>();
 	bool configured = false;
 
 	AutomaticFixture(DuckDB &db, Connection &connection, const string &path)
 	    : database(db), setup(connection), root(path) {
 		models.emplace(0, Model {});
+		SaveAcknowledged();
 	}
 	~AutomaticFixture() {
 		try {
@@ -149,6 +202,10 @@ struct AutomaticFixture {
 		}
 		Write(root + "/plans.json", json.Finish(list));
 	}
+	void SaveAcknowledged() {
+		vortex_detail::ViewJSON json;
+		Write(root + "/acknowledged.json", json.Finish(AutomaticReceipts(json, acknowledged)));
+	}
 	DuckLakeVortexWriteResult Submit(const string &request, vector<AutomaticRow> rows, vector<int64_t> deletes = {},
 	                                 const std::function<void(const string &)> &observe = {}) {
 		AutomaticPlan plan;
@@ -175,6 +232,8 @@ struct AutomaticFixture {
 				std::this_thread::sleep_for(std::chrono::milliseconds(20));
 			}
 		}
+		acknowledged.push_back(pending.receipt);
+		SaveAcknowledged();
 		for (auto id : pending.deletes) {
 			model.erase(id);
 		}
@@ -242,7 +301,7 @@ struct AutomaticFixture {
 		options.max_source_bytes = 64 * 1024 * 1024;
 		options.max_rows = 100000;
 		DuckLakeVortexSearchRequest request;
-		request.query = {133, 0};
+		request.query = {AUTOMATIC_QUERY_X, 0};
 		request.k = 10;
 		request.filter_category = filtered;
 		request.category = "B";
@@ -261,16 +320,32 @@ struct AutomaticFixture {
 		    yyjson_obj_get(yyjson_obj_get(yyjson_doc_get_root(json.get()), "native_capture"), "snapshot_id");
 		Require(yyjson_is_uint(snapshot), "Missing exact automatic query snapshot");
 		observation.snapshot = yyjson_get_uint(snapshot);
+		auto routes = yyjson_obj_get(yyjson_doc_get_root(json.get()), "routes");
+		auto files = [&](const char *key) {
+			auto value = yyjson_obj_get(routes, key);
+			Require(yyjson_is_arr(value), "Missing automatic file route");
+			return yyjson_arr_size(value);
+		};
+		auto count = [&](const char *key) {
+			auto value = yyjson_obj_get(routes, key);
+			Require(yyjson_is_uint(value), "Missing automatic query route counter");
+			return yyjson_get_uint(value);
+		};
+		observation.indexed_files = files("indexed_files");
+		observation.scan_files = files("scan_files");
+		observation.inline_rows = count("inline_rows");
+		observation.scanned_rows = count("scanned_rows");
+		observation.ann_calls = count("ann_calls");
 		return observation;
 	}
-	void Grow(idx_t wave, const std::function<void(const string &)> &observe = {}) {
+	idx_t Grow(idx_t wave, const std::function<void(const string &)> &observe = {}) {
 		vector<AutomaticRow> rows;
 		for (idx_t id = wave * 128; id < (wave + 1) * 128; id++) {
 			rows.push_back(Row(id, 0));
 		}
-		Submit("seed-" + to_string(wave), std::move(rows), {}, observe);
+		return Submit("seed-" + to_string(wave), std::move(rows), {}, observe).snapshot_id;
 	}
-	void Wave(idx_t wave) {
+	idx_t Wave(idx_t wave) {
 		auto index = Index();
 		auto largest =
 		    std::max_element(index.segments.begin(), index.segments.end(),
@@ -309,19 +384,43 @@ struct AutomaticFixture {
 		for (idx_t id = 512 + wave * 32; id < 544 + wave * 32; id++) {
 			rows.push_back(Row(id, wave + 1));
 		}
-		Submit("wave-" + to_string(wave), std::move(rows), std::move(deletes));
+		auto receipt = Submit("wave-" + to_string(wave), std::move(rows), std::move(deletes));
 		Require(model.size() == 512, "Automatic wave changed the live key count");
+		return receipt.snapshot_id;
+	}
+	void CheckCurrentModel() {
+		auto rows = SQL(setup, "SELECT {'id':id,'embedding':embedding,'category':category,'payload':payload} "
+		                       "FROM lake.items ORDER BY id");
+		Require(rows->RowCount() == model.size(), "Automatic replay changed the live key count");
+		idx_t offset = 0;
+		for (auto &entry : model) {
+			Require(rows->GetValue(0, offset++) == entry.second.ToValue(), "Automatic replay changed a live row");
+		}
 	}
 	void Replay() {
+		const string snapshot_sql = "SELECT max(snapshot_id) FROM lake.snapshots()";
+		auto before = SQL(setup, snapshot_sql)->GetValue(0, 0);
+		CheckCurrentModel();
 		for (auto &plan : plans) {
 			Connection owner(database);
 			auto result = DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn",
 			                                               plan.request, Rows(plan.rows), Deletes(plan.deletes));
-			Require(result.snapshot_id == plan.receipt.snapshot_id && result.payload_hash == plan.receipt.payload_hash,
+			Require(result.snapshot_id == plan.receipt.snapshot_id &&
+			            result.payload_hash == plan.receipt.payload_hash &&
+			            result.table_uuid == plan.receipt.table_uuid && result.request_id == plan.receipt.request_id &&
+			            result.row_count == plan.receipt.row_count,
 			        "Old automatic-flow request changed its receipt");
+			Require(SQL(setup, snapshot_sql)->GetValue(0, 0) == before,
+			        "Automatic receipt replay changed the snapshot");
+			CheckCurrentModel();
 		}
-		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == model.size(),
-		        "Old automatic-flow retry duplicated data");
+	}
+	static float Distance(const AutomaticRow &row) {
+		// Keep the Float32 arithmetic boundaries even with contraction enabled.
+		const volatile float dx = row.x - AUTOMATIC_QUERY_X;
+		const volatile float xx = dx * dx;
+		const volatile float yy = row.y * row.y;
+		return xx + yy;
 	}
 	float Validate(const vector<AutomaticObservation> &observations) {
 		float minimum = 1;
@@ -329,20 +428,24 @@ struct AutomaticFixture {
 			auto state = models.upper_bound(query.snapshot);
 			Require(state != models.begin(), "Missing exact snapshot oracle");
 			const auto &expected = (--state)->second;
-			vector<std::pair<double, int64_t>> ranked;
+			vector<std::pair<float, int64_t>> ranked;
 			for (auto &entry : expected) {
 				auto &row = entry.second;
 				if (!query.filtered || row.category == "B") {
-					ranked.emplace_back((row.x - 133.0) * (row.x - 133.0) + row.y * row.y, row.id);
+					ranked.emplace_back(Distance(row), row.id);
 				}
 			}
 			std::sort(ranked.begin(), ranked.end());
+			for (idx_t i = 1; i < ranked.size(); i++) {
+				Require(ranked[i - 1].first < ranked[i].first, "Concurrent oracle inputs must have unique scores");
+			}
 			auto count = MinValue<idx_t>(10, ranked.size());
 			set<int64_t> wanted, found;
 			for (idx_t i = 0; i < count; i++) {
 				wanted.insert(ranked[i].second);
 			}
-			Require(query.result.rows.size() == count, "Automatic query lost top-k coverage");
+			Require(query.result.rows.size() <= count && (query.ann_calls || query.result.rows.size() == count),
+			        "Automatic query returned an invalid number of hits");
 			double previous = -1;
 			for (auto &values : query.result.rows) {
 				auto id = values[0].GetValue<int64_t>();
@@ -356,8 +459,9 @@ struct AutomaticFixture {
 				            StringValue::Get(values[3]) == value.payload && (!query.filtered || value.category == "B"),
 				        "Automatic query mixed row versions or filters");
 				auto distance = values[4].GetValue<double>();
-				auto exact = (value.x - 133.0) * (value.x - 133.0) + value.y * value.y;
-				Require(distance >= previous && std::fabs(distance - exact) <= 1e-4 + 1e-5 * exact,
+				auto exact = static_cast<double>(Distance(value));
+				auto tolerance = MaxValue(1e-4, 1e-5 * MaxValue(std::fabs(distance), std::fabs(exact)));
+				Require(distance > previous && std::fabs(distance - exact) <= tolerance,
 				        "Automatic query changed distance or order");
 				previous = distance;
 			}
@@ -374,10 +478,12 @@ struct AutomaticFixture {
 };
 
 inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
-	auto pause = std::make_shared<Pause>();
+	auto before_flush = std::make_shared<Pause>();
+	auto before_build = std::make_shared<Pause>();
 	AutomaticFixture f(database, setup, root);
-	ReleasePause release {*pause};
-	auto wait_for_kill = [root](const string &stage) {
+	ReleasePause release_flush {*before_flush}, release_build {*before_build};
+	auto wait_for_kill = [&database, root](const string &stage) {
+		SaveAutomaticCheckpoint(database, root);
 		Write(root + "/checkpoint", stage);
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
 		while (std::chrono::steady_clock::now() < deadline) {
@@ -386,13 +492,17 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		throw IOException("Automatic checkpoint was not killed");
 	};
 	auto events = f.events;
-	auto observe = [events, pause, root, mode, wait_for_kill](const string &stage) {
+	auto observe = [events, before_flush, before_build, mode, wait_for_kill](const string &stage) {
 		{
 			std::lock_guard<std::mutex> guard(events->lock);
 			events->stages[stage]++;
 		}
-		if (mode == "automatic-backpressure" && stage == "optimizer_before_flush") {
-			pause->Stop();
+		if ((mode == "automatic-backpressure" || mode == "automatic-live" || mode == "automatic-pause-ack") &&
+		    stage == "optimizer_before_flush") {
+			before_flush->Stop();
+		}
+		if (mode == "automatic-live" && stage == "optimizer_before_build") {
+			before_build->Stop();
 		}
 		if (mode == "automatic-pause-" + stage) {
 			wait_for_kill(stage);
@@ -401,7 +511,7 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 	f.Configure(observe, mode == "automatic-backpressure" ? 128 : 256);
 	if (mode == "automatic-backpressure") {
 		f.Grow(0);
-		pause->Wait();
+		before_flush->Wait();
 		Connection owner(database);
 		bool rejected = false;
 		try {
@@ -419,12 +529,16 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 128,
 		        "Blocked automatic write changed committed rows");
 		Connection reader(database);
-		f.Validate({f.Observe(reader, false), f.Observe(reader, true)});
-		pause->Release();
+		auto blocked_view = f.Observe(reader, false);
+		Require(blocked_view.inline_rows == 128 && !blocked_view.indexed_files && !blocked_view.scan_files &&
+		            !blocked_view.ann_calls,
+		        "Backpressure query did not use T");
+		f.Validate({blocked_view, f.Observe(reader, true)});
+		before_flush->Release();
 		f.Wait(2);
 		f.Submit("blocked", {f.Row(10000, 1)});
-		f.Replay();
 		f.Stop();
+		f.Replay();
 		std::cout << "automatic backpressure rejected atomically; queries continued; worker released admission"
 		          << std::endl;
 		return;
@@ -451,26 +565,81 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 	Require(mode == "automatic-live", "Unknown automatic fixture mode");
 	std::atomic<bool> running {true};
 	vector<AutomaticObservation> observations;
+	std::mutex observation_lock;
+	std::condition_variable sampled;
+	idx_t last_sample[2] = {0, 0};
+	std::exception_ptr reader_error;
 	Connection reader(database);
 	auto reads = std::async(std::launch::async, [&] {
-		while (running) {
-			observations.push_back(f.Observe(reader, observations.size() % 2 != 0));
-			std::this_thread::sleep_for(std::chrono::milliseconds(25));
+		bool filtered = false;
+		try {
+			while (running) {
+				auto observation = f.Observe(reader, filtered);
+				{
+					std::lock_guard<std::mutex> guard(observation_lock);
+					last_sample[filtered] = observation.snapshot;
+					observations.push_back(std::move(observation));
+				}
+				sampled.notify_one();
+				filtered = !filtered;
+				std::this_thread::sleep_for(std::chrono::milliseconds(25));
+			}
+		} catch (...) {
+			{
+				std::lock_guard<std::mutex> guard(observation_lock);
+				reader_error = std::current_exception();
+			}
+			sampled.notify_one();
+			throw;
 		}
 	});
+	auto wait_for_samples = [&](idx_t snapshot) {
+		std::unique_lock<std::mutex> guard(observation_lock);
+		auto completed = sampled.wait_for(guard, std::chrono::seconds(60), [&] {
+			return reader_error || (last_sample[0] >= snapshot && last_sample[1] >= snapshot);
+		});
+		if (reader_error) {
+			std::rethrow_exception(reader_error);
+		}
+		Require(completed, "Filtered and unfiltered queries missed a committed automatic phase");
+	};
 	try {
-		for (idx_t wave = 0; wave < 4; wave++) {
+		auto first = f.Grow(0);
+		Connection route_reader(database);
+		before_flush->Wait();
+		auto t = f.Observe(route_reader, false);
+		Require(t.snapshot == first && t.inline_rows == 128 && !t.indexed_files && !t.scan_files && !t.ann_calls,
+		        "Automatic query did not see the committed T view");
+		before_flush->Release();
+		before_build->Wait();
+		auto unindexed = f.Observe(route_reader, false);
+		Require(!unindexed.inline_rows && unindexed.scan_files == 1 && unindexed.scanned_rows == 128 &&
+		            !unindexed.indexed_files && !unindexed.ann_calls,
+		        "Automatic query did not scan the flushed F file before B publication");
+		before_build->Release();
+		f.Wait(2);
+		auto indexed = f.Observe(route_reader, false);
+		Require(!indexed.inline_rows && !indexed.scan_files && !indexed.scanned_rows && indexed.indexed_files == 1 &&
+		            indexed.ann_calls == 1,
+		        "Automatic query did not use ANN after B publication");
+		f.Validate({std::move(t), std::move(unindexed), std::move(indexed)});
+		std::cout << "automatic routes: T inline, F scan, B ANN" << std::endl;
+		wait_for_samples(first);
+		for (idx_t wave = 1; wave < 4; wave++) {
 			auto before = f.Index().revision;
-			f.Grow(wave);
+			auto snapshot = f.Grow(wave);
 			f.Wait(before + 1);
+			wait_for_samples(snapshot);
 		}
 		for (idx_t wave = 0; wave < 8; wave++) {
 			auto before = f.Index().revision;
-			f.Wave(wave);
+			auto snapshot = f.Wave(wave);
 			f.Wait(before + 1);
+			wait_for_samples(snapshot);
 		}
-		f.Replay();
 	} catch (...) {
+		before_flush->Release();
+		before_build->Release();
 		running = false;
 		reads.wait();
 		throw;
@@ -490,6 +659,7 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		        "Concurrent queries missed a committed mutation phase");
 	}
 	f.Stop();
+	f.Replay();
 	std::lock_guard<std::mutex> guard(events->lock);
 	Require(events->stages["optimizer_flushed"] >= 4 && events->stages["optimizer_before_build"] >= 4 &&
 	            events->stages["optimizer_before_merge"] > 0 && events->stages["optimizer_rewritten"] > 0 &&
