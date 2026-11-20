@@ -93,10 +93,16 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 	if (!options.index_name.empty() && !build_files) {
 		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock(interrupt);
 	}
-	reader.BeginTransaction();
+	const auto binding = identity ? *identity
+	                              : DuckLakeVortexIndex::ResolveCatalog(*reader.context, options.catalog, false,
+	                                                                    "Native Vortex read view");
+	checkpoint("before_source_admission");
+	// BEGIN can start DuckLake transactions eagerly on every attached catalog.
+	auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
 	try {
+		reader.BeginTransaction();
 		auto &resolved = Catalog::GetCatalog(*reader.context, options.catalog);
-		if (identity && resolved.GetAttached().oid != identity->lake_oid) {
+		if (resolved.GetAttached().oid != binding.lake_oid) {
 			throw TransactionException("Vortex catalog attachment changed");
 		}
 		if (resolved.GetCatalogType() != "ducklake") {
@@ -106,12 +112,8 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 			throw InvalidInputException("Native Vortex read views require DuckDB metadata");
 		}
-		checkpoint("before_source_admission");
-		auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
 		auto &transaction = DuckLakeTransaction::Get(*reader.context, catalog);
-		if (identity) {
-			DuckLakeVortexIndex::CheckCatalogIdentity(transaction, *identity);
-		}
+		DuckLakeVortexIndex::CheckCatalogIdentity(transaction, binding);
 		auto snapshot = transaction.GetSnapshot();
 		checkpoint("after_snapshot");
 		auto entry = catalog.GetEntry(*reader.context, CatalogType::TABLE_ENTRY, options.schema, options.table,

@@ -6,13 +6,14 @@ continued querying but missed its historical-snapshot drain deadline.
 
 ## Lock order
 
-A native ReadView acquires shared capture admission before starting its
-DuckLake catalog transaction. Starting that transaction briefly acquires the
-shared transaction gate. The original collector acquired the exclusive
-transaction gate before acquiring exclusive capture admission. A query between
-admission and transaction registration could wait on the gate while the
-collector waited on its admission lock. The synced #62 collector avoids that
-cycle by deferring when capture admission is busy.
+A native ReadView acquires shared capture admission before beginning its
+transaction. This includes DuckDB's eager transaction mode, which can open
+transactions on all attached catalogs during `BEGIN`. Starting a DuckLake
+catalog transaction briefly acquires the shared gate. The original collector
+acquired the exclusive transaction gate before acquiring exclusive capture
+admission. A query between admission and transaction registration could wait
+on the gate while the collector waited on its admission lock. The synced #62
+collector avoids that cycle by deferring when capture admission is busy.
 
 Source collection acquires publication and then waits interruptibly for
 exclusive capture admission. Existing captures can still enter transactions
@@ -20,7 +21,8 @@ and finish. Once admission closes, collection tries to freeze new transaction
 starts and checks for active DuckLake transactions. A busy transaction gate or
 an ordinary held transaction defers collection. The same snapshot and file
 ownership checks, private copies, deletion intent, crash checkpoints and
-shared object and byte budgets protect the collection.
+shared object and byte budgets protect the collection. A queued read retains
+its lake and metadata attachment identities across the admission wait.
 
 ## Regression
 
@@ -36,6 +38,14 @@ while admission is still held. Collection advances when the fixture releases
 admission. A third case interrupts the waiting collector, verifies the locks
 become available and snapshots remain intact, and completes a fresh collection
 after releasing admission.
+
+With eager transactions enabled, the native test pauses a captured ReadView,
+queues source collection, and then queues a second capture. It checks that
+collection expires snapshots after the first capture releases admission and
+that both queries return their expected rows.
+
+A separate test reattaches a lake while a capture waits. The queued capture
+rejects the new attachment and a fresh capture reads the reattached data.
 
 A minimal SQL regression holds an ordinary DuckLake reader in a second
 connection, verifies collection reports transaction deferral, commits the reader
