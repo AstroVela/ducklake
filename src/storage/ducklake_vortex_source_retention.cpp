@@ -523,8 +523,9 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 	DuckLakeVortexSourceGCResult result;
 	check("source_gc_waiting");
 	auto publication = VortexIndex::PublicationLock().GetExclusiveLock(interrupt);
-	auto admissions = DuckLakeVortexReadView::AdmissionLock().TryGetExclusiveLock();
-	auto transactions = admissions ? TransactionGate().TryGetExclusiveLock() : nullptr;
+	// Finish admitted captures before freezing their transaction starts.
+	auto admissions = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock(interrupt);
+	auto transactions = TransactionGate().TryGetExclusiveLock();
 	if (!transactions || Manager(catalog).HasOtherTransactions(nullptr)) {
 		result.blocked = true;
 		return result;
