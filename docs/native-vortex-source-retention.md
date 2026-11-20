@@ -54,11 +54,11 @@ ordinary native transactions currently defer collection.
 
 ## Readers and deletion ownership
 
-The collector takes publication ownership and tries to acquire ReadView and
-transaction admission in that order. An active capture or native transaction
-can defer the pass with `blocked_by_transactions=true`.
-New native transactions cannot register while
-expiration or deletion owns the gate. The collector obtains its private native
+The collector takes publication ownership and waits interruptibly for exclusive
+ReadView admission. It then tries to acquire the transaction gate. A busy gate
+or an ordinary held transaction defers the pass with
+`blocked_by_transactions=true`. New native transactions cannot register while
+expiration or deletion owns the gate. The collector obtains its private
 metadata snapshot after these checks so the cleanup plan includes concurrent
 writes that finished before collection.
 
