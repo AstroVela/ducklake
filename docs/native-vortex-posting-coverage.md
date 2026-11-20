@@ -133,3 +133,6 @@ Coverage construction is qualified for these inputs. Broader capacity and
 search quality remain unqualified: reclamation under the larger 128D load and
 the existing 0.8 recall gate need separate work. There is no claim that this
 head estimate accepts every distribution within the row/vector ceilings.
+
+For the subsequent reclamation scheduling change and qualification gates, see
+[source-only maintenance](native-vortex-source-gc-drain.md).
