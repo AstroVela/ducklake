@@ -22,13 +22,43 @@ def require_equal(actual: object, expected: object, description: str) -> None:
         raise AssertionError(f"{description}: expected {expected!r}, got {actual!r}")
 
 
+def decode_cli_rows(output: str) -> list[dict]:
+    # LOAD guards and CALL can emit results before the final SELECT.
+    decoder = json.JSONDecoder()
+    remaining = output.strip()
+    rows = []
+    while remaining:
+        rows, offset = decoder.raw_decode(remaining)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise AssertionError("Expected a CLI JSON array of rows")
+        remaining = remaining[offset:].lstrip()
+    return rows
+
+
 class RecoveryProbe:
     def __init__(self, duckdb: Path, extension: Path | None, root: Path) -> None:
         self.duckdb = duckdb
         self.root = root
         self.metadata = root / "metadata.ducklake"
         self.command = [str(duckdb), "-unsigned", "-batch", "-bail", "-json", "-c"]
-        load = "LOAD ducklake;" if extension is None else f"LOAD {sql_string(extension)};"
+        if extension is None:
+            load = (
+                "LOAD ducklake;"
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_extensions() "
+                "WHERE extension_name='ducklake' AND loaded AND install_mode='STATICALLY_LINKED') "
+                "THEN true ELSE error('Static recovery mode requires statically linked DuckLake') END;"
+            )
+        else:
+            load = (
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_extensions() "
+                "WHERE extension_name='ducklake' AND loaded) THEN "
+                "error('--extension requires a CLI without preloaded DuckLake') ELSE true END;"
+                f"LOAD {sql_string(extension)};"
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_extensions() "
+                "WHERE extension_name='ducklake' AND loaded AND install_mode<>'STATICALLY_LINKED') "
+                "THEN true ELSE error('Requested DuckLake artifact was not selected') END;"
+            )
+        self.load_ducklake_sql = load
         self.prefix = (
             "SET autoinstall_known_extensions = false;"
             "SET autoload_known_extensions = false;"
@@ -45,14 +75,7 @@ class RecoveryProbe:
         result = subprocess.run(self.command + [self.prefix + sql], capture_output=True, text=True, timeout=30)
         if result.returncode:
             raise AssertionError(f"DuckDB exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
-        # CALL can emit a result before the final SELECT in the same CLI invocation.
-        decoder = json.JSONDecoder()
-        remaining = result.stdout.strip()
-        rows = []
-        while remaining:
-            rows, offset = decoder.raw_decode(remaining)
-            remaining = remaining[offset:].lstrip()
-        return rows
+        return decode_cli_rows(result.stdout)
 
     def kill_after(self, name: str, sql: str, require_wal: bool = False) -> None:
         ready = self.root / f"{name}.ready"
@@ -156,7 +179,9 @@ def exercise(probe: RecoveryProbe) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", required=True, type=Path, help="native DuckDB CLI matching the extension")
-    parser.add_argument("--extension", type=Path, help="loadable artifact; omit for a statically linked DuckLake")
+    parser.add_argument(
+        "--extension", type=Path, help="loadable artifact; requires a matching CLI without preloaded DuckLake"
+    )
     args = parser.parse_args()
     if os.name != "posix":
         parser.error("this probe requires POSIX SIGKILL")
