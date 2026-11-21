@@ -45,6 +45,7 @@ class RecoveryProbe:
                 "WHERE extension_name='ducklake' AND loaded AND install_mode<>'STATICALLY_LINKED') "
                 "THEN true ELSE error('Requested DuckLake artifact was not selected') END;"
             )
+        self.load_ducklake_sql = load
         self.prefix = (
             "SET autoinstall_known_extensions = false;"
             "SET autoload_known_extensions = false;"

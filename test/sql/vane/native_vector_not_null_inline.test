@@ -1,0 +1,18 @@
+# name: test/sql/vane/native_vector_not_null_inline.test
+# description: inlined top-level vector NULL must obey NOT NULL
+# group: [vane]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vector_null_inline.ducklake' AS lake (DATA_PATH '__TEST_DIR__/vector_null_inline', DATA_INLINING_ROW_LIMIT 100)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT NOT NULL, embedding FLOAT[] NOT NULL)
+
+statement error
+INSERT INTO lake.items VALUES (1, NULL)
+----
+NOT NULL constraint failed

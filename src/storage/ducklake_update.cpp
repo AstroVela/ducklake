@@ -167,6 +167,7 @@ OperatorResultType DuckLakeUpdate::Execute(ExecutionContext &context, DataChunk 
 	insert_chunk.data[physical_column_count].Reference(input.data[row_id_index]);
 
 	chunk.Reference(insert_chunk);
+	table.VerifyNotNull(insert_chunk);
 
 	auto &delete_chunk = lstate.delete_chunk;
 	delete_chunk.SetCardinality(input.size());
