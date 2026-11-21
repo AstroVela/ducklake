@@ -18,6 +18,11 @@ source and shared CI tooling, and requires the exact `vane-extension-sqlite-scan
 provider for its metadata backend. See [provider releases](vane-provider-release.md)
 for dynamic-wheel qualification and the manual TestPyPI publication workflow.
 
+The [native realtime vector proof](native-realtime-vector-proof.md) validates
+inlined vectors, transaction visibility, materialization, and process recovery
+with a DuckDB metadata catalog. Its SQL tests are part of the native Vane test
+selection; the distributed scan contract below is unchanged.
+
 Distributed scans support committed, unencrypted data files and committed delete state. Inlined data,
 transaction-local changes, encrypted files, change scans, and legacy Parquet VARIANT decoding are rejected before
 worker execution. Ray execution does not fall back to a local scan.
