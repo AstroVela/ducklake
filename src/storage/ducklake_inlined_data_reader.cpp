@@ -12,13 +12,22 @@ namespace duckdb {
 
 DuckLakeInlinedDataReader::DuckLakeInlinedDataReader(DuckLakeFunctionInfo &read_info, const OpenFileInfo &info,
                                                      string table_name_p, vector<MultiFileColumnDefinition> columns_p)
-    : BaseFileReader(info), read_info(read_info), table_name(std::move(table_name_p)) {
+    : BaseFileReader(info), read_info(&read_info), table_name(std::move(table_name_p)) {
 	columns = std::move(columns_p);
 }
 DuckLakeInlinedDataReader::DuckLakeInlinedDataReader(DuckLakeFunctionInfo &read_info, const OpenFileInfo &info,
                                                      shared_ptr<DuckLakeInlinedData> data_p,
                                                      vector<MultiFileColumnDefinition> columns_p)
-    : BaseFileReader(info), read_info(read_info), data(std::move(data_p)) {
+    : BaseFileReader(info), read_info(&read_info), data(std::move(data_p)) {
+	columns = std::move(columns_p);
+}
+
+DuckLakeInlinedDataReader::DuckLakeInlinedDataReader(const OpenFileInfo &info, shared_ptr<DuckLakeInlinedData> data_p,
+                                                     vector<MultiFileColumnDefinition> columns_p)
+    : BaseFileReader(info), data(std::move(data_p)) {
+	if (!data || !data->data) {
+		throw InvalidInputException("Frozen DuckLake inline reader requires a data batch");
+	}
 	columns = std::move(columns_p);
 }
 
@@ -34,7 +43,10 @@ bool DuckLakeInlinedDataReader::TryInitializeScan(ClientContext &context, Global
 	}
 	if (!data) {
 		// scanning data from a table - read it from the metadata catalog
-		auto transaction = read_info.GetTransaction();
+		if (!read_info) {
+			throw InternalException("DuckLake inline reader has no metadata scan state");
+		}
+		auto transaction = read_info->GetTransaction();
 		auto &metadata_manager = transaction->GetMetadataManager();
 		auto &ducklake_catalog = transaction->GetCatalog();
 		// push the projections directly into the read
@@ -52,7 +64,7 @@ bool DuckLakeInlinedDataReader::TryInitializeScan(ClientContext &context, Global
 					virtual_column = "row_id";
 					break;
 				case MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID:
-					if (read_info.scan_type == DuckLakeScanType::SCAN_DELETIONS) {
+					if (read_info->scan_type == DuckLakeScanType::SCAN_DELETIONS) {
 						// when scanning deletions end_snapshot is the snapshot marker
 						virtual_column = "end_snapshot";
 					} else {
@@ -106,20 +118,21 @@ bool DuckLakeInlinedDataReader::TryInitializeScan(ClientContext &context, Global
 			}
 		}
 		unique_ptr<QueryResult> query_result;
-		switch (read_info.scan_type) {
+		switch (read_info->scan_type) {
 		case DuckLakeScanType::SCAN_TABLE:
-			query_result = metadata_manager.ReadInlinedData(read_info.snapshot, table_name, columns_to_read);
+			query_result = metadata_manager.ReadInlinedData(read_info->snapshot, table_name, columns_to_read);
 			break;
 		case DuckLakeScanType::SCAN_INSERTIONS:
-			query_result = metadata_manager.ReadInlinedDataInsertions(*read_info.start_snapshot, read_info.snapshot,
+			query_result = metadata_manager.ReadInlinedDataInsertions(*read_info->start_snapshot, read_info->snapshot,
 			                                                          table_name, columns_to_read);
 			break;
 		case DuckLakeScanType::SCAN_DELETIONS:
-			query_result = metadata_manager.ReadInlinedDataDeletions(*read_info.start_snapshot, read_info.snapshot,
+			query_result = metadata_manager.ReadInlinedDataDeletions(*read_info->start_snapshot, read_info->snapshot,
 			                                                         table_name, columns_to_read);
 			break;
 		case DuckLakeScanType::SCAN_FOR_FLUSH:
-			query_result = metadata_manager.ReadAllInlinedDataForFlush(read_info.snapshot, table_name, columns_to_read);
+			query_result =
+			    metadata_manager.ReadAllInlinedDataForFlush(read_info->snapshot, table_name, columns_to_read);
 			break;
 		default:
 			throw InternalException("Unknown DuckLake scan type");
