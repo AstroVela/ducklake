@@ -85,10 +85,13 @@ format for realtime tables. This draft qualifies only the selected native
 DuckDB catalog path. SQLite and PostgreSQL metadata backends need their own
 vector, transaction, and recovery qualification.
 
-Follow-up work covers Vortex file writing and reading, stable row identity,
-static ANN indexes, index coverage and snapshot filtering, and Vane/Ray reads
-of committed inlined rows. The current distributed path continues to reject
-inlined data. The [Vane scan contract](vane.md) describes that boundary.
+The [experimental native Vortex proof](native-vortex-files.md) separately
+validates file writing and reading, physical row identity, flush and recovery.
+DuckLake #26 merged into `dev/ducklake-vortex` at `2c5e2659`. Vane/Ray reads of
+committed inline rows alongside Parquet files are now part of that branch.
+[DuckLake #26](https://github.com/AstroVela/ducklake/pull/26) · [Vane scan contract](vane.md)
+
+Follow-up work covers static ANN indexes, index coverage, and snapshot filtering.
 
 Selecting DuckLake as the source transaction owner would replace the proposed
 custom source WAL and Iceberg handoff for these tables. Any Iceberg output

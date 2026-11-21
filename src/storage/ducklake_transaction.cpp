@@ -1,4 +1,5 @@
 #include "storage/ducklake_transaction.hpp"
+#include "storage/ducklake_vortex.hpp"
 
 #include "storage/ducklake_commit_state.hpp"
 #include "storage/ducklake_transaction_state.hpp"
@@ -785,6 +786,8 @@ void DuckLakeTransaction::Commit() {
 		throw;
 	}
 	connection.reset();
+	data_file_formats.clear();
+	pending_data_file_formats.clear();
 	state->local_changes.Clear();
 	SetRequiresNewInlinedTable(false);
 }
@@ -798,6 +801,8 @@ void DuckLakeTransaction::Rollback() {
 		connection.reset();
 	}
 	state->CleanupFiles();
+	data_file_formats.clear();
+	pending_data_file_formats.clear();
 	state->local_changes.Clear();
 	SetRequiresNewInlinedTable(false);
 }
@@ -839,7 +844,7 @@ case_insensitive_map_t<unique_ptr<DuckLakeCatalogSet>> &DuckLakeTransaction::Get
 
 bool DuckLakeTransaction::ChangesMade() const {
 	return state->SchemaChangesMade() || state->local_changes.HasChanges() || !state->dropped_files.empty() ||
-	       !new_name_maps.name_maps.empty();
+	       !new_name_maps.name_maps.empty() || !pending_data_file_formats.empty();
 }
 
 void GetTransactionTableChanges(reference<CatalogEntry> table_entry, TransactionChangeInformation &changes) {
@@ -997,6 +1002,13 @@ TransactionChangeInformation DuckLakeTransaction::GetTransactionChanges() const 
 		}
 		auto &table_changes = entry.GetTableChanges();
 		AddTableChanges(table_id, table_changes, changes);
+	}
+	// The first file-format transition changes the table's write contract. Use
+	// the existing snapshot conflict protocol to order it with schema changes.
+	for (auto &entry : pending_data_file_formats) {
+		if (dropped_tables.find(entry.first) == dropped_tables.end()) {
+			changes.altered_tables.insert(entry.first);
+		}
 	}
 	return changes;
 }
@@ -1274,6 +1286,7 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
 	data_file.id = DataFileIndex(commit_snapshot.next_file_id++);
 	data_file.table_id = table_id;
 	data_file.file_name = file.file_name;
+	data_file.format = file.format;
 	data_file.row_count = file.row_count;
 	data_file.file_size_bytes = file.file_size_bytes;
 	data_file.footer_size = file.footer_size;
@@ -1430,6 +1443,17 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		metadata_manager->ClearInlinedTableCaches();
 		connection->BeginTransaction();
 		snapshot.reset();
+		data_file_formats.clear();
+		for (auto &entry : pending_data_file_formats) {
+			if (state->dropped_tables.find(entry.first) != state->dropped_tables.end()) {
+				continue;
+			}
+			DuckLakeConfigOption option;
+			option.table_id = entry.first;
+			option.option.key = "experimental_data_file_format";
+			option.option.value = DataFileFormatToString(entry.second);
+			SetConfigOption(option);
+		}
 	};
 	context.query_metadata = [&](string q) {
 		return metadata_manager->Query(q);
@@ -1521,7 +1545,54 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 #endif
 }
 
+DataFileFormat DuckLakeTransaction::GetDataFileFormat(TableIndex table_id) {
+	if (!table_id.IsValid() || table_id.IsTransactionLocal()) {
+		return DataFileFormat::PARQUET;
+	}
+	auto cached = data_file_formats.find(table_id);
+	if (cached != data_file_formats.end()) {
+		return cached->second;
+	}
+	auto result =
+	    Query(StringUtil::Format("SELECT value FROM {METADATA_CATALOG}.ducklake_metadata "
+	                             "WHERE key = 'experimental_data_file_format' AND scope = 'table' AND scope_id = %d",
+	                             table_id.index));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to read DuckLake data file format: ");
+	}
+	auto chunk = result->Fetch();
+	auto format = chunk && chunk->size() ? DataFileFormatFromString(chunk->GetValue(0, 0).GetValue<string>())
+	                                     : DataFileFormat::PARQUET;
+	data_file_formats.emplace(table_id, format);
+	return format;
+}
+
 void DuckLakeTransaction::SetConfigOption(const DuckLakeConfigOption &option) {
+	if (option.option.key == "experimental_data_file_format") {
+		if (!option.table_id.IsValid() || option.table_id.IsTransactionLocal() || option.schema_id.IsValid()) {
+			throw InvalidInputException("experimental_data_file_format requires a committed table scope");
+		}
+		auto entry = ducklake_catalog.GetEntryById(*this, GetSnapshot(), option.table_id);
+		if (!entry || IsDeleted(*entry)) {
+			throw CatalogException("DuckLake format option table no longer exists");
+		}
+		auto &table = entry->Cast<DuckLakeTableEntry>();
+		auto format = DataFileFormatFromString(option.option.value);
+		auto current_format = GetDataFileFormat(option.table_id);
+		if (format == DataFileFormat::VORTEX) {
+			DuckLakeVortex::ValidateTable(table);
+		} else if (current_format == DataFileFormat::VORTEX) {
+			throw NotImplementedException("Experimental Vortex tables cannot change their data file format");
+		}
+		if (current_format == format) {
+			// In particular, the default Parquet setting needs no metadata row.
+			return;
+		}
+		metadata_manager->SetConfigOption(option);
+		data_file_formats[option.table_id] = format;
+		pending_data_file_formats[option.table_id] = format;
+		return;
+	}
 	// write the config option to the metadata
 	metadata_manager->SetConfigOption(option);
 	// set the option in the catalog

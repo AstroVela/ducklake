@@ -31,6 +31,7 @@ add_library(
   ducklake_initializer.cpp
   ducklake_autoload_helper.cpp
   ducklake_update.cpp
+  ducklake_vortex.cpp
   ducklake_scan.cpp
   ducklake_transaction.cpp
   ducklake_transaction_state.cpp

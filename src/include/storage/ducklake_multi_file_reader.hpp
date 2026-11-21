@@ -83,6 +83,7 @@ public:
 
 	static vector<MultiFileColumnDefinition> ColumnsFromFieldData(const DuckLakeFieldData &field_data,
 	                                                              bool emit_key_value = false);
+	static void ApplyRowFilters(ClientContext &context, BaseFileReader &reader, idx_t row_offset, DataChunk &chunk);
 
 private:
 	shared_ptr<BaseFileReader> TryCreateInlinedDataReader(const OpenFileInfo &file);
