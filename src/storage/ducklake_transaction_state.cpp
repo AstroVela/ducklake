@@ -16,6 +16,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/random_engine.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context_state.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -23,6 +24,22 @@
 #include <thread>
 
 namespace duckdb {
+
+namespace {
+
+class DuckLakeLocalCommitObserver : public ClientContextState {
+public:
+	bool rolled_back = false;
+
+	void TransactionRollback(MetaTransaction &, ClientContext &, optional_ptr<ErrorData> error) override {
+		// Only native constraint/transaction failures confirm a completed rollback.
+		// An I/O or fatal error, including after COMMIT, still has an unknown outcome.
+		rolled_back =
+		    error && (error->Type() == ExceptionType::CONSTRAINT || error->Type() == ExceptionType::TRANSACTION);
+	}
+};
+
+} // namespace
 
 DuckLakeTransactionState::DuckLakeTransactionState(DatabaseInstance &db, bool require_commit_message,
                                                    DuckLakeNameMapSet &new_name_maps, string data_path,
@@ -59,7 +76,29 @@ void DuckLakeTransactionState::EnsureCommitInfoProvided(const DuckLakeSnapshotCo
 DuckLakeTransactionState::~DuckLakeTransactionState() {
 }
 
+void DuckLakeTransactionState::CommitMetadataConnection(Connection &connection, Catalog &metadata_catalog) {
+	shared_ptr<DuckLakeLocalCommitObserver> observer;
+	if (metadata_catalog.GetCatalogType() == "duckdb") {
+		observer = connection.context->registered_state->GetOrCreate<DuckLakeLocalCommitObserver>(
+		    "ducklake_local_metadata_commit_observer");
+		observer->rolled_back = false;
+	}
+	try {
+		connection.Commit();
+	} catch (...) {
+		if (observer && observer->rolled_back) {
+			// The native engine confirmed the abort before wrapping its typed error.
+			// Preserve normal conflict retries; remote errors never take this path.
+			commit_outcome = DuckLakeCommitOutcome::NOT_COMMITTED;
+		}
+		throw;
+	}
+}
+
 void DuckLakeTransactionState::CleanupFiles() {
+	if (commit_outcome != DuckLakeCommitOutcome::NOT_COMMITTED) {
+		return;
+	}
 	// remove any files that were written
 	local_changes.CleanupFiles(db);
 }
@@ -791,10 +830,10 @@ bool DuckLakeTransactionState::TryMergeInlinedStats(const vector<DuckLakeColumnS
 }
 
 void DuckLakeTransactionState::RecomputeGlobalStatsAfterRewrite(string &batch_query, TableIndex table_id,
-                                                                 DuckLakeSnapshot snapshot,
-                                                                 const CompactionInformation &rewrite_changes,
-                                                                 const set<DataFileIndex> &removed_source_ids,
-                                                                 const DuckLakeCommitContext &context) {
+                                                                DuckLakeSnapshot snapshot,
+                                                                const CompactionInformation &rewrite_changes,
+                                                                const set<DataFileIndex> &removed_source_ids,
+                                                                const DuckLakeCommitContext &context) {
 	auto columns = context.get_table_column_schema(table_id);
 	if (columns.empty()) {
 		return; // no schema visible at the commit snapshot
@@ -914,7 +953,8 @@ void DuckLakeTransactionState::RecomputeGlobalStatsAfterRewrite(string &batch_qu
 	//    no live data becomes "unknown" -> it is scanned at query time, which is correct). UpdateGlobalTableStatsSql
 	//    only UPDATEs existing rows, so entries with no committed stats row (e.g. struct containers) are harmless
 	//    no-ops. Use the snapshot schema instead of current_stats->column_stats: the server-side stats cache is only
-	//    populated for tables with staged inserts, so a pure-rewrite commit can see an empty current_stats.column_stats.
+	//    populated for tables with staged inserts, so a pure-rewrite commit can see an empty
+	//    current_stats.column_stats.
 	for (auto &col : columns) {
 		if (new_stats.column_stats.find(col.field_index) == new_stats.column_stats.end()) {
 			new_stats.column_stats.insert(make_pair(col.field_index, DuckLakeColumnStats(col.column_type)));
@@ -1728,7 +1768,9 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 			}
 			bool flushed_inlined = !flushed_inlined_tables.empty();
 			context.flush_cache_if_pending();
+			commit_outcome = DuckLakeCommitOutcome::UNKNOWN;
 			context.commit_connection();
+			commit_outcome = DuckLakeCommitOutcome::COMMITTED;
 			if (flushed_inlined && !context.skip_drop_empty_inlined) {
 				DropEmptySupersededInlinedTables(context);
 			}
@@ -1737,6 +1779,9 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 			// finished writing
 			break;
 		} catch (std::exception &ex) {
+			if (commit_outcome != DuckLakeCommitOutcome::NOT_COMMITTED) {
+				throw;
+			}
 			ErrorData error(ex);
 			// rollback if there is an active transaction
 			context.try_rollback();
