@@ -87,11 +87,11 @@ vector, transaction, and recovery qualification.
 
 The [experimental native Vortex proof](native-vortex-files.md) separately
 validates file writing and reading, physical row identity, flush and recovery.
-Follow-up work covers static ANN indexes, index coverage and snapshot filtering,
-and Vane/Ray reads of committed inlined rows. The baseline distributed path
-continues to reject inlined data; [Draft #26](https://github.com/AstroVela/ducklake/pull/26)
-qualifies its proposed extension separately. The [Vane scan contract](vane.md)
-describes the baseline boundary.
+DuckLake #26 merged into `dev/ducklake-vortex` at `2c5e2659`. Vane/Ray reads of
+committed inline rows alongside Parquet files are now part of that branch.
+[DuckLake #26](https://github.com/AstroVela/ducklake/pull/26) · [Vane scan contract](vane.md)
+
+Follow-up work covers static ANN indexes, index coverage, and snapshot filtering.
 
 Selecting DuckLake as the source transaction owner would replace the proposed
 custom source WAL and Iceberg handoff for these tables. Any Iceberg output
