@@ -25,6 +25,8 @@ struct DuckLakeVortexOptimizerConfig {
 class DuckLakeVortexOptimizer {
 public:
 	static void Initialize(Connection &owner, const string &catalog);
+	static void CheckIndexDefinition(DuckLakeTransaction &transaction, const string &table_uuid,
+	                                 const DuckLakeVortexIndex &index);
 	static void Enable(ClientContext &context, const DuckLakeVortexOptimizerConfig &config,
 	                   const std::function<void(const string &)> &observe = nullptr);
 	static string Resume(ClientContext &context, const string &catalog, const string &schema, const string &table,

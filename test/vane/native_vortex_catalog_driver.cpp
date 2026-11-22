@@ -1437,6 +1437,29 @@ public:
 			}
 			return json.Finish(rows);
 		}
+		if (op == "cancel-create-lock") {
+			Connection caller(database);
+			auto &publication = DuckLakeVortexIndex::PublicationLock();
+			auto guard = publication.GetSharedLock([] {});
+			auto statement = ReadText(args.at(2));
+			auto create = std::async(std::launch::async, [&] {
+				auto result = caller.Query(statement);
+				return result->HasError() ? result->GetError() : string();
+			});
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!publication.WaitingWriterCount() && std::chrono::steady_clock::now() < deadline &&
+			       create.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+				std::this_thread::yield();
+			}
+			const bool waiting = publication.WaitingWriterCount() != 0;
+			caller.Interrupt();
+			const bool cancelled_before_release = create.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+			guard.reset();
+			const auto error = create.get();
+			Require(waiting && cancelled_before_release && StringUtil::Contains(error, "Interrupt"),
+			        "Create did not cancel in the publication lock wait");
+			return "{}";
+		}
 		if (op == "budget-config-interrupt") {
 			Connection caller(database);
 			auto statement = ReadText(args.at(2));
