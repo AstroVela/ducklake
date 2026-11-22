@@ -10,6 +10,7 @@
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
+#include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
 #include "storage/ducklake_vortex_search.hpp"
 #include "storage/ducklake_vortex_query_ffi.hpp"
@@ -46,6 +47,17 @@ public:
 			fs.CreateDirectory(root + "/responses");
 		}
 	}
+	~Fixture() {
+		if (optimizer_pause) {
+			optimizer_pause->Release();
+		}
+	}
+	weak_ptr<DatabaseInstance> WeakDatabase() {
+		return database.instance;
+	}
+	bool OptimizerStarted() const {
+		return optimizer_started;
+	}
 
 	string Capture(const string &name, const string &index) {
 		auto function = index.empty() ? "ducklake_vortex_read_view('lake','main','items',8,67108864,100000)"
@@ -70,6 +82,103 @@ public:
 
 	string Execute(const vector<string> &args) {
 		const auto &op = args.at(1);
+		if (op == "build-wrong-field") {
+			return DuckLakeVortexIndex::BuildAndPublish(*writer.context, "lake", "main", "items", "knn", args.at(2), 8,
+			                                            0, nullptr, "", optional_idx(999999))
+			    .ToJSON();
+		}
+		if (op == "optimizer-init") {
+			SQL(writer, "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
+			return "{}";
+		}
+		if (op == "optimizer-init-active-transaction") {
+			Connection caller(database);
+			SQL(caller, "CREATE TEMP TABLE optimizer_transaction_guard(value INTEGER);"
+			            "BEGIN;INSERT INTO optimizer_transaction_guard VALUES(1);");
+			string failure;
+			try {
+				DuckLakeVortexOptimizer::Initialize(caller, "lake");
+			} catch (const std::exception &error) {
+				failure = error.what();
+			}
+			Require(!failure.empty(), "Optimizer initialization accepted an active transaction");
+			Require(caller.context->transaction.HasActiveTransaction(),
+			        "Optimizer initialization rolled back the caller's existing transaction");
+			Require(SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
+			            1,
+			        "Optimizer initialization lost the caller's uncommitted row");
+			caller.Rollback();
+			Require(SQL(caller, "SELECT count(*) FROM optimizer_transaction_guard")->GetValue(0, 0).GetValue<int64_t>() ==
+			            0,
+			        "The caller could not roll back its own transaction");
+			return "{}";
+		}
+		if (op == "optimizer-enable") {
+			if (args.size() == 7) {
+				SQL(writer, "SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn'," +
+				                Value(args.at(2)).ToSQLString() + ",8," + args.at(3) + "," + args.at(4) + "," +
+				                args.at(5) + "," + args.at(6) + ")");
+			} else {
+				DuckLakeVortexOptimizerConfig config;
+				config.catalog = "lake";
+				config.schema = "main";
+				config.table = "items";
+				config.index = "knn";
+				config.root = args.at(2);
+				config.dimension = 8;
+				config.flush_rows = std::stoull(args.at(3));
+				config.flush_bytes = std::stoull(args.at(4));
+				config.index_rows = std::stoull(args.at(5));
+				config.index_bytes = std::stoull(args.at(6));
+				DuckLakeVortexOptimizer::Enable(*writer.context, config, OptimizerObserver(args.at(7), args.at(8)));
+			}
+			optimizer_started = true;
+			return "{}";
+		}
+		if (op == "optimizer-resume") {
+			if (args.size() == 2) {
+				SQL(writer, "SELECT * FROM ducklake_resume_vortex_optimizer('lake','main','items','knn')");
+			} else {
+				DuckLakeVortexOptimizer::Resume(*writer.context, "lake", "main", "items", "knn",
+				                                OptimizerObserver(args.at(2), args.at(3)));
+			}
+			optimizer_started = true;
+			return "{}";
+		}
+		if (op == "optimizer-cancel") {
+			SQL(writer, "SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')");
+			return "{}";
+		}
+		if (op == "optimizer-wait" || op == "optimizer-release") {
+			Require(bool(optimizer_pause), "Optimizer pause is not installed");
+			if (op == "optimizer-wait") {
+				optimizer_pause->Wait();
+			} else {
+				optimizer_pause->Release();
+			}
+			return "{}";
+		}
+		if (op == "optimizer-status") {
+			auto result = SQL(writer, "SELECT * FROM ducklake_vortex_optimizer_status('lake')");
+			ViewJSON json;
+			auto rows = json.Array();
+			for (idx_t row = 0; row < result->RowCount(); row++) {
+				auto value = json.Object();
+				for (idx_t col = 0; col < result->ColumnCount(); col++) {
+					auto item = result->GetValue(col, row);
+					if (item.type().id() == LogicalTypeId::BOOLEAN) {
+						json.Add(value, result->names[col].c_str(),
+						         yyjson_mut_bool(json.doc.get(), item.GetValue<bool>()));
+					} else if (item.type().id() == LogicalTypeId::UBIGINT) {
+						json.Number(value, result->names[col].c_str(), item.GetValue<idx_t>());
+					} else {
+						json.Text(value, result->names[col].c_str(), StringValue::Get(item));
+					}
+				}
+				yyjson_mut_arr_append(rows, value);
+			}
+			return json.Finish(rows);
+		}
 		if (op == "build") {
 			auto result = SQL(writer, "SELECT * FROM ducklake_build_vortex_index('lake','main','items'," +
 			                              Value(args.at(2)).ToSQLString() + "," + Value(args.at(3)).ToSQLString() +
@@ -484,6 +593,24 @@ public:
 	}
 
 private:
+	std::function<void(const string &)> OptimizerObserver(string stage, string mode) {
+		if (optimizer_pause) {
+			optimizer_pause->Release();
+		}
+		optimizer_pause = std::make_shared<Pause>();
+		auto pause = optimizer_pause;
+		auto marker = root + "/optimizer-" + stage + ".ready";
+		return [pause, marker, stage, mode](const string &current) {
+			if (current != stage) {
+				return;
+			}
+			if (mode == "fail") {
+				throw InvalidInputException("Injected optimizer failure");
+			}
+			Write(marker, "ready");
+			pause->Stop();
+		};
+	}
 	string SearchJSON(const vector<vector<Value>> &rows, const string &diagnostics) {
 		ViewJSON json;
 		auto value = json.Object();
@@ -534,6 +661,8 @@ private:
 	string root;
 	DuckDB database;
 	Connection writer;
+	std::shared_ptr<Pause> optimizer_pause;
+	bool optimizer_started = false;
 };
 } // namespace
 
@@ -541,20 +670,31 @@ int main(int argc, char **argv) {
 	try {
 		Require(argc == 3, "usage: native_vortex_catalog_driver ROOT create|resume");
 		Require(string(argv[2]) == "create" || string(argv[2]) == "resume", "Unknown fixture mode");
-		Fixture fixture(argv[1], string(argv[2]) == "create");
-		string line;
-		while (std::getline(std::cin, line)) {
-			auto args = StringUtil::Split(line, '\t');
-			Require(args.size() >= 2, "Invalid fixture command");
-			try {
-				fixture.Reply(args[0], fixture.Execute(args));
-			} catch (const std::exception &error) {
-				fixture.Error(args[0], error.what());
+		weak_ptr<DatabaseInstance> weak;
+		{
+			Fixture fixture(argv[1], string(argv[2]) == "create");
+			string line;
+			while (std::getline(std::cin, line)) {
+				auto args = StringUtil::Split(line, '\t');
+				Require(args.size() >= 2, "Invalid fixture command");
+				try {
+					fixture.Reply(args[0], fixture.Execute(args));
+				} catch (const std::exception &error) {
+					fixture.Error(args[0], error.what());
+				}
+				if (args[1] == "shutdown") {
+					break;
+				}
 			}
-			if (args[1] == "shutdown") {
-				break;
+			if (fixture.OptimizerStarted()) {
+				weak = fixture.WeakDatabase();
 			}
 		}
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		while (!weak.expired() && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		Require(weak.expired(), "Optimizer retained the database after its owner closed");
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << std::endl;

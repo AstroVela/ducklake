@@ -18,6 +18,7 @@
 #include "storage/ducklake_vortex_read_view.hpp"
 #include "storage/ducklake_vortex_search.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
+#include "storage/ducklake_vortex_optimizer.hpp"
 #endif
 
 namespace duckdb {
@@ -109,6 +110,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterDuckLakeVortexReadView(loader);
 	RegisterDuckLakeVortexIndexCatalog(loader);
 	RegisterDuckLakeVortexSearch(loader);
+	RegisterDuckLakeVortexOptimizer(loader);
 #endif
 
 	DuckLakeLastCommittedSnapshotFunction last_committed;
