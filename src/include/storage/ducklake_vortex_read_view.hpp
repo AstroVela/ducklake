@@ -21,6 +21,11 @@ struct DuckLakeVortexViewOptions {
 	string index_name;
 };
 
+struct DuckLakeVortexSourceBuffer {
+	idx_t file_id;
+	string bytes;
+};
+
 struct DuckLakeVortexReadView {
 	static StorageLock &AdmissionLock();
 	idx_t snapshot_id;
@@ -31,6 +36,7 @@ struct DuckLakeVortexReadView {
 	string rows_json;
 	string managed_data_path;
 	idx_t captured_business_rows = 0;
+	vector<DuckLakeVortexSourceBuffer> sources;
 
 	static DuckLakeVortexReadView Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
 	                                      const std::function<void(const string &)> &observe = nullptr,

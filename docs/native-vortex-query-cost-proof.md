@@ -198,3 +198,7 @@ archive, probe and codec/SDK inputs were hash-checked before reuse. Transaction
 guards, source/T/business budgets, score tolerances and recall thresholds remain
 unchanged. Clean engine builds and stable-load performance remain separate
 validation scopes; CI was not queried or operated for this follow-up.
+
+The next [binary-source proof](native-vortex-binary-source-proof.md) replaces
+the SQL source-byte envelope and staging files with owned in-memory buffers,
+then measures the change against this implementation.

@@ -20,6 +20,7 @@ use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex::array::arrays::struct_::StructArrayExt;
+use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
@@ -184,6 +185,19 @@ pub enum ViewInput {
     Catalogued { index_name: String },
 }
 
+enum SourceTransport {
+    Paths,
+    Staged(admission::Pins),
+    Buffers(BTreeMap<u64, ByteBuffer>),
+}
+struct PreparedView {
+    captured: MixedCapture,
+    transport: SourceTransport,
+    catalog: Option<admission::CatalogIndex>,
+    input: ViewInput,
+    digest: String,
+}
+
 impl MixedView {
     pub async fn open(
         capture: &Path,
@@ -239,6 +253,68 @@ impl MixedView {
                 None,
             )
         };
+        Self::from_prepared(
+            PreparedView {
+                captured,
+                transport: match pins {
+                    Some(pins) => SourceTransport::Staged(pins),
+                    None => SourceTransport::Paths,
+                },
+                catalog,
+                input,
+                digest: file_version(bytes),
+            },
+            leases,
+            budget,
+            session,
+            check,
+        )
+        .await
+    }
+
+    pub async fn from_binary(
+        bytes: &[u8],
+        name: &str,
+        buffers: BTreeMap<u64, ByteBuffer>,
+        leases: &Path,
+        budget: ViewBudget,
+        session: VortexSession,
+        check: &dyn Fn(&str) -> VortexResult<()>,
+    ) -> VortexResult<Self> {
+        check("before_open")?;
+        let (captured, index) = admission::prepare_binary(bytes, name)?;
+        Self::from_prepared(
+            PreparedView {
+                captured,
+                transport: SourceTransport::Buffers(buffers),
+                catalog: Some(index),
+                input: ViewInput::Catalogued {
+                    index_name: name.to_owned(),
+                },
+                digest: file_version(bytes),
+            },
+            leases,
+            budget,
+            session,
+            check,
+        )
+        .await
+    }
+
+    async fn from_prepared(
+        prepared: PreparedView,
+        leases: &Path,
+        budget: ViewBudget,
+        session: VortexSession,
+        check: &dyn Fn(&str) -> VortexResult<()>,
+    ) -> VortexResult<Self> {
+        let PreparedView {
+            captured,
+            transport,
+            catalog,
+            input,
+            digest,
+        } = prepared;
         if captured.format_version != 1 || captured.file_capture.business_fields.is_none() {
             vortex_bail!("Mixed capture requires version 1 and business field IDs");
         }
@@ -278,8 +354,12 @@ impl MixedView {
         check("sources_staged")?;
         let source_capture =
             serde_json::to_vec(&captured.file_capture).map_err(|error| vortex_err!("{error}"))?;
-        let source = Arc::new(match &pins {
-            Some(pins) => {
+        let source = Arc::new(match transport {
+            SourceTransport::Buffers(buffers) => {
+                PhysicalSource::open_buffers(&source_capture, session, budget.source_bytes, buffers)
+                    .await?
+            }
+            SourceTransport::Staged(pins) => {
                 PhysicalSource::open_pinned(
                     &source_capture,
                     session,
@@ -288,12 +368,11 @@ impl MixedView {
                 )
                 .await?
             }
-            None => {
+            SourceTransport::Paths => {
                 PhysicalSource::open_with_budget(&source_capture, session, budget.source_bytes)
                     .await?
             }
         });
-        drop(pins);
         check("source_pinned")?;
         let catalog_revision = catalog.as_ref().map(|index| index.revision);
         let (descriptor, root) = match input {
@@ -355,7 +434,7 @@ impl MixedView {
         Ok(Self {
             lease,
             source,
-            digest: file_version(bytes),
+            digest,
             inline_bytes,
             inline,
             visible,
