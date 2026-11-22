@@ -1,0 +1,75 @@
+# name: test/sql/vortex/native_vortex_build.test
+# description: native SPFresh construction publishes a ready generation and indexes flushed files
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_build.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_build_data', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','base' FROM range(128)t(i)
+
+statement error
+SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','unused',0,0)
+----
+Invalid Vortex build dimension or revision
+
+statement error
+SELECT * FROM ducklake_build_vortex_index('lake','main','items',NULL,'unused',2,0)
+----
+cannot be NULL
+
+statement error
+SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','unused',2,0)
+----
+catalog is not initialized
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_build_first.json',2,0)
+----
+1
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[8,0]::FLOAT[],1)
+----
+8
+
+statement ok
+INSERT INTO lake.items VALUES(1000,[8.125,0],'B','flushed')
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[8.12,0]::FLOAT[],1)
+----
+1000
+
+query I
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_build_second.json',2,1)
+----
+2
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[8.12,0]::FLOAT[],1)
+----
+1000
+
+statement error
+SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_build_second.json',2,2)
+----
+reference must be new
+
+statement ok
+DETACH lake

@@ -63,6 +63,32 @@ struct IndexViewBind : public TableFunctionData {
 	DuckLakeVortexViewOptions options;
 };
 
+static unique_ptr<FunctionData> BindBuild(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &types, vector<string> &names) {
+	auto result = BindCatalog(context, input, types, names);
+	auto dimension = input.inputs[5].GetValue<int64_t>();
+	if (dimension < 1 || dimension > 4096 || input.inputs[6].GetValue<int64_t>() < 0) {
+		throw InvalidInputException("Invalid Vortex build dimension or revision");
+	}
+	return result;
+}
+
+static void ExecuteBuild(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<IndexCatalogState>();
+	if (state.finished) {
+		return;
+	}
+	auto &args = input.bind_data->Cast<IndexCatalogBind>().args;
+	auto record = DuckLakeVortexIndex::BuildAndPublish(context, StringValue::Get(args[0]), StringValue::Get(args[1]),
+	                                                   StringValue::Get(args[2]), StringValue::Get(args[3]),
+	                                                   StringValue::Get(args[4]), uint32_t(args[5].GetValue<int64_t>()),
+	                                                   args[6].GetValue<idx_t>());
+	output.SetValue(0, 0, Value::UBIGINT(record.revision));
+	output.SetValue(1, 0, Value(record.generation));
+	output.SetCardinality(1);
+	state.finished = true;
+}
+
 static unique_ptr<FunctionData> BindIndexView(ClientContext &, TableFunctionBindInput &input,
                                               vector<LogicalType> &types, vector<string> &names) {
 	for (auto &value : input.inputs) {
@@ -102,6 +128,11 @@ static void ExecuteIndexView(ClientContext &context, TableFunctionInput &input, 
 }
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader) {
+	loader.RegisterFunction(
+	    TableFunction("ducklake_build_vortex_index",
+	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                   LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                  ExecuteBuild, BindBuild, InitCatalog));
 	loader.RegisterFunction(TableFunction("ducklake_initialize_vortex_indexes", {LogicalType::VARCHAR}, ExecuteCatalog,
 	                                      BindCatalog, InitCatalog));
 	loader.RegisterFunction(TableFunction("ducklake_publish_vortex_index",

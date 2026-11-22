@@ -41,6 +41,21 @@ struct DuckLakeVortexQueryRow {
 	uint8_t payload_null;
 };
 struct DuckLakeVortexQueryOutput;
+struct DuckLakeVortexBuildInput {
+	const uint8_t *admission;
+	uint64_t admission_len;
+	const DuckLakeVortexQuerySource *sources;
+	uint64_t source_count;
+	const uint8_t *data_path;
+	uint64_t data_path_len;
+	const uint8_t *reference_path;
+	uint64_t reference_path_len;
+	uint8_t (*control)(void *, const uint8_t *, uint64_t);
+	void *context;
+};
+// NULL means success; an owned error must be freed with build_error_free.
+char *ducklake_vortex_build(const DuckLakeVortexBuildInput *input);
+void ducklake_vortex_build_error_free(char *error);
 DuckLakeVortexQueryOutput *ducklake_vortex_query(const DuckLakeVortexQueryInput *input);
 const char *ducklake_vortex_query_error(const DuckLakeVortexQueryOutput *output);
 const char *ducklake_vortex_query_diagnostics(const DuckLakeVortexQueryOutput *output);

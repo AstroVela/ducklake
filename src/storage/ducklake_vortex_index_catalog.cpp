@@ -2,15 +2,21 @@
 
 #include "common/ducklake_vortex_json.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/opener_file_system.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_vortex_read_view.hpp"
+#include "storage/ducklake_vortex_control.hpp"
+#include "storage/ducklake_vortex_query_ffi.hpp"
 #include "mbedtls_wrapper.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <set>
 
@@ -117,6 +123,27 @@ string Canonical(const string &path) {
 void CheckInterrupted(Connection &owner, ClientContext &caller) {
 	if (caller.IsInterrupted() || owner.context->IsInterrupted()) {
 		throw InterruptException();
+	}
+}
+
+void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (!fs.DirectoryExists(root)) {
+		throw IOException("Vortex index output directory does not exist: %s", root);
+	}
+	auto &config = DBConfig::GetConfig(context);
+	if (Settings::Get<EnableExternalAccessSetting>(config)) {
+		return;
+	}
+	auto directory = config.SanitizeAllowedPath(root);
+	if (!StringUtil::EndsWith(directory, "/")) {
+		directory += "/";
+	}
+	// Construction creates generated descendants, which require directory-wide authorization.
+	auto allowed = std::any_of(config.options.allowed_directories.begin(), config.options.allowed_directories.end(),
+	                           [&](const string &prefix) { return StringUtil::StartsWith(directory, prefix); });
+	if (!allowed) {
+		throw PermissionException("Vortex index construction cannot access output directory \"%s\"", root);
 	}
 }
 
@@ -381,6 +408,81 @@ string DuckLakeVortexIndex::ToJSON() const {
 	json.Text(value, "root", root);
 	json.Add(value, "reference", yyjson_val_mut_copy(json.doc.get(), parsed.Root()));
 	return json.Finish(value);
+}
+
+DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(ClientContext &context, const string &catalog_name,
+                                                         const string &schema, const string &table_name,
+                                                         const string &name, const string &reference_path,
+                                                         uint32_t dimension, idx_t expected_revision,
+                                                         const std::function<void(const string &)> &observe) {
+	Name(name);
+	if (!dimension || dimension > 4096 || reference_path.empty() || reference_path.size() > 65536 ||
+	    reference_path.find('\0') != string::npos || expected_revision > idx_t(NumericLimits<int64_t>::Maximum())) {
+		throw InvalidInputException("Invalid Vortex build dimension, reference or revision");
+	}
+	auto check = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	};
+	check("before_build");
+	Connection owner(*context.db);
+	try {
+		Initialized(Begin(owner, catalog_name));
+		owner.Commit();
+	} catch (...) {
+		Rollback(owner);
+		throw;
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (!fs.IsPathAbsolute(reference_path)) {
+		throw InvalidInputException("Vortex build reference must be absolute");
+	}
+	auto separator = reference_path.find_last_of('/');
+	auto root = Canonical(reference_path.substr(0, separator == 0 ? 1 : separator));
+	CheckBuildDirectoryAccess(context, root);
+	auto &opener_fs = fs.Cast<OpenerFileSystem>();
+	if (opener_fs.IsDuckDBExtensionName(reference_path)) {
+		opener_fs.VerifyCanAccessExtension(reference_path, FileFlags::FILE_FLAGS_WRITE);
+	}
+	std::function<void(const string &)> build_check = [&](const string &stage) {
+		check(stage);
+		CheckBuildDirectoryAccess(context, root);
+	};
+	DuckLakeVortexViewOptions options {catalog_name, schema, table_name, dimension, MAX_ARTIFACTS, 100000, ""};
+	auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, build_check, &context);
+	vector<DuckLakeVortexQuerySource> sources;
+	for (auto &source : view.sources) {
+		sources.push_back(
+		    {source.file_id, reinterpret_cast<const uint8_t *>(source.bytes.data()), source.bytes.size()});
+	}
+	DuckLakeVortexControl control {context, build_check, nullptr, view.sources};
+	DuckLakeVortexBuildInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
+	                                view.admission_json.size(),
+	                                sources.data(),
+	                                sources.size(),
+	                                reinterpret_cast<const uint8_t *>(view.managed_data_path.data()),
+	                                view.managed_data_path.size(),
+	                                reinterpret_cast<const uint8_t *>(reference_path.data()),
+	                                reference_path.size(),
+	                                DuckLakeVortexControl::Check,
+	                                &control};
+	std::unique_ptr<char, decltype(&ducklake_vortex_build_error_free)> error(ducklake_vortex_build(&input),
+	                                                                         ducklake_vortex_build_error_free);
+	if (control.error) {
+		std::rethrow_exception(control.error);
+	}
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
+	if (error) {
+		throw InvalidInputException("%s", error.get());
+	}
+	build_check("before_build_publish");
+	return Publish(owner, catalog_name, schema, table_name, name, reference_path, expected_revision, context, build_check);
 }
 
 DuckLakeVortexIndex DuckLakeVortexIndex::Publish(Connection &owner, const string &catalog_name, const string &schema,

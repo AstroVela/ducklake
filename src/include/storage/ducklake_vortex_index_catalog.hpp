@@ -37,6 +37,10 @@ struct DuckLakeVortexIndex {
 	                                   const string &table, const string &name, const string &reference,
 	                                   idx_t expected_revision, ClientContext &caller,
 	                                   const std::function<void(const string &)> &observe = nullptr);
+	static DuckLakeVortexIndex BuildAndPublish(ClientContext &context, const string &catalog, const string &schema,
+	                                           const string &table, const string &name, const string &reference,
+	                                           uint32_t dimension, idx_t expected_revision,
+	                                           const std::function<void(const string &)> &observe = nullptr);
 };
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader);

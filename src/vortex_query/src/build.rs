@@ -20,6 +20,18 @@ pub async fn build_generation(
     root: &Path,
     session: VortexSession,
 ) -> VortexResult<(Snapshot, LocalGeneration)> {
+    build_generation_checked(source, field, dimension, root, session, &|_| Ok(())).await
+}
+
+pub(crate) async fn build_generation_checked(
+    source: Arc<dyn IndexSource>,
+    field: String,
+    dimension: u32,
+    root: &Path,
+    session: VortexSession,
+    check: &dyn Fn(&str) -> VortexResult<()>,
+) -> VortexResult<(Snapshot, LocalGeneration)> {
+    check("build_started")?;
     let scratch = tempfile::Builder::new()
         .prefix(".scratch-")
         .tempdir_in(root)?;
@@ -65,11 +77,13 @@ pub async fn build_generation(
         )
         .await?;
     let mut identity = metadata.clone();
+    check("build_complete")?;
     identity.artifacts.clear();
     if identity != expected {
         vortex_bail!("Provider changed requested identity or coverage");
     }
     let generation = store.seal(&metadata)?;
+    check("generation_sealed")?;
     let (verified, reopened) =
         LocalIndexStore::open(root, &generation, &metadata.snapshot, LIMITS)?;
     drop(
