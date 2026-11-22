@@ -6,7 +6,7 @@
 
 namespace duckdb {
 namespace {
-enum class Operation { INITIALIZE, ENABLE, RESUME, CANCEL, STATUS };
+enum class Operation { INITIALIZE, ENABLE, RESUME, CANCEL, STATUS, WRITE_BUDGET };
 
 struct OptimizerBind : public TableFunctionData {
 	Operation operation;
@@ -41,19 +41,44 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 			throw InvalidInputException("Vortex optimizer dimension exceeds 4096");
 		}
 	}
+	if (OP == Operation::WRITE_BUDGET) {
+		for (idx_t i = 4; i < input.inputs.size(); i++) {
+			if (input.inputs[i].GetValue<int64_t>() <= 0) {
+				throw InvalidInputException("Vortex write budgets must be positive");
+			}
+		}
+	}
 	auto bind = make_uniq<OptimizerBind>();
 	bind->operation = OP;
 	bind->args = input.inputs;
 	if (OP == Operation::STATUS) {
-		names = {"table_uuid",  "schema_name",  "table_name",        "index_name",           "state",
-		         "enabled",     "run_id",       "expected_revision", "candidate_generation", "published_revision",
-		         "inline_rows", "inline_bytes", "unindexed_rows",    "unindexed_bytes",      "error",
-		         "run_count",   "running"};
+		names = {"table_uuid",
+		         "schema_name",
+		         "table_name",
+		         "index_name",
+		         "state",
+		         "enabled",
+		         "run_id",
+		         "expected_revision",
+		         "candidate_generation",
+		         "published_revision",
+		         "inline_rows",
+		         "inline_bytes",
+		         "unindexed_rows",
+		         "unindexed_bytes",
+		         "error",
+		         "run_count",
+		         "running",
+		         "max_inline_rows",
+		         "max_inline_bytes",
+		         "max_unindexed_rows",
+		         "max_unindexed_bytes"};
 		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 		         LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::UBIGINT,
 		         LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 		         LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::UBIGINT,
-		         LogicalType::BOOLEAN};
+		         LogicalType::BOOLEAN, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+		         LogicalType::UBIGINT};
 	} else {
 		names = {"state"};
 		types = {LogicalType::VARCHAR};
@@ -103,6 +128,13 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		case Operation::STATUS:
 			state.rows = DuckLakeVortexOptimizer::Status(context, text(0));
 			break;
+		case Operation::WRITE_BUDGET: {
+			DuckLakeVortexWriteBudget budget {args[4].GetValue<idx_t>(), args[5].GetValue<idx_t>(),
+			                                  args[6].GetValue<idx_t>(), args[7].GetValue<idx_t>()};
+			DuckLakeVortexOptimizer::SetWriteBudget(context, text(0), text(1), text(2), text(3), budget);
+			result = "configured";
+			break;
+		}
 		}
 		if (bind.operation != Operation::STATUS) {
 			state.rows.push_back({Value(result)});
@@ -138,5 +170,10 @@ void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader) {
 	}
 	loader.RegisterFunction(TableFunction("ducklake_vortex_optimizer_status", {LogicalType::VARCHAR}, Execute,
 	                                      Bind<Operation::STATUS>, Init));
+	loader.RegisterFunction(
+	    TableFunction("ducklake_set_vortex_write_budget",
+	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                   LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	                  Execute, Bind<Operation::WRITE_BUDGET>, Init));
 }
 } // namespace duckdb

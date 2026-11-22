@@ -1,0 +1,131 @@
+# name: test/sql/vortex/native_vortex_write_budget.test
+# description: reject growth before commit and reuse inline/file budgets after flush and indexing
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_write_budget.ducklake' AS lake (DATA_PATH '__WORKING_DIRECTORY__/__TEST_DIR__/vortex_write_budget_data', DATA_INLINING_ROW_LIMIT 100)
+
+statement ok
+CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_indexes('lake')
+
+statement ok
+INSERT INTO lake.items SELECT 10000+i,[10000+i,0],'A','base' FROM range(128)t(i)
+
+statement ok
+SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_write_budget_base.json',2,0)
+
+statement ok
+SELECT * FROM ducklake_initialize_vortex_optimizer('lake')
+
+statement ok
+SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2,100000,4194304,100000,67108864)
+
+statement ok
+SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')
+
+statement error
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',0,4096,8,67108864)
+----
+must be positive
+
+query T
+SELECT state FROM ducklake_set_vortex_write_budget('lake','main','items','knn',2,4096,8,67108864)
+----
+configured
+
+statement ok
+INSERT INTO lake.items VALUES(1,[1,0],'A','中文'),(2,[2,0],NULL,NULL)
+
+statement error
+INSERT INTO lake.items VALUES(3,[3,0],'A','rejected')
+----
+RESOURCE_EXHAUSTED: Vortex write inline rows
+
+query I
+SELECT count(*) FROM lake.items
+----
+130
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM lake.items WHERE id=1
+
+statement ok
+INSERT INTO lake.items VALUES(3,[3,0],'A','replacement')
+
+statement ok
+COMMIT
+
+statement error
+UPDATE lake.items SET payload=repeat('x',5000) WHERE id=2
+----
+RESOURCE_EXHAUSTED: Vortex write inline bytes
+
+query IT
+SELECT id,coalesce(payload,'NULL') FROM lake.items WHERE id<10000 ORDER BY id
+----
+2	NULL
+3	replacement
+
+statement ok
+CALL ducklake_flush_inlined_data('lake')
+
+statement ok
+INSERT INTO lake.items VALUES(4,[4,0],'A','four'),(5,[5,0],'A','five')
+
+statement ok
+CALL ducklake_flush_inlined_data('lake')
+
+statement error
+INSERT INTO lake.items SELECT 100+i,[i::FLOAT,0],'A','file' FROM range(101)t(i)
+----
+RESOURCE_EXHAUSTED: Vortex write unindexed rows
+
+query I
+SELECT count(*) FROM lake.items
+----
+132
+
+statement ok
+SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/vortex_write_budget_index.json',2,1)
+
+statement ok
+INSERT INTO lake.items VALUES(6,[6,0],'A','after-index')
+
+statement ok
+CALL ducklake_flush_inlined_data('lake')
+
+query I
+SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[6,0]::FLOAT[],1)
+----
+6
+
+statement ok
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',2,4096,100000,67108864)
+
+statement error
+INSERT INTO lake.items SELECT 1000+i,[i::FLOAT,0],'A','row-budget' FROM range(99999)t(i)
+----
+RESOURCE_EXHAUSTED: Vortex write physical and inline rows
+
+query I
+SELECT count(*) FROM lake.items
+----
+133
+
+statement ok
+DETACH lake
