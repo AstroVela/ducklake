@@ -20,13 +20,14 @@ For paced/burst/recovery measurements and concurrent SQL checks, see
 
 ## Fixed inputs and packaging
 
-`vane-native-vortex.toml` records the Vane profile. The validation fixes:
+`vane-native-vortex.toml` records the Vane profile. The native build uses
+these pinned inputs.
 
 | Input | Revision |
 | --- | --- |
 | Vane | `e14bf92d4053141697a59dcbd6098677cbddb80a` |
-| duckdb-vortex | `84cef20459d15a2e950dee3e6b91e2804d729ec9` |
-| Vortex | `b20e34c2abe63dd8f1b886b370d060b0b1ce499b` |
+| duckdb-vortex | `684bf8b0bfe305feeff155e0b3eb335540444b07` |
+| Vortex | `8a3b12a4a2f90dde6ba7f158ba63fb43537da39d` |
 | SPFresh | `5893eb61ee3b18610b6b00f1939be7dae1af8904` with the existing static-only patch |
 | LLVM OpenMP | `18.1.8`, source archives verified by SHA-256 |
 | DuckLake vcpkg | `84bab45d415d22042bd0b9081aea57f362da3f35` |
