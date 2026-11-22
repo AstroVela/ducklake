@@ -23,7 +23,7 @@ use vortex_index::store::LocalGeneration;
 use crate::build::{
     BuildTarget, build_generation_at, build_generation_checked, write_reference_at,
 };
-use crate::source::PhysicalSource;
+use crate::source::{Capture, PhysicalSource};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -37,7 +37,7 @@ pub struct Reference {
     pub generation: LocalGeneration,
 }
 
-fn snapshot(source: &PhysicalSource, files: Vec<SourceFile>) -> VortexResult<Snapshot> {
+pub(crate) fn snapshot(source: &PhysicalSource, files: Vec<SourceFile>) -> VortexResult<Snapshot> {
     let inventory = serde_json::to_vec(&files).map_err(|error| vortex_err!("{error}"))?;
     let snapshot = Snapshot {
         dataset_id: format!("ducklake-physical-files:{}", source.capture.table_uuid),
@@ -89,9 +89,9 @@ pub fn validate_reference(source: &PhysicalSource, descriptor: &Reference) -> Vo
     Ok(())
 }
 
-struct FileSource {
-    source: Arc<PhysicalSource>,
-    snapshot: Snapshot,
+pub(crate) struct FileSource {
+    pub source: Arc<PhysicalSource>,
+    pub snapshot: Snapshot,
 }
 
 #[async_trait]
@@ -151,7 +151,14 @@ pub(crate) async fn build_checked(
         check,
     )
     .await?;
-    finish_reference(&source, reference, snapshot, generation, root, check)
+    finish_reference(
+        &source.capture,
+        reference,
+        snapshot,
+        generation,
+        root,
+        check,
+    )
 }
 
 pub(crate) async fn build_owned(
@@ -184,11 +191,18 @@ pub(crate) async fn build_owned(
         check,
     )
     .await?;
-    finish_reference(&source, reference, snapshot, generation, workspace, check)
+    finish_reference(
+        &source.capture,
+        reference,
+        snapshot,
+        generation,
+        workspace,
+        check,
+    )
 }
 
-fn finish_reference(
-    source: &PhysicalSource,
+pub(crate) fn finish_reference(
+    capture: &Capture,
     reference: &Path,
     snapshot: Snapshot,
     generation: LocalGeneration,
@@ -197,9 +211,9 @@ fn finish_reference(
 ) -> VortexResult<()> {
     let descriptor = Reference {
         format_version: 1,
-        table_uuid: source.capture.table_uuid.clone(),
-        field_id: source.capture.field_id,
-        dimension: source.capture.dimension,
+        table_uuid: capture.table_uuid.clone(),
+        field_id: capture.field_id,
+        dimension: capture.dimension,
         metric: "squared_l2".to_owned(),
         snapshot,
         generation,

@@ -209,6 +209,9 @@ public:
 	Connection &GetConnection();
 
 	DuckLakeSnapshot GetSnapshot();
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	DuckLakeSnapshot RefreshVortexRewriteSnapshot();
+#endif
 	DuckLakeSnapshot GetSnapshot(optional_ptr<BoundAtClause> at_clause,
 	                             SnapshotBound bound = SnapshotBound::UPPER_BOUND);
 

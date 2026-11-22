@@ -6,6 +6,7 @@ use std::{path::Path, ptr, slice, str, sync::Arc};
 use crate::{
     ffi::{Source, copy_sources},
     file_index,
+    rebind::{self, PreparedIndex},
     source::{Capture, PhysicalSource},
 };
 use serde::Deserialize;
@@ -42,7 +43,7 @@ struct BuildAdmission {
 }
 
 // All metadata/descriptors remain readable until return; bytes until source_pinned.
-unsafe fn execute(input: &BuildInput) -> VortexResult<()> {
+unsafe fn execute(input: &BuildInput, prepare: bool) -> VortexResult<Option<PreparedIndex>> {
     if input.admission.is_null()
         || !(1..=32 * 1024 * 1024).contains(&input.admission_len)
         || input.data_path.is_null()
@@ -120,6 +121,18 @@ unsafe fn execute(input: &BuildInput) -> VortexResult<()> {
                 .await?,
         );
         check("source_pinned")?;
+        if prepare {
+            return rebind::prepare(
+                source,
+                reference,
+                generation.to_owned(),
+                workspace,
+                session,
+                &check,
+            )
+            .await
+            .map(Some);
+        }
         file_index::build_owned(
             source,
             reference,
@@ -128,7 +141,8 @@ unsafe fn execute(input: &BuildInput) -> VortexResult<()> {
             session,
             &check,
         )
-        .await
+        .await?;
+        Ok(None)
     })
 }
 
@@ -137,10 +151,93 @@ unsafe fn execute(input: &BuildInput) -> VortexResult<()> {
 /// remain readable until source_pinned or earlier return. NULL means success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ducklake_vortex_build(input: &BuildInput) -> *mut c_char {
-    let error = match catch_unwind(AssertUnwindSafe(|| unsafe { execute(input) })) {
-        Ok(Ok(())) => return ptr::null_mut(),
+    let error = match catch_unwind(AssertUnwindSafe(|| unsafe { execute(input, false) })) {
+        Ok(Ok(_)) => return ptr::null_mut(),
         Ok(Err(error)) => error.to_string(),
         Err(_) => "Native Vortex build panicked".to_owned(),
+    };
+    CString::new(error.replace('\0', "\\0"))
+        .expect("NUL escaped")
+        .into_raw()
+}
+
+pub struct PreparedOutput {
+    prepared: Option<PreparedIndex>,
+    error: Option<CString>,
+}
+
+#[repr(C)]
+pub struct BindInput {
+    prepared: *const PreparedOutput,
+    old_file_id: u64,
+    new_file_id: u64,
+    control: extern "C" fn(*mut c_void, *const u8, u64) -> u8,
+    context: *mut c_void,
+}
+
+/// # Safety
+/// Same borrowed-input lifetime as build. Free the returned handle exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ducklake_vortex_prepare(input: &BuildInput) -> *mut PreparedOutput {
+    let error = match catch_unwind(AssertUnwindSafe(|| unsafe { execute(input, true) })) {
+        Ok(Ok(Some(prepared))) => {
+            return Box::into_raw(Box::new(PreparedOutput {
+                prepared: Some(prepared),
+                error: None,
+            }));
+        }
+        Ok(Ok(None)) => "Native preparation returned no candidate".to_owned(),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "Native Vortex preparation panicked".to_owned(),
+    };
+    Box::into_raw(Box::new(PreparedOutput {
+        prepared: None,
+        error: Some(CString::new(error.replace('\0', "\\0")).expect("NUL escaped")),
+    }))
+}
+
+/// # Safety
+/// Handle must remain live; returned error is borrowed until prepare_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ducklake_vortex_prepare_error(output: &PreparedOutput) -> *const c_char {
+    output
+        .error
+        .as_ref()
+        .map_or(ptr::null(), |error| error.as_ptr())
+}
+
+/// # Safety
+/// Free one live handle returned by prepare exactly once, after bind has returned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ducklake_vortex_prepare_free(output: *mut PreparedOutput) {
+    unsafe {
+        drop(Box::from_raw(output));
+    }
+}
+
+/// # Safety
+/// Prepared handle and callback must remain live until return. Free errors with build_error_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ducklake_vortex_bind(input: &BindInput) -> *mut c_char {
+    let error = match catch_unwind(AssertUnwindSafe(|| -> VortexResult<()> {
+        let prepared = unsafe { input.prepared.as_ref() }
+            .and_then(|output| output.prepared.as_ref())
+            .ok_or_else(|| vortex_err!("A successful prepared index is required"))?;
+        let check = |stage: &str| {
+            if (input.control)(input.context, stage.as_ptr(), stage.len() as u64) != 0 {
+                vortex_bail!("Native Vortex binding interrupted");
+            }
+            Ok(())
+        };
+        block_on(|_| async {
+            prepared
+                .bind(input.old_file_id, input.new_file_id, &check)
+                .await
+        })
+    })) {
+        Ok(Ok(())) => return ptr::null_mut(),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "Native Vortex binding panicked".to_owned(),
     };
     CString::new(error.replace('\0', "\\0"))
         .expect("NUL escaped")

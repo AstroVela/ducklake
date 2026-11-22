@@ -142,10 +142,10 @@ struct DuckLakeVortexIndex {
 struct DuckLakeVortexRewriteState : public ClientContextState {
 	static shared_ptr<DuckLakeVortexRewriteState> Get(ClientContext &context);
 	string catalog, schema, table, table_uuid, build_id, selected, reference, workspace, private_path, source_root,
-	    new_path;
+	    new_path, input_identity;
 	optional_ptr<ClientContext> caller;
 	DuckLakeVortexCatalogIdentity identity;
-	idx_t table_id = 0, snapshot_id = 0, schema_version = 0, new_file_id = 0;
+	idx_t table_id = 0, snapshot_id = 0, schema_version = 0, new_file_id = 0, commit_snapshot_id = 0;
 	idx_t copy_plans = 0, new_rows = 0, new_bytes = 0;
 	idx_t staged_source_bytes = 0;
 	vector<string> staged_inputs;
@@ -153,6 +153,7 @@ struct DuckLakeVortexRewriteState : public ClientContextState {
 	vector<DuckLakeVortexIndexFile> selected_files;
 	DuckLakeVortexIndex before, candidate;
 	std::function<void(const string &)> check;
+	std::function<void(idx_t)> bind;
 };
 
 void RegisterDuckLakeVortexIndexCatalog(ExtensionLoader &loader);
