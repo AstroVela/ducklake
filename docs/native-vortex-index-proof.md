@@ -33,6 +33,11 @@ qualifies rebuilt current and historical generations. Retaining old physical
 addresses across compaction requires an actively pinned catalog read view or an
 explicit source-view lease; this process proof does not provide such a lease.
 
+The separate [retained read-view proof](native-vortex-read-view-proof.md) adds a
+bounded source-view lease using pinned file bytes and verified private index
+artifacts. It checks old-view business take across actual DuckLake cleanup;
+the one-shot proof below continues to recapture physical inventories.
+
 The bridge indexes complete physical files, including rows hidden by DuckLake.
 Its per-file Vortex `LocalFileSource` instances verify and pin encoded bytes.
 They accommodate the internal row-ID and snapshot columns that flush or rewrite
