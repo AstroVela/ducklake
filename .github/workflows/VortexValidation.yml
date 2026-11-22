@@ -251,6 +251,13 @@ jobs:
           python3 -I test/vane/test_native_vortex_backpressure.py \
             --driver build/index-shell/ducklake_vortex_catalog_driver \
             --output-dir build/index-logs/backpressure
+      - name: Validate independent B segments and retained multi-segment views
+        run: |
+          python3 -I test/vane/test_native_vortex_segments.py \
+            --duckdb build/index-shell/duckdb \
+            --driver build/index-shell/ducklake_vortex_catalog_driver \
+            --probe build/index-cargo/ci/ducklake-vortex-index-probe \
+            --output-dir build/index-logs/segments
       - name: Validate query projections and record isolated process cost
         run: |
           python3 -I test/vane/test_native_vortex_cost.py \

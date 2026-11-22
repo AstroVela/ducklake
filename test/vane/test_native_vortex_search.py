@@ -504,7 +504,7 @@ def exercise_data_paths(proof, scratch, checks):
         require(
             named["capture"]["file_capture"]["files"] == original_files
             and named["index"]["revision"] == 1
-            and named["index"]["reference"] == json.loads(reference.read_text()),
+            and CAT.single_reference(named["index"]) == json.loads(reference.read_text()),
             f"managed path expansion changed the sealed source identity for {mode}",
         )
         if mode in ("relative", "file-colon"):

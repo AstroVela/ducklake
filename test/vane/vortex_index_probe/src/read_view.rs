@@ -207,7 +207,7 @@ impl RetainedView {
     fn artifact_bytes(&self) -> u64 {
         match self {
             Self::Snapshot(view) => view.lease.artifact_bytes,
-            Self::Mixed(view) => view.lease.artifact_bytes,
+            Self::Mixed(view) => view.artifact_bytes(),
         }
     }
 
@@ -408,9 +408,9 @@ impl Registry {
                 )
                 .await?;
                 let result = json!({"capture_digest":opened.digest,"snapshot_id":opened.source.capture.snapshot_id,
-                    "source_bytes":opened.source.pinned_bytes(),"artifact_bytes":opened.lease.artifact_bytes,
+                    "source_bytes":opened.source.pinned_bytes(),"artifact_bytes":opened.artifact_bytes(),
                     "inline_rows":opened.inline_rows(),"inline_bytes":opened.inline_bytes,
-                    "index_revision":opened.catalog_revision,"generation":opened.lease.index.metadata().generation});
+                    "index_revision":opened.catalog_revision,"generation":opened.generation(),"generations":opened.generations()});
                 self.views.insert(view, RetainedView::Mixed(opened));
                 Ok(result)
             }
