@@ -1,0 +1,37 @@
+#pragma once
+
+#include "duckdb/common/common.hpp"
+#include "duckdb/main/connection.hpp"
+
+#include <functional>
+
+namespace duckdb {
+
+class ExtensionLoader;
+class StorageLock;
+void RegisterDuckLakeVortexReadView(ExtensionLoader &loader);
+
+struct DuckLakeVortexViewOptions {
+	string catalog;
+	string schema;
+	string table;
+	uint32_t dimension;
+	idx_t max_source_bytes;
+	idx_t max_rows;
+};
+
+struct DuckLakeVortexReadView {
+	static StorageLock &AdmissionLock();
+	idx_t snapshot_id;
+	idx_t source_bytes = 0;
+	idx_t visible_rows = 0;
+	idx_t inline_rows = 0;
+	string admission_json;
+	string rows_json;
+
+	static DuckLakeVortexReadView Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
+	                                      const std::function<void(const string &)> &observe = nullptr,
+	                                      optional_ptr<ClientContext> owner = nullptr);
+};
+
+} // namespace duckdb

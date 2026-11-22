@@ -110,6 +110,24 @@ impl PhysicalSource {
         session: VortexSession,
         budget: usize,
     ) -> VortexResult<Self> {
+        Self::open_files(bytes, session, budget, None).await
+    }
+
+    pub async fn open_pinned(
+        bytes: &[u8],
+        session: VortexSession,
+        budget: usize,
+        pins: &BTreeMap<u64, String>,
+    ) -> VortexResult<Self> {
+        Self::open_files(bytes, session, budget, Some(pins)).await
+    }
+
+    async fn open_files(
+        bytes: &[u8],
+        session: VortexSession,
+        budget: usize,
+        pins: Option<&BTreeMap<u64, String>>,
+    ) -> VortexResult<Self> {
         let capture: Capture =
             serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
         if capture.format_version != 1
@@ -131,6 +149,9 @@ impl PhysicalSource {
             files: capture.files.clone(),
         };
         snapshot.validate()?;
+        if pins.is_some_and(|pins| pins.len() != snapshot.files.len()) {
+            vortex_bail!("Admitted source inventory must match every captured file");
+        }
         let mut visible = BTreeSet::new();
         for row in &capture.visible {
             snapshot.validate_row(*row)?;
@@ -141,11 +162,17 @@ impl PhysicalSource {
         let mut files = BTreeMap::new();
         let mut remaining = budget.min(MAX_SOURCE_BYTES);
         for file in &snapshot.files {
-            let metadata = fs::metadata(&file.uri)?;
+            let path = match pins {
+                Some(pins) => pins
+                    .get(&file.id)
+                    .ok_or_else(|| vortex_err!("Missing admitted source file"))?,
+                None => &file.uri,
+            };
+            let metadata = fs::metadata(path)?;
             if !metadata.is_file() || metadata.len() > remaining as u64 {
                 vortex_bail!("Physical source exceeds its local byte budget");
             }
-            let bytes = fs::read(&file.uri)?;
+            let bytes = fs::read(path)?;
             if bytes.len() > remaining || file_version(&bytes) != file.version {
                 vortex_bail!("Physical source file version mismatch");
             }
@@ -195,6 +222,7 @@ impl PhysicalSource {
             let mut physical_snapshot = snapshot.clone();
             physical_snapshot.schema_fingerprint = schema_fingerprint(&dtype)?;
             physical_snapshot.files = vec![file.clone()];
+            physical_snapshot.files[0].uri = path.clone();
             let source = LocalFileSource::open(
                 physical_snapshot,
                 dtype,

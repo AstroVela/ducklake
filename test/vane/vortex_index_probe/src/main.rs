@@ -1,5 +1,6 @@
 //! Test-only DuckLake bridge to the existing Vortex SPFresh provider.
 
+mod admission;
 mod file_index;
 mod mixed;
 mod read_view;
@@ -326,7 +327,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.get(1).cloned().unwrap_or_default();
     if !matches!(
         (command.as_str(), args.len()),
-        ("build" | "build-file-index", 4) | ("search", 6) | ("serve", 4)
+        (
+            "build" | "build-file-index" | "build-admitted-file-index",
+            4
+        ) | ("search", 6)
+            | ("serve", 4)
     ) {
         return Err(
             "usage: probe build|build-file-index CAPTURE REFERENCE | search CAPTURE REFERENCE REQUEST OUTPUT | serve ROOT LIMITS_JSON".into(),
@@ -337,11 +342,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if command == "serve" {
             return read_view::serve(Path::new(&args[2]), &args[3], session).await;
         }
-        let source = Arc::new(PhysicalSource::open(&fs::read(&args[2])?, session.clone()).await?);
         let reference = Path::new(&args[3]);
         if !reference.is_absolute() {
             vortex_bail!("Reference must be absolute");
         }
+        if command == "build-admitted-file-index" {
+            if fs::metadata(&args[2])?.len() > 160 * 1024 * 1024 {
+                vortex_bail!("Native admission exceeds its byte budget");
+            }
+            let prepared = admission::prepare(
+                &fs::read(&args[2])?,
+                64 * 1024 * 1024,
+                reference
+                    .parent()
+                    .ok_or_else(|| vortex_err!("Reference parent required"))?,
+            )?;
+            let source = Arc::new(
+                PhysicalSource::open_pinned(
+                    &serde_json::to_vec(&prepared.capture.file_capture)
+                        .map_err(|error| vortex_err!("{error}"))?,
+                    session.clone(),
+                    64 * 1024 * 1024,
+                    &prepared.pins.files,
+                )
+                .await?,
+            );
+            return file_index::build(source, reference, session).await;
+        }
+        let source = Arc::new(PhysicalSource::open(&fs::read(&args[2])?, session.clone()).await?);
         if command == "build-file-index" {
             file_index::build(source, reference, session).await
         } else if command == "build" {
