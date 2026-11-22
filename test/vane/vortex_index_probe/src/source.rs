@@ -47,7 +47,7 @@ use vortex_index::file::schema_fingerprint;
 
 const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capture {
     pub format_version: u32,
@@ -62,7 +62,7 @@ pub struct Capture {
     pub business_fields: Option<BusinessFields>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BusinessFields {
     pub id: u32,
@@ -70,7 +70,8 @@ pub struct BusinessFields {
     pub payload: u32,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BusinessRow {
     pub id: Option<i64>,
     pub embedding: Vec<f32>,

@@ -1,5 +1,7 @@
 //! Test-only DuckLake bridge to the existing Vortex SPFresh provider.
 
+mod file_index;
+mod mixed;
 mod read_view;
 mod source;
 
@@ -96,6 +98,28 @@ async fn build(
     let root = reference
         .parent()
         .ok_or_else(|| vortex_err!("Reference parent required"))?;
+    let digest = source.digest.clone();
+    let field = source.field.clone();
+    let dimension = source.capture.dimension;
+    let (snapshot, generation) = build_generation(source, field, dimension, root, session).await?;
+    write_reference(
+        reference,
+        &Reference {
+            format_version: 1,
+            capture_digest: digest,
+            snapshot,
+            generation,
+        },
+    )
+}
+
+async fn build_generation(
+    source: Arc<dyn IndexSource>,
+    field: String,
+    dimension: u32,
+    root: &Path,
+    session: VortexSession,
+) -> VortexResult<(Snapshot, LocalGeneration)> {
     let scratch = tempfile::Builder::new()
         .prefix(".scratch-")
         .tempdir_in(root)?;
@@ -110,12 +134,12 @@ async fn build(
     let store = Arc::new(LocalIndexStore::create(root, &generation, LIMITS)?);
     let metadata = IndexMetadata {
         format_version: 1,
-        name: format!("field-{}", source.capture.field_id),
+        name: field.clone(),
         generation,
         backend: SPFRESH_ID.into(),
         backend_version: 1,
         snapshot: source.snapshot().clone(),
-        fields: vec![source.field.clone()],
+        fields: vec![field],
         covered_files: source.snapshot().files.iter().map(|file| file.id).collect(),
         artifacts: vec![],
     };
@@ -125,10 +149,9 @@ async fn build(
         ..SpFreshBuildLimits::default()
     };
     let builder = SpFreshIndexBuilder::try_new(scratch.path().to_path_buf(), session, limits)?;
-    let options = serde_json::json!({"format_version":1, "dimension":source.capture.dimension,
+    let options = serde_json::json!({"format_version":1, "dimension":dimension,
         "head_count":64, "posting_page_limit":12, "replicas":4});
     let expected = metadata.clone();
-    let digest = source.digest.clone();
     let metadata = builder
         .build(
             IndexBuildRequest {
@@ -154,14 +177,15 @@ async fn build(
             .open(&reopened, Arc::new(verified))
             .await?,
     );
-    let descriptor = Reference {
-        format_version: 1,
-        capture_digest: digest,
-        snapshot: metadata.snapshot,
-        generation,
-    };
+    Ok((metadata.snapshot, generation))
+}
+
+fn write_reference(reference: &Path, descriptor: &impl Serialize) -> VortexResult<()> {
+    let root = reference
+        .parent()
+        .ok_or_else(|| vortex_err!("Reference parent required"))?;
     let mut pending = tempfile::NamedTempFile::new_in(root)?;
-    serde_json::to_writer(&mut pending, &descriptor).map_err(|error| vortex_err!("{error}"))?;
+    serde_json::to_writer(&mut pending, descriptor).map_err(|error| vortex_err!("{error}"))?;
     pending.flush()?;
     pending.as_file().sync_all()?;
     pending
@@ -302,10 +326,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.get(1).cloned().unwrap_or_default();
     if !matches!(
         (command.as_str(), args.len()),
-        ("build", 4) | ("search", 6) | ("serve", 4)
+        ("build" | "build-file-index", 4) | ("search", 6) | ("serve", 4)
     ) {
         return Err(
-            "usage: probe build CAPTURE REFERENCE | search CAPTURE REFERENCE REQUEST OUTPUT | serve ROOT LIMITS_JSON".into(),
+            "usage: probe build|build-file-index CAPTURE REFERENCE | search CAPTURE REFERENCE REQUEST OUTPUT | serve ROOT LIMITS_JSON".into(),
         );
     }
     block_on(|handle| async move {
@@ -318,7 +342,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !reference.is_absolute() {
             vortex_bail!("Reference must be absolute");
         }
-        if command == "build" {
+        if command == "build-file-index" {
+            file_index::build(source, reference, session).await
+        } else if command == "build" {
             build(source, reference, session).await
         } else {
             search(
