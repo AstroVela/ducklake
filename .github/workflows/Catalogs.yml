@@ -73,6 +73,7 @@ jobs:
 
     - name: Test native vector transaction recovery
       run: |
+        python3 -I test/vane/test_native_realtime_vector_loading.py --duckdb build/release/duckdb
         python3 -I test/vane/test_native_realtime_vector_recovery.py --duckdb build/release/duckdb
 
     - name: Test Quack
@@ -102,6 +103,8 @@ jobs:
         mkdir -p "$EXT_DIR"
         cp "$REPO_DIR/postgres_scanner.duckdb_extension" "$EXT_DIR/"
         createdb ducklakedb
+        python3 -I test/vane/test_postgres_realtime_vector_loading.py \
+          --duckdb build/release/duckdb --postgres-extension "$REPO_DIR/postgres_scanner.duckdb_extension"
         python3 -I test/vane/test_postgres_realtime_vector.py \
           --duckdb build/release/duckdb --dsn 'dbname=ducklakedb'
         python3 -I test/vane/test_postgres_commit_outcome.py \
