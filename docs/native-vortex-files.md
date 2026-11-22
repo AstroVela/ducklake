@@ -12,8 +12,9 @@ The draft is based on the uncertain-COMMIT repair in
 [DuckLake #25](https://github.com/AstroVela/ducklake/pull/25). The existing
 [native vector proof](native-realtime-vector-proof.md) and
 [commit-outcome proof](postgres-commit-outcome-proof.md) describe that baseline.
-Ray validation in [#26](https://github.com/AstroVela/ducklake/pull/26) remains a
-separate branch and qualification effort.
+DuckLake #26 merged into `dev/ducklake-vortex` at `2c5e2659`, bringing frozen
+inline reads through Vane/Ray into the integration branch.
+[DuckLake #26](https://github.com/AstroVela/ducklake/pull/26)
 
 ## Build and use
 
