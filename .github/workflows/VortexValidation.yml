@@ -104,6 +104,13 @@ jobs:
             --duckdb build/vortex-validation/duckdb \
             --unittest build/vortex-validation/test/unittest \
             --mode '${{ matrix.vortex }}' --output-dir build/validation-logs/tests
+      - name: Retain the qualified shell for the index proof
+        if: matrix.vortex == 'ON'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-vortex-index-shell
+          path: build/vortex-validation/duckdb
+          retention-days: 7
       - name: Upload validation evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -112,4 +119,72 @@ jobs:
           path: |
             build/validation-logs/
             build/vortex-validation/CMakeCache.txt
+          retention-days: 7
+
+  index:
+    name: Native DuckLake to Vortex SPFresh
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/build/index-cargo
+      VORTEX_SPFRESH_NATIVE: ${{ github.workspace }}/build/spfresh/build
+      VORTEX_REVISION: ee085f55a705cb9b2edab18d392dd822540774d7
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-vortex-index-shell
+          path: build/index-shell
+      - name: Install the native backend build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libzstd-dev
+          rustup toolchain install 1.91.0 --profile minimal --component clippy --component rustfmt
+          chmod +x build/index-shell/duckdb
+          mkdir -p build/index-logs
+      - name: Restore Rust build cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/index-cargo
+          key: ducklake-index-v1-${{ runner.os }}-${{ hashFiles('test/vane/vortex_index_probe/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ducklake-index-v1-${{ runner.os }}-${{ hashFiles('test/vane/vortex_index_probe/Cargo.lock') }}-
+      - name: Check out the existing Vortex index implementation
+        run: |
+          git init build/vortex-source
+          git -C build/vortex-source fetch --depth 1 https://github.com/AstroVela/vortex.git "$VORTEX_REVISION"
+          git -C build/vortex-source checkout --detach FETCH_HEAD
+          test "$(git -C build/vortex-source rev-parse HEAD)" = "$VORTEX_REVISION"
+      - name: Build and qualify the pinned SPFresh native libraries
+        run: |
+          bash build/vortex-source/vortex-index-spfresh/native/build.sh "$PWD/build/spfresh" \
+            2>&1 | tee build/index-logs/native-build.log
+      - name: Build and lint the test-only bridge
+        run: |
+          manifest=test/vane/vortex_index_probe/Cargo.toml
+          cargo +1.91.0 fmt --manifest-path "$manifest" --all -- --check
+          cargo +1.91.0 clippy --manifest-path "$manifest" --profile ci --locked \
+            --all-targets --all-features -- -D warnings 2>&1 | tee build/index-logs/clippy.log
+          cargo +1.91.0 build --manifest-path "$manifest" --profile ci --locked \
+            2>&1 | tee build/index-logs/bridge-build.log
+      - name: Validate the DuckLake and Vortex index boundary
+        run: |
+          python3 -I test/vane/test_native_vortex_index.py \
+            --duckdb build/index-shell/duckdb \
+            --probe build/index-cargo/ci/ducklake-vortex-index-probe \
+            --output-dir build/index-logs/proof
+      - name: Upload index validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-ducklake-vortex-index
+          path: build/index-logs/
           retention-days: 7
