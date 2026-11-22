@@ -5,6 +5,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/opener_file_system.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/settings.hpp"
@@ -551,9 +552,10 @@ bool PublishedGeneration(DuckLakeTransaction &transaction, const string &root, c
 	return result->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 0;
 }
 
-void ReconcileBuild(Connection &owner, const string &catalog, const string &id) {
+void ReconcileBuild(Connection &owner, const string &catalog, const string &id,
+                    optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr) {
 	try {
-		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog);
+		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog, identity);
 		auto result =
 		    DuckLakeVortexIndex::Query(transaction, "SELECT index_root,generation,keep_generation FROM "
 		                                            "{METADATA_CATALOG}." +
@@ -950,13 +952,26 @@ bool RemoveBuildFile(int32_t root, const CollectedFile &file, idx_t &remaining, 
 
 } // namespace
 
-DuckLakeTransaction &DuckLakeVortexIndex::Begin(Connection &owner, const string &name) {
+DuckLakeTransaction &DuckLakeVortexIndex::Begin(Connection &owner, const string &name,
+                                                optional_ptr<const DuckLakeVortexCatalogIdentity> identity) {
 	owner.BeginTransaction();
-	auto &catalog = Catalog::GetCatalog(*owner.context, name).Cast<DuckLakeCatalog>();
+	auto &resolved = Catalog::GetCatalog(*owner.context, name);
+	if (identity && resolved.GetAttached().oid != identity->lake_oid) {
+		throw TransactionException("Vortex maintenance catalog attachment changed");
+	}
+	auto &catalog = resolved.Cast<DuckLakeCatalog>();
 	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 		throw InvalidInputException("Vortex index catalog requires native DuckDB metadata");
 	}
 	auto &transaction = DuckLakeTransaction::Get(*owner.context, catalog);
+	if (identity) {
+		// Resolve on the actual metadata connection so its transaction retains this
+		// attachment.
+		auto &metadata = Catalog::GetCatalog(*transaction.GetConnection().context, catalog.MetadataDatabaseName());
+		if (metadata.GetAttached().oid != identity->metadata_oid) {
+			throw TransactionException("Vortex maintenance metadata attachment changed");
+		}
+	}
 	transaction.GetSnapshot();
 	return transaction;
 }
@@ -1061,9 +1076,16 @@ vector<vector<Value>> DuckLakeVortexIndex::GenerationStatus(Connection &owner, c
 	}
 }
 
+string DuckLakeVortexIndex::CollectibleGenerationPredicate(idx_t max_artifact_bytes) {
+	return "g.state IN ('retired','deleting') AND g.artifact_bytes<=" + to_string(max_artifact_bytes) +
+	       " AND NOT EXISTS (SELECT 1 FROM {METADATA_CATALOG}." + GENERATION_REFS +
+	       " r WHERE r.index_root=g.index_root AND r.generation=g.generation)";
+}
+
 DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, const string &catalog,
                                                     idx_t max_generations, idx_t max_artifact_bytes,
-                                                    const std::function<void(const string &)> &observe) {
+                                                    const std::function<void(const string &)> &observe,
+                                                    optional_ptr<const DuckLakeVortexCatalogIdentity> identity) {
 	if (!max_generations || max_generations > 16 || !max_artifact_bytes || max_artifact_bytes > MAX_ARTIFACTS) {
 		throw InvalidInputException("Invalid Vortex collection count or artifact byte budget");
 	}
@@ -1092,18 +1114,13 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 	Connection owner(*context.db);
 	DuckLakeVortexGCResult collected;
 	try {
-		auto &transaction = Begin(owner, catalog);
+		auto &transaction = Begin(owner, catalog, identity);
 		Initialized(transaction);
-		auto result =
-		    Query(transaction,
-		          "SELECT index_root,generation,reference,manifest,artifact_bytes,state FROM {METADATA_CATALOG}." +
-		              string(GENERATIONS) +
-		              " g WHERE state IN ('retired','deleting') AND NOT EXISTS "
-		              "(SELECT 1 FROM {METADATA_CATALOG}." +
-		              GENERATION_REFS +
-		              " r WHERE r.index_root=g.index_root AND r.generation=g.generation) "
-		              "ORDER BY index_root,generation LIMIT " +
-		              to_string(max_generations));
+		auto result = Query(transaction, "SELECT index_root,generation,reference,manifest,artifact_bytes,state "
+		                                 "FROM {METADATA_CATALOG}." +
+		                                     string(GENERATIONS) + " g WHERE " +
+		                                     CollectibleGenerationPredicate(max_artifact_bytes) +
+		                                     " ORDER BY index_root,generation LIMIT " + to_string(max_generations));
 		vector<vector<Value>> entries;
 		while (auto chunk = result->Fetch()) {
 			for (idx_t row = 0; row < chunk->size(); row++) {
@@ -1148,9 +1165,9 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 			auto plan = Plan(reference, manifest, bytes);
 			auto directory = OpenRoot(root, resume);
 			auto stored = directory ? OpenDirectory(directory->fd, generation, resume) : nullptr;
-			struct stat identity;
+			struct stat file_identity;
 			if (stored) {
-				if (fstat(stored->fd, &identity)) {
+				if (fstat(stored->fd, &file_identity)) {
 					throw IOException("Cannot identify registered Vortex generation");
 				}
 				InspectDirectory(stored->fd, "", plan);
@@ -1161,7 +1178,7 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 			}
 			check("gc_validated");
 			auto where = GenerationWhere(root, generation);
-			auto &mark = Begin(owner, catalog);
+			auto &mark = Begin(owner, catalog, identity);
 			Query(mark, "UPDATE {METADATA_CATALOG}." + string(GENERATIONS) + " SET state='deleting'" + where);
 			owner.Commit();
 			check("gc_deleting");
@@ -1177,14 +1194,14 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 				}
 				struct stat current;
 				if (fstatat(directory->fd, generation.c_str(), &current, AT_SYMLINK_NOFOLLOW) ||
-				    current.st_dev != identity.st_dev || current.st_ino != identity.st_ino) {
+				    current.st_dev != file_identity.st_dev || current.st_ino != file_identity.st_ino) {
 					throw IOException("Registered Vortex directory identity changed during collection");
 				}
 				check("gc_before_unlink");
 				Unlink(directory->fd, generation, true);
 			}
 			check("gc_files_deleted");
-			auto &finish = Begin(owner, catalog);
+			auto &finish = Begin(owner, catalog, identity);
 			Query(finish, "DELETE FROM {METADATA_CATALOG}." + string(GENERATIONS) + where);
 			check("gc_before_finish");
 			owner.Commit();
@@ -1192,7 +1209,7 @@ DuckLakeVortexGCResult DuckLakeVortexIndex::Collect(ClientContext &context, cons
 			collected.artifact_bytes += bytes;
 			check("gc_after_finish");
 		}
-		auto &remaining = Begin(owner, catalog);
+		auto &remaining = Begin(owner, catalog, identity);
 		auto count = Query(remaining, "SELECT count(*) FROM {METADATA_CATALOG}." + string(GENERATIONS) +
 		                                  " WHERE state IN ('retired','deleting')");
 		collected.remaining = count->Fetch()->GetValue(0, 0).GetValue<idx_t>();
@@ -1236,7 +1253,8 @@ vector<vector<Value>> DuckLakeVortexIndex::BuildStatus(Connection &owner, const 
 }
 
 idx_t DuckLakeVortexIndex::RecoverBuilds(ClientContext &context, const string &catalog, idx_t max_builds,
-                                         const std::function<void(const string &)> &observe) {
+                                         const std::function<void(const string &)> &observe,
+                                         optional_ptr<const DuckLakeVortexCatalogIdentity> identity) {
 	if (!max_builds || max_builds > 16) {
 		throw InvalidInputException("Invalid Vortex build recovery count budget");
 	}
@@ -1257,7 +1275,7 @@ idx_t DuckLakeVortexIndex::RecoverBuilds(ClientContext &context, const string &c
 	interrupt();
 	Connection owner(*context.db);
 	try {
-		auto &transaction = Begin(owner, catalog);
+		auto &transaction = Begin(owner, catalog, identity);
 		Initialized(transaction);
 		auto result =
 		    Query(transaction, "SELECT build_id FROM {METADATA_CATALOG}." + string(BUILDS) +
@@ -1272,7 +1290,7 @@ idx_t DuckLakeVortexIndex::RecoverBuilds(ClientContext &context, const string &c
 		owner.Commit();
 		for (auto &id : ids) {
 			check("build_recovery_before_reconcile");
-			ReconcileBuild(owner, catalog, id);
+			ReconcileBuild(owner, catalog, id, identity);
 			check("build_recovery_reconciled");
 		}
 		interrupt();
@@ -1283,9 +1301,10 @@ idx_t DuckLakeVortexIndex::RecoverBuilds(ClientContext &context, const string &c
 	}
 }
 
-DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &context, const string &catalog,
-                                                               idx_t max_builds, idx_t max_bytes,
-                                                               const std::function<void(const string &)> &observe) {
+DuckLakeVortexBuildGCResult
+DuckLakeVortexIndex::CollectBuilds(ClientContext &context, const string &catalog, idx_t max_builds, idx_t max_bytes,
+                                   const std::function<void(const string &)> &observe,
+                                   optional_ptr<const DuckLakeVortexCatalogIdentity> identity) {
 	if (!max_builds || max_builds > 16 || !max_bytes || max_bytes > MAX_ARTIFACTS) {
 		throw InvalidInputException("Invalid Vortex build collection count or byte budget");
 	}
@@ -1312,7 +1331,7 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 	Connection owner(*context.db);
 	DuckLakeVortexBuildGCResult collected;
 	try {
-		auto &transaction = Begin(owner, catalog);
+		auto &transaction = Begin(owner, catalog, identity);
 		Initialized(transaction);
 		auto result =
 		    Query(transaction, "SELECT build_id,index_root,generation,workspace,keep_generation FROM "
@@ -1350,7 +1369,7 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 			    StringUtil::StartsWith(root, managed == "/" ? managed : managed + "/")) {
 				throw InvalidInputException("Registered Vortex build namespace mismatch");
 			}
-			auto &inspect = Begin(owner, catalog);
+			auto &inspect = Begin(owner, catalog, identity);
 			bool keep = entry[4].GetValue<bool>() || PublishedGeneration(inspect, root, generation);
 			targets = {workspace};
 			if (!keep) {
@@ -1378,7 +1397,7 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 				}
 			}
 			check("build_gc_validated");
-			auto &mark = Begin(owner, catalog);
+			auto &mark = Begin(owner, catalog, identity);
 			Query(mark, "UPDATE {METADATA_CATALOG}." + string(BUILDS) + " SET state='deleting',keep_generation=" +
 			                string(keep ? "true" : "false") + " WHERE build_id=" + Value(id).ToSQLString());
 			owner.Commit();
@@ -1403,7 +1422,7 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 				break;
 			}
 			check("build_gc_files_deleted");
-			auto &finish = Begin(owner, catalog);
+			auto &finish = Begin(owner, catalog, identity);
 			Query(finish,
 			      "DELETE FROM {METADATA_CATALOG}." + string(BUILDS) + " WHERE build_id=" + Value(id).ToSQLString());
 			check("build_gc_before_finish");
@@ -1411,7 +1430,7 @@ DuckLakeVortexBuildGCResult DuckLakeVortexIndex::CollectBuilds(ClientContext &co
 			collected.builds++;
 			check("build_gc_after_finish");
 		}
-		auto &finish = Begin(owner, catalog);
+		auto &finish = Begin(owner, catalog, identity);
 		auto count = Query(finish, "SELECT count(*) FROM {METADATA_CATALOG}." + string(BUILDS));
 		collected.remaining = count->Fetch()->GetValue(0, 0).GetValue<idx_t>();
 		owner.Commit();

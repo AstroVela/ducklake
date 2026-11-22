@@ -314,7 +314,7 @@ def exercise(proof, native, root, checks, workers):
     paths = [directory(row) for row in pending]
     protected = [row for row in status(native) if row["state"] == "active"]
     source_identity = {f["uri"]: BASE.digest(Path(f["uri"])) for f in M.files([first, *parts])}
-    limited = native.call("gc", 16, pending[0]["artifact_bytes"] - 1)
+    limited = native.call("gc", 16, min(row["artifact_bytes"] for row in pending) - 1)
     require(limited["collected_generations"] == 0 and limited["remaining_generations"] == 2, "Byte budget was exceeded")
     require(all(path.exists() for path in paths), "Budget rejection changed registered files")
     first_batch = native.call("gc", 1, LIMIT)

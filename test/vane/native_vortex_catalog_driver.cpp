@@ -134,6 +134,62 @@ public:
 			SQL(writer, "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
 			return "{}";
 		}
+		if (op == "maintenance-enable") {
+			if (args.size() == 4) {
+				SQL(writer,
+				    "SELECT * FROM ducklake_enable_vortex_maintenance('lake'," + args.at(2) + "," + args.at(3) + ")");
+			} else {
+				DuckLakeVortexOptimizer::EnableMaintenance(*writer.context, "lake", std::stoull(args.at(2)),
+				                                           std::stoull(args.at(3)),
+				                                           OptimizerObserver(args.at(4), args.at(5)));
+			}
+			return "{}";
+		}
+		if (op == "maintenance-resume") {
+			if (args.size() < 4) {
+				auto name = Value(args.size() == 3 ? args[2] : "lake").ToSQLString();
+				SQL(writer, "SELECT * FROM ducklake_resume_vortex_maintenance(" + name + ")");
+			} else {
+				DuckLakeVortexOptimizer::ResumeMaintenance(*writer.context, "lake",
+				                                           OptimizerObserver(args.at(2), args.at(3)));
+			}
+			return "{}";
+		}
+		if (op == "maintenance-cancel") {
+			auto name = Value(args.size() == 3 ? args[2] : "lake").ToSQLString();
+			SQL(writer, "SELECT * FROM ducklake_cancel_vortex_maintenance(" + name + ")");
+			return "{}";
+		}
+		if (op == "maintenance-reattach") {
+			Connection caller(database);
+			caller.BeginTransaction();
+			SQL(caller, "SELECT count(*) FROM lake.items");
+			Require(!DuckLakeVortexOptimizer::MaintenanceStatus(*caller.context, "lake").empty(),
+			        "Could not inspect maintenance on the caller's existing metadata transaction");
+			caller.Commit();
+
+			caller.context->transaction.BeginTransaction();
+			Require(caller.context->transaction.IsAutoCommit(), "Fixture did not retain autocommit");
+			auto &original = Catalog::GetCatalog(*caller.context, "lake");
+			SQL(writer, "DETACH lake");
+			Attach(writer, root);
+			Require(&Catalog::GetCatalog(*caller.context, "LAKE") == &original,
+			        "The caller did not retain its original attachment");
+			auto reject_stale = [&](const std::function<void()> &operation) {
+				try {
+					operation();
+				} catch (const TransactionException &error) {
+					Require(string(error.what()).find("caller attachment changed") != string::npos,
+					        "Maintenance rejected the caller for the wrong reason");
+					return;
+				}
+				throw InvalidInputException("Maintenance accepted the reattached catalog for a stale caller");
+			};
+			reject_stale([&] { DuckLakeVortexOptimizer::MaintenanceStatus(*caller.context, "LAKE"); });
+			reject_stale([&] { DuckLakeVortexOptimizer::ResumeMaintenance(*caller.context, "LAKE"); });
+			caller.context->transaction.Rollback(nullptr);
+			return "{\"retained_status_rejected\":true,\"retained_resume_rejected\":true}";
+		}
 		if (op == "optimizer-init-active-transaction") {
 			Connection caller(database);
 			SQL(caller, "CREATE TEMP TABLE optimizer_transaction_guard(value INTEGER);"
@@ -201,11 +257,14 @@ public:
 			}
 			return "{}";
 		}
-		if (op == "optimizer-status" || op == "generation-status" || op == "build-status") {
-			auto function = op == "generation-status" ? "ducklake_vortex_generation_status"
-			                : op == "build-status"    ? "ducklake_vortex_build_status"
-			                                          : "ducklake_vortex_optimizer_status";
-			auto result = SQL(writer, "SELECT * FROM " + string(function) + "('lake')");
+		if (op == "optimizer-status" || op == "generation-status" || op == "build-status" ||
+		    op == "maintenance-status") {
+			auto function = op == "generation-status"    ? "ducklake_vortex_generation_status"
+			                : op == "build-status"       ? "ducklake_vortex_build_status"
+			                : op == "maintenance-status" ? "ducklake_vortex_maintenance_status"
+			                                             : "ducklake_vortex_optimizer_status";
+			auto name = Value(op == "maintenance-status" && args.size() == 3 ? args[2] : "lake").ToSQLString();
+			auto result = SQL(writer, "SELECT * FROM " + string(function) + "(" + name + ")");
 			ViewJSON json;
 			auto rows = json.Array();
 			for (idx_t row = 0; row < result->RowCount(); row++) {
@@ -1351,6 +1410,9 @@ private:
 			}
 			Write(marker, "ready");
 			pause->Stop();
+			if (mode == "fail-after-release") {
+				throw InvalidInputException("Injected optimizer failure after checkpoint");
+			}
 		};
 	}
 	string SearchJSON(const vector<vector<Value>> &rows, const string &diagnostics) {
