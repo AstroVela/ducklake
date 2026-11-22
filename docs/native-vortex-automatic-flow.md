@@ -108,6 +108,9 @@ native and recovery cases. The Vane native Vortex providers workflow runs
 this proof alongside managed-write, append and source-retention proofs. It
 retains the report, driver logs and recovery evidence for the tested commit.
 
+For isolated-process load measurements and the subsequent flush coordination
+regression, see [sustained mixed load](native-vortex-sustained-load.md).
+
 ## Physical footprint and limits
 
 After each drain, the probe checks actual source bytes against the complete

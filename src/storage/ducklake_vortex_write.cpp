@@ -34,11 +34,6 @@ string Qualified(const string &catalog, const string &schema, const string &tabl
 	       KeywordHelper::WriteOptionallyQuoted(table);
 }
 
-DuckLakeVortexCollectionLock &WriteLock() {
-	static DuckLakeVortexCollectionLock lock;
-	return lock;
-}
-
 void CheckWriteInterrupted(Connection &owner, ClientContext &caller) {
 	if (owner.context->IsInterrupted() || caller.IsInterrupted()) {
 		throw InterruptException();
@@ -171,6 +166,11 @@ void Initialized(DuckLakeTransaction &transaction) {
 }
 } // namespace
 
+DuckLakeVortexCollectionLock &DuckLakeVortexWriteBatch::WriterLock() {
+	static DuckLakeVortexCollectionLock lock;
+	return lock;
+}
+
 DuckLakeVortexWriteBatchState::DuckLakeVortexWriteBatchState(ClientContext &caller,
                                                              DuckLakeVortexCatalogIdentity identity, idx_t table_id,
                                                              const string &table_uuid, const DuckLakeVortexIndex &index,
@@ -212,7 +212,7 @@ void DuckLakeVortexWriteBatch::Initialize(Connection &owner, ClientContext &call
 	auto interrupt = [&] {
 		CheckWriteInterrupted(owner, caller);
 	};
-	auto guard = WriteLock().GetExclusiveLock(interrupt);
+	auto guard = WriterLock().GetExclusiveLock(interrupt);
 	try {
 		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog, &identity);
 		DuckLakeVortexIndex::Query(transaction, "CREATE TABLE {METADATA_CATALOG}." + string(REQUESTS) +
@@ -239,7 +239,7 @@ void DuckLakeVortexWriteBatch::Manage(Connection &owner, ClientContext &caller, 
 	auto interrupt = [&] {
 		CheckWriteInterrupted(owner, caller);
 	};
-	auto guard = WriteLock().GetExclusiveLock(interrupt);
+	auto guard = WriterLock().GetExclusiveLock(interrupt);
 	auto admission = DuckLakeVortexOptimizer::WriteAdmissionLock(*owner.context->db).GetExclusiveLock(interrupt);
 	auto publication = DuckLakeVortexIndex::PublicationLock().GetSharedLock(interrupt);
 	try {
@@ -340,7 +340,7 @@ DuckLakeVortexWriteResult DuckLakeVortexWriteBatch::Write(Connection &owner, Cli
 		interrupt();
 	};
 	check("waiting");
-	auto guard = WriteLock().GetExclusiveLock([&] { check("lock_wait"); });
+	auto guard = WriterLock().GetExclusiveLock([&] { check("lock_wait"); });
 	check("acquired");
 	// Metadata-side request staging must not be discarded by a native commit retry.
 	auto setting = owner.Query("SET SESSION ducklake_max_retry_count=0");

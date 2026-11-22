@@ -94,8 +94,9 @@ struct DuckLakeVortexIndex {
 	vector<string> SmallestSegments() const;
 	static DuckLakeVortexCollectionLock &PublicationLock();
 	static DuckLakeVortexCollectionLock &CollectionLock();
-	static DuckLakeVortexCatalogIdentity ResolveCatalog(ClientContext &context, const string &name, bool write,
-	                                                    const char *operation);
+	static DuckLakeVortexCatalogIdentity
+	ResolveCatalog(ClientContext &context, const string &name, bool write, const char *operation,
+	               optional_ptr<const DuckLakeVortexCatalogIdentity> expected = nullptr);
 	static DuckLakeVortexCatalogIdentity BoundCatalogIdentity(DuckLakeTransaction &transaction);
 	static void CheckCatalogIdentity(DuckLakeTransaction &transaction, const DuckLakeVortexCatalogIdentity &identity);
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog,
@@ -126,30 +127,33 @@ struct DuckLakeVortexIndex {
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static bool CoversFile(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, idx_t file_id);
 	static void CheckFileRetirements(ClientContext &context, DuckLakeTransaction &transaction);
-	static DuckLakeVortexIndex RetireEmpty(ClientContext &context, const string &catalog, const string &schema,
-	                                       const string &table, const string &index, const string &generation,
-	                                       idx_t expected_revision,
-	                                       const std::function<void(const string &)> &observe = nullptr,
-	                                       const string &optimizer_run_id = "");
+	static DuckLakeVortexIndex
+	RetireEmpty(ClientContext &context, const string &catalog, const string &schema, const string &table,
+	            const string &index, const string &generation, idx_t expected_revision,
+	            const std::function<void(const string &)> &observe = nullptr, const string &optimizer_run_id = "",
+	            optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog = nullptr);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
 	                                   const string &table, const string &name, const string &reference,
 	                                   idx_t expected_revision, ClientContext &caller,
 	                                   const std::function<void(const string &)> &observe = nullptr,
 	                                   DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
-	                                   const vector<string> &merge_generations = {});
+	                                   const vector<string> &merge_generations = {},
+	                                   optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog = nullptr);
 	static DuckLakeVortexIndex
 	BuildAndPublish(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                const string &name, const string &reference, uint32_t dimension, idx_t expected_revision,
 	                const std::function<void(const string &)> &observe = nullptr,
 	                const string &expected_table_uuid = "", optional_idx expected_field_id = optional_idx(),
 	                DuckLakeVortexIndexOperation operation = DuckLakeVortexIndexOperation::REPLACE,
-	                const vector<string> &merge_generations = {});
+	                const vector<string> &merge_generations = {},
+	                optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog = nullptr);
 	static DuckLakeVortexIndex Rewrite(ClientContext &context, const string &catalog, const string &schema,
 	                                   const string &table, const string &index, const string &generation,
 	                                   const string &reference, idx_t expected_revision,
 	                                   const std::function<void(const string &)> &observe = nullptr,
 	                                   const string &optimizer_run_id = "",
-	                                   DuckLakeVortexRewriteMode mode = DuckLakeVortexRewriteMode::INDEXED);
+	                                   DuckLakeVortexRewriteMode mode = DuckLakeVortexRewriteMode::INDEXED,
+	                                   optional_ptr<const DuckLakeVortexCatalogIdentity> expected_catalog = nullptr);
 	static void CheckRewriteCommit(ClientContext &context, DuckLakeTransaction &transaction);
 	static void PublishRewrite(ClientContext &context, DuckLakeTransaction &transaction,
 	                           const DuckLakeSnapshot &snapshot);

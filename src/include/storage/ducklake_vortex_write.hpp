@@ -31,6 +31,7 @@ struct DuckLakeVortexWriteBatchState : public ClientContextState {
 
 struct DuckLakeVortexWriteBatch {
 	static LogicalType RowsType();
+	static DuckLakeVortexCollectionLock &WriterLock();
 	static void Initialize(Connection &owner, ClientContext &caller, const string &catalog);
 	static void Manage(Connection &owner, ClientContext &caller, const string &catalog, const string &schema,
 	                   const string &table, const string &index);
