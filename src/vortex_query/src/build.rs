@@ -12,8 +12,33 @@ use vortex_index::{
     IndexBuildRequest, IndexBuilder, IndexMetadata, IndexProvider, IndexSource, IndexStore,
     Snapshot,
 };
-use vortex_index_spfresh::{SPFRESH_ID, SpFreshBuildLimits, SpFreshIndexBuilder};
+use vortex_index_spfresh::{
+    SPFRESH_ID, SpFreshBuildLimits, SpFreshBuildOptions, SpFreshIndexBuilder,
+};
 pub(crate) const POSTING_PAGE_LIMIT: u32 = 12;
+
+fn build_options(snapshot: &Snapshot, dimension: u32) -> VortexResult<SpFreshBuildOptions> {
+    let rows = snapshot.files.iter().try_fold(0u64, |rows, file| {
+        rows.checked_add(file.row_count)
+            .ok_or_else(|| vortex_err!("SPFresh physical row count overflow"))
+    })?;
+    if !(65..=100_000).contains(&rows) {
+        vortex_bail!("SPFresh build requires 65..=100000 physical rows");
+    }
+    let replicas = 4;
+    let stride = 4 + u64::from(dimension) * 4;
+    // Target quarter-full postings at the maximum replica count; skew still fails coverage validation.
+    let heads = (rows * replicas * stride * 4)
+        .div_ceil(u64::from(POSTING_PAGE_LIMIT) * 4096)
+        .clamp(64, rows - 1);
+    Ok(SpFreshBuildOptions {
+        format_version: 1,
+        dimension,
+        head_count: heads as u32,
+        posting_page_limit: POSTING_PAGE_LIMIT,
+        replicas: replicas as u32,
+    })
+}
 pub async fn build_generation(
     source: Arc<dyn IndexSource>,
     field: String,
@@ -97,8 +122,7 @@ pub(crate) async fn build_generation_at(
         ..SpFreshBuildLimits::default()
     };
     let builder = SpFreshIndexBuilder::try_new(scratch.to_path_buf(), session, limits)?;
-    let options = serde_json::json!({"format_version":1, "dimension":dimension,
-        "head_count":64, "posting_page_limit":POSTING_PAGE_LIMIT, "replicas":4});
+    let options = build_options(&metadata.snapshot, dimension)?;
     let expected = metadata.clone();
     let metadata = builder
         .build(

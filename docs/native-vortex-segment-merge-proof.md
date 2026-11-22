@@ -34,8 +34,9 @@ The strict version-2 segment manifest format is unchanged. Three active segments
 share the existing 100,000 physical-row and 64 MiB vector/source/artifact ceilings
 and 1 MiB catalog-manifest limit. Direct append at the three-slot limit fails
 explicitly. The new selected build cannot bypass admission by capturing only a
-small pair from an oversized table. Fixed 64-head SPFresh build options are
-unchanged; ordinary new F still requires at least 65 physical rows.
+small pair from an oversized table. Ordinary new F still requires at least 65
+physical rows; [head planning](native-vortex-posting-coverage.md) sizes larger
+builds within the same posting page budget.
 
 ## Scheduled maintenance and recovery
 

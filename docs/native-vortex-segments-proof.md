@@ -19,9 +19,11 @@ checks the entire physical inventory against the existing global limits, then
 copies and decodes only files outside current B coverage. The result is a sealed
 ordinary segment reference covering only that F snapshot. Empty increments,
 stale revisions, overlapping file IDs/paths, duplicate generations and changed
-table/field/source identities fail explicitly. The existing build configuration
-uses 64 heads and requires strictly more covered rows, so new F must contain at
-least 65 physical rows. Smaller segments fail without padding or a full rebuild.
+table/field/source identities fail explicitly. The build configuration uses at
+least 64 heads and requires strictly more covered rows, so new F must contain at
+least 65 physical rows. [Head planning](native-vortex-posting-coverage.md) also
+accounts for larger row counts and vector widths within the same posting budget.
+Smaller segments fail without padding or a full rebuild.
 Newer F and T stay queryable.
 
 `ducklake_publish_vortex_index_segment` accepts an already sealed reference and
