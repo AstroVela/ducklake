@@ -41,7 +41,11 @@ features stay disabled in this configuration.
 
 The raw SPFresh source remains pinned to
 `5893eb61ee3b18610b6b00f1939be7dae1af8904`, with Vortex's reviewed static patch.
-The static LLVM OpenMP 18.1.8 and zstd archives retain their qualified identities.
+The SDK verifies the LLVM OpenMP 18.1.8 source archive against SHA-256
+`60ed57245e73894e4a2a89b15889f367bd906abfe6d3f92e1718223d4b496150`.
+The final-pin validation at `19f5d221` rebuilt `libomp.a` and recorded the
+output SHA-256 `efb12d1c1769296a7ef8a66f6bf9bbbfba21be75a1a4021edf303f533b51da6e`
+for that build. The build reused the qualified static zstd archive.
 There is one required source revision per component, without alternate pins,
 compatibility branches, native retries or fallback paths.
 
@@ -53,8 +57,9 @@ The frozen filtered-query proof reuses byte-identical native artifacts:
 SDK and passes with the fix. The builder's seven workspace groups previously
 reported 2,185 uninitialized-memory errors in 12 contexts; strict Memcheck
 reports zero after the initialization fix, under both qualified OpenMP links.
-Those proofs are upstream evidence; the installed-provider checks below qualify
-this consumer revision separately.
+Those proofs cover the upstream changes. The installed-provider checks below
+were run against the original DuckLake #65 head
+`fd1afc257de34338fd7d738f3a090a4ab11d8f49`.
 
 The fixed canary gate and exploration-quality reporting remain unchanged.
 A bounded regression does not establish arbitrary-data recall, production
