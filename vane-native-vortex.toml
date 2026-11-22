@@ -1,0 +1,13 @@
+schema_version = 2
+name = "ducklake"
+extension_config = "extension_config_vane_native_vortex.cmake"
+build_extensions = ["core_functions", "file", "json", "parquet", "icu", "httpfs"]
+native_test_selection = "test/sql/vortex/*"
+
+[vane]
+repository = "AstroVela/vane"
+revision = "e14bf92d4053141697a59dcbd6098677cbddb80a"
+
+[vcpkg]
+repository = "microsoft/vcpkg"
+revision = "84bab45d415d22042bd0b9081aea57f362da3f35"
