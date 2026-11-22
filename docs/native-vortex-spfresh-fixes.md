@@ -19,18 +19,19 @@ per-vector sentinel. Both fixes use the existing native format and ABI.
 
 The DuckLake Rust query crate, standalone qualification probe, SDK source
 check and both validation workflows use
-`1835d60a7e36e8ed6aca10113c45dc966fd4664a`. It combines both SPFresh fixes with
+`8a3b12a4a2f90dde6ba7f158ba63fb43537da39d`. It combines both SPFresh fixes with
 the verified-source URI and reader lifecycle fixes from the preceding pin.
+It also registers DuckDB full-text SQL only when a full-text provider is available.
 The workspace root `Cargo.lock` covers both Rust members. The native provider
 cache also includes the wrapper's ordinary workspace lockfile.
 
 Pin the DuckDB Vortex wrapper to
-`64390b086af939a6f66b80cd6484275e1f3db69b`
+`684bf8b0bfe305feeff155e0b3eb335540444b07`
 ([wrapper #38](https://github.com/AstroVela/duckdb-vortex/pull/38)). Its ordinary and distributed Vane
 workspaces both consume the same Vortex revision, including their lockfiles,
 installed-wheel identity check and strict release-source check. The native
 DuckLake configuration uses the ordinary wrapper; the distributed provider uses
-the separate Vane workspace.
+the separate Vane workspace. Its vector-only build keeps vector SQL available.
 
 Build and sign the Vortex and DuckLake artifacts together. The DuckLake provider
 wheel declares the exact new Vortex dependency wheel. Keep the installed Vane

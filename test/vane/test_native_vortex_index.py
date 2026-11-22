@@ -13,7 +13,7 @@ import subprocess
 import time
 
 
-VORTEX_REVISION = "1835d60a7e36e8ed6aca10113c45dc966fd4664a"
+VORTEX_REVISION = "8a3b12a4a2f90dde6ba7f158ba63fb43537da39d"
 
 
 def quote(value: object) -> str:
