@@ -33,6 +33,7 @@ struct DuckLakeVortexSourceBuffer {
 
 struct DuckLakeVortexReadView {
 	static DuckLakeVortexCollectionLock &AdmissionLock();
+	static bool IsCapturing(ClientContext &context);
 	static const DuckLakeFieldId &ResolveField(DuckLakeTableEntry &table, const string &name);
 	idx_t snapshot_id;
 	idx_t source_bytes = 0;

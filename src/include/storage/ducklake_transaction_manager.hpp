@@ -23,7 +23,7 @@ public:
 	void RollbackTransaction(Transaction &transaction) override;
 
 	void Checkpoint(ClientContext &context, bool force = false) override;
-	bool HasOtherTransactions(const DuckLakeTransaction *exclude);
+	bool HasOtherTransactions(const DuckLakeTransaction *exclude, bool exclude_vortex_captures);
 
 private:
 	DuckLakeCatalog &ducklake_catalog;
