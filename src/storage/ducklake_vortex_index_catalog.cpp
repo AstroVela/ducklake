@@ -1459,6 +1459,9 @@ DuckLakeTransaction &DuckLakeVortexIndex::Begin(Connection &owner, const string 
 	if (identity && resolved.GetAttached().oid != identity->lake_oid) {
 		throw TransactionException("Vortex maintenance catalog attachment changed");
 	}
+	if (resolved.GetCatalogType() != "ducklake") {
+		throw InvalidInputException("Vortex operations require an attached DuckLake catalog");
+	}
 	auto &catalog = resolved.Cast<DuckLakeCatalog>();
 	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 		throw InvalidInputException("Vortex index catalog requires native DuckDB metadata");

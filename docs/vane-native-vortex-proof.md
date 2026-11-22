@@ -7,6 +7,9 @@ The DuckLake provider declares its exact Vortex provider dependency. Loading
 uses Vane's existing installed-provider resolver and source/ABI/artifact
 identity checks.
 
+For bounded append with concurrent request identity and safe client retries,
+see the [native WriteBatch API](native-vortex-write-batch.md).
+
 ## Fixed inputs and packaging
 
 `vane-native-vortex.toml` records the Vane profile. The validation fixes:
