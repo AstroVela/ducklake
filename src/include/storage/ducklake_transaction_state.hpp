@@ -157,9 +157,9 @@ public:
 	bool TryMergeInlinedStats(const vector<DuckLakeColumnSchemaEntry> &columns,
 	                          const vector<string> &inlined_table_names, DuckLakeSnapshot snapshot,
 	                          DuckLakeTableStats &target, const DuckLakeCommitContext &context);
-	vector<DuckLakeDeleteFileInfo>
-	GetNewDeleteFiles(const DuckLakeCommitState &commit_state,
-	                  vector<DuckLakeOverwrittenDeleteFile> &overwritten_delete_files) const;
+	vector<DuckLakeDeleteFileInfo> GetNewDeleteFiles(const DuckLakeCommitState &commit_state,
+	                                                 vector<DuckLakeOverwrittenDeleteFile> &overwritten_delete_files,
+	                                                 string &flushed_inline_file_deletes) const;
 	vector<DuckLakeDeletedInlinedDataInfo> GetNewInlinedDeletes(DuckLakeCommitState &commit_state) const;
 	vector<DuckLakeInlinedFileDeletionInfo> GetNewInlinedFileDeletes(DuckLakeCommitState &commit_state);
 	NewNameMapInfo GetNewNameMaps(DuckLakeCommitState &commit_state);

@@ -326,6 +326,16 @@ def blocked(driver, root, kind, checks):
                 "internal inlining/global schema changes do not create false compaction groups for unchanged table columns"
             )
             return {"fixture_recalls": recalls}
+        if kind == "empty":
+            row = published(native, 4)
+            require(
+                row["task_kind"] == "retire" and len(SEG.segments(native.call("head", "knn"))) == 2,
+                "Fully masked B was not retired",
+            )
+            observed = visible_only(native, "retired-empty")
+            finish(native)
+            checks.append("fully masked B uses metadata-only retirement without constructing an empty ANN generation")
+            return {"informational_recall": observed}
         row = OPT.wait(native, lambda s: s["compaction_reason"] == reason, "unsupported candidate classification")
         require(
             row["run_count"] == 0 and row["enabled"] and not row["running"],
@@ -352,25 +362,18 @@ def retirement_boundary(driver, root, checks):
         native.sql("DELETE FROM lake.items WHERE id<4096")
         configure(native)
         native.call("optimizer-resume")
-        deadline = time.monotonic() + 60
-        while True:
-            row = OPT.status(native)
-            if row["state"] == "failed" and not row["running"]:
-                break
-            require(time.monotonic() < deadline, f"Retired-source boundary did not fail explicitly: {row}")
-            time.sleep(0.02)
+        row = published(native, 4)
+        require(row["run_count"] == 1 and row["task_kind"] == "retire", "Full-file DELETE did not schedule retirement")
         require(
-            not row["enabled"] and row["run_count"] == 0 and "explicit rebuild required" in row["error"],
-            "Missing indexed coverage was silently accepted or scheduled",
+            SEG.segments(native.call("head", "knn")) == SEG.segments(before)[1:] and RW.active_rows(native) == 256,
+            "Full-file retirement rebuilt another B or lost source inventory",
         )
-        require(native.call("head", "knn") == before, "Coverage failure rewrote the index plan")
-        native.call("core-search", expected="absent")
-        OPT.steady(native, row)
+        observed = visible_only(native, "retired-sources")
         finish(native)
         checks.append(
-            "native full-file retirement remains an explicit missing-coverage error; neither planner nor query downgrades or falls back"
+            "native full-file DELETE retains indexed inputs until atomic B retirement; current queries remain valid"
         )
-        return {}
+        return {"informational_recall": observed}
     finally:
         M.stop(native)
 
@@ -579,6 +582,7 @@ def dense_overlap(driver, root, checks):
     native = CAT.Native(driver, root / "native")
     try:
         single_segment(native, root)
+        indexed = SEG.segments(native.call("head", "knn"))[0]
         bulk = SEG.sql(native, root, "DELETE FROM lake.items WHERE id>=66")
         inline = root / "inline-delete.sql"
         inline.write_text("DELETE FROM lake.items WHERE id>=66 AND id<146")
@@ -591,6 +595,7 @@ def dense_overlap(driver, root, checks):
             "THEN true ELSE error('dense overlap fixture did not preserve its 66 live rows') END"
         )
         native.sql("CREATE TEMP TABLE visible_before_dense_rewrite AS SELECT id,rowid AS row_id FROM lake.items")
+        native.call("retire", SEG.generation(indexed), 1, expected="still has visible rows")
         configure(native, 4030, 98)
         selected = pause(native, "optimizer_before_rewrite")
         require(

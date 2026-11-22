@@ -432,7 +432,20 @@ static void FlushInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &c
 	}
 
 	// Query the inlined deletions with file paths and existing delete file info
-	auto deletions_result = transaction.Query(snapshot, StringUtil::Format(R"(
+	auto retirement = metadata_manager.VortexRetiredSourcePredicate();
+	string file_filter;
+	if (!retirement.empty()) {
+		// Keep historical inline masks for a retired source and for a completed mask version.
+		file_filter = "WHERE NOT (" + retirement + R"(
+OR EXISTS (
+    SELECT 1 FROM {METADATA_CATALOG}.ducklake_delete_file previous
+    WHERE previous.data_file_id = data.data_file_id AND previous.end_snapshot = existing_del.begin_snapshot
+)
+)
+)";
+	}
+	auto deletions_result =
+	    transaction.Query(snapshot, StringUtil::Format(R"(
 SELECT del.file_id, data.path, data.path_is_relative, del.row_id, del.begin_snapshot,
        existing_del.delete_file_id, existing_del.path as del_path, existing_del.path_is_relative as del_path_is_relative,
        existing_del.begin_snapshot as del_begin_snapshot, existing_del.encryption_key as del_encryption_key,
@@ -444,13 +457,25 @@ LEFT JOIN (
     WHERE table_id = %d AND {SNAPSHOT_ID} >= begin_snapshot
           AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
 ) existing_del ON del.file_id = existing_del.data_file_id
+%s
 	)",
-	                                                                       inlined_table_name, table_id.index));
+	                                                   inlined_table_name, table_id.index, file_filter));
 	if (deletions_result->HasError()) {
 		deletions_result->GetErrorObject().Throw("Failed to query inlined file deletions for flush: ");
 	}
 
 	unordered_map<idx_t, FileDeleteInfo> files_to_flush;
+	unordered_set<idx_t> staged_masks;
+	for (auto &entry : transaction.GetLocalChanges().Changes()) {
+		if (entry.GetTableIndex() != table_id) {
+			continue;
+		}
+		for (auto &path : entry.GetTableChanges().new_delete_files) {
+			for (auto &file : path.second) {
+				staged_masks.insert(file.data_file_id.index);
+			}
+		}
+	}
 
 	while (true) {
 		auto chunk = deletions_result->Fetch();
@@ -459,6 +484,9 @@ LEFT JOIN (
 		}
 		for (idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
 			auto file_id = chunk->GetValue(0, row_idx).GetValue<idx_t>();
+			if (staged_masks.count(file_id)) {
+				continue;
+			}
 			auto row_id = chunk->GetValue(3, row_idx).GetValue<int64_t>();
 			auto begin_snapshot = chunk->GetValue(4, row_idx).GetValue<idx_t>();
 
@@ -497,7 +525,7 @@ LEFT JOIN (
 			PositionWithSnapshot pos_with_snap;
 			pos_with_snap.position = row_id;
 			pos_with_snap.snapshot_id = static_cast<int64_t>(begin_snapshot);
-			file_info.deletions.insert(pos_with_snap);
+			MergeDeletePosition(file_info.deletions, pos_with_snap);
 		}
 	}
 
@@ -572,15 +600,8 @@ LEFT JOIN (
 		delete_files.push_back(std::move(delete_file));
 	}
 
-	// Register the delete files
+	// Commit removes the inlined positions only for flush masks still staged at publication.
 	transaction.AddDeletes(table_id, std::move(delete_files));
-
-	// Delete the flushed inlined deletions
-	auto delete_result =
-	    transaction.Query(snapshot, StringUtil::Format("DELETE FROM {METADATA_CATALOG}.%s", inlined_table_name));
-	if (delete_result->HasError()) {
-		delete_result->GetErrorObject().Throw("Failed to delete inlined file deletions after flush: ");
-	}
 }
 
 //===--------------------------------------------------------------------===//
