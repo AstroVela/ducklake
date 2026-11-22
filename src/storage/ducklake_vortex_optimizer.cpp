@@ -1679,8 +1679,10 @@ DuckLakeVortexCollectionLock &DuckLakeVortexOptimizer::WriteAdmissionLock(Databa
 unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
                                     unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard) {
+	auto &catalog = transaction.GetCatalog();
+	auto logical = transaction.GetLogicalWriteTables();
 	auto rewrite = DuckLakeVortexRewriteState::Get(context);
-	auto write_batch = DuckLakeVortexWriteBatchState::Get(context);
+	auto write_batch = DuckLakeVortexWriteBatchState::Get(context, catalog);
 	auto interrupt = [&] {
 		if (context.IsInterrupted() || (rewrite && rewrite->caller->IsInterrupted()) ||
 		    (write_batch && write_batch->caller.IsInterrupted())) {
@@ -1692,9 +1694,9 @@ DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientCont
 	for (auto &entry : transaction.GetLocalChanges().Changes()) {
 		grows |= Grows(entry.GetTableChanges());
 	}
-	auto &catalog = transaction.GetCatalog();
 	unique_ptr<DuckLakeVortexCollectionLock::Key> admission;
-	if (grows && (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb")) {
+	if ((grows || !logical.empty() || write_batch) &&
+	    (catalog.MetadataType().empty() || catalog.MetadataType() == "duckdb")) {
 		admission = WriteAdmissionLock(*context.db).GetExclusiveLock(interrupt);
 	}
 	// Use the same admission/publication order as configuration, and keep coverage stable through commit.
@@ -1703,14 +1705,17 @@ DuckLakeVortexOptimizer::AdmitWrite(DuckLakeTransaction &transaction, ClientCont
 	if (!admission) {
 		return nullptr;
 	}
-	optional_ptr<const DuckLakeVortexCatalogIdentity> identity;
+	DuckLakeVortexCatalogIdentity identity;
 	if (rewrite) {
-		identity = &rewrite->identity;
+		identity = rewrite->identity;
 	} else if (write_batch) {
-		identity = &write_batch->identity;
+		identity = write_batch->identity;
+	} else {
+		identity = VortexCatalog::BoundCatalogIdentity(transaction);
 	}
-	Metadata meta(*context.db, rewrite ? rewrite->catalog : catalog.GetName(), false, identity);
+	Metadata meta(*context.db, rewrite ? rewrite->catalog : catalog.GetName(), false, &identity);
 	try {
+		DuckLakeVortexWriteBatch::CheckManagedWrites(meta.transaction, logical, context);
 		if (write_batch) {
 			// Index replacement can commit without advancing the writer's DuckLake snapshot.
 			write_batch->CheckCurrentIndex(meta.transaction);

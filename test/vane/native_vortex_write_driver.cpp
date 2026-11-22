@@ -1,4 +1,5 @@
 #include "native_vortex_fixture.hpp"
+#include "native_vortex_keyed_fixture.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -62,14 +63,15 @@ static void CheckQueuedCancellation(DuckDB &database, Connection &setup, const V
 	        "Canceled writer added a receipt");
 }
 
-static void CheckCommitWaitCancellation(DuckDB &database, Connection &setup, const Value &rows) {
+static void CheckCommitWaitCancellation(DuckDB &database, Connection &setup,
+                                        const std::function<void(Connection &, ClientContext &)> &write) {
 	Connection owner(database), caller(database);
 	auto &publication = DuckLakeVortexIndex::PublicationLock();
 	auto lock = publication.GetExclusiveLock([] {});
 	const auto initial_waits = publication.SharedWaitCount();
 	auto writer = std::async(std::launch::async, [&] {
 		try {
-			DuckLakeVortexWriteBatch::Append(owner, *caller.context, "lake", "main", "items", "knn", "waiting", rows);
+			write(owner, *caller.context);
 		} catch (const std::exception &error) {
 			Require(StringUtil::Contains(StringUtil::Lower(error.what()), "interrupt"), error.what());
 			return true;
@@ -136,6 +138,18 @@ int main(int argc, char **argv) {
 			        "Canceled initialization created the request table");
 			return 0;
 		}
+		if (mode == "keyed-noop-cancel-commit-wait") {
+			KeyedFixture fixture(database, setup, root);
+			fixture.Manage();
+			CheckCommitWaitCancellation(database, setup, [&](Connection &writer, ClientContext &caller) {
+				fixture.DeleteMissing(writer, caller);
+			});
+			return 0;
+		}
+		if (StringUtil::StartsWith(mode, "keyed-")) {
+			RunKeyedFixture(database, setup, root, mode);
+			return 0;
+		}
 		auto input = SQL(setup, "SELECT [{'id':1::BIGINT,'embedding':[1,0]::FLOAT[],'category':'A'::VARCHAR,"
 		                        "'payload':'一'::VARCHAR},{'id':2::BIGINT,'embedding':[2,0]::FLOAT[],"
 		                        "'category':NULL::VARCHAR,'payload':NULL::VARCHAR}]");
@@ -145,7 +159,9 @@ int main(int argc, char **argv) {
 			return 0;
 		}
 		if (mode == "cancel-commit-wait") {
-			CheckCommitWaitCancellation(database, setup, rows);
+			CheckCommitWaitCancellation(database, setup, [&](Connection &writer, ClientContext &caller) {
+				DuckLakeVortexWriteBatch::Append(writer, caller, "lake", "main", "items", "knn", "waiting", rows);
+			});
 			return 0;
 		}
 		const bool replacement = mode == "replace-dimension" || mode == "replace-same-dimension";

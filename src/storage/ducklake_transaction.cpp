@@ -796,14 +796,23 @@ void DuckLakeTransaction::Start() {
 
 void DuckLakeTransaction::Commit() {
 	try {
-		if (ChangesMade()) {
+		const auto changes_made = ChangesMade();
 #ifdef DUCKLAKE_ENABLE_VORTEX
-			unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard;
-			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock(), publication_guard);
-			if (DuckLakeVortexRewriteState::Get(*context.lock())) {
-				DuckLakeVortexIndex::CheckRewriteCommit(*context.lock(), *this);
+		unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard, write_admission;
+		auto client = context.lock();
+		// A complete delete of a freshly flushed file can leave only staged metadata changes.
+		// A missing-key mutation also commits its receipt without adding a snapshot.
+		if (changes_made || !state->local_file_deletes.empty() ||
+		    DuckLakeVortexWriteBatchState::Get(*client, ducklake_catalog)) {
+			write_admission = DuckLakeVortexOptimizer::AdmitWrite(*this, *client, publication_guard);
+		}
+#endif
+		if (changes_made) {
+#ifdef DUCKLAKE_ENABLE_VORTEX
+			if (DuckLakeVortexRewriteState::Get(*client)) {
+				DuckLakeVortexIndex::CheckRewriteCommit(*client, *this);
 			} else {
-				DuckLakeVortexIndex::CheckFileRetirements(*context.lock(), *this);
+				DuckLakeVortexIndex::CheckFileRetirements(*client, *this);
 			}
 #endif
 			FlushChanges();
@@ -1062,6 +1071,35 @@ TransactionChangeInformation DuckLakeTransaction::GetTransactionChanges() const 
 	}
 #endif
 	return changes;
+}
+
+set<TableIndex> DuckLakeTransaction::GetLogicalWriteTables() const {
+	auto changes = GetTransactionChanges();
+	set<TableIndex> result = state->tables_deleted_from;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	result.insert(state->local_file_deletes.begin(), state->local_file_deletes.end());
+#endif
+	for (auto tables : {&changes.altered_tables, &changes.dropped_tables}) {
+		result.insert(tables->begin(), tables->end());
+	}
+	result.insert(state->renamed_tables.begin(), state->renamed_tables.end());
+	for (auto &entry : state->local_changes.Changes()) {
+		auto &local = entry.GetTableChanges();
+		bool logical =
+		    local.new_inlined_data || !local.new_inlined_data_deletes.empty() || local.new_inlined_file_deletes;
+		for (auto &file : local.new_data_files) {
+			logical |= !file.begin_snapshot.IsValid();
+		}
+		for (auto &deletes : local.new_delete_files) {
+			for (auto &file : deletes.second) {
+				logical |= file.source == DeleteFileSource::REGULAR;
+			}
+		}
+		if (logical) {
+			result.insert(entry.GetTableIndex());
+		}
+	}
+	return result;
 }
 
 // DuckLakeCommitState is defined in storage/ducklake_commit_state.hpp
@@ -1466,6 +1504,12 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 	auto effective_retry_config = retry_config;
 	effective_retry_config.fail_on_snapshot_conflict = fail_distributed_write_on_snapshot_conflict;
 #endif
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	const auto &metadata_type = ducklake_catalog.MetadataType();
+	const bool native_retries = retry_config.max_retry_count && (metadata_type.empty() || metadata_type == "duckdb");
+	const auto admitted_identity =
+	    native_retries ? DuckLakeVortexIndex::BoundCatalogIdentity(*this) : DuckLakeVortexCatalogIdentity {};
+#endif
 	DuckLakeCommitContext context;
 	context.conflict_query_executor = [&](string q) -> unique_ptr<QueryResult> {
 		auto result = metadata_manager->Query(transaction_snapshot, q);
@@ -1496,7 +1540,7 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		if (rewrite) {
 			rewrite->check("rewrite_before_native_commit");
 		}
-		auto write_batch = DuckLakeVortexWriteBatchState::Get(*this->context.lock());
+		auto write_batch = DuckLakeVortexWriteBatchState::Get(*this->context.lock(), ducklake_catalog);
 		if (write_batch && write_batch->caller.IsInterrupted()) {
 			throw InterruptException();
 		}
@@ -1514,6 +1558,15 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 	context.prepare_retry = [&]() {
 		metadata_manager->ClearInlinedTableCaches();
 		connection->BeginTransaction();
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (native_retries) {
+			auto attached = DatabaseManager::Get(*connection->context).GetDatabase(ducklake_catalog.GetName());
+			if (!attached || attached->oid != admitted_identity.lake_oid) {
+				throw TransactionException("DuckLake catalog attachment changed before commit retry");
+			}
+			DuckLakeVortexIndex::CheckCatalogIdentity(*this, admitted_identity);
+		}
+#endif
 		snapshot.reset();
 		data_file_formats.clear();
 		for (auto &entry : pending_data_file_formats) {
@@ -1814,6 +1867,9 @@ shared_ptr<DuckLakeInlinedData> DuckLakeTransaction::GetTransactionLocalInlinedD
 void DuckLakeTransaction::DropTransactionLocalFile(TableIndex table_id, const string &path) {
 	auto context_ref = context.lock();
 	state->local_changes.DropTransactionLocalFile(*context_ref, table_id, path);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	state->local_file_deletes.insert(table_id);
+#endif
 }
 
 void DuckLakeTransaction::AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files) {
@@ -1925,6 +1981,9 @@ void DuckLakeTransaction::TransactionLocalDelete(TableIndex table_id, const stri
                                                  DuckLakeDeleteFile delete_file) {
 	auto context_ref = context.lock();
 	state->local_changes.TransactionLocalDelete(*context_ref, table_id, data_file_path, std::move(delete_file));
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	state->local_file_deletes.insert(table_id);
+#endif
 }
 
 DuckLakeTransaction &DuckLakeTransaction::Get(ClientContext &context, Catalog &catalog) {
