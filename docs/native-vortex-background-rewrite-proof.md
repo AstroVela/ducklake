@@ -55,8 +55,9 @@ Planning counters reflect the last probe and can lag a just-completed commit;
 task publication and registered ownership determine collection safety.
 Entirely masked B now uses the [metadata-only retirement protocol](native-vortex-empty-retirement-proof.md).
 Native DELETE retains indexed inputs until that atomic operation removes both
-source inventory and index references. A partially live B with no nonempty
-rewrite output still starts no rewrite task.
+source inventory and index references. The [sparse-B follow-up](native-vortex-sparse-rewrite-proof.md)
+rewrites complete 1–64-row B inputs into explicitly admitted F. Larger indexed
+rewrites still require nonempty output.
 
 An eligible source rewrite takes priority at the initial probe and at the probe
 after a committed flush. If a candidate becomes eligible during flush, the

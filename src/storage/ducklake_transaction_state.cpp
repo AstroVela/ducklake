@@ -733,6 +733,7 @@ CompactionInformation DuckLakeTransactionState::GetCompactionChanges(DuckLakeCom
 				file_info.source_id = compacted_file.file.id;
 				file_info.table_index = entry.GetTableIndex();
 				file_info.rewrite_snapshot = commit_snapshot.snapshot_id;
+				file_info.has_physical_rewrite_rows = compacted_file.has_physical_rewrite_rows;
 				if (has_new_file) {
 					file_info.new_id = new_file.id;
 				}

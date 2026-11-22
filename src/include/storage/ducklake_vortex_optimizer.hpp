@@ -44,6 +44,8 @@ public:
 	static vector<vector<Value>> MaintenanceStatus(ClientContext &context, const string &catalog);
 	static void SetWriteBudget(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                           const string &index, const DuckLakeVortexWriteBudget &budget);
+	static void CheckRewriteToF(ClientContext &context, const DuckLakeVortexRewriteState &rewrite, idx_t live_rows,
+	                            idx_t source_bytes);
 	static DuckLakeVortexCollectionLock &WriteAdmissionLock(DatabaseInstance &db);
 	static unique_ptr<DuckLakeVortexCollectionLock::Key>
 	AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
