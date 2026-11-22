@@ -31,7 +31,6 @@ pub(crate) async fn build_generation_checked(
     session: VortexSession,
     check: &dyn Fn(&str) -> VortexResult<()>,
 ) -> VortexResult<(Snapshot, LocalGeneration)> {
-    check("build_started")?;
     let scratch = tempfile::Builder::new()
         .prefix(".scratch-")
         .tempdir_in(root)?;
@@ -43,7 +42,43 @@ pub(crate) async fn build_generation_checked(
             .ok_or_else(|| vortex_err!("Scratch name required"))?
             .to_string_lossy()
     );
+    build_generation_at(
+        source,
+        field,
+        dimension,
+        BuildTarget {
+            root,
+            generation,
+            scratch: scratch.path(),
+        },
+        session,
+        check,
+    )
+    .await
+}
+
+pub(crate) struct BuildTarget<'a> {
+    pub root: &'a Path,
+    pub generation: String,
+    pub scratch: &'a Path,
+}
+
+pub(crate) async fn build_generation_at(
+    source: Arc<dyn IndexSource>,
+    field: String,
+    dimension: u32,
+    target: BuildTarget<'_>,
+    session: VortexSession,
+    check: &dyn Fn(&str) -> VortexResult<()>,
+) -> VortexResult<(Snapshot, LocalGeneration)> {
+    check("build_started")?;
+    let BuildTarget {
+        root,
+        generation,
+        scratch,
+    } = target;
     let store = Arc::new(LocalIndexStore::create(root, &generation, LIMITS)?);
+    check("generation_created")?;
     let metadata = IndexMetadata {
         format_version: 1,
         name: field.clone(),
@@ -60,7 +95,7 @@ pub(crate) async fn build_generation_checked(
         max_vector_bytes: 64 * 1024 * 1024,
         ..SpFreshBuildLimits::default()
     };
-    let builder = SpFreshIndexBuilder::try_new(scratch.path().to_path_buf(), session, limits)?;
+    let builder = SpFreshIndexBuilder::try_new(scratch.to_path_buf(), session, limits)?;
     let options = serde_json::json!({"format_version":1, "dimension":dimension,
         "head_count":64, "posting_page_limit":12, "replicas":4});
     let expected = metadata.clone();
@@ -87,7 +122,7 @@ pub(crate) async fn build_generation_checked(
     let (verified, reopened) =
         LocalIndexStore::open(root, &generation, &metadata.snapshot, LIMITS)?;
     drop(
-        provider(scratch.path())?
+        provider(scratch)?
             .open(&reopened, Arc::new(verified))
             .await?,
     );
@@ -98,13 +133,27 @@ pub fn write_reference(reference: &Path, descriptor: &impl Serialize) -> VortexR
     let root = reference
         .parent()
         .ok_or_else(|| vortex_err!("Reference parent required"))?;
-    let mut pending = tempfile::NamedTempFile::new_in(root)?;
+    write_reference_at(reference, descriptor, root, &|_| Ok(()))
+}
+
+pub(crate) fn write_reference_at(
+    reference: &Path,
+    descriptor: &impl Serialize,
+    temporary: &Path,
+    check: &dyn Fn(&str) -> VortexResult<()>,
+) -> VortexResult<()> {
+    let root = reference
+        .parent()
+        .ok_or_else(|| vortex_err!("Reference parent required"))?;
+    let mut pending = tempfile::NamedTempFile::new_in(temporary)?;
     serde_json::to_writer(&mut pending, descriptor).map_err(|error| vortex_err!("{error}"))?;
     pending.flush()?;
     pending.as_file().sync_all()?;
+    check("reference_written")?;
     pending
         .persist_noclobber(reference)
         .map_err(|error| vortex_err!("{error}"))?;
     fs::File::open(root)?.sync_all()?;
+    fs::File::open(temporary)?.sync_all()?;
     Ok(())
 }

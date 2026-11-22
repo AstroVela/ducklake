@@ -798,7 +798,7 @@ void DuckLakeTransaction::Commit() {
 	try {
 		if (ChangesMade()) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
-			unique_ptr<StorageLockKey> publication_guard;
+			unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard;
 			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock(), publication_guard);
 #endif
 			FlushChanges();

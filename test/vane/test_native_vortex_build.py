@@ -405,9 +405,26 @@ def exercise_historical_fields(driver, root, scratch):
             native.finish()
 
 
+def check_denied_output(native, output, stage=None):
+    claims = [row for row in native.call("build-status") if Path(row["index_root"]) == output]
+    if stage is None:
+        require(not claims and not list(output.iterdir()), "Denied admission created build ownership or files")
+        return
+    require(len(claims) == 1 and claims[0]["state"] == "abandoned", "Revoked access lost the registered task")
+    workspace = Path(claims[0]["workspace"])
+    expected = {workspace, workspace / "scratch"} if stage == "build_started" else {workspace}
+    require(
+        set(output.rglob("*")) == expected and all(path.is_dir() for path in expected),
+        "Construction wrote additional paths after access was revoked",
+    )
+    native.call("reopen")
+    native.call("build-gc", 16, 67108864)
+    require(not list(output.iterdir()), "Authorized recovery left the abandoned workspace")
+
+
 def exercise_output_permissions(driver, root, scratch):
     cases = []
-    for mode in ("denied", "exact-paths", "allowed-directory", "revoke-during-build"):
+    for mode in ("denied", "exact-paths", "allowed-directory", "allowed-source-files", "revoke-during-build"):
         case = root / ("permissions-" + mode)
         case.mkdir()
         output = case / "output"
@@ -420,12 +437,18 @@ def exercise_output_permissions(driver, root, scratch):
             native.call("init")
             native.call("build", "knn", initial / "ready.json", 0)
             previous = native.call("head", "knn")
-            directories = [native.root / "data"]
-            if mode == "allowed-directory":
+            directories = [] if mode == "allowed-source-files" else [native.root / "data"]
+            allowed = mode in ("allowed-directory", "allowed-source-files")
+            if allowed:
                 directories.extend([output, initial, scratch])
             policy = "SET allowed_directories=[" + ",".join(BASE.quote(path) for path in directories) + "];"
             if mode == "exact-paths":
                 policy += "SET allowed_paths=[" + BASE.quote(output) + "," + BASE.quote(reference) + "];"
+            if mode == "allowed-source-files":
+                native.call("raw", "source-files")
+                files = CAT.descriptor(native.capture("source-files"))["capture"]["file_capture"]["files"]
+                require(files, "File-scoped authorization needs materialized sources")
+                policy += "SET allowed_paths=[" + ",".join(BASE.quote(file["uri"]) for file in files) + "];"
             policy += "SET enable_external_access=false;"
             if mode == "revoke-during-build":
                 mutation = case / "restrict.sql"
@@ -433,7 +456,7 @@ def exercise_output_permissions(driver, root, scratch):
                 native.call("mutate-build", reference, 1, "build_started", mutation, expected="directory")
             else:
                 native.sql(policy)
-            if mode == "allowed-directory":
+            if allowed:
                 built = native.call("build", "knn", reference, 1)
                 require(built["revision"] == 2 and reference.exists(), "allowed output directory could not publish")
                 result = SEARCH.query(native, SEARCH.search_sql(VECTOR, k=1))
@@ -447,7 +470,7 @@ def exercise_output_permissions(driver, root, scratch):
                 native.call("sql", control, expected="file system operations are disabled")
                 if mode != "revoke-during-build":
                     native.call("build", "knn", reference, 1, expected="directory")
-                require(not list(output.iterdir()), "rejected construction wrote a reference, generation or scratch")
+                check_denied_output(native, output, "build_started" if mode == "revoke-during-build" else None)
                 require(native.call("head", "knn") == previous, "denied output authorization changed the ready head")
             SEARCH.no_leases(scratch)
             cases.append(
@@ -494,7 +517,7 @@ def exercise_disabled_filesystems(driver, root, scratch):
             control = case / "copy.sql"
             control.write_text("COPY (SELECT 1) TO " + BASE.quote(output / "ordinary-copy.csv") + ";")
             native.call("sql", control, expected="disabled by configuration")
-            require(not list(output.iterdir()), "disabled filesystem construction wrote output artifacts")
+            check_denied_output(native, output, None if stage == "before-call" else stage)
             require(native.call("head", "knn") == previous, "disabled filesystem changed the ready head")
             SEARCH.no_leases(scratch)
             cases.append(

@@ -10,7 +10,6 @@
 #include "storage/ducklake_transaction.hpp"
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_read_view.hpp"
-#include "duckdb/storage/storage_lock.hpp"
 #endif
 
 namespace duckdb {
@@ -140,7 +139,11 @@ void DuckLakeCleanupExecute(ClientContext &context, TableFunctionInput &data_p, 
 	}
 	if (!state.executed && !data.dry_run) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
-		auto admission_guard = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock();
+		auto admission_guard = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock([&] {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+		});
 #endif
 		// delete the files
 		auto &fs = FileSystem::GetFileSystem(context);

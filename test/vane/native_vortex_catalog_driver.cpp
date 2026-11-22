@@ -201,10 +201,11 @@ public:
 			}
 			return "{}";
 		}
-		if (op == "optimizer-status" || op == "generation-status") {
-			auto result =
-			    SQL(writer, op == "generation-status" ? "SELECT * FROM ducklake_vortex_generation_status('lake')"
-			                                          : "SELECT * FROM ducklake_vortex_optimizer_status('lake')");
+		if (op == "optimizer-status" || op == "generation-status" || op == "build-status") {
+			auto function = op == "generation-status" ? "ducklake_vortex_generation_status"
+			                : op == "build-status"    ? "ducklake_vortex_build_status"
+			                                          : "ducklake_vortex_optimizer_status";
+			auto result = SQL(writer, "SELECT * FROM " + string(function) + "('lake')");
 			ViewJSON json;
 			auto rows = json.Array();
 			for (idx_t row = 0; row < result->RowCount(); row++) {
@@ -234,6 +235,228 @@ public:
 			}
 			return json.Finish(rows);
 		}
+		if (op == "recover-builds") {
+			auto result = SQL(writer, "SELECT * FROM ducklake_recover_vortex_builds('lake'," + args.at(2) + ")");
+			return to_string(result->GetValue(0, 0).GetValue<idx_t>());
+		}
+		if (op == "build-status-transaction") {
+			Connection caller(database);
+			SQL(caller, "CREATE TEMP TABLE status_marker(i INTEGER)");
+			caller.BeginTransaction();
+			SQL(caller, "INSERT INTO status_marker VALUES (1)");
+			bool rejected = false;
+			try {
+				DuckLakeVortexIndex::BuildStatus(caller, "lake");
+			} catch (const InvalidInputException &error) {
+				rejected = string(error.what()).find("idle dedicated connection") != string::npos;
+			}
+			Require(rejected && caller.context->transaction.HasActiveTransaction(),
+			        "Build status did not preserve its caller transaction");
+			Require(SQL(caller, "SELECT count(*) FROM status_marker")->GetValue(0, 0).GetValue<idx_t>() == 1,
+			        "Build status discarded pending work");
+			caller.Rollback();
+			Require(SQL(caller, "SELECT count(*) FROM status_marker")->GetValue(0, 0).GetValue<idx_t>() == 0,
+			        "Build status committed pending work");
+			return "{\"caller_rollback\":true}";
+		}
+		if (op == "publication-commit-order") {
+			const bool cancel = args.at(2) == "cancel";
+			Require(cancel || args.at(2) == "finish", "Unknown publication ordering case");
+			Connection caller(database), owner(database), later(database);
+			SQL(later, "BEGIN; INSERT INTO lake.publication_markers VALUES (1)");
+			auto &gate = DuckLakeVortexIndex::PublicationLock();
+			auto first_commit = gate.GetSharedLock([] {});
+			std::promise<void> validated, resume;
+			auto inside = validated.get_future();
+			auto release = resume.get_future();
+			auto publisher = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", args.at(2), args.at(3), 0,
+				                                    *caller.context, [&](const string &stage) {
+					                                    if (stage == "after_validation") {
+						                                    validated.set_value();
+						                                    release.wait_for(std::chrono::seconds(5));
+					                                    }
+				                                    });
+			});
+			// The first commit keeps the exclusive guard unavailable. A refused shared admission signals reservation.
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			bool reserved = false;
+			while (std::chrono::steady_clock::now() < deadline) {
+				if (!gate.TryGetSharedLock()) {
+					reserved = true;
+					break;
+				}
+				std::this_thread::yield();
+			}
+			const auto before = gate.SharedWaitCount();
+			auto late_commit = std::async(std::launch::async, [&] { later.Commit(); });
+			const auto admission_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (gate.SharedWaitCount() == before && std::chrono::steady_clock::now() < admission_deadline &&
+			       late_commit.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout) {
+				std::this_thread::yield();
+			}
+			// Only the actual COMMIT can enter a shared wait in this fixture.
+			const auto shared_waits = gate.SharedWaitCount() - before;
+			const bool late_waited =
+			    shared_waits == 1 && late_commit.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
+			bool ordered;
+			if (cancel) {
+				caller.Interrupt();
+				const bool stopped = publisher.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+				ordered = stopped && late_commit.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+				first_commit.reset();
+			} else {
+				first_commit.reset();
+				ordered = inside.wait_for(std::chrono::seconds(5)) == std::future_status::ready &&
+				          late_commit.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
+			}
+			resume.set_value();
+			bool interrupted = false;
+			try {
+				publisher.get();
+			} catch (const InterruptException &) {
+				interrupted = true;
+			}
+			late_commit.get();
+			Require(reserved && late_waited && ordered && cancel == interrupted,
+			        "Publication reservation lost ordering or retained a cancelled guard");
+			return "{\"ordered\":true,\"shared_waits\":" + to_string(shared_waits) + "}";
+		}
+		if (op == "build-cancel-source-wait") {
+			const auto &stage = args.at(2);
+			Require(stage == "before_source_admission" || stage == "before_publish_source_admission",
+			        "Unknown source admission stage");
+			Connection builder(database);
+			Pause pause;
+			auto pending = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::BuildAndPublish(*builder.context, "lake", "main", "items", "knn",
+				                                            args.at(3), 8, std::stoull(args.at(4)),
+				                                            [&](const string &observed) {
+					                                            if (observed == stage) {
+						                                            pause.Stop();
+					                                            }
+				                                            });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			auto source_cleanup = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock([] {});
+			pause.Release();
+			const bool blocked = pending.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+			builder.Interrupt();
+			const bool cancelled = pending.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+			auto maintenance = std::async(std::launch::async, [&] {
+				Connection collector(database);
+				return DuckLakeVortexIndex::CollectBuilds(*collector.context, "lake", 1, 64 * 1024 * 1024);
+			});
+			const bool collected = maintenance.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+			source_cleanup.reset();
+			bool interrupted = false;
+			try {
+				pending.get();
+			} catch (const InterruptException &) {
+				interrupted = true;
+			}
+			auto result = maintenance.get();
+			Require(blocked && cancelled && interrupted, "Build cancellation waited for source cleanup");
+			Require(collected && result.builds == 1, "Cancelled build retained its maintenance guard");
+			return "{\"collected_before_source_unlock\":true}";
+		}
+		if (op == "build-gc" || op == "build-gc-cancel" || op == "build-gc-fail" || op == "build-gc-crash" ||
+		    op == "build-gc-policy") {
+			Connection collector(database);
+			const bool controlled = op != "build-gc";
+			auto result = DuckLakeVortexIndex::CollectBuilds(
+			    *collector.context, "lake", std::stoull(args.at(controlled ? 3 : 2)),
+			    std::stoull(args.at(controlled ? 4 : 3)), [&](const string &stage) {
+				    if (!controlled || stage != args.at(2)) {
+					    return;
+				    }
+				    if (op == "build-gc-cancel") {
+					    collector.Interrupt();
+				    } else if (op == "build-gc-policy") {
+					    SQL(writer, ReadText(args.at(5)));
+				    } else if (op == "build-gc-fail") {
+					    throw InvalidInputException("Injected Vortex build collection failure");
+				    } else {
+					    Write(root + "/build-gc-" + stage + ".ready", "ready");
+					    string line;
+					    std::getline(std::cin, line);
+					    throw InvalidInputException("Build collection resumed without SIGKILL");
+				    }
+			    });
+			return BuildGCJSON(result);
+		}
+		if (op == "build-maintenance-race") {
+			Connection builder(database);
+			Pause pause;
+			auto pending = std::async(std::launch::async, [&] {
+				return DuckLakeVortexIndex::BuildAndPublish(
+				    *builder.context, "lake", "main", "items", "knn", args.at(2), 8, std::stoull(args.at(3)),
+				    [&](const string &stage) {
+					    if (stage == args.at(4)) {
+						    pause.Stop();
+					    }
+				    },
+				    "", optional_idx(), DuckLakeVortexIndexOperation::APPEND);
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			std::promise<void> waiting;
+			auto started = waiting.get_future();
+			auto maintenance = std::async(std::launch::async, [&] {
+				Connection collector(database);
+				auto observe = [&](const string &stage) {
+					if (stage == "build_gc_waiting" || stage == "build_recovery_waiting") {
+						waiting.set_value();
+					}
+				};
+				if (args.at(5) == "recover") {
+					return to_string(DuckLakeVortexIndex::RecoverBuilds(*collector.context, "lake", 16, observe));
+				}
+				return BuildGCJSON(
+				    DuckLakeVortexIndex::CollectBuilds(*collector.context, "lake", 16, 64 * 1024 * 1024, observe));
+			});
+			ReleasePause release_maintenance {pause};
+			started.wait();
+			Require(maintenance.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
+			        "Build maintenance bypassed a live registered builder");
+			pause.Release();
+			auto published = pending.get();
+			return "{\"published\":" + published.ToJSON() + ",\"maintenance\":" + maintenance.get() + "}";
+		}
+		if (op == "build-gc-publish-race") {
+			Pause pause;
+			auto gc = std::async(std::launch::async, [&] {
+				Connection collector(database);
+				return DuckLakeVortexIndex::CollectBuilds(*collector.context, "lake", 16, 64 * 1024 * 1024,
+				                                          [&](const string &stage) {
+					                                          if (stage == "build_gc_deleting") {
+						                                          pause.Stop();
+					                                          }
+				                                          });
+			});
+			ReleasePause release {pause};
+			pause.Wait();
+			auto publish = std::async(std::launch::async, [&] {
+				Connection publisher(database);
+				try {
+					DuckLakeVortexIndex::Publish(publisher, "lake", "main", "items", "gc-alias", args.at(2), 0,
+					                             *publisher.context);
+					return string();
+				} catch (const std::exception &error) {
+					return string(error.what());
+				}
+			});
+			ReleasePause release_publish {pause};
+			Require(publish.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout,
+			        "Publication bypassed candidate collection");
+			pause.Release();
+			auto result = gc.get();
+			auto error = publish.get();
+			Require(error.find("Cannot resolve local Vortex index path") != string::npos,
+			        "Publisher did not reject the collected candidate: " + error);
+			return BuildGCJSON(result);
+		}
 		if (op == "gc" || op == "gc-cancel" || op == "gc-fail" || op == "gc-crash" || op == "gc-policy") {
 			Connection collector(database);
 			const bool controlled = op != "gc";
@@ -258,25 +481,31 @@ public:
 			    });
 			return GCJSON(result);
 		}
-		if (op == "gc-cancel-wait") {
+		if (op == "gc-cancel-wait" || op == "build-gc-cancel-wait" || op == "build-recovery-cancel-wait") {
 			Require(args.at(2) == "admissions" || args.at(2) == "publication", "Unknown GC wait lock");
 			unique_ptr<DuckLakeVortexCollectionLock::Key> admission_blocker;
-			unique_ptr<StorageLockKey> publication_blocker;
+			unique_ptr<DuckLakeVortexCollectionLock::Key> publication_blocker;
 			if (args.at(2) == "admissions") {
 				admission_blocker = DuckLakeVortexIndex::CollectionLock().GetSharedLock([] {});
 			} else {
-				publication_blocker = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+				publication_blocker = DuckLakeVortexIndex::PublicationLock().GetSharedLock([] {});
 			}
 			Connection collector(database);
 			std::promise<void> waiting;
 			auto started = waiting.get_future();
+			auto observe = [&](const string &stage) {
+				if (stage == "gc_waiting" || stage == "build_gc_waiting" || stage == "build_recovery_waiting") {
+					waiting.set_value();
+				}
+			};
 			auto pending = std::async(std::launch::async, [&] {
-				return DuckLakeVortexIndex::Collect(*collector.context, "lake", 1, 64 * 1024 * 1024,
-				                                    [&](const string &stage) {
-					                                    if (stage == "gc_waiting") {
-						                                    waiting.set_value();
-					                                    }
-				                                    });
+				if (op == "build-recovery-cancel-wait") {
+					DuckLakeVortexIndex::RecoverBuilds(*collector.context, "lake", 1, observe);
+				} else if (op == "build-gc-cancel-wait") {
+					DuckLakeVortexIndex::CollectBuilds(*collector.context, "lake", 1, 64 * 1024 * 1024, observe);
+				} else {
+					DuckLakeVortexIndex::Collect(*collector.context, "lake", 1, 64 * 1024 * 1024, observe);
+				}
 			});
 			const bool reached = started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
 			const bool blocked = pending.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
@@ -296,7 +525,8 @@ public:
 			return "{\"interrupted_before_unlock\":true}";
 		}
 		if (op == "gc-cancel-admission") {
-			Require(args.at(2) == "search" || args.at(2) == "append" || args.at(2) == "merge",
+			auto kind = args.at(2);
+			Require(kind == "search" || kind == "replace" || kind == "append" || kind == "merge",
 			        "Unknown waiting admission kind");
 			auto head = Head("knn");
 			Pause pause;
@@ -315,21 +545,30 @@ public:
 			std::promise<void> entered;
 			auto started = entered.get_future();
 			auto pending = std::async(std::launch::async, [&] {
-				if (args.at(2) == "search") {
+				if (kind == "search") {
 					DuckLakeVortexSearchRequest request;
 					request.query = {133, 4, 2, 0, 1, 8, 7, 16};
 					request.k = 10;
 					entered.set_value();
 					DuckLakeVortexSearch::Execute(*caller.context, Options("knn"), request);
 				} else {
-					Connection owner(database);
-					auto options = Options("knn");
-					options.unindexed_only = args.at(2) == "append";
-					if (!options.unindexed_only) {
-						options.merge_generations = {head.segments[0].generation, head.segments[1].generation};
+					vector<string> selected;
+					auto operation = DuckLakeVortexIndexOperation::REPLACE;
+					if (kind == "merge") {
+						operation = DuckLakeVortexIndexOperation::MERGE;
+						selected = {head.segments[0].generation, head.segments[1].generation};
+					} else if (kind == "append") {
+						operation = DuckLakeVortexIndexOperation::APPEND;
 					}
-					entered.set_value();
-					DuckLakeVortexReadView::AcquireBuild(owner, options, nullptr, caller.context.get());
+					DuckLakeVortexIndex::BuildAndPublish(
+					    *caller.context, "lake", "main", "items", "knn", root + "/cancelled-capture.json", 8,
+					    head.revision,
+					    [&](const string &stage) {
+						    if (stage == "before_build") {
+							    entered.set_value();
+						    }
+					    },
+					    "", optional_idx(), operation, selected);
 				}
 			});
 			const bool reached = started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
@@ -802,7 +1041,7 @@ public:
 		if (op == "budget-config-interrupt") {
 			Connection caller(database);
 			auto statement = ReadText(args.at(2));
-			auto publication = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock();
+			auto publication = DuckLakeVortexIndex::PublicationLock().GetExclusiveLock([] {});
 			std::promise<void> started;
 			auto ready = started.get_future();
 			auto configuring = std::async(std::launch::async, [&] {
@@ -861,7 +1100,7 @@ public:
 		}
 		if (op == "cancel-init" || op == "cancel-publish") {
 			Connection caller(database);
-			auto guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock();
+			auto guard = DuckLakeVortexIndex::PublicationLock().GetSharedLock([] {});
 			auto &connections = ConnectionManager::Get(*caller.context);
 			auto existing = connections.GetConnectionList();
 			auto before = existing.size();
@@ -1080,6 +1319,14 @@ public:
 	}
 
 private:
+	string BuildGCJSON(const DuckLakeVortexBuildGCResult &result) {
+		ViewJSON json;
+		auto value = json.Object();
+		json.Number(value, "collected_builds", result.builds);
+		json.Number(value, "collected_bytes", result.bytes);
+		json.Number(value, "remaining_builds", result.remaining);
+		return json.Finish(value);
+	}
 	string GCJSON(const DuckLakeVortexGCResult &result) {
 		ViewJSON json;
 		auto value = json.Object();

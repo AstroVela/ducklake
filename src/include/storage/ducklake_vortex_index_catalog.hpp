@@ -10,7 +10,6 @@ namespace duckdb {
 class DuckLakeTransaction;
 class DuckLakeTableEntry;
 class ExtensionLoader;
-class StorageLock;
 class ClientContext;
 
 class DuckLakeVortexCollectionLock {
@@ -31,7 +30,10 @@ public:
 
 	DuckLakeVortexCollectionLock();
 	unique_ptr<Key> GetSharedLock(const std::function<void()> &check);
+	unique_ptr<Key> TryGetSharedLock();
+	idx_t SharedWaitCount() const;
 	unique_ptr<Key> GetExclusiveLock(const std::function<void()> &check);
+	unique_ptr<Key> TryGetExclusiveLock();
 
 private:
 	shared_ptr<State> state;
@@ -41,6 +43,10 @@ enum class DuckLakeVortexIndexOperation { REPLACE, APPEND, MERGE };
 
 struct DuckLakeVortexGCResult {
 	idx_t generations = 0, artifact_bytes = 0, remaining = 0;
+};
+
+struct DuckLakeVortexBuildGCResult {
+	idx_t builds = 0, bytes = 0, remaining = 0;
 };
 
 struct DuckLakeVortexIndexFile {
@@ -71,7 +77,7 @@ struct DuckLakeVortexIndex {
 	void ValidateCoverage(const vector<DuckLakeVortexIndexFile> &current) const;
 	vector<DuckLakeVortexIndexFile> SelectedFiles(const vector<string> &generations) const;
 	vector<string> SmallestSegments() const;
-	static StorageLock &PublicationLock();
+	static DuckLakeVortexCollectionLock &PublicationLock();
 	static DuckLakeVortexCollectionLock &CollectionLock();
 	static DuckLakeTransaction &Begin(Connection &owner, const string &catalog);
 	static void Rollback(Connection &owner);
@@ -82,6 +88,12 @@ struct DuckLakeVortexIndex {
 	                                      idx_t max_artifact_bytes,
 	                                      const std::function<void(const string &)> &observe = nullptr);
 	static vector<vector<Value>> GenerationStatus(Connection &owner, const string &catalog);
+	static vector<vector<Value>> BuildStatus(Connection &owner, const string &catalog);
+	static idx_t RecoverBuilds(ClientContext &context, const string &catalog, idx_t max_builds,
+	                           const std::function<void(const string &)> &observe = nullptr);
+	static DuckLakeVortexBuildGCResult CollectBuilds(ClientContext &context, const string &catalog, idx_t max_builds,
+	                                                 idx_t max_bytes,
+	                                                 const std::function<void(const string &)> &observe = nullptr);
 	static DuckLakeVortexIndex ParseSegments(const string &reference, const string &table_uuid, idx_t field_id);
 	static DuckLakeVortexIndex Lookup(DuckLakeTransaction &transaction, DuckLakeTableEntry &table, const string &name);
 	static DuckLakeVortexIndex Publish(Connection &owner, const string &catalog, const string &schema,
