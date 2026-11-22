@@ -69,18 +69,15 @@ idx_t DuckLakeDeleteData::Filter(row_t start_row_index, idx_t count, SelectionVe
 	idx_t result_count = 0;
 	bool check_snapshots = snapshot_filter.IsValid() && !snapshot_ids.empty();
 	for (idx_t i = 0; i < count; i++) {
-		if (delete_idx < deleted_rows.size() && start_row_index + i == deleted_rows[delete_idx]) {
-			bool is_deleted = true;
-			if (check_snapshots) {
-				// only consider deletions where snapshot_id <= snapshot_filter
-				is_deleted = snapshot_ids[delete_idx] <= snapshot_filter.GetIndex();
-			}
+		bool is_deleted = false;
+		// External and inlined delete records can refer to the same position.
+		while (delete_idx < deleted_rows.size() && start_row_index + i == deleted_rows[delete_idx]) {
+			is_deleted = is_deleted || !check_snapshots || snapshot_ids[delete_idx] <= snapshot_filter.GetIndex();
 			delete_idx++;
-			if (is_deleted) {
-				continue;
-			}
 		}
-		result_sel.set_index(result_count++, i);
+		if (!is_deleted) {
+			result_sel.set_index(result_count++, i);
+		}
 	}
 	return result_count;
 }
@@ -111,15 +108,26 @@ idx_t DuckLakeDeleteFilter::Filter(row_t start_row_index, idx_t count, Selection
 }
 
 DeleteFileScanResult DuckLakeDeleteFilter::ScanDeletionVectorFile(ClientContext &context,
-                                                                  const DuckLakeFileData &delete_file) {
+                                                                  const DuckLakeFileData &delete_file,
+                                                                  optional_idx source_rows) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto file_handle = fs.OpenFile(delete_file.path, FileOpenFlags::FILE_FLAGS_READ);
 	auto file_size = file_handle->GetFileSize();
-
+	if (source_rows.IsValid() && (file_size < 0 || idx_t(file_size) != delete_file.file_size_bytes)) {
+		throw InvalidInputException("Compaction delete file size changed");
+	}
 	auto buffer = make_unsafe_uniq_array<data_t>(file_size);
 	file_handle->Read(buffer.get(), file_size);
 
 	auto dv_data = DuckLakeDeletionVectorData::FromBlob(buffer.get(), file_size);
+	if (source_rows.IsValid()) {
+		for (auto &entry : dv_data->bitmaps) {
+			auto &bitmap = entry.second;
+			if (!bitmap.isEmpty() && ((idx_t(entry.first) << 32) | bitmap.maximum()) >= source_rows.GetIndex()) {
+				throw InvalidInputException("Compaction delete position exceeds source rows");
+			}
+		}
+	}
 
 	DeleteFileScanResult result;
 	result.has_embedded_snapshots = false;
@@ -134,10 +142,18 @@ DeleteFileScanResult DuckLakeDeleteFilter::ScanDeletionVectorFile(ClientContext 
 
 DeleteFileScanResult DuckLakeDeleteFilter::ScanDeleteFile(ClientContext &context, const DuckLakeFileData &delete_file,
                                                           optional_idx snapshot_filter_min,
-                                                          optional_idx snapshot_filter_max) {
+                                                          optional_idx snapshot_filter_max, optional_idx source_rows) {
 	// Check if this is a puffin deletion vector file
 	if (delete_file.format == DeleteFileFormat::PUFFIN) {
-		return ScanDeletionVectorFile(context, delete_file);
+		return ScanDeletionVectorFile(context, delete_file, source_rows);
+	}
+	if (source_rows.IsValid()) {
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto handle = fs.OpenFile(delete_file.path, FileOpenFlags::FILE_FLAGS_READ);
+		auto size = handle->GetFileSize();
+		if (size < 0 || idx_t(size) != delete_file.file_size_bytes) {
+			throw InvalidInputException("Compaction delete file size changed");
+		}
 	}
 
 	// Set up custom MultiFileReader to avoid HEAD requests
@@ -221,6 +237,9 @@ DeleteFileScanResult DuckLakeDeleteFilter::ScanDeleteFile(ClientContext &context
 				    row_id, last_delete);
 			}
 
+			if (source_rows.IsValid() && idx_t(row_id) >= source_rows.GetIndex()) {
+				throw InvalidInputException("Compaction delete position exceeds source rows");
+			}
 			result.deleted_rows.push_back(row_id);
 			last_delete = row_id;
 

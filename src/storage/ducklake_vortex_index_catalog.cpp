@@ -18,6 +18,7 @@
 #include "storage/ducklake_vortex_read_view.hpp"
 #include "storage/ducklake_vortex_control.hpp"
 #include "storage/ducklake_vortex_query_ffi.hpp"
+#include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 #include "mbedtls_wrapper.hpp"
 
@@ -1320,6 +1321,9 @@ void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransac
 	}
 	Query(transaction, "UPDATE {METADATA_CATALOG}." + string(REWRITES) + " SET keep_file=true,new_file_id=" +
 	                       to_string(plan->new_file_id) + " WHERE build_id=" + Value(plan->build_id).ToSQLString());
+	if (!plan->optimizer_run_id.empty()) {
+		DuckLakeVortexOptimizer::RecordRewritePublication(transaction, *plan);
+	}
 	plan->check("rewrite_after_stage");
 }
 
@@ -2104,7 +2108,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
                                                  const string &schema, const string &table_name, const string &name,
                                                  const string &selected, const string &reference_path,
                                                  idx_t expected_revision,
-                                                 const std::function<void(const string &)> &observe) {
+                                                 const std::function<void(const string &)> &observe,
+                                                 const string &optimizer_run_id) {
 	Name(name);
 	if (selected.empty() || reference_path.empty() || reference_path.size() > 65536 ||
 	    reference_path.find('\0') != string::npos || expected_revision >= idx_t(NumericLimits<int64_t>::Maximum())) {
@@ -2123,6 +2128,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 	plan->catalog = catalog_name;
 	plan->selected = selected;
 	plan->reference = reference_path;
+	plan->optimizer_run_id = optimizer_run_id;
 	plan->build_id = UUID::ToString(UUID::GenerateRandomUUID());
 	auto generation = "generation-" + plan->build_id;
 	bool registered = false, committed = false;

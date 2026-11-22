@@ -2,6 +2,7 @@
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_schema_entry.hpp"
+#include "storage/ducklake_delete_filter.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_insert.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
@@ -529,7 +530,21 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 				if (source.delete_files.back().end_snapshot.IsValid()) {
 					continue;
 				}
-				result.delete_file = source.delete_files.back().data;
+				const auto &delete_file = source.delete_files.back();
+				result.delete_file = delete_file.data;
+				if (!source.inlined_file_deletions.empty()) {
+					// Row accounting in the compaction record needs disjoint masks.
+					// The reader still sees the original masks at the transaction snapshot.
+					auto external = DuckLakeDeleteFilter::ScanDeleteFile(context, result.delete_file, optional_idx(),
+					                                                     transaction.GetSnapshot().snapshot_id,
+					                                                     source.file.row_count);
+					if (external.deleted_rows.size() != delete_file.row_count) {
+						throw InvalidInputException("Compaction delete file row count changed");
+					}
+					for (auto position : external.deleted_rows) {
+						source.inlined_file_deletions.erase(position);
+					}
+				}
 			}
 			break;
 		}

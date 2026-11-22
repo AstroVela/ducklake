@@ -13,6 +13,7 @@ enum class Operation {
 	CANCEL,
 	STATUS,
 	WRITE_BUDGET,
+	COMPACTION_POLICY,
 	ENABLE_MAINTENANCE,
 	RESUME_MAINTENANCE,
 	CANCEL_MAINTENANCE,
@@ -59,6 +60,11 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 			}
 		}
 	}
+	if (OP == Operation::COMPACTION_POLICY &&
+	    (input.inputs[5].GetValue<int64_t>() < 1 || input.inputs[5].GetValue<int64_t>() > 100000 ||
+	     input.inputs[6].GetValue<int64_t>() < 1 || input.inputs[6].GetValue<int64_t>() > 100)) {
+		throw InvalidInputException("Invalid Vortex compaction thresholds");
+	}
 	if (OP == Operation::ENABLE_MAINTENANCE &&
 	    (input.inputs[1].GetValue<int64_t>() < 1 || input.inputs[1].GetValue<int64_t>() > 16 ||
 	     input.inputs[2].GetValue<int64_t>() < 1 || input.inputs[2].GetValue<int64_t>() > 64 * 1024 * 1024)) {
@@ -90,7 +96,14 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 		         "max_unindexed_rows",
 		         "max_unindexed_bytes",
 		         "task_kind",
-		         "selected_generations"};
+		         "selected_generations",
+		         "compaction_enabled",
+		         "min_deleted_rows",
+		         "min_deleted_percent",
+		         "compaction_candidate",
+		         "reclaimable_rows",
+		         "remaining_rows",
+		         "compaction_reason"};
 		types = {LogicalType::VARCHAR,
 		         LogicalType::VARCHAR,
 		         LogicalType::VARCHAR,
@@ -113,7 +126,14 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 		         LogicalType::UBIGINT,
 		         LogicalType::UBIGINT,
 		         LogicalType::VARCHAR,
-		         LogicalType::LIST(LogicalType::VARCHAR)};
+		         LogicalType::LIST(LogicalType::VARCHAR),
+		         LogicalType::BOOLEAN,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::VARCHAR,
+		         LogicalType::UBIGINT,
+		         LogicalType::UBIGINT,
+		         LogicalType::VARCHAR};
 	} else if (OP == Operation::MAINTENANCE_STATUS) {
 		names = {"state",
 		         "enabled",
@@ -205,6 +225,12 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			result = "configured";
 			break;
 		}
+		case Operation::COMPACTION_POLICY:
+			DuckLakeVortexOptimizer::ConfigureCompaction(context, text(0), text(1), text(2), text(3),
+			                                             args[4].GetValue<bool>(), args[5].GetValue<idx_t>(),
+			                                             args[6].GetValue<idx_t>());
+			result = "configured";
+			break;
 		}
 		if (bind.operation != Operation::STATUS && bind.operation != Operation::MAINTENANCE_STATUS) {
 			state.rows.push_back({Value(result)});
@@ -224,6 +250,11 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 } // namespace
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader) {
+	loader.RegisterFunction(
+	    TableFunction("ducklake_set_vortex_data_compaction_policy",
+	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                   LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::BIGINT},
+	                  Execute, Bind<Operation::COMPACTION_POLICY>, Init));
 	loader.RegisterFunction(TableFunction("ducklake_enable_vortex_maintenance",
 	                                      {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT}, Execute,
 	                                      Bind<Operation::ENABLE_MAINTENANCE>, Init));

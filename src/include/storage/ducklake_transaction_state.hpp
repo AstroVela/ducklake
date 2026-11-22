@@ -77,9 +77,9 @@ struct DuckLakeCommitContext {
 	std::function<vector<string>(TableIndex)> get_inlined_table_names = [](TableIndex) {
 		return vector<string> {};
 	};
-	//! Net (delete-adjusted) row count of a table's regular data files.
-	std::function<idx_t(TableIndex)> get_net_data_file_row_count = [](TableIndex) {
-		return 0;
+	//! Exact visible row count of regular data files, when available from metadata.
+	std::function<optional_idx(TableIndex)> get_exact_data_file_row_count = [](TableIndex) {
+		return optional_idx();
 	};
 	//! Net (delete-adjusted) row count of a table's inlined-data tables.
 	std::function<idx_t(TableIndex)> get_net_inlined_row_count = [](TableIndex) {
