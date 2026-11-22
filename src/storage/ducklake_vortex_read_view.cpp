@@ -76,6 +76,14 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			throw InterruptException();
 		}
 	};
+	unique_ptr<DuckLakeVortexCollectionLock::Key> generation_guard;
+	if (!options.index_name.empty()) {
+		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock([&] {
+			if (reader.context->IsInterrupted() || (owner && owner->IsInterrupted())) {
+				throw InterruptException();
+			}
+		});
+	}
 	reader.BeginTransaction();
 	try {
 		auto &catalog = Catalog::GetCatalog(*reader.context, options.catalog).Cast<DuckLakeCatalog>();
@@ -165,6 +173,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		}
 		map<string, idx_t> by_path;
 		DuckLakeVortexReadView result;
+		result.generation_guard = std::move(generation_guard);
 		result.snapshot_id = snapshot.snapshot_id;
 		auto &fs = FileSystem::GetFileSystem(*reader.context);
 		result.managed_data_path = fs.ExpandPath(catalog.DataPath());
