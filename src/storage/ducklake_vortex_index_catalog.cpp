@@ -8,7 +8,9 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
@@ -16,6 +18,7 @@
 #include "storage/ducklake_vortex_read_view.hpp"
 #include "storage/ducklake_vortex_control.hpp"
 #include "storage/ducklake_vortex_query_ffi.hpp"
+#include "storage/ducklake_metadata_manager.hpp"
 #include "mbedtls_wrapper.hpp"
 
 #include <algorithm>
@@ -93,6 +96,11 @@ idx_t DuckLakeVortexCollectionLock::SharedWaitCount() const {
 	return state->shared_waits;
 }
 
+idx_t DuckLakeVortexCollectionLock::WaitingWriterCount() const {
+	std::lock_guard<std::mutex> guard(state->lock);
+	return state->waiting_writers;
+}
+
 unique_ptr<DuckLakeVortexCollectionLock::Key>
 DuckLakeVortexCollectionLock::GetExclusiveLock(const std::function<void()> &check) {
 	std::unique_lock<std::mutex> guard(state->lock);
@@ -129,8 +137,10 @@ const char *CATALOG_TABLE = "ducklake_vortex_indexes_v1";
 const char *GENERATIONS = "ducklake_vortex_generations_v1";
 const char *GENERATION_REFS = "ducklake_vortex_generation_refs_v1";
 const char *BUILDS = "ducklake_vortex_builds_v1";
+const char *REWRITES = "ducklake_vortex_rewrites_v1";
 const idx_t MAX_MANIFEST = 1024 * 1024;
 const idx_t MAX_ARTIFACTS = 64 * 1024 * 1024;
+const idx_t MAX_BUILD_CLEANUP_ENTRIES = 4096;
 
 string Hash(const string &bytes) {
 	return "sha256:" + Hex(duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes));
@@ -261,6 +271,13 @@ bool CheckDirectoryAccess(ClientContext &context, const string &root) {
 void CheckBuildDirectoryAccess(ClientContext &context, const string &root) {
 	if (!CheckDirectoryAccess(context, root)) {
 		throw IOException("Vortex index output directory does not exist: %s", root);
+	}
+}
+
+void CheckBuildReferenceWriteAccess(FileSystem &fs, const string &path) {
+	auto &opener = fs.Cast<OpenerFileSystem>();
+	if (opener.IsDuckDBExtensionName(path)) {
+		opener.VerifyCanAccessExtension(path, FileFlags::FILE_FLAGS_WRITE);
 	}
 }
 
@@ -509,12 +526,51 @@ string VerifyGeneration(FileSystem &fs, const DuckLakeVortexIndex &index, const 
 	return bytes;
 }
 
+void BuildNative(ClientContext &context, DuckLakeVortexReadView &view, const string &reference_path,
+                 const string &generation, const string &workspace, const std::function<void(const string &)> &check) {
+	vector<DuckLakeVortexQuerySource> sources;
+	for (auto &source : view.sources) {
+		sources.push_back(
+		    {source.file_id, reinterpret_cast<const uint8_t *>(source.bytes.data()), source.bytes.size()});
+	}
+	DuckLakeVortexControl control {context, check, nullptr, view.sources};
+	DuckLakeVortexBuildInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
+	                                view.admission_json.size(),
+	                                sources.data(),
+	                                sources.size(),
+	                                reinterpret_cast<const uint8_t *>(view.managed_data_path.data()),
+	                                view.managed_data_path.size(),
+	                                reinterpret_cast<const uint8_t *>(reference_path.data()),
+	                                reference_path.size(),
+	                                reinterpret_cast<const uint8_t *>(generation.data()),
+	                                generation.size(),
+	                                reinterpret_cast<const uint8_t *>(workspace.data()),
+	                                workspace.size(),
+	                                DuckLakeVortexControl::Check,
+	                                &control};
+	std::unique_ptr<char, decltype(&ducklake_vortex_build_error_free)> error(ducklake_vortex_build(&input),
+	                                                                         ducklake_vortex_build_error_free);
+	if (control.error) {
+		std::rethrow_exception(control.error);
+	}
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
+	if (error) {
+		throw InvalidInputException("%s", error.get());
+	}
+}
+
 string GenerationWhere(const string &root, const string &generation) {
 	return " WHERE index_root=" + Value(root).ToSQLString() + " AND generation=" + Value(generation).ToSQLString();
 }
 
 string LocalChild(const string &root, const string &child) {
 	return root == "/" ? root + child : root + "/" + child;
+}
+
+string RewriteSourceName(const string &build_id) {
+	return DuckLakeVortexIndex::RewriteSourcePrefix() + build_id + ".vortex";
 }
 
 // The publication lock serializes registration and publication with this check.
@@ -578,9 +634,10 @@ void ReconcileBuild(Connection &owner, const string &catalog, const string &id,
 	}
 }
 
-void BuildState(Connection &owner, const string &catalog, const string &id, const string &state) {
+void BuildState(Connection &owner, const string &catalog, const string &id, const string &state,
+                optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr) {
 	try {
-		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog);
+		auto &transaction = DuckLakeVortexIndex::Begin(owner, catalog, identity);
 		DuckLakeVortexIndex::Query(
 		    transaction, "UPDATE {METADATA_CATALOG}." + string(BUILDS) + " SET state=" + Value(state).ToSQLString() +
 		                     " WHERE build_id=" + Value(id).ToSQLString() +
@@ -885,7 +942,7 @@ void InspectBuild(int32_t fd, const string &prefix, CollectionPlan &plan,
 		check("build_gc_inspecting");
 		Relative(name, true);
 		auto path = prefix + "/" + name;
-		if (plan.files.size() + plan.directories.size() >= 4096) {
+		if (plan.files.size() + plan.directories.size() >= MAX_BUILD_CLEANUP_ENTRIES) {
 			throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex build cleanup entry budget exceeded");
 		}
 		struct stat info;
@@ -948,9 +1005,240 @@ bool RemoveBuildFile(int32_t root, const CollectedFile &file, idx_t &remaining, 
 	check("build_gc_file_deleted");
 	return true;
 }
+
+void RemoveLinkedRewriteSource(ClientContext &context, int32_t root, const string &workspace_name,
+                               const string &source_root, const string &source_name,
+                               const std::function<void(const string &)> &check) {
+	auto workspace = OpenDirectory(root, workspace_name, true);
+	if (!workspace) {
+		return;
+	}
+	struct stat private_file;
+	if (fstatat(workspace->fd, "rewrite.vortex", &private_file, AT_SYMLINK_NOFOLLOW)) {
+		if (errno == ENOENT) {
+			return;
+		}
+		throw IOException("Cannot inspect private Vortex rewrite source");
+	}
+	if (!S_ISREG(private_file.st_mode) || private_file.st_nlink < 2) {
+		return;
+	}
+	CheckDirectoryAccess(context, source_root);
+	auto source = OpenRoot(source_root, true);
+	if (!source) {
+		return;
+	}
+	check("build_gc_before_unlink");
+	CheckDirectoryAccess(context, source_root);
+	struct stat destination;
+	if (fstatat(source->fd, source_name.c_str(), &destination, AT_SYMLINK_NOFOLLOW)) {
+		if (errno == ENOENT) {
+			return;
+		}
+		throw IOException("Cannot inspect managed Vortex rewrite source");
+	}
+	if (S_ISREG(destination.st_mode) && destination.st_dev == private_file.st_dev &&
+	    destination.st_ino == private_file.st_ino) {
+		// Keep the private link until the managed link is gone. The ordinary
+		// workspace cleanup accounts for bytes when it removes the last link.
+		Unlink(source->fd, source_name, false);
+		check("build_gc_file_deleted");
+	}
+}
 #endif
 
 } // namespace
+
+DuckLakeVortexCatalogIdentity DuckLakeVortexIndex::ResolveCatalog(ClientContext &context, const string &name,
+                                                                  bool write, const char *operation) {
+	auto &transaction = context.transaction;
+	const bool active_transaction = transaction.HasActiveTransaction();
+	if (write &&
+	    (!transaction.IsAutoCommit() || (active_transaction && transaction.ActiveTransaction().IsReadOnly()))) {
+		throw TransactionException("%s controls require autocommit", operation);
+	}
+	auto &manager = DatabaseManager::Get(context);
+	auto resolve = [&](const string &alias) {
+		auto attached = manager.GetDatabase(alias);
+		if (active_transaction && manager.GetDatabase(context, alias).get() != attached.get()) {
+			throw TransactionException("%s caller attachment changed", operation);
+		}
+		return attached;
+	};
+	auto lake = resolve(name);
+	if (!lake || lake->GetCatalog().GetCatalogType() != "ducklake") {
+		throw InvalidInputException("%s requires an attached DuckLake catalog", operation);
+	}
+	auto &catalog = lake->GetCatalog().Cast<DuckLakeCatalog>();
+	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
+		throw InvalidInputException("%s requires native DuckDB metadata", operation);
+	}
+	const auto &metadata_name = catalog.MetadataDatabaseName();
+	auto metadata = resolve(metadata_name);
+	if (!metadata || manager.GetDatabase(name) != lake || manager.GetDatabase(metadata_name) != metadata) {
+		throw TransactionException("%s catalog attachment changed", operation);
+	}
+	if (active_transaction) {
+		auto caller_lake = transaction.ActiveTransaction().TryGetTransaction(*lake);
+		if (caller_lake) {
+			// A DuckLake transaction can retain its metadata attachment on a separate connection.
+			auto &metadata_context = *caller_lake->Cast<DuckLakeTransaction>().GetConnection().context;
+			if (manager.GetDatabase(metadata_context, metadata_name).get() != metadata.get()) {
+				throw TransactionException("%s caller metadata attachment changed", operation);
+			}
+		}
+	}
+	if (write && (lake->IsReadOnly() || metadata->IsReadOnly())) {
+		throw TransactionException("%s controls require a writable DuckLake attachment", operation);
+	}
+	return {lake->oid, metadata->oid};
+}
+
+shared_ptr<DuckLakeVortexRewriteState> DuckLakeVortexRewriteState::Get(ClientContext &context) {
+	return context.registered_state->Get<DuckLakeVortexRewriteState>("ducklake_vortex_rewrite");
+}
+
+string DuckLakeVortexIndex::StageRewriteInput(DuckLakeVortexRewriteState &plan, idx_t file_id, const string &uri,
+                                              idx_t rows) {
+	auto selected = std::find_if(plan.selected_files.begin(), plan.selected_files.end(),
+	                             [&](const DuckLakeVortexIndexFile &file) { return file.id == file_id; });
+	if (selected == plan.selected_files.end() || selected->uri != uri || selected->row_count != rows) {
+		throw InvalidInputException("Vortex rewrite input descriptor changed");
+	}
+	// The collector also counts the workspace and the compactor's single output.
+	if (plan.staged_inputs.size() >= MAX_BUILD_CLEANUP_ENTRIES - 2) {
+		throw InvalidInputException("RESOURCE_EXHAUSTED: Vortex rewrite input entry budget exceeded");
+	}
+	auto &caller = *plan.caller;
+	CheckInterrupted(caller);
+	auto &fs = FileSystem::GetFileSystem(caller);
+	auto bytes = Read(fs, uri, MAX_ARTIFACTS - plan.staged_source_bytes, false);
+	if (Hash(bytes) != selected->version) {
+		throw InvalidInputException("Vortex rewrite input content version changed");
+	}
+	CheckInterrupted(caller);
+	CheckBuildDirectoryAccess(caller, plan.workspace);
+	auto path = LocalChild(plan.workspace, "input-" + to_string(file_id) + ".vortex");
+	auto destination = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW |
+	                                         FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE);
+	if (!bytes.empty() && destination->Write(&bytes[0], bytes.size()) != static_cast<int64_t>(bytes.size())) {
+		throw IOException("Cannot stage complete Vortex rewrite input");
+	}
+	plan.staged_source_bytes += bytes.size();
+	plan.staged_inputs.push_back(path);
+	return path;
+}
+
+void DuckLakeVortexIndex::CheckRewriteCommit(ClientContext &context, DuckLakeTransaction &transaction) {
+	auto plan = DuckLakeVortexRewriteState::Get(context);
+	if (!plan || plan->candidate.generation.empty()) {
+		throw InvalidInputException("Vortex rewrite candidate is not prepared");
+	}
+	CheckCatalogIdentity(transaction, plan->identity);
+	Connection probe(*context.db);
+	try {
+		auto &fresh = Begin(probe, plan->catalog, &plan->identity);
+		auto snapshot = fresh.GetSnapshot();
+		auto entry = fresh.GetCatalog().GetEntry(*probe.context, CatalogType::TABLE_ENTRY, plan->schema, plan->table,
+		                                         OnEntryNotFound::THROW_EXCEPTION);
+		auto &table = entry->Cast<DuckLakeTableEntry>();
+		auto current = Lookup(fresh, table, plan->before.name);
+		auto aliases = Query(fresh, "SELECT count(*) FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
+		                                " WHERE table_uuid=" + Value(plan->table_uuid).ToSQLString());
+		if (table.GetTableUUID() != plan->table_uuid || table.GetTableId().index != plan->table_id ||
+		    snapshot.snapshot_id != plan->snapshot_id || snapshot.next_file_id != plan->new_file_id ||
+		    current.ToJSON() != plan->before.ToJSON() || aliases->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
+			throw TransactionException("Vortex rewrite capture or index changed before commit");
+		}
+		probe.Commit();
+		plan->check("rewrite_before_commit");
+	} catch (...) {
+		Rollback(probe);
+		throw;
+	}
+}
+
+void DuckLakeVortexIndex::PublishRewrite(ClientContext &context, DuckLakeTransaction &transaction,
+                                         const DuckLakeSnapshot &snapshot) {
+	auto plan = DuckLakeVortexRewriteState::Get(context);
+	if (!plan || snapshot.snapshot_id != plan->snapshot_id + 1) {
+		throw TransactionException("Vortex rewrite commit snapshot mismatch");
+	}
+	auto entry = transaction.GetCatalog().GetEntryById(transaction, snapshot, TableIndex(plan->table_id));
+	if (!entry) {
+		throw TransactionException("Vortex rewrite table disappeared before publication");
+	}
+	auto &table = entry->Cast<DuckLakeTableEntry>();
+	auto current = Lookup(transaction, table, plan->before.name);
+	if (current.ToJSON() != plan->before.ToJSON()) {
+		throw TransactionException("Vortex rewrite publication revision conflict");
+	}
+	auto &caller = *plan->caller;
+	auto &fs = FileSystem::GetFileSystem(caller);
+	auto data_path = ResolveLocalPath(fs.ExpandPath(transaction.GetCatalog().DataPath()));
+	auto files = transaction.GetMetadataManager().GetExtendedFilesForTable(table, snapshot);
+	vector<DuckLakeVortexIndexFile> identities;
+	idx_t remaining = MAX_ARTIFACTS;
+	bool found_output = false;
+	for (auto &file : files) {
+		if (file.data_type != DuckLakeDataType::DATA_FILE) {
+			continue;
+		}
+		if (std::find(plan->replaced.begin(), plan->replaced.end(), file.file_id.index) != plan->replaced.end()) {
+			throw InvalidInputException("Vortex rewrite source stayed active");
+		}
+		CheckInterrupted(caller);
+		auto bytes = Read(fs, file.file.path, remaining, false);
+		remaining -= bytes.size();
+		identities.push_back({file.file_id.index, file.file.path, Hash(bytes), file.row_count});
+		if (file.file.path == plan->new_path) {
+			found_output = file.file_id.index == plan->new_file_id && file.row_count == plan->new_rows;
+		}
+	}
+	if (!found_output) {
+		throw InvalidInputException("Vortex rewrite output file identity mismatch");
+	}
+	plan->candidate.ValidateCoverage(identities);
+	remaining = MAX_ARTIFACTS;
+	for (auto &segment : plan->candidate.segments) {
+		auto part = ParseReference(segment.reference, plan->table_uuid, plan->before.field_id);
+		part.root = segment.root;
+		CheckInterrupted(caller);
+		auto generation_path = LocalChild(part.root, part.generation);
+		CheckCollectibleDirectory(generation_path, data_path);
+		CheckBuildOwnership(transaction, part.root, part.generation, {generation_path});
+		auto before = remaining;
+		auto manifest = VerifyGeneration(fs, part, data_path, remaining);
+		RegisterGeneration(transaction, part, manifest, before - remaining);
+	}
+	UpdateGenerationRefs(transaction, plan->table_uuid, plan->candidate);
+	auto updated = Query(transaction, "UPDATE {METADATA_CATALOG}." + string(CATALOG_TABLE) +
+	                                      " SET revision=" + to_string(plan->candidate.revision) +
+	                                      ",index_root=" + Value(plan->candidate.root).ToSQLString() +
+	                                      ",reference=" + Value(plan->candidate.reference).ToSQLString() +
+	                                      " WHERE table_uuid=" + Value(plan->table_uuid).ToSQLString() +
+	                                      " AND index_name=" + Value(plan->before.name).ToSQLString() +
+	                                      " AND revision=" + to_string(plan->before.revision) + " RETURNING revision");
+	if (!updated->Fetch()) {
+		throw TransactionException("Vortex rewrite publication ownership changed");
+	}
+	Query(transaction, "UPDATE {METADATA_CATALOG}." + string(REWRITES) +
+	                       " SET keep_file=true WHERE build_id=" + Value(plan->build_id).ToSQLString());
+	plan->check("rewrite_after_stage");
+}
+
+void DuckLakeVortexIndex::CheckCatalogIdentity(DuckLakeTransaction &transaction,
+                                               const DuckLakeVortexCatalogIdentity &identity) {
+	auto &catalog = transaction.GetCatalog();
+	if (catalog.GetAttached().oid != identity.lake_oid) {
+		throw TransactionException("Vortex catalog attachment changed");
+	}
+	// Pin the selected attachment on the connection that will execute the metadata statements.
+	auto &metadata = Catalog::GetCatalog(*transaction.GetConnection().context, catalog.MetadataDatabaseName());
+	if (metadata.GetAttached().oid != identity.metadata_oid) {
+		throw TransactionException("Vortex metadata attachment changed");
+	}
+}
 
 DuckLakeTransaction &DuckLakeVortexIndex::Begin(Connection &owner, const string &name,
                                                 optional_ptr<const DuckLakeVortexCatalogIdentity> identity) {
@@ -965,12 +1253,7 @@ DuckLakeTransaction &DuckLakeVortexIndex::Begin(Connection &owner, const string 
 	}
 	auto &transaction = DuckLakeTransaction::Get(*owner.context, catalog);
 	if (identity) {
-		// Resolve on the actual metadata connection so its transaction retains this
-		// attachment.
-		auto &metadata = Catalog::GetCatalog(*transaction.GetConnection().context, catalog.MetadataDatabaseName());
-		if (metadata.GetAttached().oid != identity->metadata_oid) {
-			throw TransactionException("Vortex maintenance metadata attachment changed");
-		}
+		CheckCatalogIdentity(transaction, *identity);
 	}
 	transaction.GetSnapshot();
 	return transaction;
@@ -984,7 +1267,7 @@ void DuckLakeVortexIndex::Rollback(Connection &owner) {
 
 void DuckLakeVortexIndex::Initialized(DuckLakeTransaction &transaction) {
 	auto &catalog = transaction.GetCatalog();
-	for (auto &name : {CATALOG_TABLE, GENERATIONS, GENERATION_REFS, BUILDS}) {
+	for (auto &name : {CATALOG_TABLE, GENERATIONS, GENERATION_REFS, BUILDS, REWRITES}) {
 		if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
 		                                           name)) {
 			throw InvalidInputException("Vortex index catalog is not initialized");
@@ -1042,6 +1325,10 @@ void DuckLakeVortexIndex::Initialize(Connection &owner, const string &catalog, C
 		                   "workspace VARCHAR NOT NULL,reference_path VARCHAR NOT NULL,state VARCHAR NOT NULL "
 		                   "CHECK(state IN ('allocated','building','sealed','published','abandoned','deleting')),"
 		                   "keep_generation BOOLEAN NOT NULL,UNIQUE(index_root,generation))");
+		Query(transaction, "CREATE TABLE {METADATA_CATALOG}.ducklake_vortex_rewrites_v1("
+		                   "build_id VARCHAR PRIMARY KEY,table_uuid VARCHAR NOT NULL,source_root VARCHAR NOT NULL,"
+		                   "new_path VARCHAR NOT NULL,capture_snapshot BIGINT NOT NULL,new_file_id BIGINT NOT NULL,"
+		                   "keep_file BOOLEAN NOT NULL)");
 		CheckInterrupted(owner, caller);
 		owner.Commit();
 	} catch (...) {
@@ -1371,6 +1658,27 @@ DuckLakeVortexIndex::CollectBuilds(ClientContext &context, const string &catalog
 			}
 			auto &inspect = Begin(owner, catalog, identity);
 			bool keep = entry[4].GetValue<bool>() || PublishedGeneration(inspect, root, generation);
+			string source_root, source_name;
+			bool keep_source = true;
+			auto rewrite = Query(inspect, "SELECT source_root,new_path,keep_file FROM {METADATA_CATALOG}." +
+			                                  string(REWRITES) + " WHERE build_id=" + Value(id).ToSQLString());
+			auto rewrite_row = rewrite->Fetch();
+			if (rewrite_row && rewrite_row->size()) {
+				source_root = StringValue::Get(rewrite_row->GetValue(0, 0));
+				source_name = RewriteSourceName(id);
+				auto source_path = StringValue::Get(rewrite_row->GetValue(1, 0));
+				if ((source_root != managed &&
+				     !StringUtil::StartsWith(source_root, managed == "/" ? managed : managed + "/")) ||
+				    source_path != LocalChild(source_root, source_name)) {
+					throw InvalidInputException("Registered Vortex rewrite source namespace mismatch");
+				}
+				auto references = Query(
+				    inspect, "SELECT count(*) FROM {METADATA_CATALOG}.ducklake_data_file WHERE path=" +
+				                 Value(source_path).ToSQLString() + " OR path=" + Value(source_name).ToSQLString() +
+				                 " OR path LIKE " + Value("%/" + source_name).ToSQLString());
+				keep_source = keep || rewrite_row->GetValue(2, 0).GetValue<bool>() ||
+				              references->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 0;
+			}
 			targets = {workspace};
 			if (!keep) {
 				targets.push_back(LocalChild(root, generation));
@@ -1400,10 +1708,22 @@ DuckLakeVortexIndex::CollectBuilds(ClientContext &context, const string &catalog
 			auto &mark = Begin(owner, catalog, identity);
 			Query(mark, "UPDATE {METADATA_CATALOG}." + string(BUILDS) + " SET state='deleting',keep_generation=" +
 			                string(keep ? "true" : "false") + " WHERE build_id=" + Value(id).ToSQLString());
+			if (!source_root.empty()) {
+				Query(mark, "UPDATE {METADATA_CATALOG}." + string(REWRITES) + " SET keep_file=" +
+				                string(keep_source ? "true" : "false") + " WHERE build_id=" + Value(id).ToSQLString());
+			}
 			owner.Commit();
 			check("build_gc_deleting");
 			bool complete = true;
 			if (directory) {
+				unique_ptr<DuckLakeVortexCollectionLock::Key> source_admission;
+				if (!source_root.empty()) {
+					// Keep the managed link stable while counting and releasing private links.
+					source_admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
+				}
+				if (!source_root.empty() && !keep_source) {
+					RemoveLinkedRewriteSource(context, directory->fd, ".build-" + id, source_root, source_name, check);
+				}
 				for (auto &file : plan.files) {
 					check("build_gc_before_unlink");
 					if (!RemoveBuildFile(directory->fd, file, remaining, collected.bytes, check)) {
@@ -1423,6 +1743,8 @@ DuckLakeVortexIndex::CollectBuilds(ClientContext &context, const string &catalog
 			}
 			check("build_gc_files_deleted");
 			auto &finish = Begin(owner, catalog, identity);
+			Query(finish,
+			      "DELETE FROM {METADATA_CATALOG}." + string(REWRITES) + " WHERE build_id=" + Value(id).ToSQLString());
 			Query(finish,
 			      "DELETE FROM {METADATA_CATALOG}." + string(BUILDS) + " WHERE build_id=" + Value(id).ToSQLString());
 			check("build_gc_before_finish");
@@ -1607,10 +1929,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		auto separator = reference_path.find_last_of('/');
 		root = Canonical(reference_path.substr(0, separator == 0 ? 1 : separator));
 		CheckBuildDirectoryAccess(context, root);
-		auto &opener = fs.Cast<OpenerFileSystem>();
-		if (opener.IsDuckDBExtensionName(reference_path)) {
-			opener.VerifyCanAccessExtension(reference_path, FileFlags::FILE_FLAGS_WRITE);
-		}
+		CheckBuildReferenceWriteAccess(fs, reference_path);
 		if (reference_path.back() == '/' || fs.FileExists(reference_path)) {
 			throw InvalidInputException("Build reference must be new, canonical and outside the managed data path");
 		}
@@ -1665,37 +1984,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 		options.expected_table_uuid = table_uuid;
 		options.expected_field_id = expected_field_id;
 		auto view = DuckLakeVortexReadView::AcquireBuild(owner, options, check, &context);
-		vector<DuckLakeVortexQuerySource> sources;
-		for (auto &source : view.sources) {
-			sources.push_back(
-			    {source.file_id, reinterpret_cast<const uint8_t *>(source.bytes.data()), source.bytes.size()});
-		}
-		DuckLakeVortexControl control {context, check, nullptr, view.sources};
-		DuckLakeVortexBuildInput input {reinterpret_cast<const uint8_t *>(view.admission_json.data()),
-		                                view.admission_json.size(),
-		                                sources.data(),
-		                                sources.size(),
-		                                reinterpret_cast<const uint8_t *>(view.managed_data_path.data()),
-		                                view.managed_data_path.size(),
-		                                reinterpret_cast<const uint8_t *>(reference_path.data()),
-		                                reference_path.size(),
-		                                reinterpret_cast<const uint8_t *>(generation.data()),
-		                                generation.size(),
-		                                reinterpret_cast<const uint8_t *>(workspace.data()),
-		                                workspace.size(),
-		                                DuckLakeVortexControl::Check,
-		                                &control};
-		std::unique_ptr<char, decltype(&ducklake_vortex_build_error_free)> error(ducklake_vortex_build(&input),
-		                                                                         ducklake_vortex_build_error_free);
-		if (control.error) {
-			std::rethrow_exception(control.error);
-		}
-		if (context.IsInterrupted()) {
-			throw InterruptException();
-		}
-		if (error) {
-			throw InvalidInputException("%s", error.get());
-		}
+		BuildNative(context, view, reference_path, generation, workspace, check);
 		check("before_build_publish");
 		return Publish(owner, catalog_name, schema, table_name, name, reference_path, expected_revision, context, check,
 		               operation, merge_generations);
@@ -1712,6 +2001,293 @@ DuckLakeVortexIndex DuckLakeVortexIndex::BuildAndPublish(
 			}
 		}
 		std::rethrow_exception(error);
+	}
+}
+
+DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const string &catalog_name,
+                                                 const string &schema, const string &table_name, const string &name,
+                                                 const string &selected, const string &reference_path,
+                                                 idx_t expected_revision,
+                                                 const std::function<void(const string &)> &observe) {
+	Name(name);
+	if (selected.empty() || reference_path.empty() || reference_path.size() > 65536 ||
+	    reference_path.find('\0') != string::npos || expected_revision >= idx_t(NumericLimits<int64_t>::Maximum())) {
+		throw InvalidInputException("Invalid Vortex rewrite arguments");
+	}
+	auto identity = ResolveCatalog(context, catalog_name, true, "Vortex rewrite");
+	auto interrupt = [&] {
+		CheckInterrupted(context);
+	};
+	auto guard = CollectionLock().GetSharedLock(interrupt);
+	interrupt();
+	Connection source(*context.db), owner(*context.db);
+	auto plan = source.context->registered_state->GetOrCreate<DuckLakeVortexRewriteState>("ducklake_vortex_rewrite");
+	plan->caller = context;
+	plan->identity = identity;
+	plan->catalog = catalog_name;
+	plan->schema = schema;
+	plan->table = table_name;
+	plan->selected = selected;
+	plan->reference = reference_path;
+	plan->build_id = UUID::ToString(UUID::GenerateRandomUUID());
+	auto generation = "generation-" + plan->build_id;
+	bool registered = false, committed = false;
+	plan->check = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		CheckInterrupted(source, context);
+		if (registered && stage == "generation_sealed") {
+			BuildState(owner, catalog_name, plan->build_id, "sealed", &identity);
+		}
+	};
+	try {
+		auto &transaction = Begin(source, catalog_name, &identity);
+		Initialized(transaction);
+		auto snapshot = transaction.GetSnapshot();
+		plan->snapshot_id = snapshot.snapshot_id;
+		plan->schema_version = snapshot.schema_version;
+		plan->new_file_id = snapshot.next_file_id;
+		auto &catalog = transaction.GetCatalog();
+		auto entry = catalog.GetEntry(*source.context, CatalogType::TABLE_ENTRY, schema, table_name,
+		                              OnEntryNotFound::THROW_EXCEPTION);
+		auto &table = entry->Cast<DuckLakeTableEntry>();
+		plan->table_uuid = table.GetTableUUID();
+		plan->table_id = table.GetTableId().index;
+		plan->before = Lookup(transaction, table, name);
+		if (plan->before.revision != expected_revision) {
+			throw TransactionException("Vortex rewrite publication revision conflict");
+		}
+		for (auto &segment : plan->before.segments) {
+			if (segment.generation == selected) {
+				plan->selected_files = segment.files;
+			}
+		}
+		if (plan->selected_files.empty()) {
+			throw InvalidInputException("Vortex rewrite selected generation is not ready");
+		}
+		auto aliases = Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
+		                                      " WHERE table_uuid=" + Value(plan->table_uuid).ToSQLString());
+		if (aliases->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
+			throw InvalidInputException("Vortex rewrite requires one named index for the table");
+		}
+		if (!transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(),
+		                                           "ducklake_vortex_write_budgets_v1")) {
+			throw InvalidInputException("Vortex rewrite requires an installed write budget");
+		}
+		auto budget = Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}.ducklake_vortex_write_budgets_v1"
+		                                 " WHERE table_uuid=" +
+		                                     Value(plan->table_uuid).ToSQLString() +
+		                                     " AND index_name=" + Value(name).ToSQLString());
+		if (budget->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
+			throw InvalidInputException("Vortex rewrite requires an installed write budget for this index");
+		}
+		auto &fs = FileSystem::GetFileSystem(context);
+		if (!fs.IsPathAbsolute(reference_path) || reference_path.back() == '/' || fs.FileExists(reference_path) ||
+		    fs.DirectoryExists(reference_path)) {
+			throw InvalidInputException("Vortex rewrite requires a new absolute reference path");
+		}
+		auto root = Canonical(
+		    reference_path.substr(0, reference_path.find_last_of('/') == 0 ? 1 : reference_path.find_last_of('/')));
+		CheckBuildDirectoryAccess(context, root);
+		CheckBuildReferenceWriteAccess(fs, reference_path);
+		auto managed = fs.ExpandPath(catalog.DataPath());
+		while (managed.size() > 1 && managed.back() == '/') {
+			managed.pop_back();
+		}
+		managed = Canonical(managed);
+		OutsideManagedDataPath(reference_path, managed);
+		auto source_root = fs.ExpandPath(table.DataPath());
+		while (source_root.size() > 1 && source_root.back() == '/') {
+			source_root.pop_back();
+		}
+		plan->source_root = Canonical(source_root);
+		if (plan->source_root != managed &&
+		    !StringUtil::StartsWith(plan->source_root, managed == "/" ? managed : managed + "/")) {
+			throw InvalidInputException("Vortex rewrite requires a managed table data path");
+		}
+#ifndef _WIN32
+		auto root_fd = OpenRoot(root, false);
+		CheckBuildDirectoryAccess(context, plan->source_root);
+		auto source_fd = OpenRoot(plan->source_root, false);
+		auto source_name = RewriteSourceName(plan->build_id);
+		auto generation_path = LocalChild(root, generation);
+		plan->workspace = LocalChild(root, ".build-" + plan->build_id);
+		plan->private_path = LocalChild(plan->workspace, "rewrite.vortex");
+		plan->new_path = LocalChild(plan->source_root, source_name);
+		CheckCollectibleDirectory(plan->workspace, managed);
+		CheckCollectibleDirectory(generation_path, managed);
+		{
+			auto publication = PublicationLock().GetExclusiveLock(interrupt);
+			auto &allocation = Begin(owner, catalog_name, &identity);
+			CheckBuildOwnership(allocation, root, generation, {plan->workspace, generation_path, reference_path});
+			for (auto &path : {plan->workspace, generation_path, plan->new_path}) {
+				if (fs.FileExists(path) || fs.DirectoryExists(path)) {
+					throw InvalidInputException("Vortex rewrite owned namespace already exists");
+				}
+			}
+			Query(allocation, "INSERT INTO {METADATA_CATALOG}." + string(BUILDS) + " VALUES(" +
+			                      Value(plan->build_id).ToSQLString() + "," + Value(plan->table_uuid).ToSQLString() +
+			                      "," + Value(name).ToSQLString() + "," + to_string(expected_revision) + "," +
+			                      Value(root).ToSQLString() + "," + Value(generation).ToSQLString() + "," +
+			                      Value(plan->workspace).ToSQLString() + "," + Value(reference_path).ToSQLString() +
+			                      ",'allocated',false)");
+			Query(allocation, "INSERT INTO {METADATA_CATALOG}." + string(REWRITES) + " VALUES(" +
+			                      Value(plan->build_id).ToSQLString() + "," + Value(plan->table_uuid).ToSQLString() +
+			                      "," + Value(plan->source_root).ToSQLString() + "," +
+			                      Value(plan->new_path).ToSQLString() + "," + to_string(plan->snapshot_id) + "," +
+			                      to_string(plan->new_file_id) + ",false)");
+			CheckInterrupted(owner, context);
+			owner.Commit();
+			registered = true;
+		}
+		plan->check("rewrite_allocated");
+		CheckBuildDirectoryAccess(context, root);
+		if (mkdirat(root_fd->fd, (".build-" + plan->build_id).c_str(), 0700)) {
+			throw IOException("Cannot create Vortex rewrite workspace");
+		}
+		SyncDirectory(root_fd->fd);
+		auto work_fd = OpenDirectory(root_fd->fd, ".build-" + plan->build_id, false);
+		BuildState(owner, catalog_name, plan->build_id, "building", &identity);
+		plan->check("rewrite_before_copy");
+		{
+			auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
+			CheckInterrupted(source, context);
+			auto result = source.Query("SELECT * FROM ducklake_rewrite_data_files(" +
+			                           Value(catalog_name).ToSQLString() + "," + Value(table_name).ToSQLString() +
+			                           ",schema=>" + Value(schema).ToSQLString() + ",delete_threshold=>0)");
+			if (result->HasError()) {
+				result->ThrowError();
+			}
+		}
+		if (plan->copy_plans != 1 || plan->replaced.empty() || !plan->new_rows ||
+		    !transaction.GetNewNameMaps().name_maps.empty()) {
+			throw InvalidInputException("Vortex rewrite requires one nonempty compaction without new name maps");
+		}
+		// Never mix staged input entries with the native builder's scratch and generation.
+		for (auto &input : plan->staged_inputs) {
+			CheckInterrupted(source, context);
+			fs.RemoveFile(input);
+		}
+		CheckBuildDirectoryAccess(context, plan->workspace);
+		SyncDirectory(work_fd->fd);
+		plan->staged_inputs.clear();
+		plan->check("rewrite_written");
+		DuckLakeVortexReadView view;
+		view.managed_data_path = managed;
+		ViewJSON json;
+		auto admission = json.Object(), capture = json.Object(), business = json.Object(), inventory = json.Array();
+		json.Number(admission, "format_version", 1);
+		json.Add(admission, "capture", capture);
+		json.Number(capture, "format_version", 1);
+		json.Text(capture, "table_uuid", plan->table_uuid);
+		json.Number(capture, "snapshot_id", plan->snapshot_id + 1);
+		json.Number(capture, "schema_version", plan->schema_version);
+		json.Number(capture, "field_id", plan->before.field_id);
+		json.Number(capture, "dimension", plan->before.dimension);
+		for (auto &field : {"id", "category", "payload"}) {
+			json.Number(business, field, table.GetFieldId(vector<string> {field}).GetFieldIndex().index);
+		}
+		json.Add(capture, "business_fields", business);
+		json.Add(capture, "files", inventory);
+		json.Add(capture, "visible", json.Array());
+		vector<DuckLakeVortexIndexFile> inputs;
+		for (auto &file : plan->selected_files) {
+			if (std::find(plan->replaced.begin(), plan->replaced.end(), file.id) == plan->replaced.end()) {
+				inputs.push_back(file);
+			}
+		}
+		inputs.push_back({plan->new_file_id, plan->new_path, "", plan->new_rows});
+		idx_t remaining = MAX_ARTIFACTS;
+		for (auto &file : inputs) {
+			auto bytes = Read(fs, file.id == plan->new_file_id ? plan->private_path : file.uri, remaining, false);
+			remaining -= bytes.size();
+			if (file.id != plan->new_file_id && Hash(bytes) != file.version) {
+				throw InvalidInputException("Vortex rewrite retained source identity changed");
+			}
+			auto item = json.Object();
+			json.Number(item, "id", file.id);
+			json.Text(item, "uri", file.uri);
+			json.Text(item, "version", Hash(bytes));
+			json.Number(item, "row_count", file.row_count);
+			yyjson_mut_arr_append(inventory, item);
+			view.sources.push_back({file.id, std::move(bytes)});
+		}
+		view.admission_json = json.Finish(admission);
+		BuildNative(context, view, reference_path, generation, plan->workspace, [&](const string &stage) {
+			plan->check(stage);
+			CheckBuildDirectoryAccess(context, root);
+			CheckDirectoryAccess(context, plan->workspace);
+			CheckDirectoryAccess(context, generation_path);
+		});
+		auto replacement =
+		    ParseReference(Read(fs, reference_path, MAX_MANIFEST, true), plan->table_uuid, plan->before.field_id);
+		replacement.root = root;
+		vector<DuckLakeVortexIndexSegment> segments;
+		for (auto &segment : plan->before.segments) {
+			if (segment.generation != selected) {
+				segments.push_back(segment);
+			}
+		}
+		segments.push_back({root, replacement.generation, replacement.reference, replacement.files});
+		Compose(replacement, std::move(segments));
+		replacement.name = name;
+		replacement.revision = expected_revision + 1;
+		plan->candidate = std::move(replacement);
+		plan->check("rewrite_candidate_ready");
+		CheckBuildDirectoryAccess(context, plan->workspace);
+		CheckBuildDirectoryAccess(context, plan->source_root);
+		auto fd = openat(work_fd->fd, "rewrite.vortex", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+		if (fd < 0) {
+			throw IOException("Cannot open private Vortex rewrite source");
+		}
+		Descriptor private_file(fd);
+		struct stat info;
+		if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size < 0 || idx_t(info.st_size) != plan->new_bytes ||
+		    fsync(fd)) {
+			throw IOException("Cannot validate and sync private Vortex rewrite source");
+		}
+		// Make the private link durable before publishing the managed link.
+		SyncDirectory(work_fd->fd);
+		CheckInterrupted(source, context);
+		CheckBuildDirectoryAccess(context, plan->workspace);
+		CheckBuildDirectoryAccess(context, plan->source_root);
+		if (linkat(work_fd->fd, "rewrite.vortex", source_fd->fd, source_name.c_str(), 0)) {
+			if (errno == EEXIST) {
+				throw IOException("Vortex rewrite destination already exists; existing file retained");
+			}
+			throw IOException("Cannot link Vortex rewrite output; roots must share a filesystem");
+		}
+		SyncDirectory(source_fd->fd);
+		plan->check("rewrite_source_linked");
+		transaction.GetConnection().Rollback();
+		transaction.GetConnection().BeginTransaction();
+		source.Commit();
+		committed = true;
+		plan->check("rewrite_after_commit");
+		return plan->candidate;
+#else
+		throw NotImplementedException("Native Vortex rewrite requires POSIX paths");
+#endif
+	} catch (const std::exception &error) {
+		if (committed) {
+			throw IOException("Vortex rewrite committed but acknowledgement failed; inspect catalog before retry");
+		}
+		try {
+			Rollback(source);
+			Rollback(owner);
+			if (registered) {
+				ReconcileBuild(owner, catalog_name, plan->build_id, &identity);
+			}
+		} catch (const std::exception &cleanup) {
+			ErrorData failure(error);
+			throw Exception(failure.ExtraInfo(), failure.Type(),
+			                failure.RawMessage() +
+			                    "\nVortex rewrite ownership reconciliation also failed. Inspect "
+			                    "rewrite status: " +
+			                    ErrorData(cleanup).RawMessage());
+		}
+		throw;
 	}
 }
 

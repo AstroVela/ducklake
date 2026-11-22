@@ -34,7 +34,6 @@
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
-#include "duckdb/storage/storage_lock.hpp"
 #endif
 
 namespace duckdb {
@@ -800,6 +799,9 @@ void DuckLakeTransaction::Commit() {
 #ifdef DUCKLAKE_ENABLE_VORTEX
 			unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard;
 			auto write_budget = DuckLakeVortexOptimizer::AdmitWrite(*this, *context.lock(), publication_guard);
+			if (DuckLakeVortexRewriteState::Get(*context.lock())) {
+				DuckLakeVortexIndex::CheckRewriteCommit(*context.lock(), *this);
+			}
 #endif
 			FlushChanges();
 		} else if (connection) {
@@ -1396,6 +1398,11 @@ void DuckLakeTransaction::FlushChanges() {
 		return;
 	}
 	auto retry_config = DuckLakeRetryConfig::FromContext(*context.lock());
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	if (DuckLakeVortexRewriteState::Get(*context.lock())) {
+		retry_config.max_retry_count = 0;
+	}
+#endif
 	auto transaction_changes = GetTransactionChanges();
 	if (metadata_manager->CanSkipSnapshotFetch(transaction_changes)) {
 		lock_guard<mutex> guard(snapshot_lock);
@@ -1458,12 +1465,24 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		return GetSnapshot();
 	};
 	context.execute_commit_batch = [&](DuckLakeSnapshot snapshot, string &query) {
-		return metadata_manager->Execute(snapshot, query);
+		auto result = metadata_manager->Execute(snapshot, query);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (!result->HasError() && DuckLakeVortexRewriteState::Get(*this->context.lock())) {
+			DuckLakeVortexIndex::PublishRewrite(*this->context.lock(), *this, snapshot);
+		}
+#endif
+		return result;
 	};
-	context.flush_cache_if_pending = [&]() {
+	context.before_commit = [&]() {
 		if (metadata_manager->TakePendingCacheClear()) {
 			metadata_manager->ClearCache();
 		}
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		auto rewrite = DuckLakeVortexRewriteState::Get(*this->context.lock());
+		if (rewrite) {
+			rewrite->check("rewrite_before_native_commit");
+		}
+#endif
 	};
 	context.commit_connection = [&]() {
 		auto &metadata_catalog = Catalog::GetCatalog(*connection->context, ducklake_catalog.MetadataDatabaseName());

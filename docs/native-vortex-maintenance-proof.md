@@ -129,6 +129,9 @@ managed artifact namespace on POSIX. Static SPFresh, all dependency pins, global
 source/vector/artifact budgets, the three-B limit and write admission ceilings
 remain unchanged. This does not compact source data or reclaim physical table
 row capacity, and it adds no SPFresh online update interface or fallback.
+An [explicit indexed-source rewrite](native-vortex-index-rewrite-proof.md)
+provides a separate data-compaction and atomic index-handoff path; registered
+leftovers from that operation use the same maintenance worker and collector.
 
 Local qualification used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`,
 native wrapper `84cef204` and the static SPFresh SDK qualified by #44. The
