@@ -581,7 +581,7 @@ def main() -> None:
     proof = Proof(args.duckdb.resolve(strict=True), args.probe.resolve(strict=True), root)
     report = {
         "backend": "spfresh.static",
-        "vortex_revision": "703ed464a5e03bee45c8713c5a4286571349bce1",
+        "vortex_revision": "307eaf56644845f45dfe6099d7148e6b6afb17a5",
         "duckdb_sha256": digest(proof.duckdb),
         "probe_sha256": digest(proof.probe),
     }

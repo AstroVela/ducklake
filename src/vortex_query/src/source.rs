@@ -36,7 +36,6 @@ use vortex::dtype::PType;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
-use vortex::file::OpenOptionsSessionExt;
 use vortex::session::VortexSession;
 use vortex_index::IndexSource;
 use vortex_index::RowAddress;
@@ -44,6 +43,7 @@ use vortex_index::Snapshot;
 use vortex_index::SourceBatch;
 use vortex_index::SourceFile;
 use vortex_index::file::LocalFileSource;
+use vortex_index::file::VerifiedFile;
 use vortex_index::file::file_version;
 use vortex_index::file::schema_fingerprint;
 
@@ -203,15 +203,11 @@ impl PhysicalSource {
                     ByteBuffer::from(fs::read(path)?)
                 }
             };
-            if bytes.len() > remaining || file_version(&bytes) != file.version {
-                vortex_bail!("Physical source file version mismatch or byte budget exceeded");
-            }
-            remaining -= bytes.len();
-            let opened = session.open_options().open_buffer(bytes.clone())?;
-            let dtype = opened.dtype().clone();
-            if opened.row_count() != file.row_count {
-                vortex_bail!("Physical source row count mismatch");
-            }
+            let verified =
+                VerifiedFile::from_buffer(file.clone(), bytes, remaining, session.clone())?;
+            let size = verified.pinned_bytes();
+            remaining -= size;
+            let dtype = verified.dtype().clone();
             let DType::Struct(fields, Nullability::NonNullable) = &dtype else {
                 vortex_bail!("DuckLake physical file requires a struct schema");
             };
@@ -250,13 +246,11 @@ impl PhysicalSource {
             let mut physical_snapshot = snapshot.clone();
             physical_snapshot.schema_fingerprint = schema_fingerprint(&dtype)?;
             physical_snapshot.files = vec![file.clone()];
-            let size = bytes.len();
-            let source = LocalFileSource::from_buffers(
+            let source = LocalFileSource::from_verified(
                 physical_snapshot,
                 dtype,
-                BTreeMap::from([(file.id, bytes)]),
+                BTreeMap::from([(file.id, verified)]),
                 size,
-                session.clone(),
             )?;
             files.insert(file.id, Arc::new(source));
         }

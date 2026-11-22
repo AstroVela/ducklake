@@ -507,6 +507,31 @@ def exercise_data_paths(proof, scratch, checks):
             and named["index"]["reference"] == json.loads(reference.read_text()),
             f"managed path expansion changed the sealed source identity for {mode}",
         )
+        if mode in ("relative", "file-colon"):
+            catalogued = CAT.MIXED.write_json(case / "catalogued.json", named)
+            worker = CAT.Worker(proof, f"uri-identity-{mode}")
+            try:
+                worker.open("bound", catalogued)
+                held = worker.stats()
+                vector = [133, 4, 2, 0, 1, 8, 7, 16]
+                retained = worker.search("bound", vector, k=1)
+                require(
+                    retained["hits"][0]["row"]["id"] == 133 and retained["hits"][0]["distance"] == 0.0,
+                    f"verified {mode} source lost its retained reader result",
+                )
+                rebound = json.loads(catalogued.read_text())
+                rebound["capture"]["file_capture"]["files"][0]["uri"] += ".rebound"
+                changed = CAT.MIXED.write_json(case / "rebound.json", rebound)
+                worker.open("rebound", changed, expected="Referenced index file identity mismatch")
+                require(worker.stats() == held, f"rejected {mode} identity retained resources")
+                require(
+                    worker.search("bound", vector, k=1) == retained,
+                    f"rejected {mode} identity changed the held source",
+                )
+                worker.close_view("bound")
+                require(worker.stats() == CAT.MIXED.READ.empty_stats(), f"{mode} reader did not release resources")
+            finally:
+                worker.finish()
         no_leases(scratch)
         if mode == "file-colon":
             try:
@@ -524,10 +549,14 @@ def exercise_data_paths(proof, scratch, checks):
                 "visible_rows": 4096,
                 "winner": 133,
                 "source_identity_unchanged": True,
+                "identity_rebinding_rejected": mode in ("relative", "file-colon"),
             }
         )
     checks.append(
         "canonical/dot/relative/symlink/file: managed paths execute SQL search with unchanged source URI binding; physical managed scratch containment remains enforced"
+    )
+    checks.append(
+        "relative/file: verified readers reject URI rebinding without changing held results or resource counts"
     )
     return cases
 
@@ -550,7 +579,7 @@ def main():
         "duckdb_sha256": BASE.digest(proof.duckdb),
         "probe_sha256": BASE.digest(proof.probe),
         "driver_sha256": BASE.digest(args.driver.resolve(strict=True)),
-        "vortex_revision": "703ed464a5e03bee45c8713c5a4286571349bce1",
+        "vortex_revision": "307eaf56644845f45dfe6099d7148e6b6afb17a5",
     }
     try:
         native = CAT.Native(args.driver.resolve(strict=True), root / "native")
