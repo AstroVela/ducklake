@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -21,6 +22,7 @@ use vortex::array::arrays::ListViewArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::VarBinViewArray;
+use vortex::array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex::array::arrays::list::ListArrayExt;
 use vortex::array::arrays::list::ListArraySlotsExt;
 use vortex::array::arrays::listview::list_from_list_view;
@@ -90,6 +92,9 @@ pub struct PhysicalSource {
     snapshot: Snapshot,
     files: BTreeMap<u64, Arc<LocalFileSource>>,
     session: VortexSession,
+    category_rows: AtomicU64,
+    business_rows: AtomicU64,
+    vector_rows: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -239,6 +244,9 @@ impl PhysicalSource {
             snapshot,
             files,
             session,
+            category_rows: AtomicU64::new(0),
+            business_rows: AtomicU64::new(0),
+            vector_rows: AtomicU64::new(0),
         })
     }
 
@@ -254,6 +262,62 @@ impl PhysicalSource {
             .values()
             .map(|source| source.pinned_bytes())
             .sum()
+    }
+
+    pub fn projection_counts(&self) -> serde_json::Value {
+        serde_json::json!({"category_rows":self.category_rows.load(Ordering::Relaxed),
+            "business_rows":self.business_rows.load(Ordering::Relaxed),
+            "vector_rows":self.vector_rows.load(Ordering::Relaxed)})
+    }
+
+    pub async fn take_categories(&self, rows: &[RowAddress]) -> VortexResult<Vec<Option<String>>> {
+        let business = self
+            .capture
+            .business_fields
+            .as_ref()
+            .ok_or_else(|| vortex_err!("Category projection requires captured field IDs"))?;
+        let fields = [physical_name(business.category)];
+        let mut groups: BTreeMap<u64, Vec<(usize, RowAddress)>> = BTreeMap::new();
+        for (rank, row) in rows.iter().enumerate() {
+            self.snapshot.validate_row(*row)?;
+            groups.entry(row.file_id).or_default().push((rank, *row));
+        }
+        let mut result = vec![None; rows.len()];
+        let mut context = self.session.create_execution_ctx();
+        for (id, group) in groups {
+            let selected: Vec<_> = group.iter().map(|(_, row)| *row).collect();
+            let source = self
+                .files
+                .get(&id)
+                .ok_or_else(|| vortex_err!("Unknown physical file ID"))?;
+            let taken = source.take(&selected, &fields).await?;
+            if taken.rows != selected {
+                vortex_bail!("Category take changed row order");
+            }
+            let data = taken.data.execute::<StructArray>(&mut context)?;
+            let categories = strings(data.unmasked_field(0).clone(), &mut context)?;
+            for ((rank, _), category) in group.into_iter().zip(categories) {
+                result[rank] = category;
+            }
+        }
+        self.category_rows
+            .fetch_add(rows.len() as u64, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    pub async fn take_vectors(&self, rows: &[RowAddress]) -> VortexResult<Vec<f32>> {
+        let taken = self.take(rows, std::slice::from_ref(&self.field)).await?;
+        let mut context = self.session.create_execution_ctx();
+        let data = taken.data.execute::<StructArray>(&mut context)?;
+        let vectors = data
+            .unmasked_field(0)
+            .clone()
+            .execute::<FixedSizeListArray>(&mut context)?;
+        let elements = vectors
+            .elements()
+            .clone()
+            .execute::<PrimitiveArray>(&mut context)?;
+        Ok(elements.as_slice::<f32>().to_vec())
     }
 
     pub async fn take_business(&self, rows: &[RowAddress]) -> VortexResult<Vec<BusinessRow>> {
@@ -306,6 +370,8 @@ impl PhysicalSource {
                 });
             }
         }
+        self.business_rows
+            .fetch_add(rows.len() as u64, Ordering::Relaxed);
         result
             .into_iter()
             .map(|row| row.ok_or_else(|| vortex_err!("Missing business row")))
@@ -462,6 +528,8 @@ impl IndexSource for PhysicalSource {
                     .copy_from_slice(&vectors[offset * dimension..(offset + 1) * dimension]);
             }
         }
+        self.vector_rows
+            .fetch_add(rows.len() as u64, Ordering::Relaxed);
         self.adapter().batch(rows.to_vec(), values)
     }
 }

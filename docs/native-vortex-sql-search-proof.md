@@ -153,22 +153,31 @@ remain `rel_tol=1e-5` and `abs_tol=1e-4`, and recall remains at least 0.8.
 The decimal `[8001.1,0,...]::FLOAT[]` query against `[8000,0,...]` must return
 `1.2102148532867432`; the old double oracle incorrectly rejects that result.
 
+A column-rename fixture retains one published B generation, adds F and creates
+three inline sources under different schema versions. It swaps category/payload
+names and inserts while payload has a quoted name, then restores the SQL
+contract. Exact business-value and category checks cover prepared execution and
+cache eviction and a further rename committed after visibility selection. The held query preserves
+its field meanings while a fresh execution sees the new names. This fixture
+uses one additional index build; its ten recall checks and 22 native requests
+also verify that the original B generation remains ready.
+
 Five independent 4,096-row fixtures capture, build, publish and search with
 canonical, dot-component, relative, symlinked and `file:` managed paths.
 Named captures retain the original source inventory and sealed reference.
 The `file:` fixture also rejects a scratch directory physically inside the
 managed root, then repeats a successful search. These fixtures use five further
-builds, bringing the full SQL proof to nine explicit builds.
+builds, bringing the full SQL proof to ten explicit builds.
 
-The local SQL proof passed 46 native requests with 12 expected rejections,
-including five interruption checkpoints and two injected failures. Eight fixture
+The local SQL lifecycle proof passed 51 native requests with 13 expected rejections,
+including six interruption checkpoints and two injected failures. Nine fixture
 queries passed with recall 1.0 at the 0.8 threshold. Actual maintenance reclaimed
-three B/F source files. The reusable prepared statement saw committed source
+four B/F source files. The reusable prepared statement saw committed source
 changes, rejected stale B and discovered the explicitly rebuilt generation.
 No external query worker ran.
 
 The ten Float32 regression queries also passed with recall 1.0, using 17
-additional native requests. Both controls reproduced the earlier problems:
+additional native requests. The controls from #33 reproduced the earlier problems:
 the earlier runtime rejects the committed `file:` path
 regression, and the earlier oracle rejects the same correct decimal SQL result.
 These are fixture results rather than workload or general ANN recall claims.
@@ -191,3 +200,7 @@ retains its qualified build and lint results; source, query-library and probe
 hashes are checked before reuse. The validation workflow includes all six
 process proofs. Background indexing, index GC, cloud/multiprocess ownership,
 out-of-core queries and general SQL optimizer integration remain later work.
+
+The next [query-cost proof](native-vortex-query-cost-proof.md) separates SQL
+visibility/T capture from the full oracle, projects category and reranking
+vectors independently, and measures the change against this implementation.

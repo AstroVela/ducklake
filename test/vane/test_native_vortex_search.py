@@ -135,7 +135,7 @@ def exercise(proof, native, scratch, checks):
     native.sql("ROLLBACK;")
     failures = [
         ("cancel-search", stage, "Interrupted")
-        for stage in ("after_open", "category_filter", "after_ann", "scan_batch", "before_fetch")
+        for stage in ("after_visibility", "after_open", "category_filter", "after_ann", "scan_batch", "before_fetch")
     ]
     failures += [("fail-search", stage, "Injected query lease failure") for stage in ("source_pinned", "after_open")]
     for op, stage, error in failures:
@@ -149,6 +149,23 @@ def exercise(proof, native, scratch, checks):
     no_leases(scratch)
     checks.append(
         "interruption after index admission, injected failure, dimension rejection and early SQL LIMIT release private staging and leave fresh SQL queries usable"
+    )
+
+    split_write = proof.root / "split-write.sql"
+    split_write.write_text(
+        "UPDATE lake.items SET payload='committed-after-visibility' WHERE id=6000;"
+        "CALL ducklake_flush_inlined_data('lake');"
+    )
+    overlapping = native.call("split-search", split_write)
+    require(overlapping["rows"] == delta["rows"], "split visibility/T capture mixed metadata transactions")
+    native.call("raw", "delta")
+    oracle = native.rows("delta")
+    delta = query(native, "EXECUTE reusable_search")
+    recalls.append(qualify(delta, oracle, vector))
+    require(delta["rows"][0]["payload"] == "committed-after-visibility", "fresh SQL view missed the concurrent flush")
+    no_leases(scratch)
+    checks.append(
+        "a writer commits and flushes after visibility capture; the held query keeps old T business rows and a fresh query sees the new F version"
     )
 
     maintenance = proof.root / "maintenance.sql"
@@ -292,6 +309,109 @@ def exercise_float32(proof, driver, scratch, checks):
     return {"recalls": recalls, "native_requests": native.requests, "index_builds": 1}
 
 
+def exercise_column_renames(proof, driver, scratch, checks):
+    root = proof.root / "column-renames"
+    root.mkdir()
+    native = CAT.Native(driver, root / "native")
+    vector = [133, 4, 2, 0, 1, 8, 7, 16]
+    recalls = []
+    try:
+        native.call("raw", "bootstrap")
+        reference = root / "index.json"
+        proof.run([str(proof.probe), "build-admitted-file-index", str(native.capture("bootstrap")), str(reference)])
+        native.call("init")
+        native.call("publish", "knn", reference, 0)
+        native.sql(
+            "PREPARE renamed_search AS " + search_sql(vector) + ";"
+            "INSERT INTO lake.items VALUES(9000,[133.5,4,2,0,1,8,7,16],'old-file-category','new-file-category');"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items');"
+            "INSERT INTO lake.items VALUES(9001,[133,4,2,0,1,8,7,16],'old-category','new-category');"
+        )
+        swap = (
+            "ALTER TABLE lake.items RENAME category TO temporary_name;"
+            "ALTER TABLE lake.items RENAME payload TO category;"
+            "ALTER TABLE lake.items RENAME temporary_name TO payload;"
+        )
+        native.sql(swap)
+        native.call("raw", "swapped")
+        oracle = native.rows("swapped")
+        selected = {row["id"]: row for row in oracle if row["id"] in (9000, 9001)}
+        require(
+            selected[9001]["filename"].startswith("ducklake_inlined_data_")
+            and selected[9001]["category"] == "new-category"
+            and selected[9001]["payload"] == "old-category",
+            "rename fixture did not retain the old inline source and swap logical field meanings",
+        )
+        for category, identifier in (("new-category", 9001), ("new-file-category", 9000)):
+            result = query(native, search_sql(vector, k=1, category=category))
+            recalls.append(qualify(result, oracle, vector, category=category, k=1))
+            require([row["id"] for row in result["rows"]] == [identifier], "renamed category lost its row")
+            no_leases(scratch)
+        require(query(native, search_sql(vector, category="old-category"))["rows"] == [], "old category admitted T")
+        prepared = query(native, "EXECUTE renamed_search")
+        recalls.append(qualify(prepared, oracle, vector))
+        require({9000, 9001} <= {row["id"] for row in prepared["rows"]}, "prepared search lost renamed F/T")
+        no_leases(scratch)
+
+        native.sql(
+            "INSERT INTO lake.items(id,embedding,category,payload) "
+            "VALUES(9002,[133.0625,4,2,0,1,8,7,16],'second-category','second-payload');"
+            'ALTER TABLE lake.items RENAME payload TO "body ""value""";'
+            'INSERT INTO lake.items(id,embedding,category,"body ""value""") '
+            "VALUES(9003,[133.125,4,2,0,1,8,7,16],'quoted-category','renamed-value');"
+            'ALTER TABLE lake.items RENAME "body ""value""" TO payload;'
+        )
+        native.call("raw", "multiple-schemas")
+        oracle = native.rows("multiple-schemas")
+        selected = {row["id"]: row for row in oracle if row["id"] in (9001, 9002, 9003)}
+        require(
+            len({row["filename"] for row in selected.values()}) == 3
+            and all(row["filename"].startswith("ducklake_inlined_data_") for row in selected.values())
+            and selected[9003]["payload"] == "renamed-value",
+            "rename fixture did not create three inline sources with distinct historical schemas",
+        )
+        for category, identifier in (("new-category", 9001), ("second-category", 9002), ("quoted-category", 9003)):
+            result = query(native, search_sql(vector, k=1, category=category))
+            recalls.append(qualify(result, oracle, vector, category=category, k=1))
+            require([row["id"] for row in result["rows"]] == [identifier], "historical inline schema lost its row")
+            no_leases(scratch)
+        prepared = query(native, "EXECUTE renamed_search")
+        recalls.append(qualify(prepared, oracle, vector))
+        require({9000, 9001, 9002, 9003} <= {row["id"] for row in prepared["rows"]}, "mixed schema search lost F/T")
+        no_leases(scratch)
+        cached = native.call("cache-search")
+        require(cached["rows"] == prepared["rows"], "schema cache eviction changed mixed-schema business rows")
+        no_leases(scratch)
+
+        # Resolve historical columns after a concurrent rename, using the held query schema.
+        rename = root / "rename-after-visibility.sql"
+        rename.write_text(swap)
+        held = native.call("split-search", rename)
+        recalls.append(qualify(held, oracle, vector))
+        require(held["rows"] == prepared["rows"], "concurrent rename changed held inline field mappings")
+        native.call("raw", "restored")
+        oracle = native.rows("restored")
+        fresh = query(native, "EXECUTE renamed_search")
+        recalls.append(qualify(fresh, oracle, vector))
+        require(fresh["rows"] != held["rows"], "fresh execution did not observe renamed field meanings")
+        result = query(native, search_sql(vector, k=1, category="old-category"))
+        recalls.append(qualify(result, oracle, vector, category="old-category", k=1))
+        require([row["id"] for row in result["rows"]] == [9001], "fresh renamed category lost T")
+        core = native.call("core-search")
+        require(
+            core["diagnostics"]["index_revision"] == 1 and core["diagnostics"]["routes"]["inline_rows"] == 3,
+            "column renames changed the published B generation or lost inline sources",
+        )
+        no_leases(scratch)
+    finally:
+        if native.process.poll() is None:
+            native.finish()
+    checks.append(
+        "field IDs preserve T/F business values and category predicates across swapped names, quoted historical columns, three inline schemas, prepared execution, cache eviction and concurrent rename after visibility"
+    )
+    return {"recalls": recalls, "native_requests": native.requests, "inline_sources": 3, "index_builds": 1}
+
+
 def exercise_data_paths(proof, scratch, checks):
     root = proof.root / "data-paths"
     root.mkdir()
@@ -404,9 +524,13 @@ def main():
         float32 = exercise_float32(proof, args.driver.resolve(strict=True), scratch, checks)
         report["float32_fixture_recalls"] = float32["recalls"]
         report["float32_native_requests"] = float32["native_requests"]
+        renames = exercise_column_renames(proof, args.driver.resolve(strict=True), scratch, checks)
+        report["column_rename_regressions"] = renames
         report["data_path_regressions"] = exercise_data_paths(proof, scratch, checks)
         report["lifecycle_index_builds"] = report["index_builds"]
-        report["index_builds"] += float32["index_builds"] + len(report["data_path_regressions"])
+        report["index_builds"] += (
+            float32["index_builds"] + renames["index_builds"] + len(report["data_path_regressions"])
+        )
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

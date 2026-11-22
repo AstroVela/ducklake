@@ -30,10 +30,14 @@ struct DuckLakeVortexReadView {
 	string admission_json;
 	string rows_json;
 	string managed_data_path;
+	idx_t captured_business_rows = 0;
 
 	static DuckLakeVortexReadView Acquire(Connection &reader, const DuckLakeVortexViewOptions &options,
 	                                      const std::function<void(const string &)> &observe = nullptr,
 	                                      optional_ptr<ClientContext> owner = nullptr);
+	static DuckLakeVortexReadView AcquireQuery(Connection &reader, const DuckLakeVortexViewOptions &options,
+	                                           const std::function<void(const string &)> &observe = nullptr,
+	                                           optional_ptr<ClientContext> owner = nullptr);
 };
 
 } // namespace duckdb
