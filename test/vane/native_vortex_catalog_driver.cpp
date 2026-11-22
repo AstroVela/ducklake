@@ -339,9 +339,11 @@ public:
 			                                    std::stoull(args.at(3)), nullptr, "", DuckLakeVortexRewriteMode::FILES)
 			    .ToJSON();
 		}
-		if (op == "rewrite") {
+		if (op == "rewrite" || op == "prune") {
 			return DuckLakeVortexIndex::Rewrite(*writer.context, "lake", "main", "items", "knn", args.at(2), args.at(3),
-			                                    std::stoull(args.at(4)))
+			                                    std::stoull(args.at(4)), nullptr, "",
+			                                    op == "prune" ? DuckLakeVortexRewriteMode::PRUNE
+			                                                  : DuckLakeVortexRewriteMode::INDEXED)
 			    .ToJSON();
 		}
 		if (op == "rewrite-fail" || op == "rewrite-cancel" || op == "rewrite-crash" || op == "rewrite-collision" ||

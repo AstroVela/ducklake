@@ -58,6 +58,7 @@ struct Policy {
 	idx_t min_deleted_rows = 1, min_deleted_percent = 50;
 	string rewrite_candidate, rewrite_reason = "disabled";
 	idx_t rewrite_deleted = 0, rewrite_remaining = 0;
+	bool rewrite_prune = false;
 	Key Id() const {
 		return {uuid, config.index};
 	}
@@ -588,7 +589,6 @@ void SelectCompaction(Metadata &meta, Policy &p, DuckLakeTableEntry &table, cons
 		auto budget_reason = to_f ? UnindexedGrowthBlocked(p, remaining, source_bytes, max_rows, max_bytes) : "";
 		string why = deleted < p.min_deleted_rows || 100 * deleted < p.min_deleted_percent * rows ? "below_threshold"
 		             : !remaining                                                                 ? "eligible"
-		             : !to_f && !output                                ? "empty_rewrite_output"
 		             : (to_f ? all_partitioned : partitioned)          ? "unsupported_partition"
 		             : (to_f ? all_groups.size() : groups.size()) != 1 ? "multiple_schema_groups"
 		             : !budget_reason.empty()                          ? budget_reason
@@ -599,6 +599,7 @@ void SelectCompaction(Metadata &meta, Policy &p, DuckLakeTableEntry &table, cons
 				eligible = segment.generation;
 				eligible_deleted = deleted;
 				eligible_remaining = remaining;
+				p.rewrite_prune = remaining >= VortexCatalog::MIN_BUILD_ROWS && !output;
 			}
 		} else if (blocked.empty() || deleted > blocked_deleted ||
 		           (deleted == blocked_deleted && segment.generation < blocked)) {
@@ -741,6 +742,7 @@ void Probe(Metadata &meta, Policy &p, bool select_compaction = false,
 	p.expected = revision;
 	if (select_compaction) {
 		p.rewrite_candidate.clear();
+		p.rewrite_prune = false;
 		p.rewrite_deleted = p.rewrite_remaining = 0;
 		p.rewrite_reason = p.compaction_enabled ? "no_index" : "disabled";
 		if (p.compaction_enabled && index) {
@@ -772,7 +774,7 @@ bool IndexDue(const Policy &p) {
 }
 
 bool IsCompactionTask(const string &kind) {
-	return kind == "rewrite" || kind == "rewrite_f" || kind == "retire";
+	return kind == "rewrite" || kind == "rewrite_f" || kind == "retire" || kind == "prune";
 }
 
 bool Published(Metadata &meta, const Policy &p) {
@@ -1120,7 +1122,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			if (current.run != p.run) {
 				throw TransactionException("Optimizer task ownership changed");
 			}
-			if (p.kind != "retire" && p.kind != "rewrite_f") {
+			if (p.kind == "prune") {
+				current.generation = "generation-" + p.run;
+			} else if (p.kind != "retire" && p.kind != "rewrite_f") {
 				current.generation = Candidate(meta.connection, p.reference);
 			}
 			current.state = "publishing";
@@ -1216,6 +1220,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					current.expected = metrics.expected;
 					current.kind = rewrite && !metrics.rewrite_remaining                                  ? "retire"
 					               : rewrite && metrics.rewrite_remaining < VortexCatalog::MIN_BUILD_ROWS ? "rewrite_f"
+					               : rewrite && metrics.rewrite_prune                                     ? "prune"
 					               : rewrite                                                              ? "rewrite"
 					               : flush                                                                ? "flush"
 					               : metrics.merge_candidates.empty()                                     ? "build"
@@ -1261,7 +1266,9 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					VortexCatalog::Rewrite(
 					    *job.context, p.config.catalog, p.config.schema, p.config.table, p.config.index, p.selected[0],
 					    p.reference, p.expected, [&](const string &stage) { Stage(db, *pending, p, stage); }, p.run,
-					    p.kind == "rewrite_f" ? DuckLakeVortexRewriteMode::FILES : DuckLakeVortexRewriteMode::INDEXED);
+					    p.kind == "rewrite_f" ? DuckLakeVortexRewriteMode::FILES
+					    : p.kind == "prune"   ? DuckLakeVortexRewriteMode::PRUNE
+					                          : DuckLakeVortexRewriteMode::INDEXED);
 				}
 				if (flush) {
 					Stage(db, *pending, p, "optimizer_before_flush");
@@ -1940,9 +1947,9 @@ void DuckLakeVortexOptimizer::ConfigureCompaction(ClientContext &context, const 
 
 void DuckLakeVortexOptimizer::RecordRewritePublication(DuckLakeTransaction &transaction,
                                                        const DuckLakeVortexRewriteState &plan) {
-	// Keep the last committed rewrite or retirement per policy outside the mutable task row.
+	// Keep the last committed compaction per policy outside the mutable task row.
 	// The source and index commit makes the receipt visible at the same time.
-	auto kind = plan.retire ? "retire" : plan.to_f ? "rewrite_f" : "rewrite";
+	auto kind = plan.retire ? "retire" : plan.to_f ? "rewrite_f" : plan.prune ? "prune" : "rewrite";
 	auto result = VortexCatalog::Query(
 	    transaction, "INSERT OR REPLACE INTO {METADATA_CATALOG}." + string(REWRITE_RECEIPTS) +
 	                     " SELECT table_uuid,index_name,run_id," +
