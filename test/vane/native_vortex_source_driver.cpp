@@ -2,6 +2,7 @@
 #include "common/ducklake_vortex_json.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/main/connection_manager.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_search.hpp"
@@ -23,6 +24,21 @@ using Source = DuckLakeVortexSourceRetention;
 using VortexIndex = DuckLakeVortexIndex;
 
 namespace {
+constexpr const char *STATUS_POLICY_READ_ERROR = "Injected source status policy read error";
+Pause *status_pause = nullptr;
+std::atomic<bool> pause_status {false};
+bool fail_status_read = false;
+
+bool StatusEnabled(bool enabled) {
+	if (pause_status.exchange(false)) {
+		status_pause->Stop();
+		if (fail_status_read) {
+			throw InvalidInputException(STATUS_POLICY_READ_ERROR);
+		}
+	}
+	return enabled;
+}
+
 void WaitForSourceAdmission(std::future<DuckLakeVortexSourceGCResult> &collecting, idx_t previous_waiters) {
 	auto &admission = DuckLakeVortexReadView::AdmissionLock();
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -35,7 +51,8 @@ void WaitForSourceAdmission(std::future<DuckLakeVortexSourceGCResult> &collectin
 	}
 }
 
-void WaitForCaptureAdmission(std::future<DuckLakeVortexSearchResult> &capture, idx_t previous_waits) {
+template <class Result>
+void WaitForCaptureAdmission(std::future<Result> &capture, idx_t previous_waits) {
 	auto &admission = DuckLakeVortexReadView::AdmissionLock();
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
 	while (admission.SharedWaitCount() == previous_waits) {
@@ -453,6 +470,62 @@ void MixedSizes(Fixture &f) {
 	        "Oversized source did not remain pending");
 }
 
+void InstallStatusPolicyGate(Fixture &f, Pause &pause, bool fail_read) {
+	f.Policy();
+	f.writer.CreateScalarFunction<bool, bool>("source_status_gate", &StatusEnabled);
+	SQL(f.writer, "ALTER TABLE __ducklake_metadata_lake.ducklake_vortex_source_retention_v1 RENAME TO "
+	              "source_policy_backing;"
+	              "CREATE VIEW __ducklake_metadata_lake.ducklake_vortex_source_retention_v1 AS "
+	              "SELECT * REPLACE(source_status_gate(enabled) AS enabled) FROM "
+	              "__ducklake_metadata_lake.source_policy_backing");
+	status_pause = &pause;
+	fail_status_read = fail_read;
+	pause_status = true;
+}
+
+void RestoreStatusPolicy(Fixture &f) {
+	SQL(f.writer, "DROP VIEW __ducklake_metadata_lake.ducklake_vortex_source_retention_v1;"
+	              "ALTER TABLE __ducklake_metadata_lake.source_policy_backing RENAME TO "
+	              "ducklake_vortex_source_retention_v1");
+}
+
+void StatusErrorRollback(Fixture &f) {
+	Pause pause;
+	InstallStatusPolicyGate(f, pause, true);
+	auto pending = std::async(std::launch::async, [&] {
+		return f.writer.Query("SELECT * FROM ducklake_vortex_source_retention_status('lake')");
+	});
+	ReleasePause release {pause};
+	pause.Wait();
+
+	auto clients = ConnectionManager::Get(*f.database.instance).GetConnectionList();
+	shared_ptr<ClientContext> observed_status;
+	for (auto &client : clients) {
+		if (DuckLakeVortexReadView::IsCapturing(*client)) {
+			Require(!observed_status, "Expected one private status capture");
+			observed_status = client;
+		}
+	}
+	Require(observed_status && observed_status->transaction.HasActiveTransaction(),
+	        "The observer did not retain the status transaction");
+	pause.Release();
+	auto result = pending.get();
+	Require(result->HasError() && result->GetError().find(STATUS_POLICY_READ_ERROR) != string::npos,
+	        "Expected the public status query to surface the policy read error");
+
+	auto admission = DuckLakeVortexReadView::AdmissionLock().TryGetExclusiveLock();
+	Require(bool(admission), "Failed status did not release shared read admission");
+	const auto active_after_admission = observed_status->transaction.HasActiveTransaction();
+	admission.reset();
+
+	RestoreStatusPolicy(f);
+	const auto collected = f.Collect(1, 1);
+	Require(!collected.blocked, "Failed status transaction blocked eligible source GC");
+	Require(collected.expired == 1 && collected.files == 0 && collected.bytes == 0,
+	        "Source GC did not spend exactly one object on expiry");
+	Require(!active_after_admission, "Status released admission before rolling back its transaction");
+}
+
 void CaptureReadiness(Fixture &f, bool eager) {
 	const string catalog = eager ? "mirror" : "lake";
 	if (eager) {
@@ -468,7 +541,7 @@ void CaptureReadiness(Fixture &f, bool eager) {
 		f.Policy();
 	}
 	Pause capture;
-	Connection reader(f.database);
+	Connection reader(f.database), status_reader(f.database);
 	auto pending = std::async(std::launch::async, [&] {
 		return f.Search(reader, [&](const string &stage) {
 			if (stage == "after_snapshot") {
@@ -476,6 +549,7 @@ void CaptureReadiness(Fixture &f, bool eager) {
 			}
 		});
 	});
+	std::future<vector<Value>> status;
 	ReleasePause release_capture {capture};
 	capture.Wait();
 
@@ -515,13 +589,17 @@ void CaptureReadiness(Fixture &f, bool eager) {
 		Require(std::chrono::steady_clock::now() < deadline, "The other lake never reached capture admission");
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
-	auto queued = Source::Status(*f.writer.context, catalog).at(0);
-	Require(queued.back().GetValue<bool>() && queued[3] == before[3],
+	const auto previous_waits = admission.SharedWaitCount();
+	status = std::async(std::launch::async, [&] { return Source::Status(*status_reader.context, catalog).at(0); });
+	WaitForCaptureAdmission(status, previous_waits);
+	auto queued = SQL(f.writer,
+	                  "SELECT expired_snapshots FROM __ducklake_metadata_mirror.ducklake_vortex_source_retention_v1");
+	Require(queued->GetValue(0, 0) == before[3],
 	        "Maintenance expired snapshots before the other lake's capture completed");
 	capture.Release();
 	Require(pending.get().rows.at(0).at(0).GetValue<int64_t>() == 0, "The eager capture lost its query winner");
 	completed->Wait();
-	auto after = Source::Status(*f.writer.context, catalog).at(0);
+	auto after = status.get();
 	auto maintenance = DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, catalog).at(0);
 	Require(after[3].GetValue<idx_t>() == before[3].GetValue<idx_t>() + 1 && maintenance[4].GetValue<idx_t>() == 1,
 	        "The first source pass did not expire one snapshot with an object budget of one");
@@ -739,6 +817,39 @@ int main(int argc, char **argv) {
 		f.Seed();
 		if (mode == "concurrent") {
 			Concurrent(f);
+			return 0;
+		}
+		if (mode == "status-readiness") {
+			Pause pause;
+			InstallStatusPolicyGate(f, pause, false);
+			auto pending = std::async(std::launch::async, [&] { return Source::Status(*f.writer.context, "lake"); });
+			ReleasePause release {pause};
+			pause.Wait();
+			auto admission = DuckLakeVortexReadView::AdmissionLock().TryGetExclusiveLock();
+			bool admitted = !admission;
+			admission.reset();
+			Connection held(f.database), owner(f.database);
+			held.BeginTransaction();
+			SQL(held, "SELECT count(*) FROM lake.items");
+			auto &transaction = VortexIndex::Begin(owner, "lake");
+			bool ordinary_blocked = !Source::WorkReady(transaction, 64 * 1024 * 1024);
+			held.Commit();
+			bool ready = Source::WorkReady(transaction, 64 * 1024 * 1024);
+			owner.Commit();
+			pause.Release();
+			auto status = pending.get();
+			RestoreStatusPolicy(f);
+			Require(status.size() == 1 && status[0][0].GetValue<bool>(), "Finite status capture lost its result");
+			Require(ordinary_blocked, "Status readiness ignored an ordinary transaction");
+			Require(ready, "Source readiness discarded finite status work");
+			Require(admitted, "Source status did not hold finite read admission");
+			f.Drain();
+			Connection reader(f.database);
+			Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == 0, "Status capture changed the query winner");
+			return 0;
+		}
+		if (mode == "status-error-rollback") {
+			StatusErrorRollback(f);
 			return 0;
 		}
 		if (mode == "capture-readiness" || mode == "capture-readiness-eager") {

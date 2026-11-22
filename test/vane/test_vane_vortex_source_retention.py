@@ -238,6 +238,8 @@ def native_cases(driver, root, report):
         "admission",
         "capture-gate",
         "capture-readiness",
+        "status-readiness",
+        "status-error-rollback",
         "capture-readiness-eager",
         "cancel-capture-wait",
         "eager-capture-order",

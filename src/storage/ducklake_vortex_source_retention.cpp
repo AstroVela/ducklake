@@ -467,25 +467,37 @@ bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, 
 
 vector<vector<Value>> DuckLakeVortexSourceRetention::Status(ClientContext &context, const string &catalog) {
 	auto identity = VortexIndex::ResolveCatalog(context, catalog, false, "Vortex source retention status");
-	Owner owner(context, catalog, identity);
-	auto policy = Load(owner.transaction);
-	auto counts = VortexIndex::Query(
-	    owner.transaction,
-	    "SELECT expired_snapshots,collected_files,collected_bytes FROM {METADATA_CATALOG}." + string(POLICY));
-	auto values = counts->Fetch();
-	vector<Value> row {Value::BOOLEAN(policy.enabled), Value::UBIGINT(policy.keep), Value::UBIGINT(policy.age)};
-	for (idx_t col = 0; col < 3; col++) {
-		row.push_back(Value::UBIGINT(values->GetValue(col, 0).GetValue<idx_t>()));
+	auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock([&] {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
+	Connection owner(*context.db);
+	DuckLakeVortexReadCaptureScope capture(*owner.context);
+	try {
+		auto &transaction = VortexIndex::Begin(owner, catalog, &identity);
+		auto policy = Load(transaction);
+		auto counts = VortexIndex::Query(
+		    transaction,
+		    "SELECT expired_snapshots,collected_files,collected_bytes FROM {METADATA_CATALOG}." + string(POLICY));
+		auto values = counts->Fetch();
+		vector<Value> row {Value::BOOLEAN(policy.enabled), Value::UBIGINT(policy.keep), Value::UBIGINT(policy.age)};
+		for (idx_t col = 0; col < 3; col++) {
+			row.push_back(Value::UBIGINT(values->GetValue(col, 0).GetValue<idx_t>()));
+		}
+		for (auto &sql : {"SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy),
+		                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(SCHEDULED),
+		                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(DELETIONS)}) {
+			row.push_back(Value::UBIGINT(Count(transaction, sql)));
+		}
+		row.push_back(
+		    Value::BOOLEAN(Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction, false)));
+		owner.Commit();
+		return {std::move(row)};
+	} catch (...) {
+		VortexIndex::Rollback(owner);
+		throw;
 	}
-	for (auto &sql : {"SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy),
-	                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(SCHEDULED),
-	                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(DELETIONS)}) {
-		row.push_back(Value::UBIGINT(Count(owner.transaction, sql)));
-	}
-	row.push_back(
-	    Value::BOOLEAN(Manager(owner.transaction.GetCatalog()).HasOtherTransactions(&owner.transaction, false)));
-	owner.connection.Commit();
-	return {std::move(row)};
 }
 
 DuckLakeVortexSourceGCResult

@@ -29,19 +29,6 @@ constexpr const char *READ_CAPTURE = "ducklake_vortex_read_capture";
 
 struct ReadCaptureContext final : public ClientContextState {};
 
-struct ReadCaptureScope {
-	explicit ReadCaptureScope(ClientContext &context_p) : context(context_p) {
-		context.registered_state->GetOrCreate<ReadCaptureContext>(READ_CAPTURE);
-	}
-	~ReadCaptureScope() {
-		context.registered_state->Remove(READ_CAPTURE);
-	}
-	ReadCaptureScope(const ReadCaptureScope &) = delete;
-	ReadCaptureScope &operator=(const ReadCaptureScope &) = delete;
-
-	ClientContext &context;
-};
-
 yyjson_mut_val *Business(ViewJSON &json, const vector<Value> &values, uint32_t dimension) {
 	auto row = json.Object();
 	if (values[0].IsNull()) {
@@ -66,6 +53,14 @@ yyjson_mut_val *Business(ViewJSON &json, const vector<Value> &values, uint32_t d
 }
 
 } // namespace
+
+DuckLakeVortexReadCaptureScope::DuckLakeVortexReadCaptureScope(ClientContext &context_p) : context(context_p) {
+	context.registered_state->GetOrCreate<ReadCaptureContext>(READ_CAPTURE);
+}
+
+DuckLakeVortexReadCaptureScope::~DuckLakeVortexReadCaptureScope() {
+	context.registered_state->Remove(READ_CAPTURE);
+}
 
 DuckLakeVortexCollectionLock &DuckLakeVortexReadView::AdmissionLock() {
 	static DuckLakeVortexCollectionLock lock;
@@ -121,7 +116,7 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 	checkpoint("before_source_admission");
 	// BEGIN can start DuckLake transactions eagerly on every attached catalog.
 	auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
-	ReadCaptureScope capture(*reader.context);
+	DuckLakeVortexReadCaptureScope capture(*reader.context);
 	try {
 		reader.BeginTransaction();
 		auto &resolved = Catalog::GetCatalog(*reader.context, options.catalog);

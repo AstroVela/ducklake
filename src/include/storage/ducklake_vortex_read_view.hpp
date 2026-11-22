@@ -31,6 +31,18 @@ struct DuckLakeVortexSourceBuffer {
 	string bytes;
 };
 
+// Register a dedicated read connection under shared admission before it opens transactions.
+class DuckLakeVortexReadCaptureScope {
+public:
+	explicit DuckLakeVortexReadCaptureScope(ClientContext &context);
+	~DuckLakeVortexReadCaptureScope();
+	DuckLakeVortexReadCaptureScope(const DuckLakeVortexReadCaptureScope &) = delete;
+	DuckLakeVortexReadCaptureScope &operator=(const DuckLakeVortexReadCaptureScope &) = delete;
+
+private:
+	ClientContext &context;
+};
+
 struct DuckLakeVortexReadView {
 	static DuckLakeVortexCollectionLock &AdmissionLock();
 	static bool IsCapturing(ClientContext &context);
