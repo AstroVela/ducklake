@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +25,24 @@ CONFLICT_ID = f"{os.getpid()}-{uuid.uuid4().hex}"
 CONFLICT_STARTED_PATH = Path("/tmp") / f"vane-ray-ducklake-conflict-{CONFLICT_ID}.started"
 CONFLICT_RELEASE_PATH = Path("/tmp") / f"vane-ray-ducklake-conflict-{CONFLICT_ID}.release"
 DISTRIBUTED_ARTIFACT_PREFIX = ".vane-ducklake-"
+
+
+def cleanup_integration(steps: list[tuple[str, Callable[[], object]]], primary_error: BaseException | None) -> None:
+    errors = []
+    for name, cleanup in steps:
+        try:
+            cleanup()
+        except BaseException as error:
+            errors.append((name, error))
+            print(f"DuckLake Ray cleanup failed: {name}", file=sys.stderr, flush=True)
+            traceback.print_exception(error, file=sys.stderr)
+    if not errors:
+        return
+    detail = "; ".join(f"{name}: {type(error).__name__}: {error}" for name, error in errors)
+    if primary_error is not None:
+        primary_error.add_note(f"DuckLake Ray cleanup also failed: {detail}")
+    else:
+        raise RuntimeError(f"DuckLake Ray integration cleanup failed: {detail}") from errors[0][1]
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -853,6 +872,10 @@ def run_mutated_worker_write(
         nonlocal mutated_file_count
         result = fragment_executor(request)
         if drop_task_result:
+            # Let intermediate exchanges finish so the terminal writer actually
+            # runs; this fault targets its selected commit result, not shuffle output.
+            if dict(request).get("exchange_sink_instance") is not None:
+                return result
             mutated_file_count += sum(payload.num_rows for payload in result.partition_payloads)
             return None
         payloads = []
@@ -2478,7 +2501,9 @@ def main() -> None:
 
         with tempfile.TemporaryDirectory(prefix="vane-ducklake-ray-") as temporary_directory:
             root = Path(temporary_directory)
+            print("DuckLake Ray phase: seed tables", flush=True)
             seed_tables(connection, root)
+            print("DuckLake Ray phase: metadata", flush=True)
             exercise_metadata(vane, connection, runner, root)
 
             write_dispatch_count = 0
@@ -2505,6 +2530,7 @@ def main() -> None:
                 require_write_count(1, f"{description} Ray dispatch count")
 
             runner.run_write = record_distributed_write
+            print("DuckLake Ray phase: distributed writes", flush=True)
             exercise_distributed_writes(
                 vane,
                 connection,
@@ -2513,6 +2539,7 @@ def main() -> None:
                 require_distributed_write,
                 require_write_count,
             )
+            print("DuckLake Ray phase: distributed mutations", flush=True)
             exercise_distributed_mutations(
                 vane,
                 connection,
@@ -2521,6 +2548,7 @@ def main() -> None:
                 require_distributed_write,
                 require_write_count,
             )
+            print("DuckLake Ray phase: distributed merges", flush=True)
             exercise_distributed_merges(
                 vane,
                 connection,
@@ -2531,6 +2559,7 @@ def main() -> None:
                 require_write_count,
             )
 
+            print("DuckLake Ray phase: worker transport and stale splits", flush=True)
             verify_worker_transport(vane, connection)
             verify_stale_split_rejected(
                 vane,
@@ -2561,6 +2590,7 @@ def main() -> None:
 
             runner.run_iter_tables = record_distributed_read
 
+            print("DuckLake Ray phase: distributed reads", flush=True)
             require_equal(
                 scan_split_count(vane, connection, "SELECT id, payload FROM lake.source"),
                 FILE_COUNT,
@@ -2641,21 +2671,25 @@ def main() -> None:
             require_equal(observed_nodes, expected_nodes, "two-worker DuckLake scan topology")
             require_true(dispatch_count >= 4, "DuckLake queries did not use the Ray runner")
             require_true(write_dispatch_count >= 25, "DuckLake writes did not use the Ray runner")
+    except BaseException:
+        # Print the query traceback before teardown: a worker crash can make
+        # connection.close() fail too, and that later error must not hide it.
+        traceback.print_exc()
+        raise
     finally:
+        primary_error = sys.exc_info()[1]
         if runner is not None and original_run_iter_tables is not None:
             runner.run_iter_tables = original_run_iter_tables
         if runner is not None and original_run_write is not None:
             runner.run_write = original_run_write
-        try:
-            if connection is not None:
-                connection.close()
-        finally:
-            try:
-                vane.teardown_runner()
-            finally:
-                if ray.is_initialized():
-                    ray.shutdown()
-                cluster.shutdown()
+        cleanup_steps = []
+        if connection is not None:
+            cleanup_steps.append(("connection.close", connection.close))
+        cleanup_steps.append(("vane.teardown_runner", vane.teardown_runner))
+        if ray.is_initialized():
+            cleanup_steps.append(("ray.shutdown", ray.shutdown))
+        cleanup_steps.append(("cluster.shutdown", cluster.shutdown))
+        cleanup_integration(cleanup_steps, primary_error)
 
 
 if __name__ == "__main__":
