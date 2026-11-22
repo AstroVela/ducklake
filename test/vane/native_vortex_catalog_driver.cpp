@@ -30,6 +30,24 @@ string ReadText(const string &path) {
 	return string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
 }
 
+class PublishedContext {
+public:
+	explicit PublishedContext(DuckDB &database)
+	    : manager(database.instance->GetConnectionManager()),
+	      context(make_shared_ptr<ClientContext>(database.instance)) {
+		manager.AddConnection(*context);
+	}
+	~PublishedContext() {
+		manager.RemoveConnection(*context);
+	}
+	PublishedContext(const PublishedContext &) = delete;
+	PublishedContext &operator=(const PublishedContext &) = delete;
+
+private:
+	ConnectionManager &manager;
+	shared_ptr<ClientContext> context;
+};
+
 class Fixture {
 public:
 	Fixture(string root_p, bool create) : root(std::move(root_p)), database(nullptr), writer(database) {
@@ -55,9 +73,6 @@ public:
 	weak_ptr<DatabaseInstance> WeakDatabase() {
 		return database.instance;
 	}
-	bool OptimizerStarted() const {
-		return optimizer_started;
-	}
 
 	string Capture(const string &name, const string &index) {
 		auto function = index.empty() ? "ducklake_vortex_read_view('lake','main','items',8,67108864,100000)"
@@ -80,8 +95,36 @@ public:
 		return json.Finish(value);
 	}
 
+	string Owners() {
+		ViewJSON json;
+		auto value = json.Object();
+		json.Number(value, "database_references", database.instance.use_count());
+		auto entries = json.Array();
+		// Foreign contexts are published before ID assignment; inspect shared ownership only.
+		for (auto &context : database.instance->GetConnectionManager().GetConnectionList()) {
+			auto item = json.Object();
+			json.Number(item, "references", context.use_count());
+			// Only this command's writer context is idle and exclusively owned here.
+			auto active = context == writer.context
+			                  ? yyjson_mut_bool(json.doc.get(), context->transaction.HasActiveTransaction())
+			                  : yyjson_mut_null(json.doc.get());
+			json.Add(item, "active", active);
+			yyjson_mut_arr_append(entries, item);
+		}
+		json.Add(value, "connections", entries);
+		return json.Finish(value);
+	}
+
 	string Execute(const vector<string> &args) {
 		const auto &op = args.at(1);
+		if (op == "owners") {
+			return Owners();
+		}
+		if (op == "owners-published-context") {
+			// Hold construction at its published-but-unassigned prefix.
+			PublishedContext pending(database);
+			return Owners();
+		}
 		if (op == "build-wrong-field") {
 			return DuckLakeVortexIndex::BuildAndPublish(*writer.context, "lake", "main", "items", "knn", args.at(2), 8,
 			                                            0, nullptr, "", optional_idx(999999))
@@ -132,7 +175,6 @@ public:
 				config.index_bytes = std::stoull(args.at(6));
 				DuckLakeVortexOptimizer::Enable(*writer.context, config, OptimizerObserver(args.at(7), args.at(8)));
 			}
-			optimizer_started = true;
 			return "{}";
 		}
 		if (op == "optimizer-resume") {
@@ -142,7 +184,6 @@ public:
 				DuckLakeVortexOptimizer::Resume(*writer.context, "lake", "main", "items", "knn",
 				                                OptimizerObserver(args.at(2), args.at(3)));
 			}
-			optimizer_started = true;
 			return "{}";
 		}
 		if (op == "optimizer-cancel") {
@@ -662,39 +703,49 @@ private:
 	DuckDB database;
 	Connection writer;
 	std::shared_ptr<Pause> optimizer_pause;
-	bool optimizer_started = false;
 };
+
+void CloseFixture(unique_ptr<Fixture> &fixture) {
+	auto weak = fixture->WeakDatabase();
+	fixture.reset();
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+	while (!weak.expired() && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	Require(weak.expired(), "Native catalog fixture retained database resources after close");
+}
 } // namespace
 
 int main(int argc, char **argv) {
 	try {
 		Require(argc == 3, "usage: native_vortex_catalog_driver ROOT create|resume");
 		Require(string(argv[2]) == "create" || string(argv[2]) == "resume", "Unknown fixture mode");
-		weak_ptr<DatabaseInstance> weak;
-		{
-			Fixture fixture(argv[1], string(argv[2]) == "create");
-			string line;
-			while (std::getline(std::cin, line)) {
-				auto args = StringUtil::Split(line, '\t');
-				Require(args.size() >= 2, "Invalid fixture command");
-				try {
-					fixture.Reply(args[0], fixture.Execute(args));
-				} catch (const std::exception &error) {
-					fixture.Error(args[0], error.what());
+		auto fixture = make_uniq<Fixture>(argv[1], string(argv[2]) == "create");
+		string line;
+		while (std::getline(std::cin, line)) {
+			auto args = StringUtil::Split(line, '\t');
+			Require(args.size() >= 2, "Invalid fixture command");
+			try {
+				string result;
+				if (args[1] == "reopen") {
+					CloseFixture(fixture);
+					fixture = make_uniq<Fixture>(argv[1], false);
+					result = "{}";
+				} else {
+					result = fixture->Execute(args);
 				}
-				if (args[1] == "shutdown") {
-					break;
+				fixture->Reply(args[0], result);
+			} catch (const std::exception &error) {
+				if (!fixture) {
+					throw;
 				}
+				fixture->Error(args[0], error.what());
 			}
-			if (fixture.OptimizerStarted()) {
-				weak = fixture.WeakDatabase();
+			if (args[1] == "shutdown") {
+				break;
 			}
 		}
-		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-		while (!weak.expired() && std::chrono::steady_clock::now() < deadline) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
-		Require(weak.expired(), "Optimizer retained the database after its owner closed");
+		CloseFixture(fixture);
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << std::endl;
