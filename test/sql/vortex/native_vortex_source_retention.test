@@ -79,6 +79,22 @@ SELECT expired_snapshots FROM ducklake_collect_vortex_sources('lake',16,67108864
 statement ok
 SELECT * FROM ducklake_set_vortex_source_retention('lake',true,1,0)
 
+statement ok reader
+BEGIN
+
+query I reader
+SELECT count(*) FROM lake.items
+----
+2
+
+query I
+SELECT blocked_by_transactions::INTEGER FROM ducklake_collect_vortex_sources('lake',1,1)
+----
+1
+
+statement ok reader
+COMMIT
+
 query I
 SELECT expired_snapshots FROM ducklake_collect_vortex_sources('lake',1,1)
 ----

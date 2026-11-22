@@ -23,6 +23,30 @@ using Source = DuckLakeVortexSourceRetention;
 using VortexIndex = DuckLakeVortexIndex;
 
 namespace {
+void WaitForSourceAdmission(std::future<DuckLakeVortexSourceGCResult> &collecting, idx_t previous_waiters) {
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+	while (admission.WaitingWriterCount() <= previous_waiters) {
+		if (collecting.wait_for(std::chrono::milliseconds(1)) == std::future_status::ready) {
+			collecting.get();
+			throw InvalidInputException("Source collection finished before waiting for capture admission");
+		}
+		Require(std::chrono::steady_clock::now() < deadline, "Source collection did not reach capture admission");
+	}
+}
+
+void WaitForCaptureAdmission(std::future<DuckLakeVortexSearchResult> &capture, idx_t previous_waits) {
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+	while (admission.SharedWaitCount() == previous_waits) {
+		if (capture.wait_for(std::chrono::milliseconds(1)) == std::future_status::ready) {
+			capture.get();
+			throw InvalidInputException("The capture finished before waiting for admission");
+		}
+		Require(std::chrono::steady_clock::now() < deadline, "The capture did not wait for admission");
+	}
+}
+
 string Read(const string &path) {
 	std::ifstream input(path, std::ios::binary);
 	Require(bool(input), "Cannot read source fixture file");
@@ -429,6 +453,96 @@ void MixedSizes(Fixture &f) {
 	        "Oversized source did not remain pending");
 }
 
+void CaptureGate(Fixture &f, bool cancel) {
+	f.Policy();
+	Connection caller(f.database);
+	std::future<DuckLakeVortexSourceGCResult> collecting;
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	auto held = admission.GetSharedLock([] {});
+	const auto previous_waiters = admission.WaitingWriterCount();
+	const auto snapshots = f.Count("__ducklake_metadata_lake.ducklake_snapshot");
+	collecting =
+	    std::async(std::launch::async, [&] { return Source::Collect(*caller.context, "lake", 16, 64 * 1024 * 1024); });
+	WaitForSourceAdmission(collecting, previous_waiters);
+	Require(bool(Source::TransactionGate().TryGetExclusiveLock()), "Source collection froze transaction entry");
+	Connection reader(f.database);
+	Require(SQL(reader, "SELECT min(id) FROM lake.items")->GetValue(0, 0).GetValue<int64_t>() == 0,
+	        "Transaction entry lost current data");
+	if (cancel) {
+		caller.context->Interrupt();
+		Require(collecting.wait_for(std::chrono::seconds(15)) == std::future_status::ready,
+		        "An interrupted collector kept waiting for capture admission");
+		bool interrupted = false;
+		try {
+			collecting.get();
+		} catch (const InterruptException &) {
+			interrupted = true;
+		}
+		Require(interrupted && admission.WaitingWriterCount() == previous_waiters &&
+		            bool(VortexIndex::PublicationLock().TryGetExclusiveLock()),
+		        "Source collection interruption did not release its locks");
+		Require(f.Count("__ducklake_metadata_lake.ducklake_snapshot") == snapshots,
+		        "Interrupted source collection expired snapshots");
+	}
+	held.reset();
+	auto result = cancel ? f.Collect() : collecting.get();
+	Require(!result.blocked && result.expired, "Source collection did not progress after capture admission closed");
+}
+
+void EagerCaptureOrder(Fixture &f) {
+	f.Policy();
+	SQL(f.writer, "SET GLOBAL immediate_transaction_mode=true");
+	Connection first(f.database), second(f.database);
+	Pause pause;
+	std::future<DuckLakeVortexSearchResult> capturing, queued;
+	std::future<DuckLakeVortexSourceGCResult> collecting;
+	ReleasePause release {pause};
+	capturing = std::async(std::launch::async, [&] {
+		return f.Search(first, [&](const string &stage) {
+			if (stage == "after_snapshot") {
+				pause.Stop();
+			}
+		});
+	});
+	pause.Wait();
+
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	const auto waiting_writers = admission.WaitingWriterCount();
+	collecting = std::async(std::launch::async, [&] { return f.Collect(); });
+	WaitForSourceAdmission(collecting, waiting_writers);
+
+	const auto shared_waits = admission.SharedWaitCount();
+	queued = std::async(std::launch::async, [&] { return f.Search(second); });
+	WaitForCaptureAdmission(queued, shared_waits);
+	pause.Release();
+	auto result = collecting.get();
+	Require(capturing.get().rows.at(0).at(0).GetValue<int64_t>() == 0 &&
+	            queued.get().rows.at(0).at(0).GetValue<int64_t>() == 0,
+	        "Source collection changed either admitted query result");
+	Require(!result.blocked && result.expired, "A queued eager capture registered before source collection");
+}
+
+void ReboundCapture(Fixture &f) {
+	Connection reader(f.database);
+	std::future<DuckLakeVortexSearchResult> capture;
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	auto held = admission.GetExclusiveLock([] {});
+	const auto previous_waits = admission.SharedWaitCount();
+	capture = std::async(std::launch::async, [&] { return f.Search(reader); });
+	WaitForCaptureAdmission(capture, previous_waits);
+	SQL(f.writer, "DETACH lake");
+	Attach(f.writer, f.root);
+	held.reset();
+	bool rejected = false;
+	try {
+		capture.get();
+	} catch (const TransactionException &error) {
+		rejected = StringUtil::Contains(error.what(), "catalog attachment changed");
+	}
+	Require(rejected, "A queued capture used the replacement catalog");
+	Require(f.Search(reader).rows.at(0).at(0).GetValue<int64_t>() == 0, "A fresh capture lost the reattached data");
+}
+
 void Concurrent(Fixture &f) {
 	auto seed = f.WriteBatch(0, "seed");
 	f.Policy(2);
@@ -551,6 +665,18 @@ int main(int argc, char **argv) {
 			Concurrent(f);
 			return 0;
 		}
+		if (mode == "capture-gate" || mode == "cancel-capture-wait") {
+			CaptureGate(f, mode == "cancel-capture-wait");
+			return 0;
+		}
+		if (mode == "eager-capture-order") {
+			EagerCaptureOrder(f);
+			return 0;
+		}
+		if (mode == "rebound-capture") {
+			ReboundCapture(f);
+			return 0;
+		}
 		if (mode == "held" || mode == "admission") {
 			Pause pause;
 			Connection reader(f.database);
@@ -565,7 +691,17 @@ int main(int argc, char **argv) {
 			pause.Wait();
 			f.Policy();
 			if (mode == "admission") {
-				Require(f.Collect().blocked, "Capture admission was not protected from source expiry");
+				const auto waiting = DuckLakeVortexReadView::AdmissionLock().WaitingWriterCount();
+				auto collecting = std::async(std::launch::async, [&] { return f.Collect(); });
+				ReleasePause release_on_error {pause};
+				WaitForSourceAdmission(collecting, waiting);
+				Require(bool(Source::TransactionGate().TryGetExclusiveLock()),
+				        "Source collection froze transactions before native capture completed");
+				pause.Release();
+				Require(pending.get().rows[0][0].GetValue<int64_t>() == 0, "Admitted query lost its native view");
+				auto result = collecting.get();
+				Require(!result.blocked && result.expired, "Source collector did not progress after native capture");
+				return 0;
 			} else {
 				f.Rewrite();
 				VortexIndex::Collect(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
