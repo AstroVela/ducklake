@@ -78,15 +78,23 @@ SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[]
 ----
 3000
 
+query I
+SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-third.json',2,2)
+----
+3
+
+statement ok
+INSERT INTO lake.items SELECT 4000+i,[0.015625+i,0],'E','fourth-F' FROM range(128)t(i)
+
 statement error
-SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-third.json',2,2)
+SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-fourth.json',2,3)
 ----
 segment count budget exceeded
 
 query I
-SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-rebuilt.json',2,2)
+SELECT revision FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/segments-rebuilt.json',2,3)
 ----
-3
+4
 
 query I
 SELECT array_length(regexp_extract_all(admission,'"generation":"[^"]+"')) FROM ducklake_vortex_index_view('lake','main','items','knn',67108864,100000)
