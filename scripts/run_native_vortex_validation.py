@@ -86,6 +86,20 @@ def main() -> None:
                     [str(duckdb), "-batch", "-bail", "-c", sql],
                     expected_error="native DUCKLAKE_ENABLE_VORTEX build",
                 )
+                run(
+                    "disabled-index-functions",
+                    [
+                        str(duckdb),
+                        "-batch",
+                        "-bail",
+                        "-c",
+                        "LOAD ducklake; SELECT CASE WHEN count(*)=0 THEN true "
+                        "ELSE error('Vortex view/catalog functions exposed in the OFF build') END "
+                        "FROM duckdb_functions() WHERE function_name IN "
+                        "('ducklake_vortex_read_view','ducklake_initialize_vortex_indexes',"
+                        "'ducklake_publish_vortex_index','ducklake_vortex_index_view');",
+                    ],
+                )
         else:
             run(
                 "vortex-sql",

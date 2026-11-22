@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -10,6 +11,7 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
 
+use crate::file_index::Reference;
 use crate::mixed::MixedCapture;
 
 #[derive(Deserialize)]
@@ -25,6 +27,24 @@ struct Admission {
     format_version: u32,
     capture: MixedCapture,
     sources: Vec<EncodedSource>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogIndex {
+    pub name: String,
+    pub revision: u64,
+    pub root: PathBuf,
+    pub reference: Reference,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogAdmission {
+    format_version: u32,
+    capture: MixedCapture,
+    sources: Vec<EncodedSource>,
+    index: CatalogIndex,
 }
 
 pub struct Pins {
@@ -43,6 +63,44 @@ pub fn prepare(bytes: &[u8], source_budget: usize, scratch_root: &Path) -> Vorte
     }
     let admission: Admission =
         serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
+    materialize(admission, source_budget, scratch_root)
+}
+
+pub fn prepare_catalogued(
+    bytes: &[u8],
+    name: &str,
+    source_budget: usize,
+    scratch_root: &Path,
+) -> VortexResult<(Prepared, CatalogIndex)> {
+    if bytes.len() > 160 * 1024 * 1024 {
+        vortex_bail!("Native admission exceeds its byte budget");
+    }
+    let admission: CatalogAdmission =
+        serde_json::from_slice(bytes).map_err(|error| vortex_err!("{error}"))?;
+    if admission.index.name != name
+        || name.is_empty()
+        || admission.index.revision == 0
+        || !admission.index.root.is_absolute()
+    {
+        vortex_bail!("Catalogued index name, revision or root mismatch");
+    }
+    let prepared = materialize(
+        Admission {
+            format_version: admission.format_version,
+            capture: admission.capture,
+            sources: admission.sources,
+        },
+        source_budget,
+        scratch_root,
+    )?;
+    Ok((prepared, admission.index))
+}
+
+fn materialize(
+    admission: Admission,
+    source_budget: usize,
+    scratch_root: &Path,
+) -> VortexResult<Prepared> {
     if admission.format_version != 1
         || admission.sources.len() != admission.capture.file_capture.files.len()
     {

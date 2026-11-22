@@ -18,6 +18,7 @@ struct DuckLakeVortexViewOptions {
 	uint32_t dimension;
 	idx_t max_source_bytes;
 	idx_t max_rows;
+	string index_name;
 };
 
 struct DuckLakeVortexReadView {
