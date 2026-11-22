@@ -16,6 +16,7 @@
 
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_read_view.hpp"
+#include "storage/ducklake_vortex_search.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #endif
 
@@ -107,6 +108,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	RegisterDuckLakeVortexReadView(loader);
 	RegisterDuckLakeVortexIndexCatalog(loader);
+	RegisterDuckLakeVortexSearch(loader);
 #endif
 
 	DuckLakeLastCommittedSnapshotFunction last_committed;

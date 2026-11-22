@@ -1,4 +1,4 @@
-//! Bounded physical-file adapter for the DuckLake validation probe.
+//! Bounded physical-file adapter for native DuckLake read views.
 //! The provider indexes complete physical files. A mandatory query RowFilter
 //! applies DuckLake visibility, which is bound by the immutable capture digest.
 

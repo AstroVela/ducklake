@@ -36,8 +36,8 @@ use vortex_index_spfresh::SPFRESH_ID;
 
 use crate::admission;
 use crate::file_index;
-use crate::read_view::IndexLease;
-use crate::read_view::ViewBudget;
+use crate::lease::IndexLease;
+use crate::lease::ViewBudget;
 use crate::source::BusinessRow;
 use crate::source::Capture;
 use crate::source::PhysicalSource;
@@ -142,9 +142,9 @@ fn squared_l2(query: &[f32], vector: &[f32]) -> VortexResult<f32> {
 
 #[derive(Serialize)]
 pub struct MixedHit {
-    row_ref: RowRef,
-    distance: f32,
-    row: BusinessRow,
+    pub row_ref: RowRef,
+    pub distance: f32,
+    pub row: BusinessRow,
 }
 
 #[derive(Serialize)]
@@ -162,8 +162,8 @@ pub struct Routes {
 
 #[derive(Serialize)]
 pub struct MixedResult {
-    hits: Vec<MixedHit>,
-    routes: Routes,
+    pub hits: Vec<MixedHit>,
+    pub routes: Routes,
 }
 
 pub struct MixedView {
@@ -201,18 +201,40 @@ impl MixedView {
             vortex_bail!("Mixed capture exceeds its byte budget");
         }
         let bytes = fs::read(capture)?;
+        Self::from_bytes(&bytes, input, leases, budget, session, &|_| Ok(())).await
+    }
+
+    pub async fn from_bytes(
+        bytes: &[u8],
+        input: ViewInput,
+        leases: &Path,
+        budget: ViewBudget,
+        session: VortexSession,
+        check: &dyn Fn(&str) -> VortexResult<()>,
+    ) -> VortexResult<Self> {
+        check("before_open")?;
+        let max_bytes = if matches!(&input, ViewInput::Mixed { .. }) {
+            64
+        } else {
+            160
+        } * 1024
+            * 1024;
+        if bytes.len() > max_bytes {
+            vortex_bail!("Mixed capture exceeds its byte budget");
+        }
+        let admitted = !matches!(&input, ViewInput::Mixed { .. });
         let mut catalog = None;
         let (captured, pins) = if let ViewInput::Catalogued { index_name } = &input {
             let (prepared, index) =
-                admission::prepare_catalogued(&bytes, index_name, budget.source_bytes, leases)?;
+                admission::prepare_catalogued(bytes, index_name, budget.source_bytes, leases)?;
             catalog = Some(index);
             (prepared.capture, Some(prepared.pins))
         } else if admitted {
-            let prepared = admission::prepare(&bytes, budget.source_bytes, leases)?;
+            let prepared = admission::prepare(bytes, budget.source_bytes, leases)?;
             (prepared.capture, Some(prepared.pins))
         } else {
             (
-                serde_json::from_slice::<MixedCapture>(&bytes)
+                serde_json::from_slice::<MixedCapture>(bytes)
                     .map_err(|error| vortex_err!("{error}"))?,
                 None,
             )
@@ -271,6 +293,7 @@ impl MixedView {
             }
         });
         drop(pins);
+        check("source_pinned")?;
         let catalog_revision = catalog.as_ref().map(|index| index.revision);
         let (descriptor, root) = match input {
             ViewInput::Mixed { reference } | ViewInput::Admitted { reference } => {
@@ -306,6 +329,7 @@ impl MixedView {
             budget.artifact_bytes,
         )
         .await?;
+        check("after_open")?;
         let metadata = lease.index.metadata();
         let vector = lease
             .index
@@ -330,7 +354,7 @@ impl MixedView {
         Ok(Self {
             lease,
             source,
-            digest: file_version(&bytes),
+            digest: file_version(bytes),
             inline_bytes,
             inline,
             visible,
@@ -399,19 +423,66 @@ impl MixedView {
             .collect()
     }
 
+    fn validate_query(&self, query: &[f32], k: usize) -> VortexResult<()> {
+        if !(1..=64).contains(&k) {
+            vortex_bail!("Mixed k must be between 1 and 64");
+        }
+        let dimension = self.source.capture.dimension as usize;
+        if query.len() != dimension || query.iter().any(|value| !value.is_finite()) {
+            vortex_bail!("Query dimension or finite components mismatch");
+        }
+        Ok(())
+    }
+
+    pub async fn search_category(
+        &self,
+        query: Vec<f32>,
+        k: usize,
+        category: Option<&str>,
+        session: VortexSession,
+        check: &dyn Fn(&str) -> VortexResult<()>,
+    ) -> VortexResult<MixedResult> {
+        self.validate_query(&query, k)?;
+        let allow = if let Some(category) = category {
+            let rows: Vec<_> = self.visible.iter().copied().collect();
+            let mut allowed = Vec::new();
+            for chunk in rows.chunks(1024) {
+                check("category_filter")?;
+                for (address, row) in chunk.iter().zip(self.source.take_business(chunk).await?) {
+                    if row.category.as_deref() == Some(category) {
+                        allowed.push(RowRef::from(*address));
+                    }
+                }
+            }
+            for (address, row) in &self.inline {
+                if row.category.as_deref() == Some(category) {
+                    allowed.push(address.clone());
+                }
+            }
+            Some(allowed)
+        } else {
+            None
+        };
+        self.search_checked(MixedRequest { query, k, allow }, session, check)
+            .await
+    }
+
     pub async fn search(
         &self,
         request: MixedRequest,
         session: VortexSession,
     ) -> VortexResult<MixedResult> {
-        if !(1..=64).contains(&request.k) {
-            vortex_bail!("Mixed k must be between 1 and 64");
-        }
+        self.search_checked(request, session, &|_| Ok(())).await
+    }
+
+    pub async fn search_checked(
+        &self,
+        request: MixedRequest,
+        session: VortexSession,
+        check: &dyn Fn(&str) -> VortexResult<()>,
+    ) -> VortexResult<MixedResult> {
+        self.validate_query(&request.query, request.k)?;
         let dimension = self.source.capture.dimension as usize;
-        if request.query.len() != dimension || request.query.iter().any(|value| !value.is_finite())
-        {
-            vortex_bail!("Query dimension or finite components mismatch");
-        }
         let allow = request
             .allow
             .map(|rows| rows.into_iter().collect::<BTreeSet<_>>());
@@ -451,6 +522,7 @@ impl MixedView {
             .index
             .as_vector()
             .ok_or_else(|| vortex_err!("Vector capability required"))?;
+        check("before_ann")?;
         let hits = vector
             .search(
                 &request.query,
@@ -465,6 +537,7 @@ impl MixedView {
                 &filter,
             )
             .await?;
+        check("after_ann")?;
         let b_rows: Vec<_> = hits.iter().map(|hit| hit.row).collect();
         if hits.len() > request.k || b_rows.iter().collect::<BTreeSet<_>>().len() != b_rows.len() {
             vortex_bail!("ANN returned duplicate or excess candidates");
@@ -504,6 +577,7 @@ impl MixedView {
             .scan(&self.scan_files, std::slice::from_ref(&self.source.field))?;
         let mut context = session.create_execution_ctx();
         while let Some(batch) = stream.next().await {
+            check("scan_batch")?;
             let batch = batch?;
             routes.scanned_rows += batch.rows.len();
             let data = batch.data.execute::<StructArray>(&mut context)?;
@@ -531,6 +605,7 @@ impl MixedView {
             }
         }
         let mut t = TopK::new(request.k);
+        check("inline_top_k")?;
         for (row_ref, row) in &self.inline {
             if allowed(row_ref) {
                 routes.inline_eligible_rows += 1;
@@ -547,7 +622,9 @@ impl MixedView {
         }
         let ranked = merged.heap.into_sorted_vec();
         let rows: Vec<_> = ranked.iter().map(|hit| hit.row_ref.clone()).collect();
+        check("before_fetch")?;
         let business = self.fetch(&rows).await?;
+        check("after_fetch")?;
         let hits = ranked
             .into_iter()
             .zip(business)

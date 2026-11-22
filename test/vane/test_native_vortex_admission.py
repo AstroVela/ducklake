@@ -287,7 +287,7 @@ def main() -> None:
         "duckdb_sha256": BASE.digest(proof.duckdb),
         "driver_sha256": BASE.digest(driver),
         "probe_sha256": BASE.digest(proof.probe),
-        "vortex_revision": "ee085f55a705cb9b2edab18d392dd822540774d7",
+        "vortex_revision": "145f816102d6024a12164e37737ff8864faf5033",
     }
     started = time.monotonic()
     try:

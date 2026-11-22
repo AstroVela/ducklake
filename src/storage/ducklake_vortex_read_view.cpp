@@ -142,6 +142,7 @@ DuckLakeVortexReadView DuckLakeVortexReadView::Acquire(Connection &reader, const
 		DuckLakeVortexReadView result;
 		result.snapshot_id = snapshot.snapshot_id;
 		auto &fs = FileSystem::GetFileSystem(*reader.context);
+		result.managed_data_path = fs.ExpandPath(catalog.DataPath());
 		idx_t physical_rows = 0;
 		vector<DuckLakeVortexIndexFile> identities;
 		const auto row_limit = MinValue<idx_t>(options.max_rows, 64 * 1024 * 1024 / sizeof(float) / dimension);

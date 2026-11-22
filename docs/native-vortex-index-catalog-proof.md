@@ -187,5 +187,6 @@ projection, and the source/row/artifact budgets documented in the
 Publication limits each reference/manifest to 1 MiB and its B source/artifact
 inventories to 64 MiB each. Local builds reused qualified DuckDB v1.5.5 engine
 objects and pinned dependencies; ON/default-OFF CMake configuration was checked
-separately. The validation workflow includes all five process proofs. A
-production SQL vector-search operator remains a later integration step.
+separately. The validation workflow includes all five process proofs. The
+[native SQL search proof](native-vortex-sql-search-proof.md) connects named
+discovery to an experimental in-process search table function.

@@ -1,15 +1,16 @@
 //! Test-only DuckLake bridge to the existing Vortex SPFresh provider.
 
-mod admission;
-mod file_index;
-mod mixed;
+use ducklake_vortex_query::admission;
+use ducklake_vortex_query::file_index;
+use ducklake_vortex_query::mixed;
 mod read_view;
-mod source;
+use ducklake_vortex_query::source;
+
+use ducklake_vortex_query::{LIMITS, build_generation, provider, write_reference};
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,12 +33,8 @@ use vortex::io::runtime::single::block_on;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex_index::Index;
-use vortex_index::IndexBuildRequest;
-use vortex_index::IndexBuilder;
-use vortex_index::IndexMetadata;
 use vortex_index::IndexProvider;
 use vortex_index::IndexSource;
-use vortex_index::IndexStore;
 use vortex_index::RowAddress;
 use vortex_index::RowFilter;
 use vortex_index::SearchMode;
@@ -45,17 +42,6 @@ use vortex_index::Snapshot;
 use vortex_index::VectorSearchOptions;
 use vortex_index::store::LocalGeneration;
 use vortex_index::store::LocalIndexStore;
-use vortex_index::store::LocalStoreLimits;
-use vortex_index_spfresh::SPFRESH_ID;
-use vortex_index_spfresh::SpFreshBuildLimits;
-use vortex_index_spfresh::SpFreshIndexBuilder;
-use vortex_index_spfresh::SpFreshLimits;
-use vortex_index_spfresh::SpFreshProvider;
-
-const LIMITS: LocalStoreLimits = LocalStoreLimits {
-    max_artifact_bytes: 64 * 1024 * 1024,
-    max_manifest_bytes: 1024 * 1024,
-};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,10 +70,6 @@ struct Hit {
     embedding: Vec<f32>,
 }
 
-fn provider(scratch: &Path) -> VortexResult<SpFreshProvider> {
-    SpFreshProvider::try_new(scratch.to_path_buf(), SpFreshLimits::default())
-}
-
 async fn build(
     source: Arc<PhysicalSource>,
     reference: &Path,
@@ -112,88 +94,6 @@ async fn build(
             generation,
         },
     )
-}
-
-async fn build_generation(
-    source: Arc<dyn IndexSource>,
-    field: String,
-    dimension: u32,
-    root: &Path,
-    session: VortexSession,
-) -> VortexResult<(Snapshot, LocalGeneration)> {
-    let scratch = tempfile::Builder::new()
-        .prefix(".scratch-")
-        .tempdir_in(root)?;
-    let generation = format!(
-        "generation-{}",
-        scratch
-            .path()
-            .file_name()
-            .ok_or_else(|| vortex_err!("Scratch name required"))?
-            .to_string_lossy()
-    );
-    let store = Arc::new(LocalIndexStore::create(root, &generation, LIMITS)?);
-    let metadata = IndexMetadata {
-        format_version: 1,
-        name: field.clone(),
-        generation,
-        backend: SPFRESH_ID.into(),
-        backend_version: 1,
-        snapshot: source.snapshot().clone(),
-        fields: vec![field],
-        covered_files: source.snapshot().files.iter().map(|file| file.id).collect(),
-        artifacts: vec![],
-    };
-    let limits = SpFreshBuildLimits {
-        max_rows: 100_000,
-        max_vector_bytes: 64 * 1024 * 1024,
-        ..SpFreshBuildLimits::default()
-    };
-    let builder = SpFreshIndexBuilder::try_new(scratch.path().to_path_buf(), session, limits)?;
-    let options = serde_json::json!({"format_version":1, "dimension":dimension,
-        "head_count":64, "posting_page_limit":12, "replicas":4});
-    let expected = metadata.clone();
-    let metadata = builder
-        .build(
-            IndexBuildRequest {
-                metadata,
-                backend_options: Bytes::from(
-                    serde_json::to_vec(&options).map_err(|error| vortex_err!("{error}"))?,
-                ),
-            },
-            source,
-            Arc::clone(&store) as Arc<dyn IndexStore>,
-        )
-        .await?;
-    let mut identity = metadata.clone();
-    identity.artifacts.clear();
-    if identity != expected {
-        vortex_bail!("Provider changed requested identity or coverage");
-    }
-    let generation = store.seal(&metadata)?;
-    let (verified, reopened) =
-        LocalIndexStore::open(root, &generation, &metadata.snapshot, LIMITS)?;
-    drop(
-        provider(scratch.path())?
-            .open(&reopened, Arc::new(verified))
-            .await?,
-    );
-    Ok((metadata.snapshot, generation))
-}
-
-fn write_reference(reference: &Path, descriptor: &impl Serialize) -> VortexResult<()> {
-    let root = reference
-        .parent()
-        .ok_or_else(|| vortex_err!("Reference parent required"))?;
-    let mut pending = tempfile::NamedTempFile::new_in(root)?;
-    serde_json::to_writer(&mut pending, descriptor).map_err(|error| vortex_err!("{error}"))?;
-    pending.flush()?;
-    pending.as_file().sync_all()?;
-    pending
-        .persist_noclobber(reference)
-        .map_err(|error| vortex_err!("{error}"))?;
-    fs::File::open(root)?.sync_all()?;
-    Ok(())
 }
 
 fn reference_for(source: &PhysicalSource, reference: &Path) -> VortexResult<Reference> {
