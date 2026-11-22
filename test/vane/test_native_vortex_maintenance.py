@@ -325,16 +325,16 @@ def shared_bytes(driver, root, checks):
         require(len(pending) == 1 and 0 < scratch < pending[0]["artifact_bytes"], "Invalid shared byte fixture")
         budget = pending[0]["artifact_bytes"]
         native.call("optimizer-init")
-        native.call("maintenance-enable", 16, budget, "maintenance_complete", "pause")
+        native.call("maintenance-enable", 16, budget, "gc_waiting", "pause")
         native.call("optimizer-wait")
         first = status(native)
         require(
-            first["run_count"] == 1
+            first["run_count"] == 2
             and first["collected_builds"] == 1
             and first["collected_generations"] == 0
             and first["collected_bytes"] == scratch
             and GC.retired(native) == pending,
-            "Both collectors did not share the byte budget in one completed pass",
+            "Generation collection ran before the pass had enough bytes",
         )
         native.call("optimizer-release")
         final = drain(native)
@@ -347,7 +347,7 @@ def shared_bytes(driver, root, checks):
         BG.gone(candidate)
         native.call("maintenance-cancel")
         native.finish()
-        checks.append("one completed pass shares bytes across both collectors and the next pass can use the full limit")
+        checks.append("build collection uses the shared bytes and generation collection waits for a fresh pass")
         return {"budget": budget, "first_pass_bytes": first["collected_bytes"], "total_bytes": final["collected_bytes"]}
     finally:
         M.stop(native)

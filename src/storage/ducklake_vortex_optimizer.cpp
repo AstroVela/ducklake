@@ -134,6 +134,7 @@ struct Maintenance {
 	bool enabled = true;
 	idx_t max_objects = 0, max_bytes = 0, runs = 0, recovered = 0, builds = 0, generations = 0, bytes = 0;
 	idx_t remaining_builds = 0, remaining_generations = 0;
+	optional_idx min_generation_bytes;
 	bool source_work = false;
 };
 
@@ -188,15 +189,18 @@ void SaveMaintenance(Metadata &meta, const Maintenance &m, const string &previou
 bool MaintenanceBacklog(Metadata &meta, Maintenance &m) {
 	auto result = meta.Query("SELECT (SELECT count(*) FROM "
 	                         "{METADATA_CATALOG}.ducklake_vortex_builds_v1),"
-	                         "count(*),count(*) FILTER (WHERE " +
+	                         "count(*),min(g.artifact_bytes) FILTER (WHERE " +
 	                         VortexCatalog::CollectibleGenerationPredicate(m.max_bytes) +
 	                         ") FROM {METADATA_CATALOG}.ducklake_vortex_generations_v1 g"
 	                         " WHERE g.state IN ('retired','deleting')");
 	auto chunk = result->Fetch();
 	m.remaining_builds = chunk->GetValue(0, 0).GetValue<idx_t>();
 	m.remaining_generations = chunk->GetValue(1, 0).GetValue<idx_t>();
+	auto min_generation_bytes = chunk->GetValue(2, 0);
+	m.min_generation_bytes =
+	    min_generation_bytes.IsNull() ? optional_idx() : optional_idx(min_generation_bytes.GetValue<idx_t>());
 	m.source_work = DuckLakeVortexSourceRetention::WorkReady(meta.transaction, m.max_bytes);
-	return m.remaining_builds || chunk->GetValue(2, 0).GetValue<idx_t>() != 0 || m.source_work;
+	return m.remaining_builds || m.min_generation_bytes.IsValid() || m.source_work;
 }
 
 void SetMaintenanceReadyState(Maintenance &m, bool actionable) {
@@ -1104,19 +1108,23 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				}
 			};
 			check("maintenance_before_recovery");
-			m.recovered +=
-			    VortexCatalog::RecoverBuilds(*job->context, catalog.name, m.max_objects, check, &catalog.identity);
-			StoreMaintenance(db, catalog, m, "collecting_builds");
-			check("maintenance_before_build_gc");
-			auto builds = VortexCatalog::CollectBuilds(*job->context, catalog.name, m.max_objects, m.max_bytes, check,
-			                                           &catalog.identity);
-			m.builds += builds.builds;
-			m.bytes += builds.bytes;
-			StoreMaintenance(db, catalog, m, "collecting_generations");
+			DuckLakeVortexBuildGCResult builds;
+			if (m.remaining_builds) {
+				m.recovered +=
+				    VortexCatalog::RecoverBuilds(*job->context, catalog.name, m.max_objects, check, &catalog.identity);
+				StoreMaintenance(db, catalog, m, "collecting_builds");
+				check("maintenance_before_build_gc");
+				builds = VortexCatalog::CollectBuilds(*job->context, catalog.name, m.max_objects, m.max_bytes, check,
+				                                      &catalog.identity);
+				m.builds += builds.builds;
+				m.bytes += builds.bytes;
+			}
 			check("maintenance_after_build_gc");
 			idx_t collected_objects = builds.builds;
 			idx_t collected_bytes = builds.bytes;
-			if (builds.builds < m.max_objects && builds.bytes < m.max_bytes) {
+			if (builds.builds < m.max_objects && builds.bytes < m.max_bytes && m.min_generation_bytes.IsValid() &&
+			    m.min_generation_bytes.GetIndex() <= m.max_bytes - builds.bytes) {
+				StoreMaintenance(db, catalog, m, "collecting_generations");
 				check("maintenance_before_generation_gc");
 				auto generations = VortexCatalog::Collect(*job->context, catalog.name, m.max_objects - builds.builds,
 				                                          m.max_bytes - builds.bytes, check, &catalog.identity);
