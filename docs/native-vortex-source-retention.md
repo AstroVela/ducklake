@@ -24,7 +24,8 @@ The policy retains at least the latest `keep_snapshots` native snapshots
 to become eligible. Setting `enabled=false` suspends both expiration and source
 file collection without forgetting pending deletion intents. The newest snapshot
 always remains. All operations require exclusive single-process catalog
-ownership and managed local POSIX data paths.
+ownership and managed local POSIX data paths. DuckDB's directory permissions
+apply to file collection.
 
 The existing worker performs one bounded pass at a time. Build cleanup,
 generation cleanup, source file cleanup and snapshot expiration share its
@@ -33,7 +34,9 @@ one object; source files charge their full registered size, including recovery
 after unlink. Byte accounting describes completed objects, not all bytes read
 for verification, metadata I/O or WAL size. An individual source file must fit
 the byte budget; a smaller configured budget leaves it pending. Pending source
-files take priority over further snapshot expiration within the source stage.
+files that fit the remaining budget take priority over further snapshot
+expiration within the source stage. Multiple queue entries for the same
+physical file consume one object.
 
 An explicit bounded pass uses the same implementation and policy:
 
@@ -51,12 +54,13 @@ ordinary native transactions currently defer collection.
 
 ## Readers and deletion ownership
 
-The collector first takes publication ownership, then the transaction admission
-gate. If any ordinary DuckLake transaction remains active, the pass returns
+The collector takes publication ownership and waits interruptibly for exclusive
+ReadView admission. It then tries to acquire the transaction gate. A busy gate
+or an ordinary held transaction defers the pass with
 `blocked_by_transactions=true`. New native transactions cannot register while
-expiration or deletion owns the gate. The collector then takes the existing
-ReadView admission lock. It obtains its private native metadata snapshot only
-after these checks, avoiding a plan captured before a concurrent write commits.
+expiration or deletion owns the gate. The collector obtains its private
+metadata snapshot after these checks so the cleanup plan includes concurrent
+writes that finished before collection.
 
 Existing native transactions keep their original source snapshot. An admitted
 ReadView has private copies of its required source and index data, so delayed
@@ -67,16 +71,26 @@ arriving during a deletion pass wait for that bounded pass.
 Snapshot expiration reuses native `DeleteSnapshots`, including its metadata
 reference accounting and scheduled file queue. The collector consumes only that
 queue and its own durable intent records. It checks native and current named
-index references before deleting. It never scans for arbitrary orphan files.
+index references before deleting. Shared files stay pending while any retained
+native or index reference resolves to the same local path. The final deletion
+acknowledges all the queue entries for that file.
+The native old-file and orphan cleanup functions also check live references
+for a catalog initialized for source retention.
+With retention enabled, the source collector owns deletion of scheduled
+managed files. Native old-file cleanup leaves that work in the queue for the
+worker or an explicit bounded source pass.
 
 Before unlink, a native transaction commits a deletion intent containing the
 exact queue key, file size, device, inode and SHA-256 digest. Descriptor-relative
 opens reject symlinks and path traversal; files must be regular with one link.
 The collector verifies identity and contents again, unlinks, fsyncs the parent
 directory, then atomically acknowledges the native queue, intent and counters.
+When resuming after unlink, the collector syncs the parent directory before
+acknowledging the intent. If the parent is gone, it syncs its nearest existing
+ancestor under the managed root.
 Changed files fail explicitly. A missing source is accepted only for a committed
-intent. Independent native cleanup can finish an already registered deletion;
-the collector subsequently acknowledges its remaining intent.
+intent. The source collector owns registered intents through acknowledgement.
+Native cleanup leaves those files and queue entries for the source collector.
 
 Cancellation preserves any committed intent. A crash before or after unlink
 continues from the same native metadata WAL after explicit resume. Request
@@ -97,26 +111,19 @@ VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_source_retention.py 
 
 The installed-provider probe checks policy boundaries, native transaction
 deferral, worker progress, B/T and F/T oracle queries and durable receipts.
-The native fixture covers held ReadViews and capture admission, new transaction
-admission during unlink, shared pass limits, live references, checksum and
-symlink rejection, independent manual cleanup, cancellation and explicit resume.
+The native fixture covers held ReadViews and capture admission, immediate
+transaction mode, new transaction admission during unlink, mixed-size budgets,
+shared files, directory permissions, detach, checksum and symlink rejection,
+manual cleanup, cancellation and explicit resume.
 Eight rolling epochs keep 128 current rows while concurrent ANN results are
 checked against their exact committed snapshot. After each epoch, physical
 source bytes must equal the retained native file inventory plus an untouched
-unregistered sentinel. Four injected boundaries and four real worker SIGKILLs
-exercise snapshot expiration, intent commit, unlink and acknowledgement.
+unregistered sentinel. Injected failures and real worker SIGKILLs cover snapshot
+expiration, intent commit, unlink before and after directory sync, and
+acknowledgement.
 The latter recover through installed Vane with a nonempty metadata WAL.
 Each installed recovery runs in a fresh Python process, exercising process
 restart without initializing multiple copies of static OpenMP in one process.
-
-Local qualification passed all 20 native/recovery cases and 16 oracle
-comparisons across four phases, with minimum fixture recall 1.0. The rolling
-fixture completed 1,000 snapshot-matched concurrent queries. All 35 new SQL
-assertion blocks and 28 existing WriteBatch blocks passed through installed
-Vane; native CI also runs them with its standard SQLLogicTest harness. The
-original basic flow passed 32 comparisons, and WriteBatch passed 16 comparisons
-and seven fault/recovery cases on the new provider. Separate Vane release
-processes passed 1,222 non-Ray and 32 Ray tests, with 15 optional-dependency skips.
 
 `test/sql/vortex/native_vortex_source_retention.test` supplies minimal native SQL
 coverage; the native provider workflow retains reports and fixture logs. These

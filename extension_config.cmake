@@ -2,10 +2,11 @@
 
 option(DUCKLAKE_ENABLE_VORTEX "Enable experimental native Vortex data files" OFF)
 if(DUCKLAKE_ENABLE_VORTEX)
+    set(DUCKLAKE_DUCKDB_VORTEX_REVISION e8d2d520299508ba98687a5553e7cd41384e9c90)
     duckdb_extension_load(parquet)
     duckdb_extension_load(vortex
         GIT_URL https://github.com/AstroVela/duckdb-vortex
-        GIT_TAG 4ddaeeecf64a659cfb6b691bd3b917f4f189f2a2
+        GIT_TAG ${DUCKLAKE_DUCKDB_VORTEX_REVISION}
     )
 endif()
 

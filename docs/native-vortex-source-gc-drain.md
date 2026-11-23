@@ -8,11 +8,12 @@ collection phases with no index backlog.
 
 ## Scheduling change
 
-Each maintenance pass already records its durable build and retired-generation
-backlogs. Use those counts to invoke only the applicable index phases. When
-only source work remains, skip empty build recovery, build collection and
-generation collection. Those APIs each acquire the index collection and
-publication locks even when their metadata query returns no candidates.
+Each maintenance pass records build and retired-generation backlog counts. It
+also reads the smallest collectible generation size. Generation collection
+can run when at least one eligible generation fits the remaining byte and
+object budget. The scheduler skips build work when its backlog is empty and
+generation work when no candidate fits the pass. This leaves the index
+collection and publication locks available for other work.
 
 This avoids waiting for an index capture solely to discover there is no index
 work. It also reduces the delay between observing an idle source-transaction
@@ -31,9 +32,10 @@ The worker does not add retries or an alternate cleanup path.
 The native `source-only` regression drains build and generation work first,
 then holds the index collection lock exclusively while enabling source
 maintenance. Source expiration and deletion must complete before that lock is
-released, without entering an empty index collector. The existing held-view,
-old-transaction, deletion-intent, cancellation and SIGKILL cases remain part of
-the source-retention suite.
+released. The budget-blocked variant retains a real retired generation whose
+artifacts exceed the configured limit and still reclaims its eligible source.
+The source-retention suite also exercises held views, old transactions,
+deletion intents, cancellation and SIGKILL recovery.
 The worker reports completion after observing an empty source backlog; the
 waiting test thread opens no native transactions that could defer its own GC.
 
@@ -62,7 +64,10 @@ recall gates and all production budgets stay unchanged. Full typed query-window
 consistency, final rows, receipt replay and retained-file inventory remain hard
 checks. Broader ANN quality and long-run liveness are separate acceptance work.
 
-## Local qualification on 2026-11-01
+## Local qualification of the original PR on 2026-11-01
+
+The measurements below came from the original PR head `86435518` with its
+workload and validation gates.
 
 The fixed native regression passed while the index collection lock remained
 held; the preceding implementation failed the same fixture. The rebuilt

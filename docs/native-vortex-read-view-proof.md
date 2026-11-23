@@ -33,6 +33,12 @@ not reopen canonical sources or fetch business fields through a new DuckLake
 `latest` lookup. Every request supplies the expected capture digest; a different
 digest or an invisible address is rejected before search or fetch.
 
+The Python oracle reuses the index proof's Float32 normalization for vectors,
+queries and embeddings within business/fetch results after JSON decoding.
+Business IDs, NULLs and strings retain exact comparison; squared-L2 keeps
+`rel_tol=1e-5` and `abs_tol=1e-4`. Queries are sent as raw decimals to the worker
+so the regression exercises the native Float32 parse as well as the oracle.
+
 This is an in-memory source-view lease, not a held DuckLake catalog transaction
 or a catalog GC registration. The fixture completes capture/open before releasing
 its writer barrier. Once opened, the reader is independent of canonical source
@@ -82,6 +88,9 @@ The proof verifies:
 
 - Old vectors, predicates and business rows remain unchanged, including an
   ordered duplicate fetch delayed until after maintenance.
+- Two additional 128-row fixtures cover ordinary fractional vectors, raw SQL
+  business values and a large-offset decimal query that rounds to a stored
+  Float32 self-neighbor with distance zero, including ordered duplicate fetch.
 - Previously unqueried vectors and business rows can be fetched after their
   canonical files are gone; the worker is not replaying saved query results.
 - New views reject stale generations and return updated versions after flush
