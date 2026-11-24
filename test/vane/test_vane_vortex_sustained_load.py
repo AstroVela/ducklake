@@ -27,19 +27,45 @@ assert SPEC is not None and SPEC.loader is not None
 AUTO = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(AUTO)
 BASE, KEYED = AUTO.BASE, AUTO.KEYED
+MIXED = BASE.SEARCH.CAT.MIXED
 query, require, quote = AUTO.query, AUTO.require, AUTO.quote
 REQUESTS = AUTO.WRITE.REQUESTS
 PHASES = [("paced", 1.0), ("burst", 0.0), ("recovery", 1.0)]
+SEARCH_COLUMNS = [
+    ("id", "BIGINT"),
+    ("embedding", "FLOAT[]"),
+    ("category", "VARCHAR"),
+    ("payload", "VARCHAR"),
+    ("distance", "FLOAT"),
+]
 PR_SET_PTRACER = 0x59616D61
+EXIT_AFTER_EOF_SECONDS = 30
 
 
-def enable_stall_capture():
+def enable_stall_capture(launcher_pid):
     import ctypes
     import faulthandler
 
     libc = ctypes.CDLL(None, use_errno=True)
-    require(libc.prctl(PR_SET_PTRACER, os.getppid(), 0, 0, 0) == 0, f"PR_SET_PTRACER failed: {ctypes.get_errno()}")
+    require(os.getppid() == launcher_pid, "Stall diagnostics launcher changed")
+    require(libc.prctl(PR_SET_PTRACER, launcher_pid, 0, 0, 0) == 0, f"PR_SET_PTRACER failed: {ctypes.get_errno()}")
+    if os.getppid() != launcher_pid:
+        libc.prctl(PR_SET_PTRACER, 0, 0, 0, 0)
+        raise AssertionError("Stall diagnostics launcher changed")
+    # Python restores the previous disposition before native teardown finishes.
+    signal.signal(signal.SIGUSR2, signal.SIG_IGN)
     faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
+
+
+def start_worker(command, **options):
+    # An explicitly ignored SIGCHLD makes Linux reap the child automatically.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    return subprocess.Popen(command, **options)
+
+
+def worker_exited(child):
+    # Leave the PID reserved while the debugger and watchdog can still use it.
+    return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
 
 
 def capture_stall(child, case, progress, reason):
@@ -48,44 +74,53 @@ def capture_stall(child, case, progress, reason):
         pid=child.pid,
         progress=progress,
         build_workspaces=sorted(path.name for path in (case / "indexes").glob(".build-*")),
+        python_dump_requested=False,
     )
-    try:
-        with (case / "native-stacks.log").open("w") as log:
-            result = subprocess.run(
-                [
-                    "gdb",
-                    "-q",
-                    "-n",
-                    "-batch",
-                    "-ex",
-                    "set debuginfod enabled off",
-                    "-ex",
-                    "set pagination off",
-                    "-ex",
-                    "thread apply all bt 32",
-                    "-ex",
-                    "detach",
-                    "-p",
-                    str(child.pid),
-                ],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                timeout=20,
-            )
-        diagnostic["gdb_exit_status"] = result.returncode
-        if child.poll() is None:
-            child.send_signal(signal.SIGUSR2)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        diagnostic["error"] = str(error)
+    if not progress["diagnostics_ready"]:
+        diagnostic["skipped"] = "worker_diagnostics_not_ready"
+    elif worker_exited(child):
+        diagnostic["skipped"] = "worker_exited"
+    else:
+        try:
+            with (case / "native-stacks.log").open("w") as log:
+                result = subprocess.run(
+                    [
+                        "gdb",
+                        "-q",
+                        "-n",
+                        "-batch",
+                        "-ex",
+                        "set debuginfod enabled off",
+                        "-ex",
+                        "set pagination off",
+                        "-ex",
+                        "thread apply all bt 32",
+                        "-ex",
+                        "detach",
+                        "-p",
+                        str(child.pid),
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=20,
+                )
+            diagnostic["gdb_exit_status"] = result.returncode
+        except (OSError, subprocess.TimeoutExpired) as error:
+            diagnostic["gdb_error"] = str(error)
+        if not worker_exited(child):
+            try:
+                os.kill(child.pid, signal.SIGUSR2)
+                diagnostic["python_dump_requested"] = True
+            except OSError as error:
+                diagnostic["python_error"] = str(error)
     (case / "stall.json").write_text(json.dumps(diagnostic, indent=2) + "\n")
 
 
 def row(key, epoch, dimension, fixture):
     result = AUTO.row(key, epoch)
     if fixture == "cost":
-        result["embedding"] = [float(key) + (epoch % 3) / 64] + [
-            float((key * (i + 3)) % (i + 11)) for i in range(1, dimension)
-        ]
+        first = MIXED.BASE.float32_vector([float(key) + (epoch % 3) / 64])[0]
+        result["embedding"] = [first] + [float((key * (i + 3)) % (i + 11)) for i in range(1, dimension)]
     else:
         result["embedding"].extend(((key * (i + 1)) % 17) / 16 for i in range(8, dimension))
     return result
@@ -117,6 +152,18 @@ def watermark(connection):
     )[0]["n"]
 
 
+def healthy(connection):
+    optimizer, maintenance = AUTO.healthy(connection)
+    require(not optimizer["error"], f"Optimizer reported an error: {optimizer}")
+    require(not maintenance["error"], f"Maintenance reported an error: {maintenance}")
+    return optimizer, maintenance
+
+
+def await_drain_status(ready, deadline):
+    remaining = deadline - time.monotonic()
+    return remaining > 0 and ready.wait(remaining) and time.monotonic() < deadline
+
+
 def counters():
     values = {}
     for filename, keys in [
@@ -133,7 +180,7 @@ def counters():
 
 
 def bootstrap(root, count, dimension, fixture):
-    connection = BASE.connect(root)
+    connection = BASE.connect(root, root / "extensions")
     (root / "indexes").mkdir()
     for sql in [
         "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)",
@@ -176,13 +223,25 @@ def bootstrap(root, count, dimension, fixture):
     return connection
 
 
-def worker(args):
-    if args.capture_stalls:
-        enable_stall_capture()
-    import vane
+def verify_write_budget(connection, count, dimension, fixture):
+    before = AUTO.current_stamp(connection)
+    try:
+        KEYED.mutate(connection, "budget-preflight", [row(count + i, 0, dimension, fixture) for i in range(257)])
+    except Exception as error:
+        require("RESOURCE_EXHAUSTED: Vortex write inline rows budget exceeded" in str(error), str(error))
+    else:
+        raise AssertionError("A 257-row mutation crossed the configured 256-row T budget")
+    AUTO.WRITE.check_no_request(connection, "budget-preflight")
+    require(
+        AUTO.WRITE.count(connection) == count and AUTO.current_stamp(connection) == before,
+        "Rejected preflight mutation changed the committed state",
+    )
 
+
+def worker(args):
     root, count, dimension, fixture = args.worker_case, args.rows[0], args.dimensions[0], args.fixtures[0]
     lock, stopped = threading.Lock(), threading.Event()
+    drain_ready = threading.Event()
     pipe = os.fdopen(args.events_fd, "w", encoding="utf-8", buffering=1)
     emitted = 0
     phase = "setup"
@@ -199,15 +258,13 @@ def worker(args):
         with lock:
             return dict(counters(), event_pipe_bytes=emitted, time_ns=time.monotonic_ns())
 
+    if args.capture_stalls:
+        enable_stall_capture(args.diagnostics_parent_pid)
+        emit("diagnostics_ready")
+    import vane
+
     connection = bootstrap(root, count, dimension, fixture)
-    try:
-        KEYED.mutate(connection, "budget-preflight", [row(count + i, 0, dimension, fixture) for i in range(257)])
-    except Exception as error:
-        require("RESOURCE_EXHAUSTED: Vortex write inline rows budget exceeded" in str(error), str(error))
-    else:
-        raise AssertionError("A 257-row mutation crossed the configured 256-row T budget")
-    AUTO.WRITE.check_no_request(connection, "budget-preflight")
-    require(AUTO.WRITE.count(connection) == count, "Rejected preflight mutation changed the live row count")
+    verify_write_budget(connection, count, dimension, fixture)
     emit(
         "ready",
         version=vane.__version__,
@@ -224,7 +281,8 @@ def worker(args):
     )
     keys, epoch = list(range(count)), 1
     pending_started = None
-    errors = []
+    errors, acknowledged = [], []
+    last_drain_sample = None
     cursors = [connection.cursor() for _ in range(args.readers + 1)]
     baseline = usage()
 
@@ -234,11 +292,13 @@ def worker(args):
         except Exception as error:
             errors.append(str(error))
             stopped.set()
+            drain_ready.set()
             raise
 
     def reader(index):
         cursor = cursors[index]
         serial = index
+        checked_schema = False
         while not stopped.is_set():
             serial += args.readers
             canary = index == 0
@@ -258,6 +318,11 @@ def worker(args):
             started = time.monotonic_ns()
             hits = query(cursor, BASE.SEARCH.search_sql(vector, category=category))
             finished = time.monotonic_ns()
+            if not checked_schema:
+                require(
+                    [(col[0], str(col[1])) for col in cursor.description] == SEARCH_COLUMNS, "Search schema changed"
+                )
+                checked_schema = True
             after = watermark(cursor)
             emit(
                 "query",
@@ -275,11 +340,18 @@ def worker(args):
             stopped.wait(args.recovery_query_pause if phase in ["recovery", "drain"] else args.query_pause)
 
     def monitor():
+        nonlocal last_drain_sample
         cursor = cursors[-1]
         while not stopped.is_set():
-            optimizer, maintenance = AUTO.healthy(cursor)
+            sample_phase = phase
+            optimizer, maintenance = healthy(cursor)
             source = query(cursor, "SELECT * FROM ducklake_vortex_source_retention_status('lake')")[0]
-            emit("sample", phase=phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
+            sample = dict(phase=sample_phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
+            emit("sample", **sample)
+            if sample_phase == "drain":
+                last_drain_sample = sample
+                if AUTO.ready_for_settle(optimizer, maintenance, source):
+                    drain_ready.set()
             stopped.wait(0.25)
 
     def producer(name, interval, deadline):
@@ -329,6 +401,7 @@ def worker(args):
                         elapsed_ms=(finished - started) / 1e6,
                         input_bytes=canonical_bytes(rows, deletes, dimension),
                     )
+                    acknowledged.append(receipt)
                     for slot, key in changes:
                         keys[slot] = key
                     epoch += 1
@@ -348,10 +421,23 @@ def worker(args):
                 task.result(timeout=args.seconds + 90)
                 emit("phase", phase=name, begin=begin, end=usage(), interval_seconds=interval)
                 require(not errors, str(errors))
-            phase = "drain"
             begin = usage()
-            _, source, footprint = AUTO.settle(connection, root, 2, min(100000, 3 * count + 2048))
-            emit("drained", begin=begin, end=usage(), source=source, footprint=footprint)
+            deadline_ns = begin["time_ns"] + AUTO.SETTLE_TIMEOUT_SECONDS * 1_000_000_000
+            deadline = deadline_ns / 1e9
+            phase = "drain"
+            emit("drain_started", begin=begin, deadline_ns=deadline_ns)
+            try:
+                ready = await_drain_status(drain_ready, deadline)
+                require(not errors, str(errors))
+                require(ready, "Automatic pipeline did not settle: status monitor did not observe readiness by deadline")
+                emit("drain_verifying", time_ns=time.monotonic_ns())
+                _, source, footprint = AUTO.settle(connection, root, 2, min(100000, 3 * count + 2048), deadline=deadline)
+                verified_at_ns = time.monotonic_ns()
+                require(verified_at_ns < deadline_ns, "Automatic pipeline did not settle: verification crossed deadline")
+            except Exception as error:
+                emit("drain_failed", time_ns=time.monotonic_ns(), sample=last_drain_sample, error=str(error))
+                raise
+            emit("drained", begin=begin, end=usage(), verified_at_ns=verified_at_ns, source=source, footprint=footprint)
         finally:
             stopped.set()
             for task in tasks:
@@ -360,29 +446,7 @@ def worker(args):
                 cursor.close()
     emit("measured", begin=baseline, end=usage())
     try:
-        require(not errors, str(errors))
-        emit("final_rows", rows=BASE.raw(connection))
-        recorded = query(
-            connection,
-            "SELECT request_id,snapshot_id FROM "
-            + REQUESTS
-            + " WHERE starts_with(request_id,'steady-') ORDER BY snapshot_id",
-        )
-        require(len(recorded) == epoch - 1, "Rejected attempts left receipts or successful writes lost receipts")
-        for entry in recorded[:1] + recorded[-1:]:
-            # Retry checks run outside the measured workload.
-            number = int(entry["request_id"].split("-")[-1])
-            old_keys = list(range(count))
-            for n in range(1, number + 1):
-                rows, deletes, changes = plan(old_keys, n, dimension, fixture)
-                for slot, key in changes:
-                    old_keys[slot] = key
-            require(
-                KEYED.mutate(connection, entry["request_id"], rows, deletes)["snapshot_id"] == entry["snapshot_id"],
-                "Retry changed its receipt",
-            )
-        emit("retry_rows", rows=BASE.raw(connection))
-    finally:
+        healthy(connection)
         connection.execute("SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')")
         connection.execute("SELECT * FROM ducklake_cancel_vortex_maintenance('lake')")
         deadline = time.monotonic() + 30
@@ -392,6 +456,39 @@ def worker(args):
         ):
             require(time.monotonic() < deadline, "Workers did not stop at load teardown")
             time.sleep(0.01)
+        require(not errors, str(errors))
+        final_rows = KEYED.business_rows(connection)
+        emit("final_rows", rows=final_rows)
+        recorded = query(
+            connection,
+            "SELECT table_uuid,request_id,payload_hash,row_count,snapshot_id FROM "
+            + REQUESTS
+            + " WHERE starts_with(request_id,'steady-') ORDER BY snapshot_id",
+        )
+        require(recorded == acknowledged, "Durable mutation receipts diverged from successful acknowledgements")
+        if pending_started is not None:
+            request = f"steady-{epoch}"
+            AUTO.WRITE.check_no_request(connection, request)
+            emit("unadmitted", request_id=request, started_ns=pending_started)
+        stamp = AUTO.current_stamp(connection)
+        for entry in recorded[:1] + recorded[-1:]:
+            # Retry checks run outside the measured workload.
+            number = int(entry["request_id"].split("-")[-1])
+            old_keys = list(range(count))
+            for n in range(1, number + 1):
+                rows, deletes, changes = plan(old_keys, n, dimension, fixture)
+                for slot, key in changes:
+                    old_keys[slot] = key
+            require(
+                KEYED.mutate(connection, entry["request_id"], rows, deletes) == entry,
+                "Retry changed its receipt",
+            )
+            require(
+                AUTO.current_stamp(connection) == stamp and KEYED.business_rows(connection) == final_rows,
+                "Retry changed the snapshot, index or current rows",
+            )
+        emit("retry_rows", rows=KEYED.business_rows(connection))
+    finally:
         connection.close()
         pipe.close()
 
@@ -417,29 +514,68 @@ def valid_hits(sample, model):
     rows = sample["rows"]
     if len(rows) > 10 or len({entry["id"] for entry in rows}) != len(rows):
         return None
-    previous = -1
-    point = sample["vector"]
-    for entry in rows:
-        expected = model.get(entry["id"])
-        if expected is None or any(entry[key] != expected[key] for key in ["embedding", "category", "payload"]):
-            return None
-        if sample["category"] is not None and entry["category"] != sample["category"]:
-            return None
-        exact = sum((a - b) ** 2 for a, b in zip(entry["embedding"], point))
-        if entry["distance"] < previous or not math.isclose(entry["distance"], exact, rel_tol=1e-5, abs_tol=1e-4):
-            return None
-        previous = entry["distance"]
     eligible = [
         entry for entry in model.values() if sample["category"] is None or entry["category"] == sample["category"]
     ]
     if not eligible:
         return 1.0 if not rows else None
-    vectors = np.asarray([entry["embedding"] for entry in eligible], dtype=np.float64)
-    distances = np.sum((vectors - np.asarray(point)) ** 2, axis=1)
-    ranked = sorted(zip(distances.tolist(), [entry["id"] for entry in eligible]))[:10]
-    wanted = {key for _, key in ranked}
-    recall = len(wanted & {entry["id"] for entry in rows}) / len(wanted)
-    return recall
+    point = np.asarray(sample["vector"], dtype=np.float32)
+    vectors = np.asarray([entry["embedding"] for entry in eligible], dtype=np.float32)
+    require(vectors.shape == (len(eligible), len(point)), "Oracle vector dimension mismatch")
+    # Rounding each coordinate and addition matches the native Float32 distance.
+    distances = np.zeros(len(eligible), dtype=np.float32)
+    for coordinate in range(len(point)):
+        difference = vectors[:, coordinate] - point[coordinate]
+        distances += difference * difference
+    scores = {entry["id"]: score for entry, score in zip(eligible, distances.tolist())}
+    previous = 0.0
+    for entry in rows:
+        key = entry["id"]
+        if type(key) is not int or key not in scores:
+            return None
+        expected = model[key]
+        if any(entry[field] != expected[field] for field in ("embedding", "category", "payload")):
+            return None
+        distance = entry["distance"]
+        if not math.isfinite(distance) or distance < previous:
+            return None
+        if not math.isclose(distance, scores[key], rel_tol=1e-5, abs_tol=1e-4):
+            return None
+        previous = distance
+
+    # Public search omits physical addresses. At the cutoff, assume that omitted
+    # equal-score rows precede returned rows. The frozen proof checks exact tie order.
+    k = min(10, len(scores))
+    cutoff = sorted(distances.tolist())[k - 1]
+    nearer = sum(score < cutoff for score in scores.values())
+    found_nearer = sum(scores[entry["id"]] < cutoff for entry in rows)
+    found_tied = sum(scores[entry["id"]] == cutoff for entry in rows)
+    tied = sum(score == cutoff for score in scores.values())
+    return (found_nearer + max(0, k - nearer - (tied - found_tied))) / k
+
+
+def check_oracle():
+    point = [0.0, 0.0, 0.0]
+    model = {key: dict(id=key, embedding=[float(key), 0.0, 0.0], category="B", payload=None) for key in range(8)}
+    tied_vectors = ([4096.0, 1.0, 1.0], [4096.0, 0.0, 0.0], [4096.0, 1.0, 0.0], [4096.0, 0.0, 1.0])
+    for key, vector in enumerate(tied_vectors, 8):
+        model[key] = dict(id=key, embedding=vector, category="B", payload=None)
+    rows = [dict(model[key], distance=MIXED.float32_squared_l2(point, model[key]["embedding"])) for key in range(10)]
+    sample = dict(rows=rows, vector=point, category="B")
+    require(valid_hits(sample, model) == 0.8, "Oracle treated a Float32 cutoff tie as a known physical order")
+    for bad in (
+        dict(rows[9], id=float(rows[9]["id"])),
+        dict(rows[9], embedding=[4096.0]),
+        dict(rows[9], distance=float("inf")),
+        dict(rows[9], category="A"),
+    ):
+        require(valid_hits(dict(sample, rows=rows[:-1] + [bad]), model) is None, "Oracle accepted an invalid hit")
+    require(valid_hits(dict(sample, rows=rows[::-1]), model) is None, "Oracle accepted unordered distances")
+    require(
+        valid_hits(dict(sample, rows=[dict(rows[0], distance=-0.00005)]), model) is None,
+        "Oracle accepted a negative squared distance",
+    )
+    require(row(262144, 8065, 8, "cost")["embedding"][0] == 262144.0, "Cost model lost native Float32 rounding")
 
 
 def validate(events, count, dimension, fixture):
@@ -485,12 +621,12 @@ def validate(events, count, dimension, fixture):
             if recall is not None:
                 compatible_recalls.append(recall)
         require(compatible_recalls, "Query matches no single committed state inside its read window")
-        best = min(compatible_recalls)
+        lower_bound = min(compatible_recalls)
         if sample["canary"]:
-            canary_recalls.append(best)
+            canary_recalls.append(lower_bound)
         else:
-            exploration_recalls.append(best)
-        recalls.append(best)
+            exploration_recalls.append(lower_bound)
+        recalls.append(lower_bound)
         overlapping += upper > lower
     for change in changes[position:]:
         apply(model, change)
@@ -556,6 +692,9 @@ def summarize(events):
     return dict(
         phases=result,
         burst_reached_write_budget=result["burst"]["backpressure_rejections"] > 0,
+        terminal_unadmitted_request=next(
+            (entry["request_id"] for entry in events if entry["kind"] == "unadmitted"), None
+        ),
         drain=delta(drain["begin"], drain["end"]),
         footprint=drain["footprint"],
         sampled_peak_rss_kib=max(entry["usage"]["VmRSS"] for entry in samples),
@@ -570,6 +709,121 @@ def summarize(events):
         baseline_rss_kib=next(entry for entry in events if entry["kind"] == "measured")["begin"]["VmRSS"],
         end_rss_kib=next(entry for entry in events if entry["kind"] == "measured")["end"]["VmRSS"],
     )
+
+
+def stall_reason(progress, now, deadline):
+    if progress["ready"]:
+        if now - progress["time"] >= 30:
+            return "no_events_30_seconds"
+        if now - progress["query_time"] >= 30:
+            return "queries_stalled_30_seconds"
+    exit_deadline = progress.get("exit_deadline")
+    if exit_deadline is not None and exit_deadline < deadline and exit_deadline - now <= 25:
+        return "event_pipe_exit_deadline"
+    if deadline - now <= 25:
+        return "watchdog_deadline"
+    return None
+
+
+def collect_worker_events(child, case, pipe, budget, capture_stalls):
+    events, malformed = [], None
+    exit_timed_out = False
+    expired, stopped = threading.Event(), threading.Event()
+    progress_lock = threading.Lock()
+    now = time.monotonic()
+    deadline = now + budget
+    progress = dict(time=now, query_time=now, ready=False, diagnostics_ready=False)
+
+    def kill_worker():
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def expire():
+        if not worker_exited(child):
+            expired.set()
+            kill_worker()
+
+    def diagnose():
+        while not stopped.wait(0.25):
+            if worker_exited(child):
+                return
+            with progress_lock:
+                current = dict(progress)
+            reason = stall_reason(current, time.monotonic(), deadline)
+            if reason is not None:
+                capture_stall(child, case, current, reason)
+                return
+
+    watchdog = diagnostics = None
+    try:
+        watchdog = threading.Timer(max(0, deadline - time.monotonic()), expire)
+        watchdog.start()
+        if capture_stalls:
+            diagnostics = threading.Thread(target=diagnose)
+            diagnostics.start()
+        with (case / "events.jsonl").open("wb") as trace:
+            for line in pipe:
+                trace.write(line)
+                try:
+                    event = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    malformed = malformed or str(error)
+                    continue
+                if not isinstance(event, dict) or not isinstance(event.get("kind"), str):
+                    malformed = malformed or "event kind is missing"
+                    continue
+                events.append(event)
+                if capture_stalls:
+                    with progress_lock:
+                        now = time.monotonic()
+                        kind = event["kind"]
+                        progress.update(time=now, kind=kind, phase=event.get("phase"))
+                        if kind == "diagnostics_ready":
+                            progress["diagnostics_ready"] = True
+                        elif kind == "ready":
+                            progress.update(ready=True, query_time=now)
+                        elif kind == "query":
+                            progress["query_time"] = now
+                            progress["last_query"] = {
+                                key: event.get(key) for key in ["vector", "category", "before", "after", "canary"]
+                            }
+                        elif kind == "sample":
+                            progress["sample"] = event
+                        elif kind == "measured":
+                            progress["ready"] = False
+        exit_deadline = time.monotonic() + EXIT_AFTER_EOF_SECONDS
+        if capture_stalls:
+            with progress_lock:
+                progress["exit_deadline"] = exit_deadline
+        while not worker_exited(child):
+            if time.monotonic() >= exit_deadline:
+                exit_timed_out = True
+                break
+            time.sleep(0.01)
+    finally:
+        stopped.set()
+        if watchdog is not None:
+            watchdog.cancel()
+            if watchdog.ident is not None:
+                watchdog.join()
+        if not worker_exited(child):
+            kill_worker()
+        if diagnostics and diagnostics.ident is not None:
+            diagnostics.join()
+        child.wait(timeout=10)
+
+    if child.returncode != 0 or exit_timed_out:
+        watchdog_expired = expired.is_set() and child.returncode == -signal.SIGKILL
+        error = f"Load worker failed (exit {child.returncode}, watchdog_expired={watchdog_expired}). "
+        if exit_timed_out:
+            error += f"Worker kept running after closing its event pipe for {EXIT_AFTER_EOF_SECONDS} seconds. "
+        if malformed:
+            error += f"Malformed event in events.jsonl. {malformed}. "
+        raise AssertionError(error + (case / "worker.log").read_text(errors="replace")[-6000:])
+    require(malformed is None, f"Malformed event in events.jsonl. {malformed}")
+    return events
 
 
 def run_case(args, root, count, dimension, fixture):
@@ -600,76 +854,15 @@ def run_case(args, root, count, dimension, fixture):
         str(args.recovery_query_pause),
     ]
     if args.capture_stalls:
-        command.append("--capture-stalls")
-    events = []
-    with (case / "worker.log").open("w") as log:
-        child = subprocess.Popen(command, pass_fds=(write_fd,), stdout=log, stderr=subprocess.STDOUT)
-        os.close(write_fd)
-        expired, diagnostics_stopped = threading.Event(), threading.Event()
-        progress_lock = threading.Lock()
-        progress = dict(time=time.monotonic(), query_time=time.monotonic(), ready=False)
-        deadline = time.monotonic() + 3 * args.seconds + 300
-
-        def expire():
-            expired.set()
-            child.kill()
-
-        def diagnose():
-            while not diagnostics_stopped.wait(0.25):
-                if child.poll() is not None:
-                    return
-                with progress_lock:
-                    current = dict(progress)
-                now = time.monotonic()
-                stalled = current["ready"] and now - current["time"] >= 30
-                queries_stalled = current["ready"] and now - current["query_time"] >= 30
-                if stalled or queries_stalled or deadline - now <= 25:
-                    reason = (
-                        "queries_stalled_30_seconds"
-                        if queries_stalled
-                        else "no_events_30_seconds" if stalled else "watchdog_deadline"
-                    )
-                    capture_stall(child, case, current, reason)
-                    return
-
-        watchdog = threading.Timer(3 * args.seconds + 300, expire)
-        watchdog.start()
-        diagnostics = threading.Thread(target=diagnose) if args.capture_stalls else None
-        if diagnostics:
-            diagnostics.start()
-        try:
-            with os.fdopen(read_fd, encoding="utf-8") as pipe, (case / "events.jsonl").open("w") as trace:
-                for line in pipe:
-                    trace.write(line)
-                    event = json.loads(line)
-                    events.append(event)
-                    with progress_lock:
-                        progress.update(time=time.monotonic(), kind=event["kind"], phase=event.get("phase"))
-                        if event["kind"] == "ready":
-                            progress.update(ready=True, query_time=time.monotonic())
-                        elif event["kind"] == "query":
-                            progress["query_time"] = time.monotonic()
-                            progress["last_query"] = {
-                                key: event[key] for key in ["vector", "category", "before", "after", "canary"]
-                            }
-                        elif event["kind"] == "sample":
-                            progress["sample"] = event
-                        elif event["kind"] == "measured":
-                            progress["ready"] = False
-            child.wait(timeout=30)
-            require(
-                child.returncode == 0,
-                f"Load worker failed (exit {child.returncode}, watchdog_expired={expired.is_set()}): "
-                + (case / "worker.log").read_text()[-6000:],
-            )
-        finally:
-            watchdog.cancel()
-            diagnostics_stopped.set()
-            if diagnostics:
-                diagnostics.join(timeout=25)
-            if child.poll() is None:
-                child.kill()
-                child.wait(timeout=10)
+        command.extend(["--capture-stalls", "--diagnostics-parent-pid", str(os.getpid())])
+    with (
+        os.fdopen(read_fd, "rb") as pipe,
+        os.fdopen(write_fd, "wb") as event_writer,
+        (case / "worker.log").open("w") as log,
+    ):
+        child = start_worker(command, pass_fds=(event_writer.fileno(),), stdout=log, stderr=subprocess.STDOUT)
+        event_writer.close()
+        events = collect_worker_events(child, case, pipe, 3 * args.seconds + 300, args.capture_stalls)
     result = dict(
         status="completed",
         fixture=fixture,
@@ -679,7 +872,7 @@ def run_case(args, root, count, dimension, fixture):
         **validate(events, count, dimension, fixture),
         **summarize(events),
     )
-    result["stall_capture_performed"] = (case / "stall.json").exists()
+    result["stall_capture_attempted"] = (case / "stall.json").exists()
     result["correctness"] = "passed"
     if not result["canary_gate_passed"]:
         result.update(status="failed", error="Qualified canary fell below its unchanged 0.8 recall gate")
@@ -693,6 +886,7 @@ def main():
     destination.add_argument("--output-dir", type=Path)
     destination.add_argument("--worker-case", type=Path)
     parser.add_argument("--events-fd", type=int)
+    parser.add_argument("--diagnostics-parent-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--fixtures", choices=["cost", "automatic"], nargs="+", default=["automatic"])
     parser.add_argument("--rows", type=int, nargs="+", default=[4096])
     parser.add_argument("--dimensions", type=int, nargs="+", default=[8])
@@ -704,7 +898,7 @@ def main():
         "--capture-stalls", action="store_true", help="Capture native/Python stacks before watchdog termination"
     )
     args = parser.parse_args()
-    require(os.environ.get("VANE_RUNNER") == "local-fast", "Set VANE_RUNNER=local-fast explicitly")
+    require(os.environ.get("VANE_RUNNER") == "local", "Set VANE_RUNNER=local explicitly")
     require(not args.capture_stalls or shutil.which("gdb"), "--capture-stalls requires gdb")
     require(
         all(512 <= n <= 32768 for n in args.rows) and all(8 <= n <= 128 for n in args.dimensions),
@@ -720,8 +914,11 @@ def main():
             args.events_fd is not None and len(args.rows) == len(args.dimensions) == len(args.fixtures) == 1,
             "Worker requires one case and its event pipe",
         )
+        if args.capture_stalls:
+            require(args.diagnostics_parent_pid is not None and args.diagnostics_parent_pid > 0, "Missing launcher PID")
         worker(args)
         return
+    check_oracle()
     root = args.output_dir.resolve()
     root.mkdir(mode=0o700, parents=True)
     report = dict(
@@ -746,12 +943,16 @@ def main():
                         result = run_case(args, root, count, dimension, fixture)
                     except Exception as error:
                         failed = True
+                        case = root / f"{fixture}-rows-{count}-dim-{dimension}"
                         result = dict(
-                            status="failed", fixture=fixture, rows=count, dimension=dimension, error=str(error)
+                            status="failed",
+                            fixture=fixture,
+                            rows=count,
+                            dimension=dimension,
+                            error=str(error),
+                            stall_capture_attempted=(case / "stall.json").exists(),
                         )
-                        (root / f"{fixture}-rows-{count}-dim-{dimension}" / "report.json").write_text(
-                            json.dumps(result, indent=2) + "\n"
-                        )
+                        (case / "report.json").write_text(json.dumps(result, indent=2) + "\n")
                         print(f"Load case failed: {count} rows / {dimension}D; see worker.log", flush=True)
                     else:
                         print(

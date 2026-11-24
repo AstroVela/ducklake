@@ -2,6 +2,8 @@
 
 #include "common/ducklake_data_file.hpp"
 #include "duckdb/common/open_file_info.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
 
@@ -13,8 +15,8 @@ struct DuckLakeCopyInput;
 struct DuckLakeCopyOptions;
 
 struct DuckLakeVortex {
-	static DataFileFormat GetFormat(const DuckLakeCatalog &catalog, SchemaIndex schema, TableIndex table);
-	static DataFileFormat GetFormat(DuckLakeTableEntry &table);
+	static DataFileFormat GetFormat(ClientContext &context, DuckLakeCatalog &catalog, TableIndex table);
+	static DataFileFormat GetFormat(ClientContext &context, DuckLakeTableEntry &table);
 	static void ValidateEnabled();
 	static void ValidateTable(DuckLakeTableEntry &table);
 	static bool IsVortex(const OpenFileInfo &file);

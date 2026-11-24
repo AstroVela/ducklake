@@ -55,7 +55,7 @@ The native `native_known_rollback_file_cleanup.test` verifies that ordinary
 ROLLBACK and a constraint failure before COMMIT still remove unpublished
 Parquet files and preserve previously committed rows. It also exercises
 concurrent file-backed inserts and verifies the rows and files after reopen.
-The original proof branches retain the baseline failures for comparison.
+Unpatched baseline commits remain available for negative-control runs.
 
 The repair passed all four PostgreSQL fault cases: inline/file-backed writes
 crossed with COMMIT not forwarded/COMMIT acknowledged by the server but its
@@ -64,11 +64,11 @@ removed prepared files. Fresh clients verified the actual rows, historical
 snapshots, and repeated request handling. In the file-backed cases all six
 prepared/existing Parquet files remained, including the deletion file.
 
-The affected native selection passed 51 test cases and 1,429 assertions,
-with seven tests skipped for unavailable optional httpfs/icu/json/tpch
-extensions. It includes transactions, concurrent writes, defaults, nested
-types, constraints, UPDATE, MERGE, and the Vane native tests. The native
-process-recovery probe also passed all three SIGKILL boundaries.
+The affected native selection covers transactions, concurrent writes,
+defaults, nested types, constraints, UPDATE, MERGE, and the Vane native
+tests. The native process-recovery probe independently checks three
+SIGKILL boundaries. Optional extension requirements remain explicit; a
+skipped test does not qualify its corresponding path.
 
 Local protocol qualification uses PostgreSQL 15.13 with fsync and
 synchronous_commit enabled, native DuckDB and local files. It does not
