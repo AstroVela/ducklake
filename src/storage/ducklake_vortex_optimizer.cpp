@@ -1573,7 +1573,15 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				break;
 			}
 			if (!progressed) {
-				changed.wait_for(guard, std::chrono::milliseconds(100));
+				const auto started_wait = std::chrono::steady_clock::now();
+				const auto outcome = changed.wait_for(guard, std::chrono::milliseconds(100));
+				const auto elapsed = std::chrono::steady_clock::now() - started_wait;
+				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+				const auto phase = outcome == std::cv_status::timeout ? Phase::LOOP_WAIT_TIMEOUT : Phase::LOOP_WAIT_WAKE;
+				// Credit this shared wait to the maintenance registrations scheduled in this iteration.
+				for (auto &pending : cleanup) {
+					pending->profile->Record(phase, ns);
+				}
 			}
 		}
 		{
@@ -2256,7 +2264,8 @@ vector<vector<Value>> DuckLakeVortexOptimizer::MaintenanceProfile(ClientContext 
 	const char *names[] = {
 	    "optimizer_total",      "optimizer_probe", "optimizer_metadata", "maintenance_total", "maintenance_probe",
 	    "maintenance_metadata", "build_recovery",  "build_gc",           "generation_gc",     "source_gc",
-	    "source_wait",          "source_metadata", "source_expire",      "source_artifact",   "source_unlink"};
+	    "source_wait",          "source_metadata", "source_expire",      "source_artifact",   "source_unlink",
+	    "loop_wait_timeout",    "loop_wait_wake"};
 	static_assert(sizeof(names) / sizeof(names[0]) == idx_t(Phase::COUNT), "Missing Vortex profile stage name");
 	auto samples = profile->Snapshot();
 	for (idx_t i = 0; i < samples.size(); i++) {
