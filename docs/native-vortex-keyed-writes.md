@@ -113,7 +113,7 @@ maintenance stage, see [automatic flow](native-vortex-automatic-flow.md).
 
 ```sh
 cmake --build build/runtime --target ducklake_vortex_write_driver
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_keyed_writes.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_keyed_writes.py \
     --driver build/runtime/ducklake_vortex_write_driver \
     --output-dir /tmp/vane-vortex-keyed-proof
 ```

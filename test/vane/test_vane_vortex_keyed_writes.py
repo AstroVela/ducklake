@@ -465,7 +465,7 @@ def main():
     destination.add_argument("--recover-case", type=Path)
     parser.add_argument("--committed", type=int, choices=[0, 1])
     args = parser.parse_args()
-    require(os.environ.get("VANE_RUNNER") == "local-fast", "Set VANE_RUNNER=local-fast explicitly")
+    require(os.environ.get("VANE_RUNNER") == "local", "Set VANE_RUNNER=local explicitly")
     if args.recover_case:
         require(args.committed is not None, "Recovery requires an explicit expected commit outcome")
         recover(args.recover_case.resolve(), bool(args.committed))

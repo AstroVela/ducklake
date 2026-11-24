@@ -8,7 +8,7 @@ fi
 vortex_source=${VORTEX_SOURCE_DIR:?Set the pinned Vortex source directory}
 zstd_library=${ZSTD_STATIC_LIBRARY:?Set the PIC static zstd archive}
 zstd_include=${ZSTD_INCLUDE_DIR:?Set the qualified zstd include directory}
-vortex_revision=8a3b12a4a2f90dde6ba7f158ba63fb43537da39d
+vortex_revision=54b2bde9255e24c21f936f5623fd4a66e4a7ede0
 [[ $(git -C "$vortex_source" rev-parse HEAD) == "$vortex_revision" ]]
 git -C "$vortex_source" diff --quiet HEAD
 [[ "$zstd_library" == /*.a && -f "$zstd_library" && -f "$zstd_include/zstd.h" ]]

@@ -156,7 +156,7 @@ def exercise(root, report):
     require(
         Path(vane.__file__).resolve().is_relative_to(site), "Vane must come from this environment's installed wheel"
     )
-    require(runners.get_or_infer_runner_type() == "local-fast", "Native Vane runner was not selected")
+    require(runners.get_or_infer_runner_type() == "local", "Native Vane runner was not selected")
     report.update(vane_version=importlib.metadata.version("vane-ai"), vane_path=str(Path(vane.__file__).resolve()))
     (root / "indexes").mkdir()
     connection = connect(root, root / "extensions", create=True)
@@ -308,7 +308,7 @@ def main():
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--crash-writer", type=Path)
     args = parser.parse_args()
-    require(os.environ.get("VANE_RUNNER") == "local-fast", "Set VANE_RUNNER=local-fast explicitly")
+    require(os.environ.get("VANE_RUNNER") == "local", "Set VANE_RUNNER=local explicitly")
     if args.crash_writer:
         crash_writer(args.crash_writer.resolve())
         return

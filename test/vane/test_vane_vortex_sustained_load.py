@@ -159,6 +159,11 @@ def healthy(connection):
     return optimizer, maintenance
 
 
+def await_drain_status(ready, deadline):
+    remaining = deadline - time.monotonic()
+    return remaining > 0 and ready.wait(remaining) and time.monotonic() < deadline
+
+
 def counters():
     values = {}
     for filename, keys in [
@@ -236,6 +241,7 @@ def verify_write_budget(connection, count, dimension, fixture):
 def worker(args):
     root, count, dimension, fixture = args.worker_case, args.rows[0], args.dimensions[0], args.fixtures[0]
     lock, stopped = threading.Lock(), threading.Event()
+    drain_ready = threading.Event()
     pipe = os.fdopen(args.events_fd, "w", encoding="utf-8", buffering=1)
     emitted = 0
     phase = "setup"
@@ -276,6 +282,7 @@ def worker(args):
     keys, epoch = list(range(count)), 1
     pending_started = None
     errors, acknowledged = [], []
+    last_drain_sample = None
     cursors = [connection.cursor() for _ in range(args.readers + 1)]
     baseline = usage()
 
@@ -285,6 +292,7 @@ def worker(args):
         except Exception as error:
             errors.append(str(error))
             stopped.set()
+            drain_ready.set()
             raise
 
     def reader(index):
@@ -332,11 +340,18 @@ def worker(args):
             stopped.wait(args.recovery_query_pause if phase in ["recovery", "drain"] else args.query_pause)
 
     def monitor():
+        nonlocal last_drain_sample
         cursor = cursors[-1]
         while not stopped.is_set():
+            sample_phase = phase
             optimizer, maintenance = healthy(cursor)
             source = query(cursor, "SELECT * FROM ducklake_vortex_source_retention_status('lake')")[0]
-            emit("sample", phase=phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
+            sample = dict(phase=sample_phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
+            emit("sample", **sample)
+            if sample_phase == "drain":
+                last_drain_sample = sample
+                if AUTO.ready_for_settle(optimizer, maintenance, source):
+                    drain_ready.set()
             stopped.wait(0.25)
 
     def producer(name, interval, deadline):
@@ -406,10 +421,23 @@ def worker(args):
                 task.result(timeout=args.seconds + 90)
                 emit("phase", phase=name, begin=begin, end=usage(), interval_seconds=interval)
                 require(not errors, str(errors))
-            phase = "drain"
             begin = usage()
-            _, source, footprint = AUTO.settle(connection, root, 2, min(100000, 3 * count + 2048))
-            emit("drained", begin=begin, end=usage(), source=source, footprint=footprint)
+            deadline_ns = begin["time_ns"] + AUTO.SETTLE_TIMEOUT_SECONDS * 1_000_000_000
+            deadline = deadline_ns / 1e9
+            phase = "drain"
+            emit("drain_started", begin=begin, deadline_ns=deadline_ns)
+            try:
+                ready = await_drain_status(drain_ready, deadline)
+                require(not errors, str(errors))
+                require(ready, "Automatic pipeline did not settle: status monitor did not observe readiness by deadline")
+                emit("drain_verifying", time_ns=time.monotonic_ns())
+                _, source, footprint = AUTO.settle(connection, root, 2, min(100000, 3 * count + 2048), deadline=deadline)
+                verified_at_ns = time.monotonic_ns()
+                require(verified_at_ns < deadline_ns, "Automatic pipeline did not settle: verification crossed deadline")
+            except Exception as error:
+                emit("drain_failed", time_ns=time.monotonic_ns(), sample=last_drain_sample, error=str(error))
+                raise
+            emit("drained", begin=begin, end=usage(), verified_at_ns=verified_at_ns, source=source, footprint=footprint)
         finally:
             stopped.set()
             for task in tasks:
@@ -870,7 +898,7 @@ def main():
         "--capture-stalls", action="store_true", help="Capture native/Python stacks before watchdog termination"
     )
     args = parser.parse_args()
-    require(os.environ.get("VANE_RUNNER") == "local-fast", "Set VANE_RUNNER=local-fast explicitly")
+    require(os.environ.get("VANE_RUNNER") == "local", "Set VANE_RUNNER=local explicitly")
     require(not args.capture_stalls or shutil.which("gdb"), "--capture-stalls requires gdb")
     require(
         all(512 <= n <= 32768 for n in args.rows) and all(8 <= n <= 128 for n in args.dimensions),

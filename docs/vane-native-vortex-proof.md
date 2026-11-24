@@ -1,7 +1,7 @@
 # Installed Vane native realtime vector flow
 
 This validation connects the [local realtime vector flow](native-vortex-basic-flow.md)
-to the public `vane.connect()` API. It uses the explicit `local-fast` runner,
+to the public `vane.connect()` API. It uses the explicit `local` runner,
 a normal Vane runtime wheel and two independently installed native providers.
 The DuckLake provider declares its exact Vortex provider dependency. Loading
 uses Vane's existing installed-provider resolver and source/ABI/artifact
@@ -25,9 +25,9 @@ these pinned inputs.
 
 | Input | Revision |
 | --- | --- |
-| Vane | `e14bf92d4053141697a59dcbd6098677cbddb80a` |
-| duckdb-vortex | `684bf8b0bfe305feeff155e0b3eb335540444b07` |
-| Vortex | `8a3b12a4a2f90dde6ba7f158ba63fb43537da39d` |
+| Vane | `14b4fc6a45f9c0a593202f1eb32f1062d365703e` |
+| duckdb-vortex | `e8d2d520299508ba98687a5553e7cd41384e9c90` |
+| Vortex | `54b2bde9255e24c21f936f5623fd4a66e4a7ede0` |
 | SPFresh | `5893eb61ee3b18610b6b00f1939be7dae1af8904` with the existing static-only patch |
 | LLVM OpenMP | `18.1.8`, source archives verified by SHA-256 |
 | DuckLake vcpkg | `84bab45d415d22042bd0b9081aea57f362da3f35` |
@@ -49,8 +49,8 @@ distributed profile remains a separate build entry.
 SPFresh needs OpenMP and zstd. The system GNU OpenMP static archive fails the
 shared-object PIC link check. `scripts/build_vane_vortex_native_sdk.sh` instead
 builds PIC static LLVM OpenMP and uses an explicit PIC static zstd archive.
-It then runs the existing pinned SPFresh build and its four native tests,
-including the shared-object link check. The SDK records the selected OpenMP
+The pinned SPFresh build links a shared object to check PIC, then runs five
+native tests. The SDK records the selected OpenMP
 archive for the provider configuration. Provider loading needs no SDK source
 directory or external OpenMP/zstd shared library.
 
@@ -73,7 +73,7 @@ artifacts into one environment. Select native execution explicitly:
 
 ```sh
 uv pip install path/to/vane_ai-*.whl path/to/vane_extension_vortex-*.whl path/to/vane_extension_ducklake-*.whl
-export VANE_RUNNER=local-fast
+export VANE_RUNNER=local
 ```
 
 Run this against a fresh directory:
@@ -139,7 +139,7 @@ appends B2 while preserving B1.
 ## Installed-package verification
 
 ```sh
-VANE_RUNNER=local-fast python -I test/vane/test_vane_native_vortex.py \
+VANE_RUNNER=local python -I test/vane/test_vane_native_vortex.py \
     --output-dir /tmp/vane-native-vortex-proof
 ```
 
