@@ -21,6 +21,7 @@
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -109,9 +110,33 @@ bool HasPolicyTable(DuckLakeTransaction &transaction) {
 	    transaction.GetConnection().TableInfo(catalog.MetadataDatabaseName(), catalog.MetadataSchemaName(), POLICIES));
 }
 
-void Initialized(Metadata &meta) {
-	if (!HasPolicyTable(meta.transaction)) {
+void Initialized(DuckLakeTransaction &transaction) {
+	if (!HasPolicyTable(transaction)) {
 		throw InvalidInputException("Vortex optimizer catalog is not initialized");
+	}
+}
+
+template <class Read>
+vector<vector<Value>> ReadStatus(ClientContext &context, const string &catalog, std::mutex &io,
+                                 const DuckLakeVortexCatalogIdentity &identity, Read read) {
+	// Register the private capture under admission before it can start any transactions.
+	auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock([&] {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	});
+	std::lock_guard<std::mutex> guard(io);
+	Connection connection(*context.db);
+	DuckLakeVortexReadCaptureScope capture(*connection.context);
+	try {
+		auto &transaction = Metadata::Begin(connection, catalog, true, &identity);
+		Initialized(transaction);
+		auto rows = read(transaction);
+		connection.Commit();
+		return rows;
+	} catch (...) {
+		VortexCatalog::Rollback(connection);
+		throw;
 	}
 }
 
@@ -161,7 +186,7 @@ Maintenance ReadMaintenance(DataChunk &chunk) {
 }
 
 Maintenance LoadMaintenance(Metadata &meta) {
-	Initialized(meta);
+	Initialized(meta.transaction);
 	auto result = meta.Query("SELECT " + string(MAINTENANCE_COLUMNS) + " FROM {METADATA_CATALOG}." + MAINTENANCE);
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() != 1) {
@@ -340,7 +365,7 @@ Policy Read(DataChunk &chunk, idx_t row, const string &catalog) {
 }
 
 Policy Load(Metadata &meta, const Policy &key) {
-	Initialized(meta);
+	Initialized(meta.transaction);
 	auto result = meta.Query("SELECT " + string(COLUMNS) + " FROM {METADATA_CATALOG}." + POLICIES + Where(key));
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() != 1) {
@@ -839,9 +864,15 @@ struct Pending {
 	std::function<void(const string &)> observe;
 };
 
+enum class MaintenanceGC { BUILDS, GENERATIONS, SOURCES };
+
+constexpr std::array<MaintenanceGC, 3> MAINTENANCE_GC {
+    {MaintenanceGC::BUILDS, MaintenanceGC::GENERATIONS, MaintenanceGC::SOURCES}};
+
 struct PendingMaintenance {
 	MaintenanceCatalog catalog;
 	std::function<void(const string &)> observe;
+	idx_t next_gc; // Accessed only by the maintenance worker.
 };
 
 struct Runtime : public std::enable_shared_from_this<Runtime> {
@@ -912,7 +943,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	}
 	void AddMaintenance(const MaintenanceCatalog &catalog, const std::function<void(const string &)> &observe) {
 		std::lock_guard<std::mutex> guard(lock);
-		maintenance[catalog.Id()] = std::make_shared<PendingMaintenance>(PendingMaintenance {catalog, observe});
+		maintenance[catalog.Id()] = std::make_shared<PendingMaintenance>(PendingMaintenance {catalog, observe, 0});
 		maintenance_cancelled.erase(catalog.Id());
 		maintenance_errors.erase(catalog.Id());
 		changed.notify_all();
@@ -1108,41 +1139,52 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 					throw InterruptException();
 				}
 			};
-			check("maintenance_before_recovery");
-			DuckLakeVortexBuildGCResult builds;
-			if (m.remaining_builds) {
-				m.recovered +=
-				    VortexCatalog::RecoverBuilds(*job->context, catalog.name, m.max_objects, check, &catalog.identity);
-				StoreMaintenance(db, catalog, m, "collecting_builds");
-				check("maintenance_before_build_gc");
-				builds = VortexCatalog::CollectBuilds(*job->context, catalog.name, m.max_objects, m.max_bytes, check,
-				                                      &catalog.identity);
-				m.builds += builds.builds;
-				m.bytes += builds.bytes;
-			}
-			check("maintenance_after_build_gc");
-			collected_objects = builds.builds;
-			collected_bytes = builds.bytes;
-			if (builds.builds < m.max_objects && builds.bytes < m.max_bytes && m.min_generation_bytes.IsValid() &&
-			    m.min_generation_bytes.GetIndex() <= m.max_bytes - builds.bytes) {
-				StoreMaintenance(db, catalog, m, "collecting_generations");
-				check("maintenance_before_generation_gc");
-				auto generations = VortexCatalog::Collect(*job->context, catalog.name, m.max_objects - builds.builds,
-				                                          m.max_bytes - builds.bytes, check, &catalog.identity);
-				m.generations += generations.generations;
-				m.bytes += generations.artifact_bytes;
-				collected_objects += generations.generations;
-				collected_bytes += generations.artifact_bytes;
-			}
-			check("maintenance_after_generation_gc");
-			if (m.source_work && collected_objects < m.max_objects && collected_bytes < m.max_bytes) {
-				StoreMaintenance(db, catalog, m, "collecting_sources");
-				auto source = DuckLakeVortexSourceRetention::Collect(
-				    *job->context, catalog.name, m.max_objects - collected_objects, m.max_bytes - collected_bytes, check,
-				    &catalog.identity);
-				m.bytes += source.bytes;
-				collected_objects += source.expired + source.files;
-				collected_bytes += source.bytes;
+			// Rotate which class can spend the shared budget first on each pass.
+			for (idx_t turn = 0; turn < MAINTENANCE_GC.size(); turn++) {
+				const auto objects = m.max_objects - collected_objects;
+				const auto bytes = m.max_bytes - collected_bytes;
+				switch (MAINTENANCE_GC[(pending->next_gc + turn) % MAINTENANCE_GC.size()]) {
+				case MaintenanceGC::BUILDS:
+					check("maintenance_before_recovery");
+					if (m.remaining_builds && objects && bytes) {
+						m.recovered +=
+						    VortexCatalog::RecoverBuilds(*job->context, catalog.name, objects, check, &catalog.identity);
+						StoreMaintenance(db, catalog, m, "collecting_builds");
+						check("maintenance_before_build_gc");
+						auto builds = VortexCatalog::CollectBuilds(*job->context, catalog.name, objects, bytes, check,
+						                                           &catalog.identity);
+						m.builds += builds.builds;
+						m.bytes += builds.bytes;
+						collected_objects += builds.builds;
+						collected_bytes += builds.bytes;
+					}
+					check("maintenance_after_build_gc");
+					break;
+				case MaintenanceGC::GENERATIONS:
+					if (objects && bytes && m.min_generation_bytes.IsValid() &&
+					    m.min_generation_bytes.GetIndex() <= bytes) {
+						StoreMaintenance(db, catalog, m, "collecting_generations");
+						check("maintenance_before_generation_gc");
+						auto generations =
+						    VortexCatalog::Collect(*job->context, catalog.name, objects, bytes, check, &catalog.identity);
+						m.generations += generations.generations;
+						m.bytes += generations.artifact_bytes;
+						collected_objects += generations.generations;
+						collected_bytes += generations.artifact_bytes;
+					}
+					check("maintenance_after_generation_gc");
+					break;
+				case MaintenanceGC::SOURCES:
+					if (m.source_work && objects && bytes) {
+						StoreMaintenance(db, catalog, m, "collecting_sources");
+						auto source = DuckLakeVortexSourceRetention::Collect(*job->context, catalog.name, objects, bytes,
+						                                                     check, &catalog.identity);
+						m.bytes += source.bytes;
+						collected_objects += source.expired + source.files;
+						collected_bytes += source.bytes;
+					}
+					break;
+				}
 			}
 		} catch (const std::exception &failure) {
 			error = failure.what();
@@ -1150,6 +1192,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		if (!FinishMaintenance(db, pending, m, error)) {
 			return false;
 		}
+		pending->next_gc = (pending->next_gc + 1) % MAINTENANCE_GC.size();
 		if (pending->observe) {
 			try {
 				pending->observe("maintenance_complete");
@@ -1829,7 +1872,7 @@ void DuckLakeVortexOptimizer::SetWriteBudget(ClientContext &context, const strin
 	}
 	Metadata meta(*context.db, catalog);
 	try {
-		Initialized(meta);
+		Initialized(meta.transaction);
 		auto p = Load(meta, Identify(meta, catalog, schema, table, index));
 		auto &entry = Table(meta, p);
 		if (entry.GetColumns().PhysicalColumnCount() != 4 || entry.GetColumns().LogicalColumnCount() != 4) {
@@ -1946,7 +1989,7 @@ void DuckLakeVortexOptimizer::Enable(ClientContext &context, const Config &confi
 		std::lock_guard<std::mutex> guard(owner->runtime->io);
 		interrupt();
 		Metadata meta(*context.db, config.catalog, true, &identity);
-		Initialized(meta);
+		Initialized(meta.transaction);
 		p = Identify(meta, config.catalog, config.schema, config.table, config.index);
 		p.config = config;
 		Validate(p);
@@ -2101,7 +2144,7 @@ void DuckLakeVortexOptimizer::EnableMaintenance(ClientContext &context, const st
 		std::lock_guard<std::mutex> guard(owner->runtime->io);
 		owner->runtime->MaintenanceCapacity(*context.db, binding);
 		Metadata meta(*context.db, catalog, true, &binding.identity);
-		Initialized(meta);
+		Initialized(meta.transaction);
 		meta.Query("INSERT INTO {METADATA_CATALOG}." + string(MAINTENANCE) + " VALUES(true,true,'idle',''," +
 		           to_string(max_objects) + "," + to_string(max_bytes) + ",0,0,0,0,0,0,0,'')");
 		meta.Commit();
@@ -2160,69 +2203,68 @@ void DuckLakeVortexOptimizer::ConfigureSourceRetention(ClientContext &context, c
 vector<vector<Value>> DuckLakeVortexOptimizer::MaintenanceStatus(ClientContext &context, const string &catalog) {
 	auto binding = ResolveMaintenanceCatalog(context, catalog, false);
 	auto owner = GetOwner(*context.db);
-	std::lock_guard<std::mutex> guard(owner->runtime->io);
-	Metadata meta(*context.db, catalog, true, &binding.identity);
-	Initialized(meta);
-	auto result = meta.Query("SELECT " + string(MAINTENANCE_COLUMNS) + " FROM {METADATA_CATALOG}." + MAINTENANCE);
-	auto chunk = result->Fetch();
-	vector<vector<Value>> rows;
-	if (chunk && chunk->size()) {
-		auto m = ReadMaintenance(*chunk);
-		std::lock_guard<std::mutex> guard_runtime(owner->runtime->lock);
-		auto found = owner->runtime->maintenance_errors.find(binding.Id());
-		auto &active = owner->runtime->active_maintenance;
-		rows.push_back(
-		    {Value(m.state), Value::BOOLEAN(m.enabled), Value::BOOLEAN(active && active->catalog.Id() == binding.Id()),
-		     Value(m.run), Value::UBIGINT(m.runs), Value::UBIGINT(m.max_objects), Value::UBIGINT(m.max_bytes),
-		     Value::UBIGINT(m.recovered), Value::UBIGINT(m.builds), Value::UBIGINT(m.generations),
-		     Value::UBIGINT(m.bytes), Value::UBIGINT(m.remaining_builds), Value::UBIGINT(m.remaining_generations),
-		     Value(found == owner->runtime->maintenance_errors.end() ? m.error : found->second)});
-	}
-	meta.Commit();
-	return rows;
+	return ReadStatus(context, catalog, owner->runtime->io, binding.identity, [&](DuckLakeTransaction &transaction) {
+		auto result = VortexCatalog::Query(
+		    transaction, "SELECT " + string(MAINTENANCE_COLUMNS) + " FROM {METADATA_CATALOG}." + MAINTENANCE);
+		auto chunk = result->Fetch();
+		vector<vector<Value>> rows;
+		if (chunk && chunk->size()) {
+			auto m = ReadMaintenance(*chunk);
+			std::lock_guard<std::mutex> guard_runtime(owner->runtime->lock);
+			auto found = owner->runtime->maintenance_errors.find(binding.Id());
+			auto &active = owner->runtime->active_maintenance;
+			rows.push_back(
+			    {Value(m.state), Value::BOOLEAN(m.enabled),
+			     Value::BOOLEAN(active && active->catalog.Id() == binding.Id()), Value(m.run), Value::UBIGINT(m.runs),
+			     Value::UBIGINT(m.max_objects), Value::UBIGINT(m.max_bytes), Value::UBIGINT(m.recovered),
+			     Value::UBIGINT(m.builds), Value::UBIGINT(m.generations), Value::UBIGINT(m.bytes),
+			     Value::UBIGINT(m.remaining_builds), Value::UBIGINT(m.remaining_generations),
+			     Value(found == owner->runtime->maintenance_errors.end() ? m.error : found->second)});
+		}
+		return rows;
+	});
 }
 
 vector<vector<Value>> DuckLakeVortexOptimizer::Status(ClientContext &context, const string &catalog) {
+	auto identity = VortexCatalog::ResolveCatalog(context, catalog, false, "Vortex optimizer status");
 	auto owner = GetOwner(*context.db);
-	std::lock_guard<std::mutex> guard(owner->runtime->io);
-	Metadata meta(*context.db, catalog);
-	Initialized(meta);
-	auto result = meta.Query("SELECT " + string(COLUMNS) + " FROM {METADATA_CATALOG}." + POLICIES +
-	                         " ORDER BY table_uuid,index_name");
-	vector<vector<Value>> rows;
-	while (auto chunk = result->Fetch()) {
-		for (idx_t r = 0; r < chunk->size(); r++) {
-			auto p = Read(*chunk, r, catalog);
-			auto local_error = owner->runtime->Error(p.Id());
-			rows.push_back({Value(p.uuid), Value(p.config.schema), Value(p.config.table), Value(p.config.index),
-			                Value(p.state), Value::BOOLEAN(p.enabled), Value(p.run), Value::UBIGINT(p.expected),
-			                Value(p.generation), Value::UBIGINT(p.published), Value::UBIGINT(p.t_rows),
-			                Value::UBIGINT(p.t_bytes), Value::UBIGINT(p.f_rows), Value::UBIGINT(p.f_bytes),
-			                Value(local_error.empty() ? p.error : local_error), Value::UBIGINT(p.runs),
-			                Value::BOOLEAN(owner->runtime->IsActive(p.Id()))});
-			auto budget =
-			    meta.Query("SELECT " + string(BUDGET_COLUMNS) + " FROM {METADATA_CATALOG}." + WRITE_BUDGETS + Where(p));
-			auto limits = budget->Fetch();
-			for (idx_t col = 0; col < 4; col++) {
-				rows.back().push_back(limits && limits->size() ? limits->GetValue(col, 0)
-				                                               : Value(LogicalType::UBIGINT));
+	return ReadStatus(context, catalog, owner->runtime->io, identity, [&](DuckLakeTransaction &transaction) {
+		auto result = VortexCatalog::Query(transaction, "SELECT " + string(COLUMNS) + " FROM {METADATA_CATALOG}." +
+		                                                   POLICIES + " ORDER BY table_uuid,index_name");
+		vector<vector<Value>> rows;
+		while (auto chunk = result->Fetch()) {
+			for (idx_t r = 0; r < chunk->size(); r++) {
+				auto p = Read(*chunk, r, catalog);
+				auto local_error = owner->runtime->Error(p.Id());
+				rows.push_back({Value(p.uuid), Value(p.config.schema), Value(p.config.table), Value(p.config.index),
+				                Value(p.state), Value::BOOLEAN(p.enabled), Value(p.run), Value::UBIGINT(p.expected),
+				                Value(p.generation), Value::UBIGINT(p.published), Value::UBIGINT(p.t_rows),
+				                Value::UBIGINT(p.t_bytes), Value::UBIGINT(p.f_rows), Value::UBIGINT(p.f_bytes),
+				                Value(local_error.empty() ? p.error : local_error), Value::UBIGINT(p.runs),
+				                Value::BOOLEAN(owner->runtime->IsActive(p.Id()))});
+				auto budget = VortexCatalog::Query(
+				    transaction, "SELECT " + string(BUDGET_COLUMNS) + " FROM {METADATA_CATALOG}." + WRITE_BUDGETS + Where(p));
+				auto limits = budget->Fetch();
+				for (idx_t col = 0; col < 4; col++) {
+					rows.back().push_back(limits && limits->size() ? limits->GetValue(col, 0)
+					                                               : Value(LogicalType::UBIGINT));
+				}
+				vector<Value> selected;
+				for (auto &generation : p.selected) {
+					selected.emplace_back(generation);
+				}
+				rows.back().push_back(Value(p.kind));
+				rows.back().push_back(Value::LIST(LogicalType::VARCHAR, std::move(selected)));
+				rows.back().push_back(Value::BOOLEAN(p.compaction_enabled));
+				rows.back().push_back(Value::UBIGINT(p.min_deleted_rows));
+				rows.back().push_back(Value::UBIGINT(p.min_deleted_percent));
+				rows.back().push_back(Value(p.rewrite_candidate));
+				rows.back().push_back(Value::UBIGINT(p.rewrite_deleted));
+				rows.back().push_back(Value::UBIGINT(p.rewrite_remaining));
+				rows.back().push_back(Value(p.rewrite_reason));
 			}
-			vector<Value> selected;
-			for (auto &generation : p.selected) {
-				selected.emplace_back(generation);
-			}
-			rows.back().push_back(Value(p.kind));
-			rows.back().push_back(Value::LIST(LogicalType::VARCHAR, std::move(selected)));
-			rows.back().push_back(Value::BOOLEAN(p.compaction_enabled));
-			rows.back().push_back(Value::UBIGINT(p.min_deleted_rows));
-			rows.back().push_back(Value::UBIGINT(p.min_deleted_percent));
-			rows.back().push_back(Value(p.rewrite_candidate));
-			rows.back().push_back(Value::UBIGINT(p.rewrite_deleted));
-			rows.back().push_back(Value::UBIGINT(p.rewrite_remaining));
-			rows.back().push_back(Value(p.rewrite_reason));
 		}
-	}
-	meta.Commit();
-	return rows;
+		return rows;
+	});
 }
 } // namespace duckdb

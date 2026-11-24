@@ -24,19 +24,20 @@ using Source = DuckLakeVortexSourceRetention;
 using VortexIndex = DuckLakeVortexIndex;
 
 namespace {
-constexpr const char *STATUS_POLICY_READ_ERROR = "Injected source status policy read error";
+constexpr const char *STATUS_POLICY_READ_ERROR = "Injected status metadata read error";
 Pause *status_pause = nullptr;
 std::atomic<bool> pause_status {false};
 bool fail_status_read = false;
 
-bool StatusEnabled(bool enabled) {
+template <class T>
+T StatusField(T value) {
 	if (pause_status.exchange(false)) {
 		status_pause->Stop();
-		if (fail_status_read) {
-			throw InvalidInputException(STATUS_POLICY_READ_ERROR);
-		}
 	}
-	return enabled;
+	if (fail_status_read) {
+		throw InvalidInputException(STATUS_POLICY_READ_ERROR);
+	}
+	return value;
 }
 
 void WaitForSourceAdmission(std::future<DuckLakeVortexSourceGCResult> &collecting, idx_t previous_waiters) {
@@ -191,6 +192,72 @@ idx_t DiskBytes(FileSystem &fs, const string &path) {
 		}
 	});
 	return bytes;
+}
+
+void MaintenanceFairness(Fixture &f, idx_t objects) {
+	constexpr idx_t max_bytes = 64 * 1024 * 1024;
+	constexpr idx_t passes = 3;
+	f.Rewrite();
+	// Leave enough work for fixed build-first scheduling to starve both other classes.
+	for (idx_t i = 0; i < passes * objects; i++) {
+		f.index = VortexIndex::BuildAndPublish(*f.writer.context, "lake", "main", "items", "knn",
+		                                     f.root + "/indexes/fairness-" + to_string(i) + ".json", 2,
+		                                     f.index.revision);
+	}
+	f.Policy();
+	Require(f.Count("__ducklake_metadata_lake.ducklake_vortex_builds_v1") >= passes * objects &&
+	            f.Count("__ducklake_metadata_lake.ducklake_vortex_generations_v1 WHERE state='retired'") >= objects &&
+	            Source::Status(*f.writer.context, "lake")[0][6].GetValue<idx_t>() >= objects,
+	        "The fairness fixture did not queue all three GC classes");
+
+	struct Counters {
+		idx_t builds, generations, expired, files, bytes;
+	};
+	struct Progress {
+		vector<Counters> completions;
+		Pause finished;
+	};
+	auto progress = std::make_shared<Progress>();
+	auto database = f.database.instance.get();
+	DuckLakeVortexOptimizer::EnableMaintenance(
+	    *f.writer.context, "lake", objects, max_bytes, [progress, database](const string &stage) {
+		    if (stage != "maintenance_complete") {
+			    return;
+		    }
+		    Connection probe(*database);
+		    auto m = DuckLakeVortexOptimizer::MaintenanceStatus(*probe.context, "lake").at(0);
+		    auto s = Source::Status(*probe.context, "lake").at(0);
+		    progress->completions.push_back({m[8].GetValue<idx_t>(), m[9].GetValue<idx_t>(), s[3].GetValue<idx_t>(),
+		                                     s[4].GetValue<idx_t>(), m[10].GetValue<idx_t>()});
+		    if (progress->completions.size() == passes) {
+			    progress->finished.Stop();
+		    }
+	    });
+	ReleasePause release {progress->finished};
+	progress->finished.Wait();
+	DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+	progress->finished.Release();
+
+	Counters previous {};
+	for (idx_t i = 0; i < passes; i++) {
+		auto &current = progress->completions[i];
+		auto builds = current.builds - previous.builds;
+		auto generations = current.generations - previous.generations;
+		auto expired = current.expired - previous.expired;
+		auto files = current.files - previous.files;
+		auto bytes = current.bytes - previous.bytes;
+		std::cout << "Pass " << i + 1 << ": builds=" << builds << " generations=" << generations
+		          << " expired=" << expired << " files=" << files << " bytes=" << bytes << std::endl;
+		Require(builds + generations + expired + files <= objects && bytes <= max_bytes,
+		        "Maintenance exceeded its shared per-pass budget");
+		Require(builds == (i == 0 ? objects : 0) && generations == (i == 1 ? objects : 0) &&
+		            expired + files == (i == 2 ? objects : 0) && (i != 2 || expired > 0),
+		        "The first three maintenance passes did not rotate budget priority");
+		previous = current;
+	}
+	Connection reader(f.database);
+	Require(f.Search(reader).rows.at(0).at(0).GetValue<int64_t>() == 32,
+	        "Maintenance changed the current ANN winner");
 }
 
 string AddParquet(Fixture &f, const string &table, const string &name) {
@@ -470,30 +537,70 @@ void MixedSizes(Fixture &f) {
 	        "Oversized source did not remain pending");
 }
 
-void InstallStatusPolicyGate(Fixture &f, Pause &pause, bool fail_read) {
-	f.Policy();
-	f.writer.CreateScalarFunction<bool, bool>("source_status_gate", &StatusEnabled);
-	SQL(f.writer, "ALTER TABLE __ducklake_metadata_lake.ducklake_vortex_source_retention_v1 RENAME TO "
-	              "source_policy_backing;"
-	              "CREATE VIEW __ducklake_metadata_lake.ducklake_vortex_source_retention_v1 AS "
-	              "SELECT * REPLACE(source_status_gate(enabled) AS enabled) FROM "
-	              "__ducklake_metadata_lake.source_policy_backing");
+void InstallStatusGate(Fixture &f, const string &table, const string &column, Pause &pause, bool fail_read = false) {
+	string gated;
+	if (column == "enabled") {
+		f.writer.CreateScalarFunction<bool, bool>("source_status_gate", &StatusField<bool>);
+		gated = "source_status_gate(enabled)";
+	} else {
+		f.writer.CreateScalarFunction<int64_t, int64_t>("source_status_gate", &StatusField<int64_t>);
+		gated = "source_status_gate(" + column + "::BIGINT)::UBIGINT";
+	}
+	auto qualified = "__ducklake_metadata_lake." + table;
+	SQL(f.writer, "ALTER TABLE " + qualified + " RENAME TO status_backing;"
+	              "CREATE VIEW " + qualified + " AS SELECT * REPLACE(" + gated + " AS " + column +
+	                  ") FROM __ducklake_metadata_lake.status_backing");
 	status_pause = &pause;
 	fail_status_read = fail_read;
 	pause_status = true;
 }
 
-void RestoreStatusPolicy(Fixture &f) {
-	SQL(f.writer, "DROP VIEW __ducklake_metadata_lake.ducklake_vortex_source_retention_v1;"
-	              "ALTER TABLE __ducklake_metadata_lake.source_policy_backing RENAME TO "
-	              "ducklake_vortex_source_retention_v1");
+void RestoreStatusTable(Fixture &f, const string &table) {
+	SQL(f.writer, "DROP VIEW __ducklake_metadata_lake." + table +
+	                  ";ALTER TABLE __ducklake_metadata_lake.status_backing RENAME TO " + table);
 }
 
-void StatusErrorRollback(Fixture &f) {
+using StatusReader = vector<vector<Value>> (*)(ClientContext &, const string &);
+
+void StatusReadiness(Fixture &f, StatusReader read, const string &table, const string &field, idx_t column,
+                     const Value &expected) {
+	f.Policy();
 	Pause pause;
-	InstallStatusPolicyGate(f, pause, true);
+	InstallStatusGate(f, table, field, pause);
+	auto pending = std::async(std::launch::async, [&] { return read(*f.writer.context, "lake"); });
+	ReleasePause release {pause};
+	pause.Wait();
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	auto exclusive = admission.TryGetExclusiveLock();
+	const bool admitted = !exclusive;
+	exclusive.reset();
+
+	Connection held(f.database), owner(f.database);
+	held.BeginTransaction();
+	SQL(held, "SELECT count(*) FROM lake.items");
+	auto &transaction = VortexIndex::Begin(owner, "lake");
+	const bool ordinary_blocked = !Source::WorkReady(transaction, 64 * 1024 * 1024);
+	held.Commit();
+	const bool ready = Source::WorkReady(transaction, 64 * 1024 * 1024);
+	owner.Commit();
+	pause.Release();
+	auto status = pending.get();
+	RestoreStatusTable(f, table);
+	Require(status.size() == 1 && status[0][column] == expected, "Finite status capture lost its result");
+	Require(ordinary_blocked, "Status readiness ignored an ordinary transaction");
+	Require(ready, "Source readiness discarded finite status work");
+	Require(admitted, "Status did not hold finite read admission");
+	f.Drain();
+	Connection reader(f.database);
+	Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == 0, "Status capture changed the query winner");
+}
+
+void StatusErrorRollback(Fixture &f, const string &table, const string &field, const string &function) {
+	f.Policy();
+	Pause pause;
+	InstallStatusGate(f, table, field, pause, true);
 	auto pending = std::async(std::launch::async, [&] {
-		return f.writer.Query("SELECT * FROM ducklake_vortex_source_retention_status('lake')");
+		return f.writer.Query("SELECT * FROM " + function + "('lake')");
 	});
 	ReleasePause release {pause};
 	pause.Wait();
@@ -510,15 +617,16 @@ void StatusErrorRollback(Fixture &f) {
 	        "The observer did not retain the status transaction");
 	pause.Release();
 	auto result = pending.get();
-	Require(result->HasError() && result->GetError().find(STATUS_POLICY_READ_ERROR) != string::npos,
-	        "Expected the public status query to surface the policy read error");
+	Require(result->HasError(), "The public status query swallowed the injected metadata read error");
+	Require(result->GetError().find(STATUS_POLICY_READ_ERROR) != string::npos,
+	        "The public status query replaced the injected error: " + result->GetError());
 
 	auto admission = DuckLakeVortexReadView::AdmissionLock().TryGetExclusiveLock();
 	Require(bool(admission), "Failed status did not release shared read admission");
 	const auto active_after_admission = observed_status->transaction.HasActiveTransaction();
 	admission.reset();
 
-	RestoreStatusPolicy(f);
+	RestoreStatusTable(f, table);
 	const auto collected = f.Collect(1, 1);
 	Require(!collected.blocked, "Failed status transaction blocked eligible source GC");
 	Require(collected.expired == 1 && collected.files == 0 && collected.bytes == 0,
@@ -697,6 +805,34 @@ void ReboundCapture(Fixture &f) {
 	Require(f.Search(reader).rows.at(0).at(0).GetValue<int64_t>() == 0, "A fresh capture lost the reattached data");
 }
 
+void ReboundOptimizerStatus(Fixture &f) {
+	const auto replacement = f.root + "/replacement";
+	FileSystem::GetFileSystem(*f.writer.context).CreateDirectory(replacement);
+	{
+		Fixture other(replacement, replacement + "/data", true);
+		other.Seed();
+		SQL(other.writer,
+		    "SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',777,4194304,4096,67108864)");
+	}
+
+	const string query = "SELECT max_inline_rows FROM ducklake_vortex_optimizer_status('lake')";
+	Connection reader(f.database);
+	Require(SQL(reader, query)->GetValue(0, 0).GetValue<idx_t>() == 1000, "Wrong original optimizer policy");
+	std::future<unique_ptr<MaterializedQueryResult>> pending;
+	auto &admission = DuckLakeVortexReadView::AdmissionLock();
+	auto held = admission.GetExclusiveLock([] {});
+	const auto previous_waits = admission.SharedWaitCount();
+	pending = std::async(std::launch::async, [&] { return reader.Query(query); });
+	WaitForCaptureAdmission(pending, previous_waits);
+	SQL(f.writer, "DETACH lake");
+	Attach(f.writer, replacement);
+	held.reset();
+	auto queued = pending.get();
+	Require(queued->HasError() && StringUtil::Contains(queued->GetError(), "catalog attachment changed"),
+	        "Queued optimizer status did not reject the replacement catalog");
+	Require(SQL(reader, query)->GetValue(0, 0).GetValue<idx_t>() == 777, "A fresh status lost the replacement policy");
+}
+
 void Concurrent(Fixture &f) {
 	auto seed = f.WriteBatch(0, "seed");
 	f.Policy(2);
@@ -815,41 +951,40 @@ int main(int argc, char **argv) {
 			return 0;
 		}
 		f.Seed();
+		if (mode == "maintenance-fairness-1" || mode == "maintenance-fairness-2") {
+			MaintenanceFairness(f, mode == "maintenance-fairness-1" ? 1 : 2);
+			return 0;
+		}
 		if (mode == "concurrent") {
 			Concurrent(f);
 			return 0;
 		}
 		if (mode == "status-readiness") {
-			Pause pause;
-			InstallStatusPolicyGate(f, pause, false);
-			auto pending = std::async(std::launch::async, [&] { return Source::Status(*f.writer.context, "lake"); });
-			ReleasePause release {pause};
-			pause.Wait();
-			auto admission = DuckLakeVortexReadView::AdmissionLock().TryGetExclusiveLock();
-			bool admitted = !admission;
-			admission.reset();
-			Connection held(f.database), owner(f.database);
-			held.BeginTransaction();
-			SQL(held, "SELECT count(*) FROM lake.items");
-			auto &transaction = VortexIndex::Begin(owner, "lake");
-			bool ordinary_blocked = !Source::WorkReady(transaction, 64 * 1024 * 1024);
-			held.Commit();
-			bool ready = Source::WorkReady(transaction, 64 * 1024 * 1024);
-			owner.Commit();
-			pause.Release();
-			auto status = pending.get();
-			RestoreStatusPolicy(f);
-			Require(status.size() == 1 && status[0][0].GetValue<bool>(), "Finite status capture lost its result");
-			Require(ordinary_blocked, "Status readiness ignored an ordinary transaction");
-			Require(ready, "Source readiness discarded finite status work");
-			Require(admitted, "Source status did not hold finite read admission");
-			f.Drain();
-			Connection reader(f.database);
-			Require(f.Search(reader).rows[0][0].GetValue<int64_t>() == 0, "Status capture changed the query winner");
+			StatusReadiness(f, Source::Status, "ducklake_vortex_source_retention_v1", "enabled", 0, Value::BOOLEAN(true));
+			return 0;
+		}
+		if (mode == "optimizer-status-readiness") {
+			SQL(f.writer, "SET GLOBAL immediate_transaction_mode=true");
+			StatusReadiness(f, DuckLakeVortexOptimizer::Status, "ducklake_vortex_write_budgets_v1", "max_inline_rows",
+			                17, Value::UBIGINT(1000));
+			return 0;
+		}
+		if (mode == "maintenance-status-readiness") {
+			VortexIndex::CollectBuilds(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+			DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024);
+			DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+			StatusReadiness(f, DuckLakeVortexOptimizer::MaintenanceStatus, "ducklake_vortex_maintenance_v1", "enabled",
+			                1, Value::BOOLEAN(false));
 			return 0;
 		}
 		if (mode == "status-error-rollback") {
-			StatusErrorRollback(f);
+			StatusErrorRollback(f, "ducklake_vortex_source_retention_v1", "enabled",
+			                    "ducklake_vortex_source_retention_status");
+			return 0;
+		}
+		if (mode == "optimizer-status-error-rollback") {
+			StatusErrorRollback(f, "ducklake_vortex_write_budgets_v1", "max_inline_rows",
+			                    "ducklake_vortex_optimizer_status");
 			return 0;
 		}
 		if (mode == "capture-readiness" || mode == "capture-readiness-eager") {
@@ -866,6 +1001,10 @@ int main(int argc, char **argv) {
 		}
 		if (mode == "rebound-capture") {
 			ReboundCapture(f);
+			return 0;
+		}
+		if (mode == "rebound-optimizer-status") {
+			ReboundOptimizerStatus(f);
 			return 0;
 		}
 		if (mode == "held" || mode == "admission") {
