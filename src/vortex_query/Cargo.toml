@@ -16,6 +16,6 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-vortex = { git = "https://github.com/AstroVela/vortex.git", rev = "54b2bde9255e24c21f936f5623fd4a66e4a7ede0" }
-vortex-index = { git = "https://github.com/AstroVela/vortex.git", rev = "54b2bde9255e24c21f936f5623fd4a66e4a7ede0", features = ["file", "local-store"] }
-vortex-index-spfresh = { git = "https://github.com/AstroVela/vortex.git", rev = "54b2bde9255e24c21f936f5623fd4a66e4a7ede0", features = ["native"] }
+vortex = { git = "https://github.com/AstroVela/vortex.git", rev = "42beeb3a72769869a3d3d16887a011ee7f922362" }
+vortex-index = { git = "https://github.com/AstroVela/vortex.git", rev = "42beeb3a72769869a3d3d16887a011ee7f922362", features = ["file", "local-store"] }
+vortex-index-spfresh = { git = "https://github.com/AstroVela/vortex.git", rev = "42beeb3a72769869a3d3d16887a011ee7f922362", features = ["native"] }

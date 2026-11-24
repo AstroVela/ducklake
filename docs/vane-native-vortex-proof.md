@@ -26,8 +26,8 @@ these pinned inputs.
 | Input | Revision |
 | --- | --- |
 | Vane | `14b4fc6a45f9c0a593202f1eb32f1062d365703e` |
-| duckdb-vortex | `e8d2d520299508ba98687a5553e7cd41384e9c90` |
-| Vortex | `54b2bde9255e24c21f936f5623fd4a66e4a7ede0` |
+| duckdb-vortex | `4f922e73c0201bd98d73007261d097d00aa8b2c3` |
+| Vortex | `42beeb3a72769869a3d3d16887a011ee7f922362` |
 | SPFresh | `5893eb61ee3b18610b6b00f1939be7dae1af8904` with the existing static-only patch |
 | LLVM OpenMP | `18.1.8`, source archives verified by SHA-256 |
 | DuckLake vcpkg | `84bab45d415d22042bd0b9081aea57f362da3f35` |

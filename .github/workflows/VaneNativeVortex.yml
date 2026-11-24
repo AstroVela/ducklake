@@ -49,13 +49,13 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: AstroVela/duckdb-vortex
-          ref: e8d2d520299508ba98687a5553e7cd41384e9c90
+          ref: 4f922e73c0201bd98d73007261d097d00aa8b2c3
           path: vortex-extension
           persist-credentials: false
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: AstroVela/vortex
-          ref: 54b2bde9255e24c21f936f5623fd4a66e4a7ede0
+          ref: 42beeb3a72769869a3d3d16887a011ee7f922362
           path: vortex-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
