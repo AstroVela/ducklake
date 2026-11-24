@@ -9,6 +9,7 @@ namespace duckdb {
 struct VortexSearchBind : public TableFunctionData {
 	DuckLakeVortexViewOptions options;
 	DuckLakeVortexSearchRequest request;
+	bool diagnostics = false;
 };
 struct VortexSearchState : public GlobalTableFunctionState {
 	bool initialized = false;
@@ -66,6 +67,19 @@ static unique_ptr<FunctionData> BindSearch(ClientContext &, TableFunctionBindInp
 	return std::move(data);
 }
 
+static unique_ptr<FunctionData> BindDiagnostics(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &types, vector<string> &names) {
+	auto data = BindSearch(context, input, types, names);
+	data->Cast<VortexSearchBind>().diagnostics = true;
+	child_list_t<LogicalType> fields;
+	for (idx_t i = 0; i < names.size(); i++) {
+		fields.emplace_back(names[i], types[i]);
+	}
+	types = {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::STRUCT(std::move(fields)))};
+	names = {"diagnostics", "hits"};
+	return data;
+}
+
 static unique_ptr<GlobalTableFunctionState> InitSearch(ClientContext &, TableFunctionInitInput &) {
 	return make_uniq<VortexSearchState>();
 }
@@ -74,7 +88,17 @@ static void ExecuteSearch(ClientContext &context, TableFunctionInput &input, Dat
 	auto &state = input.global_state->Cast<VortexSearchState>();
 	if (!state.initialized) {
 		auto &bind = input.bind_data->Cast<VortexSearchBind>();
-		state.rows = DuckLakeVortexSearch::Execute(context, bind.options, bind.request).rows;
+		auto result = DuckLakeVortexSearch::Execute(context, bind.options, bind.request);
+		if (bind.diagnostics) {
+			auto &hit_type = ListType::GetChildType(output.data[1].GetType());
+			vector<Value> hits;
+			for (auto &row : result.rows) {
+				hits.push_back(Value::STRUCT(hit_type, std::move(row)));
+			}
+			state.rows.push_back({Value(result.diagnostics), Value::LIST(hit_type, std::move(hits))});
+		} else {
+			state.rows = std::move(result.rows);
+		}
 		state.initialized = true;
 	}
 	if (context.IsInterrupted()) {
@@ -91,11 +115,14 @@ static void ExecuteSearch(ClientContext &context, TableFunctionInput &input, Dat
 }
 
 void RegisterDuckLakeVortexSearch(ExtensionLoader &loader) {
-	TableFunction function("ducklake_vortex_search",
-	                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::LIST(LogicalType::FLOAT), LogicalType::BIGINT},
-	                       ExecuteSearch, BindSearch, InitSearch);
-	function.named_parameters["category"] = LogicalType::VARCHAR;
-	loader.RegisterFunction(function);
+	for (auto &name : {"ducklake_vortex_search", "ducklake_vortex_search_diagnostics"}) {
+		auto bind = string(name) == "ducklake_vortex_search" ? BindSearch : BindDiagnostics;
+		TableFunction function(name,
+		                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                        LogicalType::LIST(LogicalType::FLOAT), LogicalType::BIGINT},
+		                       ExecuteSearch, bind, InitSearch);
+		function.named_parameters["category"] = LogicalType::VARCHAR;
+		loader.RegisterFunction(function);
+	}
 }
 } // namespace duckdb

@@ -271,6 +271,7 @@ def native_cases(driver, root, report):
         "source-only-blocked-generation",
         "maintenance-fairness-1",
         "maintenance-fairness-2",
+        "optimizer-profile",
         "fail-source_expiry_committed",
         "fail-source_delete_intent_committed",
         "fail-source_unlinked_before_sync",

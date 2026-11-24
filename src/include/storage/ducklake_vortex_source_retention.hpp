@@ -10,6 +10,7 @@ class Connection;
 class DuckLakeCatalog;
 class DuckLakeTransaction;
 class DuckLakeVortexCollectionLock;
+class DuckLakeVortexMaintenanceProfile;
 struct DuckLakeVortexCatalogIdentity;
 struct DuckLakeFileForCleanup;
 enum class CleanupType;
@@ -34,6 +35,7 @@ public:
 	static DuckLakeVortexSourceGCResult Collect(ClientContext &context, const string &catalog, idx_t max_objects,
 	                                            idx_t max_bytes,
 	                                            const std::function<void(const string &)> &observe = nullptr,
-	                                            optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr);
+	                                            optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr,
+	                                            DuckLakeVortexMaintenanceProfile *profile = nullptr);
 };
 } // namespace duckdb

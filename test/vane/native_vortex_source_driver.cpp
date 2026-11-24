@@ -180,6 +180,44 @@ struct Fixture {
 	}
 };
 
+idx_t CapturedSnapshot(const DuckLakeVortexSearchResult &result) {
+	using namespace duckdb_yyjson;
+	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> json(
+	    yyjson_read(result.diagnostics.data(), result.diagnostics.size(), 0), yyjson_doc_free);
+	Require(bool(json), "Search diagnostics are invalid");
+	auto capture = yyjson_obj_get(yyjson_doc_get_root(json.get()), "native_capture");
+	auto snapshot = yyjson_obj_get(capture, "snapshot_id");
+	Require(yyjson_is_uint(snapshot), "Search diagnostics lost the captured snapshot");
+	return yyjson_get_uint(snapshot);
+}
+
+constexpr const char *PROFILE_SQL = "SELECT * FROM ducklake_vortex_maintenance_profile('lake')";
+
+struct ProfileSample {
+	idx_t calls, total_ns, max_ns;
+};
+
+struct ProfileSnapshot {
+	string id;
+	std::map<string, ProfileSample> stages;
+};
+
+ProfileSnapshot ReadMaintenanceProfile(Connection &reader) {
+	auto rows = SQL(reader, PROFILE_SQL);
+	Require(rows->RowCount() == 15, "Missing fixed maintenance profile stages");
+	ProfileSnapshot profile;
+	profile.id = rows->GetValue(0, 0).GetValue<string>();
+	for (idx_t i = 0; i < rows->RowCount(); i++) {
+		auto name = rows->GetValue(1, i).GetValue<string>();
+		ProfileSample sample {rows->GetValue(2, i).GetValue<idx_t>(), rows->GetValue(3, i).GetValue<idx_t>(),
+		                      rows->GetValue(4, i).GetValue<idx_t>()};
+		Require(rows->GetValue(0, i).GetValue<string>() == profile.id && sample.max_ns <= sample.total_ns &&
+		            (sample.calls || !sample.total_ns) && profile.stages.emplace(name, sample).second,
+		        "Invalid maintenance profile identity or counters");
+	}
+	return profile;
+}
+
 idx_t DiskBytes(FileSystem &fs, const string &path) {
 	idx_t bytes = 0;
 	fs.ListFiles(path, [&](const string &name, bool directory) {
@@ -258,6 +296,38 @@ void MaintenanceFairness(Fixture &f, idx_t objects) {
 	Connection reader(f.database);
 	Require(f.Search(reader).rows.at(0).at(0).GetValue<int64_t>() == 32,
 	        "Maintenance changed the current ANN winner");
+	auto profile = ReadMaintenanceProfile(reader);
+	for (auto stage : {"maintenance_total", "maintenance_probe", "maintenance_metadata", "build_recovery", "build_gc",
+	                   "generation_gc", "source_gc", "source_wait", "source_metadata", "source_expire"}) {
+		auto sample = profile.stages.at(stage);
+		Require(sample.calls && sample.total_ns, "Missing measured maintenance stage " + string(stage));
+	}
+	SQL(f.writer, "DETACH lake");
+	Attach(f.writer, f.root);
+	Require(SQL(reader, PROFILE_SQL)->RowCount() == 0, "A reattached catalog inherited a stale profile");
+}
+
+void OptimizerProfile(Fixture &f) {
+	Require(SQL(f.writer, PROFILE_SQL)->RowCount() == 0, "Profile appeared before maintenance registration");
+	DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024);
+	auto probes = std::make_shared<idx_t>(0);
+	auto second_probe = std::make_shared<Pause>();
+	ReleasePause release {*second_probe};
+	DuckLakeVortexOptimizer::Resume(*f.writer.context, "lake", "main", "items", "knn",
+	                                [probes, second_probe](const string &stage) {
+		                                if (stage == "optimizer_before_probe" && ++*probes == 2) {
+			                                second_probe->Stop();
+		                                }
+	                                });
+	second_probe->Wait();
+	auto profile = ReadMaintenanceProfile(f.writer);
+	for (auto stage : {"optimizer_total", "optimizer_probe", "optimizer_metadata"}) {
+		auto sample = profile.stages.at(stage);
+		Require(sample.calls && sample.total_ns, "Missing measured optimizer stage " + string(stage));
+	}
+	DuckLakeVortexOptimizer::Cancel(*f.writer.context, "lake", "main", "items", "knn");
+	DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+	second_probe->Release();
 }
 
 string AddParquet(Fixture &f, const string &table, const string &name) {
@@ -852,12 +922,7 @@ void Concurrent(Fixture &f) {
 	auto reads = std::async(std::launch::async, [&] {
 		while (running && observed.size() < 1000) {
 			auto result = f.Search(reader);
-			using namespace duckdb_yyjson;
-			std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> json(
-			    yyjson_read(result.diagnostics.data(), result.diagnostics.size(), 0), yyjson_doc_free);
-			auto capture = yyjson_obj_get(yyjson_doc_get_root(json.get()), "native_capture");
-			observed.emplace_back(yyjson_get_uint(yyjson_obj_get(capture, "snapshot_id")),
-			                      result.rows[0][0].GetValue<int64_t>());
+			observed.emplace_back(CapturedSnapshot(result), result.rows[0][0].GetValue<int64_t>());
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 	});
@@ -955,6 +1020,10 @@ int main(int argc, char **argv) {
 			MaintenanceFairness(f, mode == "maintenance-fairness-1" ? 1 : 2);
 			return 0;
 		}
+		if (mode == "optimizer-profile") {
+			OptimizerProfile(f);
+			return 0;
+		}
 		if (mode == "concurrent") {
 			Concurrent(f);
 			return 0;
@@ -1008,6 +1077,8 @@ int main(int argc, char **argv) {
 			return 0;
 		}
 		if (mode == "held" || mode == "admission") {
+			const string latest = "SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot";
+			const auto snapshot = SQL(f.writer, latest)->GetValue(0, 0).GetValue<idx_t>();
 			Pause pause;
 			Connection reader(f.database);
 			auto pending = std::async(std::launch::async, [&] {
@@ -1039,7 +1110,11 @@ int main(int argc, char **argv) {
 				f.CheckReclaimed();
 			}
 			pause.Release();
-			Require(pending.get().rows[0][0].GetValue<int64_t>() == 0, "Held view lost delayed typed fetch after GC");
+			auto captured = pending.get();
+			Require(captured.rows[0][0].GetValue<int64_t>() == 0 && CapturedSnapshot(captured) == snapshot,
+			        "Held view lost its typed result or captured snapshot after GC");
+			Require(SQL(f.writer, latest)->GetValue(0, 0).GetValue<idx_t>() > snapshot,
+			        "The fixture did not publish a newer snapshot while the query was held");
 			return 0;
 		}
 		Connection old(f.database);
@@ -1300,6 +1375,8 @@ int main(int argc, char **argv) {
 			ReleasePause release {pause};
 			pause.Wait();
 			Connection cancellation(f.database);
+			const auto held_at = std::chrono::steady_clock::now();
+			auto before_profile = ReadMaintenanceProfile(cancellation);
 			auto &gate = Source::TransactionGate();
 			const auto waits = gate.SharedWaitCount();
 			auto cancelled = std::async(
@@ -1311,6 +1388,9 @@ int main(int argc, char **argv) {
 				            cancelled.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready,
 				        "Cancellation did not reach transaction admission");
 			}
+			const auto held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                         std::chrono::steady_clock::now() - held_at)
+			                         .count();
 			pause.Release();
 			cancelled.get();
 			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -1321,7 +1401,13 @@ int main(int argc, char **argv) {
 			Require(FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source) &&
 			            f.Count("__ducklake_metadata_lake.ducklake_vortex_source_deletions_v1") == 1,
 			        "Cancellation did not preserve the registered deletion intent");
+			auto cancelled_profile = ReadMaintenanceProfile(cancellation);
+			Require(cancelled_profile.id == before_profile.id &&
+			            cancelled_profile.stages.at("source_metadata").max_ns >= idx_t(held_ns),
+			        "Cancelled source collection lost its held wall time");
 			DuckLakeVortexOptimizer::ResumeMaintenance(*f.writer.context, "lake");
+			Require(ReadMaintenanceProfile(cancellation).id != before_profile.id,
+			        "Explicit resume reused the cancelled maintenance profile");
 			while (FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source)) {
 				Require(std::chrono::steady_clock::now() < deadline, "Resumed source worker did not finish");
 				std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1330,6 +1416,11 @@ int main(int argc, char **argv) {
 			while (DuckLakeVortexOptimizer::MaintenanceStatus(*f.writer.context, "lake")[0][2].GetValue<bool>()) {
 				Require(std::chrono::steady_clock::now() < deadline, "Resumed source worker did not stop");
 				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			}
+			auto completed_profile = ReadMaintenanceProfile(cancellation);
+			for (auto stage : {"source_artifact", "source_unlink"}) {
+				auto sample = completed_profile.stages.at(stage);
+				Require(sample.calls && sample.total_ns, "Resumed source collection lost timing for " + string(stage));
 			}
 			f.Drain();
 			f.CheckReclaimed();

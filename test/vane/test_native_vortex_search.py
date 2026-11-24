@@ -20,10 +20,11 @@ BASE = CAT.BASE
 require = BASE.require
 
 
-def search_sql(query, k=10, category=None):
+def search_sql(query, k=10, category=None, diagnostics=False):
     vector = "[" + ",".join(map(str, query)) + "]::FLOAT[]"
     predicate = "" if category is None else ",category=>'" + category.replace("'", "''") + "'"
-    return f"SELECT * FROM ducklake_vortex_search('lake','main','items','knn',{vector},{k}{predicate})"
+    function = "ducklake_vortex_search_diagnostics" if diagnostics else "ducklake_vortex_search"
+    return f"SELECT * FROM {function}('lake','main','items','knn',{vector},{k}{predicate})"
 
 
 def query(native, text, expected=None):
