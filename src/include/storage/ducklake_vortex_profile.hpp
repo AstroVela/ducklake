@@ -59,15 +59,23 @@ private:
 class DuckLakeVortexPhaseTimer {
 public:
 	DuckLakeVortexPhaseTimer(DuckLakeVortexMaintenanceProfile *profile_p, DuckLakeVortexPhase phase_p)
-	    : profile(profile_p), phase(phase_p), started(std::chrono::steady_clock::now()) {
+	    : profile(profile_p), phase(phase_p) {
+		if (profile) {
+			started = std::chrono::steady_clock::now();
+		}
 	}
 	~DuckLakeVortexPhaseTimer() {
-		Finish();
+		if (profile) {
+			Finish(std::chrono::steady_clock::now());
+		}
 	}
 	DuckLakeVortexPhaseTimer(const DuckLakeVortexPhaseTimer &) = delete;
 	DuckLakeVortexPhaseTimer &operator=(const DuckLakeVortexPhaseTimer &) = delete;
 
 	void Switch(DuckLakeVortexPhase next) {
+		if (!profile || phase == next) {
+			return;
+		}
 		auto now = std::chrono::steady_clock::now();
 		Finish(now);
 		phase = next;
@@ -75,10 +83,8 @@ public:
 	}
 
 private:
-	void Finish(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
-		if (profile) {
-			profile->Record(phase, std::chrono::duration_cast<std::chrono::nanoseconds>(now - started).count());
-		}
+	void Finish(std::chrono::steady_clock::time_point now) {
+		profile->Record(phase, std::chrono::duration_cast<std::chrono::nanoseconds>(now - started).count());
 	}
 	DuckLakeVortexMaintenanceProfile *profile;
 	DuckLakeVortexPhase phase;
