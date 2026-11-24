@@ -330,7 +330,7 @@ def main():
     destination.add_argument("--output-dir", type=Path)
     destination.add_argument("--recover-case", type=Path)
     args = parser.parse_args()
-    require(os.environ.get("VANE_RUNNER") == "local-fast", "Set VANE_RUNNER=local-fast explicitly")
+    require(os.environ.get("VANE_RUNNER") == "local", "Set VANE_RUNNER=local explicitly")
     if args.recover_case:
         recover(args.recover_case.resolve())
         return

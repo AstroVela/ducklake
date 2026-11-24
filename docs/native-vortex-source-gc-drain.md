@@ -101,7 +101,7 @@ fixed canary reached 1.0; the 4,096-row exploration minimum was 0.4. The repeate
 32,768-row / 128D case drained in 8.24 seconds. CI now retains all four cases:
 
 ```sh
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_sustained_load.py \
     --fixtures automatic --rows 4096 32768 --dimensions 8 128 --seconds 12 \
     --output-dir /tmp/vane-vortex-source-drain
 ```

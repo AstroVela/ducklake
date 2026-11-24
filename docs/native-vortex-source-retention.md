@@ -104,7 +104,7 @@ see the [automatic flow](native-vortex-automatic-flow.md).
 
 ```sh
 cmake --build build/runtime --target ducklake_vortex_source_driver
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_source_retention.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_source_retention.py \
     --driver build/runtime/ducklake_vortex_source_driver \
     --output-dir /tmp/vane-vortex-source-proof
 ```

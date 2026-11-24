@@ -10,7 +10,7 @@ For non-NULL unique business ids with atomic upsert/delete, use the explicit
 
 ## API
 
-Use the same installed runtime/providers and explicit `VANE_RUNNER=local-fast`
+Use the same installed runtime/providers and explicit `VANE_RUNNER=local`
 as the basic flow. Initialize the request catalog once, after attaching the
 native DuckDB-backed DuckLake catalog:
 
@@ -110,7 +110,7 @@ The caller can interrupt both the queue and the commit admission wait.
 
 ```sh
 cmake --build build/runtime --target ducklake_vortex_write_driver
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_write_batch.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_write_batch.py \
     --driver build/runtime/ducklake_vortex_write_driver \
     --output-dir /tmp/vane-vortex-write-batch-proof
 ```

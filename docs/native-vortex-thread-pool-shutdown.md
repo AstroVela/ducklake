@@ -35,9 +35,12 @@ is no compatibility layer, additional accepted revision, retry or fallback.
 
 Native helper qualification isolates a shutdown defect; the installed provider
 pair must separately exercise the complete automatic flow and long load.
-Rebuild and sign both provider wheels because the Vortex source revision changes
-their dependency closure. Preserve the existing Vane base wheel and qualify in
-a new isolated installed environment.
+Build the runtime and both signed provider wheels against Vane
+`14b4fc6a45f9c0a593202f1eb32f1062d365703e`. This pin includes the numeric
+parameter binding fix in [Vane #1148](https://github.com/AstroVela/vane/pull/1148).
+Qualify the exact installed wheel closure in a new isolated environment.
+In the sustained-load verifier, the existing status monitor and the final
+catalog and footprint checks share one 90-second deadline.
 
 The original retained 4,096-row/128D cost canary has a 0.7 lower bound under the
 unchanged 0.8 gate. Offline replay confirms failures even at a single committed

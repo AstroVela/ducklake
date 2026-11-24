@@ -55,7 +55,7 @@ protocols or call SPFresh's original online-update API.
 
 ```sh
 cmake --build build/runtime --target ducklake_vortex_write_driver
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_automatic_flow.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_automatic_flow.py \
     --driver build/runtime/ducklake_vortex_write_driver \
     --output-dir /tmp/vane-vortex-automatic-proof
 ```

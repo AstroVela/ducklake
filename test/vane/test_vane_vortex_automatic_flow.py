@@ -21,6 +21,7 @@ SPEC.loader.exec_module(KEYED)
 BASE, WRITE = KEYED.BASE, KEYED.WRITE
 query, require, quote = BASE.query, BASE.require, BASE.quote
 META = "__ducklake_metadata_lake."
+SETTLE_TIMEOUT_SECONDS = 90
 
 
 def row(key, epoch):
@@ -58,9 +59,22 @@ def healthy(connection):
     return optimizer, maintenance
 
 
-def settle(connection, root, revision, max_retained_rows=2048):
-    deadline = time.monotonic() + 90
-    while True:
+def ready_for_settle(optimizer, maintenance, source):
+    return (
+        not optimizer["running"]
+        and not maintenance["running"]
+        and optimizer["inline_rows"] == optimizer["unindexed_rows"] == 0
+        and optimizer["compaction_reason"] != "eligible"
+        and maintenance["remaining_builds"] == maintenance["remaining_generations"] == 0
+        and source["eligible_snapshots"] == source["scheduled_files"] == source["pending_deletions"] == 0
+    )
+
+
+def settle(connection, root, revision, max_retained_rows=2048, *, deadline=None):
+    if deadline is None:
+        deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
+    last_check = "deadline reached before final checks"
+    while time.monotonic() < deadline:
         optimizer, maintenance = healthy(connection)
         source = query(connection, "SELECT * FROM ducklake_vortex_source_retention_status('lake')")[0]
         head = BASE.head(connection)
@@ -84,23 +98,23 @@ def settle(connection, root, revision, max_retained_rows=2048):
         )[0]["n"]
         if (
             head["revision"] >= revision
-            and not optimizer["running"]
-            and not maintenance["running"]
-            and optimizer["inline_rows"] == optimizer["unindexed_rows"] == 0
-            and optimizer["compaction_reason"] != "eligible"
+            and ready_for_settle(optimizer, maintenance, source)
             and not inline
             and active == covered
             and not builds
             and not retired
-            and maintenance["remaining_builds"] == maintenance["remaining_generations"] == 0
-            and source["eligible_snapshots"] == source["scheduled_files"] == source["pending_deletions"] == 0
         ):
-            return head, source, footprint(connection, root, head, max_retained_rows)
-        require(
-            time.monotonic() < deadline,
-            f"Automatic pipeline did not settle: {optimizer}, {maintenance}, {source}, inline={inline}, active={active}, covered={covered}",
-        )
-        time.sleep(0.03)
+            if time.monotonic() >= deadline:
+                last_check = "deadline reached before the footprint check"
+                break
+            usage = footprint(connection, root, head, max_retained_rows)
+            require(time.monotonic() < deadline, "Automatic pipeline did not settle: footprint check crossed deadline")
+            return head, source, usage
+        last_check = f"{optimizer}, {maintenance}, {source}, inline={inline}, active={active}, covered={covered}"
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.03, remaining))
+    raise AssertionError(f"Automatic pipeline did not settle: {last_check}")
 
 
 def footprint(connection, root, head, max_retained_rows=2048):
@@ -616,7 +630,7 @@ def main():
     parser.add_argument("--stage")
     parser.add_argument("--rounds", type=int, default=8)
     args = parser.parse_args()
-    require(os.environ.get("VANE_RUNNER") == "local-fast", "Set VANE_RUNNER=local-fast explicitly")
+    require(os.environ.get("VANE_RUNNER") == "local", "Set VANE_RUNNER=local explicitly")
     if args.recover_case:
         require(args.stage is not None, "Recovery requires an expected checkpoint")
         recover(args.recover_case.resolve(), args.stage)

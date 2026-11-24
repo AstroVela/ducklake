@@ -1,7 +1,7 @@
 # Installed Vane native realtime vector flow
 
 This validation connects the [local realtime vector flow](native-vortex-basic-flow.md)
-to the public `vane.connect()` API. It uses the explicit `local-fast` runner,
+to the public `vane.connect()` API. It uses the explicit `local` runner,
 a normal Vane runtime wheel and two independently installed native providers.
 The DuckLake provider declares its exact Vortex provider dependency. Loading
 uses Vane's existing installed-provider resolver and source/ABI/artifact
@@ -25,7 +25,7 @@ these pinned inputs.
 
 | Input | Revision |
 | --- | --- |
-| Vane | `e14bf92d4053141697a59dcbd6098677cbddb80a` |
+| Vane | `14b4fc6a45f9c0a593202f1eb32f1062d365703e` |
 | duckdb-vortex | `e8d2d520299508ba98687a5553e7cd41384e9c90` |
 | Vortex | `54b2bde9255e24c21f936f5623fd4a66e4a7ede0` |
 | SPFresh | `5893eb61ee3b18610b6b00f1939be7dae1af8904` with the existing static-only patch |
@@ -73,7 +73,7 @@ artifacts into one environment. Select native execution explicitly:
 
 ```sh
 uv pip install path/to/vane_ai-*.whl path/to/vane_extension_vortex-*.whl path/to/vane_extension_ducklake-*.whl
-export VANE_RUNNER=local-fast
+export VANE_RUNNER=local
 ```
 
 Run this against a fresh directory:
@@ -139,7 +139,7 @@ appends B2 while preserving B1.
 ## Installed-package verification
 
 ```sh
-VANE_RUNNER=local-fast python -I test/vane/test_vane_native_vortex.py \
+VANE_RUNNER=local python -I test/vane/test_vane_native_vortex.py \
     --output-dir /tmp/vane-native-vortex-proof
 ```
 

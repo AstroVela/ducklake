@@ -52,7 +52,7 @@ four load cases, and retains the reports and capture files.
 python -I test/vane/test_vane_vortex_stall_capture.py \
     --output-dir /tmp/vane-vortex-stall-capture
 
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_sustained_load.py \
     --fixtures automatic --rows 512 --dimensions 8 --seconds 12 --capture-stalls \
     --output-dir /tmp/vane-vortex-stall-repro
 ```

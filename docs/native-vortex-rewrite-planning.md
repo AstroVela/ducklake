@@ -106,7 +106,7 @@ pre-termination capture and records further investigation without closing the
 original stop.
 
 ```sh
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_sustained_load.py \
     --fixtures automatic --rows 512 4096 32768 --dimensions 8 128 --seconds 12 \
     --output-dir /tmp/vane-vortex-rewrite-planning
 ```

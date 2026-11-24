@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: AstroVela/vane
-          ref: e14bf92d4053141697a59dcbd6098677cbddb80a
+          ref: 14b4fc6a45f9c0a593202f1eb32f1062d365703e
           fetch-depth: 0
           path: vane
           persist-credentials: false
@@ -145,7 +145,7 @@ jobs:
             --vane-source "$PWD/vane" --vortex-wrapper "$PWD/vortex-extension" \
             --ducklake-vcpkg-share "$PWD/build/ducklake-vcpkg/x64-linux-release/share" --output-dir "$PWD/build/notices"
           cp vane/LICENSES/vcpkg-binary-dependencies.txt build/notices/Vane-native-dependencies.txt
-          python -I vane/scripts/build_extension_wheel.py \
+          python -I vane/scripts/build_extension_wheel.py --release-number 1 \
             --artifact build/signed/vortex.duckdb_extension \
             --extension-name vortex --platform-tag manylinux_2_39_x86_64 --trust-identity vane-ci-test-key \
             --license-expression "$(cat build/notices/vortex-license-expression.txt)" \
@@ -157,7 +157,7 @@ jobs:
             --output-directory build/wheels --test-only
           mapfile -t vortex_wheels < <(find build/wheels -maxdepth 1 -name 'vane_extension_vortex-*.whl')
           test "${#vortex_wheels[@]}" = 1
-          python -I vane/scripts/build_extension_wheel.py \
+          python -I vane/scripts/build_extension_wheel.py --release-number 1 \
             --artifact build/signed/ducklake.duckdb_extension \
             --extension-name ducklake --platform-tag manylinux_2_39_x86_64 --trust-identity vane-ci-test-key \
             --dependency-wheel "${vortex_wheels[0]}" --dependency-trust-identity vane-ci-test-key \
@@ -174,7 +174,7 @@ jobs:
           uv pip install --system --no-index --find-links build/wheels build/wheels/vane_extension_ducklake-*.whl
       - name: Qualify installed Vane native vector retrieval
         env:
-          VANE_RUNNER: local-fast
+          VANE_RUNNER: local
         run: |
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_native_vortex.py --output-dir "$PWD/build/proof" \
             2>&1 | tee build/logs/vane-native-vortex.log
