@@ -7,6 +7,15 @@ Production `src/` is byte-for-byte identical to #77
 under `test/vane`, excluded from provider artifacts. All three installed wheel
 bytes, transaction protection and existing budgets are unchanged.
 
+The full timing matrix, resource numbers and qualification below come from
+the November 6, 2026 stack. The current port preserves the physical-retirement
+projection in the isolated trial and resource probe. The probe checks file IDs
+against the seed index and expects five baseline columns and seven lookup
+columns from the Vortex fixture. Both trial variants explicitly link their
+metadata object at the same position. The old executable hashes identify the
+archived experiment.
+[Original experiment at `a95702d5`](https://github.com/AstroVela/ducklake/blob/a95702d50cab0a946f798810cf549ea761926591/docs/native-vortex-expiry-lookup.md)
+
 This validation follows the [withdrawn window candidates](native-vortex-expiry-interval.md).
 It targets the ended-data-file range anti-join identified by the
 [actual source-GC baseline](native-vortex-source-gc-cost.md). It retains the
@@ -164,9 +173,9 @@ SHA-256: `021dc12d1d6edd9648402112449fd170a0cea5fbd2e893c293a92ccd8ea39985`.
 
 Build the normal qualified native **baseline** closure from the restored
 production sources, then build the test-only helpers. The trial builder applies
-the frozen patch in a fresh temporary directory and links an isolated override;
-it does not apply the patch to repository or provider sources. On this pinned
-local closure, both generated executable hashes match the actual A/B binaries:
+the test patch in a fresh directory and links a separate executable. The
+historical executables reproduced on the original pinned closure had these
+hashes.
 
 - baseline: `168562ccee3d4cc66659d4bb8b18a5b891a33ecbdd2424f99736a22e0ec0f400`
 - lookup: `79906a68eef952a9e162ae73eca21dd610c70ca9dc33f7416ec0bae4f8fa1105`
@@ -178,7 +187,7 @@ python -I test/vane/build_vortex_lookup_trial.py \
     --build-dir "$SKBUILD_BUILD_DIR" --output-dir /tmp/lookup-trial-build
 env -u VORTEX_SPFRESH_NATIVE python -I test/vane/test_vane_vortex_source_gc_benchmark.py \
     --driver /tmp/lookup-trial-build/baseline --output-dir /tmp/lookup-trial-inputs
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_expiry_lookup.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_expiry_lookup.py \
     --driver "$SKBUILD_BUILD_DIR/ducklake_vortex_expiry_lookup_driver" \
     --output-dir /tmp/lookup-interval-proof
 python -I test/vane/test_vane_vortex_expiry_lookup_resources.py \
@@ -213,7 +222,7 @@ both recall thresholds >=0.8, <=90-second drain, final rows and old receipts.
 R4 additionally needs repeated longer observations of backlog slope and
 resource growth during continued writes.
 
-## Final local qualification after withdrawal
+## Historical qualification after withdrawal
 
 Both CMake helper targets build successfully. The compiled test-only lookup,
 native Vane SQL and SQLite SQL each pass all 356 oracle cases. The native

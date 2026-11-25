@@ -50,8 +50,19 @@ SELECT count(*) FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::F
 ----
 0
 
+statement ok
+BEGIN
+
+statement error
+SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),1)
+----
+Vortex retirement controls require autocommit
+
+statement ok
+ROLLBACK
+
 query I
-SELECT revision FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),1)
+SELECT revision FROM ducklake_retire_vortex_index_segment('LAKE','MAIN','ITEMS','knn',getvariable('empty_generation'),1)
 ----
 2
 
@@ -117,6 +128,23 @@ statement ok
 UPDATE __ducklake_metadata_lake.ducklake_vortex_indexes_v1 SET reference=replace(reference,'"format_version":2','"format_version":3')
 
 statement ok
+INSERT INTO lake.items SELECT i,[i::FLOAT,0::FLOAT],'A','unindexed' FROM range(128)t(i)
+
+statement ok
+ALTER TABLE lake.items RENAME COLUMN embedding TO vector_value
+
+statement ok
+DELETE FROM lake.items
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL
+----
+0
+
+statement ok
+ALTER TABLE lake.items RENAME COLUMN vector_value TO embedding
+
+statement ok
 INSERT INTO lake.items VALUES(1000,[0.125,0],NULL,'实时向量')
 
 query IT
@@ -149,6 +177,100 @@ query I
 SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
 ----
 1000
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_empty_retirement.ducklake' AS lake (READ_ONLY)
+
+statement error
+SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('empty_generation'),3)
+----
+Vortex retirement controls require a writable DuckLake attachment
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_empty_retirement.ducklake' AS lake
+
+statement ok
+CREATE TABLE lake.named_files(id BIGINT, embedding FLOAT[], category VARCHAR, payload VARCHAR, filename VARCHAR)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'named_files')
+
+statement ok
+INSERT INTO lake.named_files SELECT i,[i::FLOAT,0::FLOAT],'A','original','report.csv' FROM range(128)t(i)
+
+statement ok
+SELECT * FROM ducklake_build_vortex_index('lake','main','named_files','knn','__WORKING_DIRECTORY__/__TEST_DIR__/named-files.json',2,0)
+
+statement ok
+SET VARIABLE named_generation=(SELECT regexp_extract(reference,'"generation":"([^"]+)"',1) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1 WHERE table_uuid IN (SELECT CAST(table_uuid AS VARCHAR) FROM __ducklake_metadata_lake.ducklake_table WHERE table_name='named_files' AND end_snapshot IS NULL))
+
+statement error
+SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','named_files','knn',getvariable('named_generation'),1)
+----
+still has visible rows
+
+query I
+SELECT count(*) FROM lake.named_files WHERE filename='report.csv'
+----
+128
+
+statement ok
+DELETE FROM lake.named_files
+
+query I
+SELECT revision FROM ducklake_retire_vortex_index_segment('lake','main','named_files','knn',getvariable('named_generation'),1)
+----
+2
+
+statement ok
+CREATE TABLE lake.row_versions(id INTEGER, val INTEGER)
+
+statement ok
+CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'row_versions')
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'row_versions')
+
+statement ok
+INSERT INTO lake.row_versions VALUES (1,10)
+
+statement ok
+UPDATE lake.row_versions SET val=20 WHERE id=1
+
+statement ok
+SET VARIABLE version_update=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'row_versions')
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'row_versions')
+
+statement ok
+DELETE FROM lake.row_versions
+
+statement ok
+SET VARIABLE version_delete=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+# Both row versions share a logical row ID but have separate positions and deletion snapshots.
+query IIIT
+SELECT file_row_number,rowid,val,CASE WHEN snapshot_id=getvariable('version_update') THEN 'update' WHEN snapshot_id=getvariable('version_delete') THEN 'delete' ELSE 'unexpected' END FROM ducklake_table_deletions('lake','main','row_versions',getvariable('version_update'),getvariable('version_delete')) ORDER BY val
+----
+0	0	10	update
+1	0	20	delete
+
+query TTI
+SELECT change_type,CASE WHEN snapshot_id=getvariable('version_update') THEN 'update' WHEN snapshot_id=getvariable('version_delete') THEN 'delete' ELSE 'unexpected' END,val FROM ducklake_table_changes('lake','main','row_versions',getvariable('version_update'),getvariable('version_delete')) ORDER BY snapshot_id,change_type
+----
+update_postimage	update	20
+update_preimage	update	10
+delete	delete	20
 
 statement ok
 DETACH lake

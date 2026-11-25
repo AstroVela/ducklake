@@ -27,6 +27,9 @@ statement ok
 INSERT INTO lake.items SELECT i,CASE WHEN i=133 THEN [0.125,0] ELSE [i::FLOAT,0::FLOAT] END,'A',CASE WHEN i=133 THEN NULL ELSE '原始向量' END FROM range(256)t(i)
 
 statement ok
+SET VARIABLE sparse_first_insert=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement ok
 SELECT * FROM ducklake_build_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/sparse-B1.json',2,0)
 
 statement ok
@@ -66,6 +69,9 @@ SELECT * FROM ducklake_rewrite_vortex_index_segment_to_f('lake','main','items','
 Invalid Vortex F rewrite revision
 
 statement ok
+DELETE FROM lake.items WHERE id=1
+
+statement ok
 DELETE FROM lake.items WHERE id<128 OR (id>=160 AND id<1000)
 
 statement ok
@@ -76,6 +82,14 @@ CREATE TABLE sparse_expected AS SELECT rowid,id,embedding,category,payload FROM 
 
 statement ok
 SET VARIABLE sparse_snapshot=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement ok
+CREATE TEMP TABLE sparse_changes_before AS SELECT * FROM ducklake_table_changes('lake','main','items',getvariable('sparse_first_insert'),getvariable('sparse_snapshot'))
+
+query II
+SELECT count(*) FILTER (WHERE change_type='insert'),count(*) FILTER (WHERE change_type='delete') FROM sparse_changes_before
+----
+385	224
 
 statement ok
 SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',100,4194304,31,67108864)
@@ -101,10 +115,66 @@ SELECT revision,(SELECT sum(record_count) FROM __ducklake_metadata_lake.ducklake
 statement ok
 SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',100,4194304,32,67108864)
 
+statement ok
+BEGIN TRANSACTION
+
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment_to_f('lake','main','items','knn',getvariable('sparse_generations')[1],2)
+----
+Vortex rewrite controls require autocommit
+
+statement ok
+ROLLBACK
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_sparse_rewrite.ducklake' AS lake (READ_ONLY)
+
+statement error
+SELECT * FROM ducklake_rewrite_vortex_index_segment_to_f('lake','main','items','knn',getvariable('sparse_generations')[1],2)
+----
+Vortex rewrite controls require a writable DuckLake attachment
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_sparse_rewrite.ducklake' AS lake (DATA_INLINING_ROW_LIMIT 100)
+
+query IIII
+SELECT revision,(SELECT max(snapshot_id) FROM lake.snapshots())=getvariable('sparse_snapshot'),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_builds_v1),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrites_v1) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
+----
+2	true	0	0
+
 query I
 SELECT revision FROM ducklake_rewrite_vortex_index_segment_to_f('lake','main','items','knn',getvariable('sparse_generations')[1],2)
 ----
 3
+
+statement ok
+SET VARIABLE sparse_rewrite_snapshot=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+query III
+SELECT
+    (SELECT count(*) FROM ducklake_table_insertions('lake','main','items',getvariable('sparse_rewrite_snapshot'),getvariable('sparse_rewrite_snapshot'))),
+    (SELECT count(*) FROM ducklake_table_deletions('lake','main','items',getvariable('sparse_rewrite_snapshot'),getvariable('sparse_rewrite_snapshot'))),
+    (SELECT count(*) FROM ducklake_table_changes('lake','main','items',getvariable('sparse_rewrite_snapshot'),getvariable('sparse_rewrite_snapshot')))
+----
+0	0	0
+
+query I
+WITH sparse_changes_after AS (
+    SELECT * FROM ducklake_table_changes('lake','main','items',getvariable('sparse_first_insert'),getvariable('sparse_rewrite_snapshot'))
+)
+SELECT count(*) FROM (
+    (SELECT * FROM sparse_changes_before EXCEPT ALL SELECT * FROM sparse_changes_after)
+    UNION ALL
+    (SELECT * FROM sparse_changes_after EXCEPT ALL SELECT * FROM sparse_changes_before)
+)
+----
+0
 
 query I
 SELECT sum(record_count) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL
@@ -163,15 +233,28 @@ statement ok
 SELECT * FROM ducklake_collect_vortex_generations('lake',16,67108864)
 
 query I
+SELECT count(*) FROM ducklake_table_insertions('lake','main','items',getvariable('sparse_rewrite_snapshot'),getvariable('sparse_rewrite_snapshot'))
+----
+0
+
+query I
 SELECT id FROM ducklake_vortex_search('lake','main','items','knn',[1000,0]::FLOAT[],1,category=>'B')
 ----
 1000
 
 statement ok
-DELETE FROM lake.items WHERE id>=1000 AND id<2000
+DELETE FROM lake.items WHERE id>=1032 AND id<2000
 
 statement ok
-SELECT * FROM ducklake_retire_vortex_index_segment('lake','main','items','knn',getvariable('sparse_generations')[2],3)
+SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',100,4194304,128,67108864)
+
+query I
+SELECT revision FROM ducklake_rewrite_vortex_index_segment_to_f('lake','main','items','knn',getvariable('sparse_generations')[2],3)
+----
+4
+
+statement ok
+SET VARIABLE sparse_second_rewrite=(SELECT max(snapshot_id) FROM lake.snapshots())
 
 query I
 SELECT array_length(regexp_extract_all(reference,'"generation":"[^"]+"')) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
@@ -182,6 +265,123 @@ query IT
 SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],1)
 ----
 9999	实时-T
+
+# Exercise successive ordinary merges after both B files become F. The new
+# Vortex file contains physical rows from two rewrites and real inserts.
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items')
+
+statement ok
+INSERT INTO lake.items SELECT 2000+i,[2000+i,0],'C','first append' FROM range(16)t(i)
+
+statement ok
+SET VARIABLE sparse_first_append=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+query II
+SELECT files_processed,files_created FROM ducklake_merge_adjacent_files('lake','items')
+----
+3	1
+
+query I
+SELECT count(*) FROM ducklake_table_changes('lake','main','items',getvariable('sparse_rewrite_snapshot'),getvariable('sparse_rewrite_snapshot'))
+----
+0
+
+statement ok
+INSERT INTO lake.items SELECT 2016+i,[2016+i,0],'C','second append' FROM range(16)t(i)
+
+statement ok
+SET VARIABLE sparse_second_append=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+query II
+SELECT files_processed,files_created FROM ducklake_merge_adjacent_files('lake','items')
+----
+2	1
+
+query III
+SELECT count(*),count(DISTINCT o.data_file_id),count(*) FILTER (WHERE o.snapshot_id IN (getvariable('sparse_rewrite_snapshot'),getvariable('sparse_second_rewrite')) AND d.partial_max IS NOT NULL AND d.record_count=96)
+FROM __ducklake_metadata_lake.ducklake_vortex_rewrite_outputs_v1 o
+LEFT JOIN __ducklake_metadata_lake.ducklake_data_file d USING (data_file_id)
+----
+2	1	2
+
+query III
+SELECT
+    (SELECT count(*) FROM ducklake_table_insertions('lake','main','items',getvariable('sparse_rewrite_snapshot'),getvariable('sparse_rewrite_snapshot'))),
+    (SELECT count(*) FROM ducklake_table_deletions('lake','main','items',getvariable('sparse_rewrite_snapshot'),getvariable('sparse_rewrite_snapshot'))),
+    (SELECT count(*) FROM ducklake_table_changes('lake','main','items',getvariable('sparse_rewrite_snapshot'),getvariable('sparse_rewrite_snapshot')))
+----
+0	0	0
+
+query I
+SELECT count(*) FROM ducklake_table_changes('lake','main','items',getvariable('sparse_second_rewrite'),getvariable('sparse_second_rewrite'))
+----
+0
+
+query III
+SELECT count(*),count(*) FILTER (WHERE change_type='insert' AND id BETWEEN 2000 AND 2015),count(*) FILTER (WHERE change_type='insert' AND id BETWEEN 2016 AND 2031)
+FROM ducklake_table_changes('lake','main','items',getvariable('sparse_first_append'),getvariable('sparse_second_append'))
+----
+32	16	16
+
+query I
+SELECT count(*) FROM ducklake_table_insertions('lake','main','items',getvariable('sparse_first_insert'),getvariable('sparse_second_append'))
+----
+417
+
+query II
+SELECT count(*) FILTER (WHERE id BETWEEN 128 AND 159),count(*) FILTER (WHERE id BETWEEN 2000 AND 2031)
+FROM lake.items AT(VERSION=>getvariable('sparse_rewrite_snapshot'))
+----
+32	0
+
+query I
+SELECT count(*) FROM ((SELECT rowid,id,embedding,category,payload FROM lake.items AT(VERSION=>getvariable('sparse_snapshot')) EXCEPT ALL SELECT * FROM sparse_expected) UNION ALL (SELECT * FROM sparse_expected EXCEPT ALL SELECT rowid,id,embedding,category,payload FROM lake.items AT(VERSION=>getvariable('sparse_snapshot'))))
+----
+0
+
+statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')
+
+statement ok
+UPDATE lake.items SET payload='new payload' WHERE id=129
+
+statement ok
+SET VARIABLE sparse_update_snapshot=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+query TIT
+SELECT change_type,id,payload FROM ducklake_table_changes('lake','main','items',getvariable('sparse_update_snapshot'),getvariable('sparse_update_snapshot')) ORDER BY change_type
+----
+update_postimage	129	new payload
+update_preimage	129	原始向量
+
+statement ok
+DELETE FROM lake.items WHERE id=128
+
+statement ok
+SET VARIABLE sparse_later_delete=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+query TI
+SELECT change_type,id FROM ducklake_table_changes('lake','main','items',getvariable('sparse_later_delete'),getvariable('sparse_later_delete'))
+----
+delete	128
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrite_outputs_v1
+----
+2
+
+statement ok
+DROP TABLE lake.items
+
+statement ok
+SELECT * FROM ducklake_expire_snapshots('lake',older_than=>now())
+
+query II
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrite_outputs_v1),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1)
+----
+0	0
 
 statement ok
 DETACH lake

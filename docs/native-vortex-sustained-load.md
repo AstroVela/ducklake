@@ -46,9 +46,11 @@ snapshots with zero minimum age. Maintenance handles at most two objects and
 The single bounded producer waits one second after each attempt in the paced
 and recovery periods; the burst has no pacing delay. A rejected attempt is
 recorded, checked for absence of a receipt, and explicitly resubmitted using
-the same request and payload. Native snapshot conflicts and T/F admission
-rejections are distinct outcomes. The runtime still performs zero implicit
-WriteBatch commit retries.
+the same request and payload while the measured phases are active. If the
+recovery phase ends with a pending request, the report records it as unadmitted
+after checking it left no receipt. Native snapshot conflicts and T/F admission
+rejections are distinct outcomes. The runtime performs zero implicit WriteBatch
+commit retries.
 
 Two query connections run throughout, including drain. Their normal pause is
 20 ms after each query. Recovery and drain use a predetermined 500 ms pause to
@@ -62,23 +64,25 @@ The burst exposed a real race: a flush captured the inline table, a managed
 mutation committed an insert, and the flush later failed native conflict
 checking. The optimizer entered its failed state and stopped draining T.
 
-Flush now acquires the existing WriteBatch writer reservation before its native
-snapshot and holds it through flush commit. Managed writes use that same
-reservation. The reservation is released before index construction. ReadViews
-remain usable during flush, and writers can commit while the subsequent index
-build runs. Source rewrite and retirement also reserve that writer before
-capture and release it after publication. This preserves their captured visible
-input against managed mutations. A data rewrite includes its static index preparation
-inside that reservation and can increase write ACK tails; pure append/merge
-index construction remains outside it. No additional mutex, schema/catalog
-version or retry loop is added.
+When a probe identifies physical work, the optimizer acquires the existing
+WriteBatch writer reservation and probes again before it records the task.
+The second probe accounts for managed mutations that committed while it waited.
+The worker checks the original DuckLake and metadata attachment identities
+after waiting.
+Flush holds the reservation through commit or rollback. Source rewrite and
+retirement hold it through publication. ReadViews remain usable during flush,
+and writers can commit during pure append and merge index construction. A data
+rewrite includes static index preparation inside its reservation and can
+increase write ACK tails.
 
 The native `automatic-flush-serialization` case pauses after the flush snapshot,
-starts a managed writer and proves it waits. It then holds the index-build
-checkpoint and requires that writer to finish. Same-view typed queries cover
+starts a managed writer and proves it waits. It starts another writer at the
+native index-build checkpoint and requires it to commit. Same-view typed queries cover
 both sides, followed by automatic promotion, GC and exact receipt replay.
-The separate rewrite case holds a prepared source replacement and checks that
-a managed mutation touching its live input waits until publication completes.
+The rewrite case holds a prepared source replacement and checks that a managed
+mutation touching its live input waits until publication completes. There are
+also cases for cancellation during the reservation wait and for switching a
+files-only rewrite to retirement after the last live rows are deleted.
 
 ## Concurrent SQL correctness and ANN quality
 
@@ -86,10 +90,10 @@ The public search result does not expose its internal ReadView snapshot. Each
 query therefore reads the durable mutation watermark immediately before and
 after executing the ordinary named SQL search. The parent reconstructs every
 committed mutation and requires the complete returned result to match one
-logical state inside that window. A query must include all writes acknowledged
-before its first watermark. It cannot choose a different version for each hit.
-Final native rows must match the model exactly, and old receipt replays after
-drain must leave that state unchanged.
+logical state inside that window. That state must include all writes acknowledged
+before the first watermark. Final business rows must match the model exactly.
+Old receipt replays after drain must return all original receipt fields while
+preserving the snapshot, index revision and current rows.
 
 This checks public read-window consistency. It does not claim to identify the
 exact internal snapshot; the automatic native probe continues checking actual
@@ -97,14 +101,17 @@ ReadView snapshot IDs. Query timing excludes watermark reads and oracle work.
 The watermark reads, status monitor and event serialization still contribute
 to overall process CPU and resource measurements.
 
-One connection uses the established fixed query as a canary. Other connections
-use rotating queries to measure quality outside that point. Both query classes
-now enforce their existing recall@10 >= 0.8 target. Typed versions, visibility,
-uniqueness, filters, distance and rank order are hard checks for both. The report
-retains the exploratory recall distribution; quality misses are not relabeled
-as version failures. Where several logical cuts fit a public read window,
-recall is reported as the conservative minimum over those cuts. Historical
-results below retain the older canary-only completion classification.
+One connection uses the established fixed query as a canary with the unchanged
+recall@10 >= 0.8 fixture gate. Another uses rotating filtered queries to measure
+quality outside that qualified point. SQL types, row versions, visibility,
+uniqueness, filters and ascending distances are hard checks for both. The report retains
+the exploratory recall distribution and whether its minimum reaches 0.8;
+exploratory quality misses are not relabeled as version failures or concealed
+by lowering the canary gate. Where several logical cuts fit a public read
+window, recall is reported as the conservative minimum over those cuts.
+The oracle rounds every distance operation to Float32. When several rows tie
+at the cutoff, the report uses the lowest recall over possible physical address
+orders. The frozen automatic-flow proof checks exact physical tie order.
 
 A completed measurement is not production quality or performance acceptance.
 New query distributions need their own agreed recall and latency targets.
@@ -114,11 +121,11 @@ work; it does not silently tune SPFresh options or select another backend.
 ## Metrics and reproduction
 
 ```sh
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_sustained_load.py \
     --fixtures automatic --rows 4096 --dimensions 8 --seconds 12 \
     --output-dir /tmp/vane-vortex-load-ci
 
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_sustained_load.py \
     --fixtures automatic cost --rows 4096 32768 --dimensions 8 128 --seconds 12 \
     --output-dir /tmp/vane-vortex-load-matrix
 ```
@@ -157,12 +164,6 @@ full query evidence and final logical state. The minimal SQL case checks quota
 rejection, admission of the unchanged request after an explicit budget change,
 named T search and exact retry. Larger matrices and longer runs are explicit;
 no production defaults or throughput claims are derived from the short CI run.
-
-For a single thirty-minute fixed-interval period with file-cost sampling, see
-[the steady-cost baseline](native-vortex-steady-cost-baseline.md). The default
-three-phase profile retains its original schedule. Failed workers and failed
-drains now retain partial phase, query and resource evidence with a failed
-result; they do not qualify the final logical state or cleanup.
 
 ## Local qualification on 2026-10-30
 
@@ -225,7 +226,7 @@ processes, with 15 optional-dependency skips. Formatting and Vane source/native
 copyleft checks passed. Replaying the retained query trace with a missing-hit
 canary or an invalid typed payload also produced the required nonzero exit.
 
-The [posting-coverage follow-up](native-vortex-posting-coverage.md) resolves the
-mapped-ID failures in this matrix. The [source-drain follow-up](native-vortex-source-gc-drain.md)
-qualifies the bounded 32,768-row / 128D reclamation cases. Broader recall,
-long-run liveness and SPFresh native online updates remain separate work.
+The [posting-coverage follow-up](native-vortex-posting-coverage.md) resolved the
+mapped-ID failures in this matrix. The original [source-drain follow-up](native-vortex-source-gc-drain.md)
+reported bounded completion for both 32,768-row / 128D reclamation cases.
+Broader recall, long-run liveness and SPFresh native online updates remain separate work.
