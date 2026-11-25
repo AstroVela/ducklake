@@ -87,7 +87,43 @@ inline void RunScratchFixture(DuckDB &database, Connection &setup, const string 
 	auto path = ScratchRoot(f.Search(first));
 	Write(root + "/scratch-root", path);
 	auto before = f.Snapshot();
+	if (mode == "scratch-wait-cancel") {
+		Pause pause;
+		Connection blocker(database), waiting(database);
+		auto blocked = std::async(std::launch::async, [&] {
+			return f.Search(blocker, [&](const string &stage) {
+				if (stage == "scratch_allocated") {
+					pause.Stop();
+				}
+			});
+		});
+		ReleasePause release {pause};
+		pause.Wait();
+		auto canceled = std::async(std::launch::async, [&] {
+			try {
+				f.Search(waiting, [&](const string &stage) {
+					if (stage == "scratch_wait_root_lock") {
+						waiting.Interrupt();
+					}
+				});
+			} catch (const InterruptException &) {
+				return true;
+			}
+			return false;
+		});
+		const bool finished_while_locked = canceled.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
+		pause.Release();
+		blocked.get();
+		Require(finished_while_locked && canceled.get(), "Interrupted query waited for the namespace holder");
+		Require(f.Snapshot() == before, "Cancellation while waiting changed canonical state");
+		auto released = ScratchCollect(setup, "lake", path, 16, 64 * 1024 * 1024);
+		Require(released[1].GetValue<idx_t>() == 0, "Interrupting admission left a scratch owner");
+		ScratchReport(root, released);
+		f.Save("scratch-complete");
+		return;
+	}
 	if (mode == "scratch-held") {
+		auto retained_rows = LifecycleSeedHits(setup);
 		Pause pause;
 		Connection reader(database);
 		auto held = std::async(std::launch::async, [&] {
@@ -97,19 +133,18 @@ inline void RunScratchFixture(DuckDB &database, Connection &setup, const string 
 				}
 			});
 		});
+		ReleasePause release {pause};
 		pause.Wait();
 		auto blocked = ScratchCollect(setup, "lake", path, 16, 64 * 1024 * 1024);
 		Require(blocked[3].GetValue<idx_t>() == 1 && blocked[4].GetValue<idx_t>() == 0,
 		        "Explicit scratch cleanup did not protect the active private view");
 		f.Retire("scratch-held");
+		f.Checkpoint();
 		blocked = ScratchCollect(setup, "lake", path, 16, 64 * 1024 * 1024);
 		Require(blocked[3].GetValue<idx_t>() == 1 && blocked[4].GetValue<idx_t>() == 0,
-		        "Canonical GC revoked private owner protection");
+		        "Canonical GC or checkpoint revoked private owner protection");
 		pause.Release();
-		auto old = held.get();
-		Require(old.rows[0][0].GetValue<int64_t>() == 0 && old.rows[0][3].ToString() == "seed-0" &&
-		            old.rows[1][0].GetValue<int64_t>() == 1,
-		        "Active private view lost its original typed values after canonical GC");
+		CheckLifecycleSeedHits(held.get(), *retained_rows);
 		f.CheckNames(true);
 		ScratchReport(root, ScratchCollect(setup, "lake", path, 16, 64 * 1024 * 1024));
 		f.Save("scratch-complete");

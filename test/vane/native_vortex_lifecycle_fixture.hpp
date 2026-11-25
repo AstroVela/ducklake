@@ -32,6 +32,7 @@ inline duckdb_yyjson::yyjson_mut_val *LifecycleValue(vortex_detail::ViewJSON &js
 	case LogicalTypeId::BIGINT:
 	case LogicalTypeId::INTEGER:
 		return yyjson_mut_sint(json.doc.get(), value.GetValue<int64_t>());
+	case LogicalTypeId::UINTEGER:
 	case LogicalTypeId::UBIGINT:
 		return yyjson_mut_uint(json.doc.get(), value.GetValue<uint64_t>());
 	case LogicalTypeId::FLOAT:
@@ -76,7 +77,7 @@ struct LifecycleFixture : KeyedFixture {
 		Write(root + "/indexes/retained.json", retained);
 		Write(root + "/indexes/caller.keep", "unregistered caller object");
 		Connection owner(database);
-		DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", "shadow", root + "/indexes/seed.json", 0);
+		DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", "shadow", root + "/indexes/seed.json", 0, *setup.context);
 	}
 
 	idx_t Count(const string &sql) {
@@ -118,7 +119,9 @@ struct LifecycleFixture : KeyedFixture {
 		for (auto name :
 		     {"ducklake_vortex_builds_v1", "ducklake_vortex_generation_refs_v1", "ducklake_vortex_generations_v1",
 		      "ducklake_vortex_indexes_v1", "ducklake_vortex_keyed_tables_v1", "ducklake_vortex_maintenance_v1",
-		      "ducklake_vortex_optimizer_v2", "ducklake_vortex_request_epochs_v1", "ducklake_vortex_rewrites_v1",
+		      "ducklake_vortex_optimizer_rewrite_receipts_v1", "ducklake_vortex_optimizer_v2",
+		      "ducklake_vortex_request_epochs_v1", "ducklake_vortex_retired_sources_v1",
+		      "ducklake_vortex_rewrite_outputs_v1", "ducklake_vortex_rewrites_v1",
 		      "ducklake_vortex_source_deletions_v1", "ducklake_vortex_source_retention_v1",
 		      "ducklake_vortex_write_budgets_v1", "ducklake_vortex_write_requests_v2"}) {
 			json.Add(
@@ -166,16 +169,17 @@ struct LifecycleFixture : KeyedFixture {
 		ReferenceState(old_generation, "active", 1);
 		Require(DuckLakeVortexIndex::Collect(*setup.context, "lake", 1, 64 * 1024 * 1024).generations == 0,
 		        "A remaining named reference failed to protect B1");
-		DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", "shadow", root + "/indexes/current.json", 1);
+		DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", "shadow", root + "/indexes/current.json", 1, *setup.context);
 		ReferenceState(old_generation, "retired", 0);
 		auto small = DuckLakeVortexIndex::Collect(*setup.context, "lake", 1, 1);
 		Require(!small.generations && !small.artifact_bytes && small.remaining == 1,
 		        "Reference lifecycle bypassed the generation byte budget");
+		const bool fault_mode = mode == "lifecycle-gc-cancel" || mode == "lifecycle-gc-fail";
 		bool injected = false;
 		try {
 			auto completed =
 			    DuckLakeVortexIndex::Collect(*setup.context, "lake", 1, 64 * 1024 * 1024, [&](const string &stage) {
-				    if (stage == "gc_file_deleted" && (mode == "lifecycle-gc-cancel" || mode == "lifecycle-gc-fail")) {
+				    if (stage == "gc_file_deleted" && fault_mode) {
 					    injected = true;
 					    if (mode == "lifecycle-gc-cancel") {
 						    setup.context->Interrupt();
@@ -184,7 +188,7 @@ struct LifecycleFixture : KeyedFixture {
 					    }
 				    }
 			    });
-			Require(!injected, "Lifecycle GC fault did not stop collection");
+			Require(!fault_mode, "Lifecycle GC did not fail at the requested deletion checkpoint");
 			Require(completed.generations == 1 && !completed.remaining && completed.artifact_bytes <= 64 * 1024 * 1024,
 			        "Generation collection changed its object/byte budget");
 		} catch (std::exception &error) {
@@ -205,19 +209,26 @@ struct LifecycleFixture : KeyedFixture {
 		        "Collectors removed caller reference output or unknown siblings");
 		bool stale = false;
 		try {
-			DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", "stale", root + "/indexes/retained.json", 0);
-		} catch (std::exception &) {
+			DuckLakeVortexIndex::Publish(owner, "lake", "main", "items", "stale", root + "/indexes/retained.json", 0,
+			                            *setup.context);
+		} catch (const InvalidInputException &error) {
+			auto detail = ErrorData(error).RawMessage();
+			Require(detail == "Cannot resolve local Vortex index path: " + root + "/indexes/" + old_generation,
+			        "Unexpected stale-reference rejection: " + detail);
 			stale = true;
 		}
 		Require(stale, "A retained JSON file revived a collected generation");
+		Require(Count("SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1 "
+		              "WHERE index_name COLLATE C='stale'") == 0,
+		        "Rejected stale publication left an index catalog row");
 		CheckNames(true);
 	}
 
 	void Window() {
 		Connection owner(database);
-		auto result = DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, "lake", "main", "items", "knn", 1);
+		auto result = DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, *setup.context, "lake", "main", "items", "knn", 1);
 		Require(result.expired_requests == 2, "Lifecycle fixture lost its existing receipts");
-		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "window",
+		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "window",
 		                                 Value::LIST(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), {}),
 		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(-999999)}), 2);
 	}
@@ -268,8 +279,30 @@ inline void LifecycleGuards(LifecycleFixture &f) {
 	DuckLakeVortexOptimizer::ConfigureSourceRetention(*f.setup.context, "lake", false, 1, 0);
 }
 
+inline unique_ptr<MaterializedQueryResult> LifecycleSeedHits(Connection &setup) {
+	auto retained_rows = SQL(setup, "SELECT id,embedding,category,payload,"
+	                                "(embedding[1]*embedding[1]+embedding[2]*embedding[2])::FLOAT AS distance "
+	                                "FROM lake.items ORDER BY distance,id LIMIT 3");
+	Require(retained_rows->RowCount() == 3, "The old-view fixture needs three typed seed rows");
+	return retained_rows;
+}
+
+inline void CheckLifecycleSeedHits(const DuckLakeVortexSearchResult &previous, MaterializedQueryResult &retained) {
+	Require(previous.rows.size() == retained.RowCount(), "Old private ReadView lost a seed hit");
+	for (idx_t row = 0; row < previous.rows.size(); row++) {
+		Require(previous.rows[row].size() == retained.ColumnCount(), "Old private ReadView changed the shape of a seed hit");
+		for (idx_t column = 0; column < retained.ColumnCount(); column++) {
+			auto expected = retained.GetValue(column, row);
+			auto &actual = previous.rows[row][column];
+			Require(actual.type() == expected.type() && actual == expected,
+			        "Old private ReadView changed a typed seed hit after cleanup and checkpoint");
+		}
+	}
+}
+
 inline void RunLifecycleFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
 	LifecycleFixture f(database, setup, root);
+	auto retained_rows = LifecycleSeedHits(setup);
 	Pause pause;
 	Connection reader(database);
 	auto held = std::async(std::launch::async, [&] {
@@ -327,7 +360,7 @@ inline void RunLifecycleFixture(DuckDB &database, Connection &setup, const strin
 		auto rows = SQL(setup, "SELECT [{'id':12345::BIGINT,'embedding':[12345,0]::FLOAT[],"
 		                       "'category':'A'::VARCHAR,'payload':'after-checkpoint'::VARCHAR}]")
 		                ->GetValue(0, 0);
-		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "after-checkpoint", rows,
+		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "after-checkpoint", rows,
 		                                 Value::LIST(LogicalType::BIGINT, {}), 2, [&](const string &stage) {
 			                                 if (mode == "lifecycle-pause-write-" + stage) {
 				                                 f.Wait("write-" + stage);
@@ -336,10 +369,7 @@ inline void RunLifecycleFixture(DuckDB &database, Connection &setup, const strin
 	}
 	f.Checkpoint();
 	pause.Release();
-	auto previous = held.get();
-	Require(previous.rows.size() == 3 && previous.rows[0][0].GetValue<int64_t>() == 0 &&
-	            previous.rows[0][3].ToString() == "seed-0" && previous.rows[1][0].GetValue<int64_t>() == 1,
-	        "Old private ReadView lost typed versions after reference cleanup, GC and checkpoint");
+	CheckLifecycleSeedHits(held.get(), *retained_rows);
 	f.CheckNames(true);
 	f.Save("complete");
 }

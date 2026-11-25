@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import statistics
 import subprocess
@@ -23,13 +24,16 @@ PIN = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PIN)
 AA, BASE = PIN.AA, PIN.AA.BASE
 CATALOG = '"__ducklake_metadata_lake"."main".'
+QUEUE_KEY = r"\(\(data_file_id=\d+ AND path COLLATE C='(?:[^']|'')*' AND path_is_relative=(?:true|false)\)\)"
+INTENT_QUERY = "SELECT count(*) FROM " + CATALOG + "ducklake_vortex_source_deletions_v1 WHERE "
+INTENT_IDENTITY = QUEUE_KEY + r" AND device=\d+ AND inode=\d+ AND file_bytes=\d+ AND digest='sha256:[0-9a-f]{64}'"
 EXPECTED = {
     "known_source_paths": 4,
     "scheduled_ownership": 4,
     "index_references": 4,
     "begin": 10,
     "commit": 5,
-    "other_sql": 15,
+    "other_sql": 17,
 }
 RULE = {
     "mode": "repeated_metadata_diagnostics",
@@ -68,8 +72,13 @@ def category(sql):
         )
         assert "ducklake_files_scheduled_for_deletion" not in sql
         return "known_source_paths"
-    if sql.startswith("SELECT count(*) FROM " + CATALOG + "ducklake_files_scheduled_for_deletion WHERE data_file_id="):
+    ownership = "SELECT count(*) FROM " + CATALOG + "ducklake_files_scheduled_for_deletion WHERE "
+    if sql.startswith(ownership):
+        assert re.fullmatch(QUEUE_KEY, sql[len(ownership) :]), "invalid scheduled ownership predicate"
         return "scheduled_ownership"
+    if sql.startswith(INTENT_QUERY):
+        assert re.fullmatch(INTENT_IDENTITY, sql[len(INTENT_QUERY) :]), "missing deletion-intent identity predicates"
+        return "other_sql"
     if sql == "SELECT table_uuid,reference FROM " + CATALOG + "ducklake_vortex_indexes_v1":
         return "index_references"
     if sql == "BEGIN TRANSACTION":
@@ -104,13 +113,20 @@ def trace_partition(sample):
     assert all(a["end_ns"] <= b["begin_ns"] for a, b in zip(top, top[1:])), "outer SQL scopes overlap"
     nested = [q for q in queries if q["depth"]]
     assert len(nested) == 5 and all(q["depth"] == 1 and q["sql"] == "COMMIT" for q in nested)
+    for commit in (q for q in top if q["sql"] == "COMMIT"):
+        assert sum(
+            commit["begin_ns"] <= child["begin_ns"] and child["end_ns"] <= commit["end_ns"]
+            for child in nested
+        ) == 1, "each outer COMMIT must contain one nested COMMIT"
     counts = Counter(category(q["sql"]) for q in top)
     assert dict(counts) == EXPECTED, "unexpected outer SQL inventory"
+    assert sum(q["sql"].startswith(INTENT_QUERY) for q in top) == 2, "missing deletion-intent checks"
     checkpoints = sample["checkpoints"]
     expected_stages = ["source_gc_waiting"] + [
         "source_before_plan",
         "source_delete_intent_committed",
         "source_before_unlink",
+        "source_unlinked_before_sync",
         "source_after_unlink",
         "source_delete_completed",
     ] * 2
@@ -244,7 +260,7 @@ def run(args):
     hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in tracked}
     private = root / "private"
     private.mkdir(mode=0o700)
-    env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local-fast")
+    env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local")
     env.pop("VORTEX_SPFRESH_NATIVE", None)
     rounds = RULE["profiles"][args.profile]
     report = {
@@ -254,6 +270,7 @@ def run(args):
         "rounds": rounds,
         "driver": str(driver),
         "driver_sha256": driver_hash,
+        "ducklake_extension_version": source["ducklake_extension_version"],
         "inputs_report_sha256": hashlib.sha256(inputs.read_bytes()).hexdigest(),
         "code_sha256": hashes,
         "original_affinity": original,
@@ -302,6 +319,7 @@ def run(args):
         old_data, new_data = ({p for p in m if p.startswith("data/")} for m in (before, after))
         deleted = {Path(p).relative_to(work).as_posix() for p in sample["deleted_paths"]}
         assert old_data - new_data == deleted and not new_data - old_data
+        assert sample["bytes"] == sum(before[p]["bytes"] for p in deleted)
         assert all(before[p] == after[p] for p in new_data)
         assert all(after.get(p) == value for p, value in before.items() if p.startswith("indexes/"))
         sample.update(

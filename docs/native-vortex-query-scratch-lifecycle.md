@@ -23,13 +23,13 @@ TMPDIR/
 
 `root.json` 绑定 DATA_PATH、euid、根／父目录／父级锁／registry／work 的 device 和 inode。查询记录进一步绑定工作目录、payload 和 owner.lock。仅名称相同、复制登记文件或替换 inode 均不能取得所有权。
 
-根初始化在同一父目录中先完整写入控制信息，fsync 后以不覆盖目标的 rename 发布。发布前不会写入查询副本。这个阶段崩溃可能留下未登记的少量初始化元数据；显式回收不会扫描或接管它。旧版临时目录和任意其他 TMPDIR 同级目录也不被接管。
+根初始化在同一父目录中先完整写入控制信息，fsync 后以不覆盖目标的 rename 发布。首次打开或复用根时，都会先核对根和同级锁的身份，再 fsync 父目录。同步成功后查询才可登记 owner 并写入副本。初始化阶段崩溃可能留下少量未登记的元数据。这些元数据、旧版临时目录和其他 TMPDIR 同级目录均在显式回收的范围之外。
 
 payload 是登记时独占委托给 SDK 的工作树。在首次回收计划发布前，其普通文件属于这一查询；无法也不声称能区分同一用户故意放入该树的其他普通文件。协议目录中的未知控制文件明确失败；不在登记中的 work 同级目录保持原样；计划发布后新增、替换或无删除意图消失的 payload 项明确失败。
 
 ## 查询与活跃保护
 
-查询先持命名空间锁，durably 写入 `allocating` 记录，再创建目录及 owner.lock，持有文件锁后发布 `live`。正常结束、取消和可返回错误都先释放 ReadView／SDK lease，再关闭登记。关闭要求 payload 已由 SDK 释放；异常残留会明确报错并保留登记，交给显式回收。
+查询先持命名空间锁，durably 写入 `allocating` 记录，再创建目录及 owner.lock，持有文件锁后发布 `live`。正常结束、取消和可返回错误都先释放 ReadView／SDK lease，再关闭登记。分配和关闭等待命名空间锁时都会检查查询取消。关闭期间如果等锁被取消，释放 owner 锁并保留登记，后续显式回收可接手。正常关闭先确认 SDK 已清空 payload，再 fsync 该目录，使 SDK 删除的目录项持久化后才发布 `finishing`。遇到残留文件或同步失败时，保留 `live` 登记供显式回收。
 
 文件锁随进程退出由内核释放，不根据 PID、时间戳或目录年龄猜测查询是否结束。回收对活跃 owner 的锁使用 try-lock，返回 `blocked_views`，不读取其 payload。已打开的旧 ReadView 在规范源／generation GC 及 metadata checkpoint 后仍持有私有副本和文件锁。
 
@@ -46,7 +46,7 @@ SELECT * FROM ducklake_collect_vortex_query_scratch(
 );
 ```
 
-参数为 catalog、已登记根、对象预算、字节预算。对象数限制为 1–16、字节为 1–64 MiB，不增加默认兼容路径或扫描重试。返回一行：
+参数为 catalog、已登记根、对象预算、字节预算。对象数限制为 1–16，字节预算为 1 字节至 64 MiB，不增加默认兼容路径或扫描重试。返回一行：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -57,21 +57,23 @@ SELECT * FROM ducklake_collect_vortex_query_scratch(
 | collected_files／collected_bytes | 已实际删除的 payload 普通文件数和文件字节 |
 | removed_views | 已完成清理的登记数 |
 
-同一次调用共享预算，不能按文件或 owner 放大。最多检查对象预算数量的 owner，持久游标轮转，避免前 16 个活跃 owner 长期阻塞后面的死 owner。命名空间锁被分配或另一回收持有时，显式调用返回 busy，由调用方决定下一次调用；没有内部重试。
+同一次调用共享预算，不能按文件或 owner 放大。回收器取得命名空间锁后，先同步 `registry` 和登记暂存文件所在的命名空间根，再枚举登记。即使最后一条登记的删除在上轮中断时已经可见，重试也要等同步成功才可报告剩余为零。遍历登记名时统计总数，内存中只保留本轮游标所需的候选名。最多检查对象预算数量的 owner，持久游标轮转，避免前 16 个活跃 owner 长期阻塞后面的死 owner。命名空间锁被分配或另一回收持有时，显式调用返回 busy，由调用方决定下一次调用；没有内部重试。
 
 每个文件仍受既有 64 MiB artifact 限制，删除清单受既有 1 MiB manifest 限制；路径长度及深度也有限制。协议元数据、清单遍历、校验及 fsync 开销不计作 payload 字节；这些预算不构成总 I/O、RSS、延迟或磁盘空间的上界。
 
-本 API 不改受管 generation/source 的 GC、13 张 Vortex 元数据表、调用方 reference JSON、业务事务、原生 WAL 或 checkpoint 协议。显式用户事务内调用拒绝执行；重开不会自动清理或启动 optimizer。
+查询和回收使用相同的文件系统路径展开规则处理 catalog 的 DATA_PATH，包括本地 file: URI。显式回收使用诊断给出的规范绝对根路径，并校验当前绑定的 native DuckLake catalog。限制外部访问时，调用方需要根目录的后代访问权限和同级命名空间锁文件的访问权限。显式用户事务内调用拒绝执行。受管 generation/source 的 GC、Vortex 元数据表、调用方 reference JSON、业务事务、原生 WAL 和 checkpoint 各自遵循现有协议。
 
 ## 部分清理与恢复
 
 死 owner 的 payload 按后序清单冻结，记录相对路径、类型、device／inode、大小和 `present/pending/removed` 状态。删除始终使用已打开的目录 FD 与 `openat(O_NOFOLLOW)`／`unlinkat`。
 
-1. 发布 `collecting` 清单并 fsync。
-2. 每项检查身份及剩余预算，写唯一 `pending` 意图并 fsync，再 unlink，fsync 父目录后确认 `removed`。
+检查点回调返回后、写入清理记录和删除文件前，回收器沿授权路径重新核对父目录、命名空间根、同级锁文件、`registry` 和 `work` 的身份。绑定变化会终止本轮回收，已经持久化的清理进度可用于恢复。
+
+1. 首次接管 `live` owner 时，核对每个 SDK 普通文件的身份和大小并 fsync 文件。按子目录到父目录的顺序一直同步到 payload 根，使清单依赖的目录项也持久化，再发布 `collecting`。同步失败时保留原 `live` 登记。后续轮次按已冻结清单核对和删除，计费仍以本轮实际删除的对象和字节为准。
+2. 每项检查身份及剩余预算，写唯一 `pending` 意图并 fsync，再从登记目录核对待删项的身份、类型及大小，unlink 后 fsync 父目录并确认 `removed`。
 3. 中断后，仅 pending 项允许已经消失；此前无意图的缺失、未知新增或身份变化均失败。
-4. 未完成 pending 优先恢复。若它尚在且超过本次字节预算，保持一个 pending，不另外创建意图；若已 unlink，则只确认状态，不重复收费。
-5. 所有 payload 项删除后，先发布 `finishing` 意图，再删除空 payload、owner.lock、工作目录，最后删除登记。崩溃后的工作目录缺失只有这一持久意图可以授权。
+4. 未完成的 `pending` 项优先恢复。若它尚在且超过本次字节预算，保留原意图。若文件或目录已消失，先 fsync 其父目录，成功后才记为 `removed`。同步失败时保留 `pending`，重试只对当轮实际删除的对象和字节计费。
+5. 所有 payload 项删除后，先发布 `finishing` 意图，再删除空 payload、owner.lock 和工作目录。恢复已有 `finishing` 登记时，先依次 fsync 登记改名的目标目录 `registry` 和暂存文件所在的命名空间根。两次同步都成功后才开始删除。即使重试时工作目录已经消失，也要先 fsync 其父目录 `work`，再复核登记的文件身份和内容并移除登记。同步失败时保留 `finishing` 登记供下一轮恢复。
 
 协议预留的 `.record.tmp` 是根锁串行化的有界元数据暂存槽；下次认证打开可丢弃它。它不存放查询副本，也不授权接管其他未知文件。
 
@@ -80,15 +82,17 @@ SELECT * FROM ducklake_collect_vortex_query_scratch(
 入口为 [Python coordinator](../test/vane/test_vane_vortex_query_scratch.py)、[独立文件系统模型](../test/vane/vortex_query_scratch_model.py)、[真实 native fixture](../test/vane/native_vortex_scratch_fixture.hpp) 和 [Rust 子进程探针](../test/vane/vortex_index_probe/src/scratch_probe.rs)。CI 在同一 provider 闭包上执行并保留报告与恢复证据。
 
 ```bash
-env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_query_scratch.py \
+env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local python -I test/vane/test_vane_vortex_query_scratch.py \
   --driver /path/to/ducklake_vortex_write_driver \
   --probe /path/to/ducklake-vortex-index-probe \
   --cpus 6,7,8,9,10,11 --output-dir /fresh/query-scratch-proof
 ```
 
-功能验证逐项比较 13 张原生元数据表、业务 typed rows、snapshots，以及全部 data／indexes 文件的 SHA-256。普通 SDK 文件边界使用独立 filesystem fixture，真实查询副本单独经 native SQL 和安装态 provider 验证，不把合成文件测试计为 ANN 质量或容量结论。
+当前功能验证逐项比较 16 张 Vortex 元数据表、业务 typed rows、snapshots，以及全部 data／indexes 文件的 SHA-256。URI 用例从建表起使用同一个 file: DATA_PATH，重开后查询已发布的 B 段，再以诊断返回的根调用显式回收。登记规模用例在超过 1 MiB 的登记名上核对连续两轮的游标和实际回收量。普通 SDK 文件边界使用独立 filesystem fixture，真实查询副本经 native SQL 和安装态 provider 验证。受限目录和替换后的 registry 分别验证拒绝路径，保留原 owner 和暂存记录。
 
-截至 2026-11-07，本轮通过：
+### 2026-11-07 历史验证
+
+以下结果对应 [原提交 `94fa95b9`](https://github.com/AstroVela/ducklake/commit/94fa95b992a71d2bb5745f15994d2b43a073f1da) 的 13 张元数据表和当时的 provider 闭包。
 
 - **25 组独立文件系统协议场景**：正常关闭、活跃锁、未完成分配、对象／字节边界、真实 64 MiB 单文件及全局字节计费、无效参数、错误／复制根、未知控制文件、符号／硬链接、目录／锁／文件身份替换、计划后新增和无意图缺失、部分回收重试，以及 18 个 owner 的轮转公平性。
 - **5 个真实查询／安装态重开场景**：正常、查询取消、分配取消、打开索引后失败，以及旧视图跨规范 GC／checkpoint 查询。

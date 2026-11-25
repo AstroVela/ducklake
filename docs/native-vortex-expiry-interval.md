@@ -6,6 +6,13 @@ The bounded query remains a test-only SQL reference, excluded from provider
 artifacts. The retained NOT EXISTS query, transaction/ownership/reference
 checks, deletion intents, scheduling and two-object/64-MiB budget are unchanged.
 
+The full matrices and installed-provider qualification below refer to the
+original November 6, 2026 stack. The current trial builder preserves the
+physical-retirement marker column and links all variants with an explicit
+metadata object at the same position. The archived build instructions and hashes
+identify the historical executables.
+[Original experiment at `beaff69a`](https://github.com/AstroVela/ducklake/blob/beaff69ac8a098be875d483b4c575e8d6c2e6d4a/docs/native-vortex-expiry-interval.md)
+
 The [restored source-GC baseline](native-vortex-source-gc-cost.md) found a
 scale-sensitive ended-data-file query in `DeleteSnapshots`. At 4,096 materialized
 history updates, its instrumented query averaged 164.928 ms; the complete
@@ -139,7 +146,7 @@ python -I test/vane/build_vortex_expiry_trial.py \
     --build-dir "$SKBUILD_BUILD_DIR" --output-dir /tmp/expiry-trial-build
 env -u VORTEX_SPFRESH_NATIVE python -I test/vane/test_vane_vortex_source_gc_benchmark.py \
     --driver /tmp/expiry-trial-build/baseline --output-dir /tmp/expiry-trial-inputs
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_expiry_interval.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_expiry_interval.py \
     --output-dir /tmp/expiry-interval-semantics
 python -I test/vane/test_vane_vortex_source_gc_ab_stats.py
 env -u VORTEX_SPFRESH_NATIVE python -I test/vane/test_vane_vortex_source_gc_ab.py \
@@ -153,7 +160,7 @@ Use `/tmp/expiry-trial-build/unbounded` and a separate output directory for the
 first trial. Output directories must be new. Inputs must remain at their
 original canonical paths, without another writer/benchmark using them.
 
-## Final local qualification after withdrawal
+## Historical qualification after withdrawal
 
 The final test-only reference passed 260 native-Vane and 260 SQLite oracle
 cases. All four paired-analysis regressions passed. The reproducible builder

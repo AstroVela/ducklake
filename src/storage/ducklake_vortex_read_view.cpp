@@ -3,9 +3,9 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
-#include "duckdb/storage/storage_lock.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -24,6 +24,10 @@ using namespace duckdb_yyjson;
 using namespace vortex_detail;
 
 namespace {
+
+constexpr const char *READ_CAPTURE = "ducklake_vortex_read_capture";
+
+struct ReadCaptureContext final : public ClientContextState {};
 
 yyjson_mut_val *Business(ViewJSON &json, const vector<Value> &values, uint32_t dimension) {
 	auto row = json.Object();
@@ -50,27 +54,38 @@ yyjson_mut_val *Business(ViewJSON &json, const vector<Value> &values, uint32_t d
 
 } // namespace
 
-StorageLock &DuckLakeVortexReadView::AdmissionLock() {
-	static StorageLock lock;
+DuckLakeVortexReadCaptureScope::DuckLakeVortexReadCaptureScope(ClientContext &context_p) : context(context_p) {
+	context.registered_state->GetOrCreate<ReadCaptureContext>(READ_CAPTURE);
+}
+
+DuckLakeVortexReadCaptureScope::~DuckLakeVortexReadCaptureScope() {
+	context.registered_state->Remove(READ_CAPTURE);
+}
+
+DuckLakeVortexCollectionLock &DuckLakeVortexReadView::AdmissionLock() {
+	static DuckLakeVortexCollectionLock lock;
 	return lock;
 }
 
-void DuckLakeVortexReadView::ValidateFields(DuckLakeTableEntry &table) {
-	for (auto &name : {"id", "embedding", "category", "payload"}) {
-		auto &field = table.GetFieldId(vector<string> {name});
-		auto expected = string(name) == "id"          ? LogicalType::BIGINT
-		                : string(name) == "embedding" ? LogicalType::LIST(LogicalType::FLOAT)
-		                                              : LogicalType::VARCHAR;
-		if (field.Type() != expected) {
-			throw InvalidInputException("Native read view field type mismatch: %s", name);
-		}
+bool DuckLakeVortexReadView::IsCapturing(ClientContext &context) {
+	return bool(context.registered_state->Get<ReadCaptureContext>(READ_CAPTURE));
+}
+
+const DuckLakeFieldId &DuckLakeVortexReadView::ResolveField(DuckLakeTableEntry &table, const string &name) {
+	auto &field = table.GetFieldId(vector<string> {name});
+	auto expected = name == "id"          ? LogicalType::BIGINT
+	                : name == "embedding" ? LogicalType::LIST(LogicalType::FLOAT)
+	                                      : LogicalType::VARCHAR;
+	if (field.Type() != expected) {
+		throw InvalidInputException("Native read view field type mismatch: %s", name);
 	}
+	return field;
 }
 
 static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVortexViewOptions &options,
                                           const std::function<void(const string &)> &observe,
-                                          optional_ptr<ClientContext> owner, bool oracle_rows,
-                                          bool build_files = false) {
+                                          optional_ptr<ClientContext> owner, bool oracle_rows, bool build_files = false,
+                                          optional_ptr<const DuckLakeVortexCatalogIdentity> identity = nullptr) {
 	const bool invalid_dimension =
 	    options.index_name.empty() ? options.dimension == 0 || options.dimension > 4096 : options.dimension != 0;
 	if (invalid_dimension || options.max_source_bytes == 0 || options.max_source_bytes > 64 * 1024 * 1024 ||
@@ -80,27 +95,43 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 	if (reader.context->transaction.HasActiveTransaction()) {
 		throw InvalidInputException("Read view acquisition requires an idle dedicated connection");
 	}
-	auto checkpoint = [&](const string &stage) {
-		if (observe) {
-			observe(stage);
-		}
+	auto interrupt = [&] {
 		if (reader.context->IsInterrupted() || (owner && owner->IsInterrupted())) {
 			throw InterruptException();
 		}
 	};
-	unique_ptr<StorageLockKey> generation_guard;
+	auto checkpoint = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		interrupt();
+	};
+	unique_ptr<DuckLakeVortexCollectionLock::Key> generation_guard;
 	if (!options.index_name.empty() && !build_files) {
-		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock();
+		generation_guard = DuckLakeVortexIndex::CollectionLock().GetSharedLock(interrupt);
 	}
-	reader.BeginTransaction();
+	const auto binding = identity ? *identity
+	                              : DuckLakeVortexIndex::ResolveCatalog(*reader.context, options.catalog, false,
+	                                                                    "Native Vortex read view");
+	checkpoint("before_source_admission");
+	// BEGIN can start DuckLake transactions eagerly on every attached catalog.
+	auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock(interrupt);
+	DuckLakeVortexReadCaptureScope capture(*reader.context);
 	try {
-		auto &catalog = Catalog::GetCatalog(*reader.context, options.catalog).Cast<DuckLakeCatalog>();
+		reader.BeginTransaction();
+		auto &resolved = Catalog::GetCatalog(*reader.context, options.catalog);
+		if (resolved.GetAttached().oid != binding.lake_oid) {
+			throw TransactionException("Vortex catalog attachment changed");
+		}
+		if (resolved.GetCatalogType() != "ducklake") {
+			throw InvalidInputException("Native Vortex read views require an attached DuckLake catalog");
+		}
+		auto &catalog = resolved.Cast<DuckLakeCatalog>();
 		if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
 			throw InvalidInputException("Native Vortex read views require DuckDB metadata");
 		}
-		auto guard = DuckLakeVortexReadView::AdmissionLock().GetSharedLock();
 		auto &transaction = DuckLakeTransaction::Get(*reader.context, catalog);
-		transaction.MarkVortexReadCapture();
+		DuckLakeVortexIndex::CheckCatalogIdentity(transaction, binding);
 		auto snapshot = transaction.GetSnapshot();
 		checkpoint("after_snapshot");
 		auto entry = catalog.GetEntry(*reader.context, CatalogType::TABLE_ENTRY, options.schema, options.table,
@@ -155,11 +186,12 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		json.Number(captured, "dimension", dimension);
 		auto business = json.Object();
 		json.Add(captured, "business_fields", business);
-		DuckLakeVortexReadView::ValidateFields(table);
+		vector<pair<FieldIndex, LogicalType>> business_fields;
 		for (auto &name : {"id", "embedding", "category", "payload"}) {
-			auto &field = table.GetFieldId(vector<string> {name});
+			auto &field = DuckLakeVortexReadView::ResolveField(table, name);
 			json.Number(string(name) == "embedding" ? captured : business,
 			            string(name) == "embedding" ? "field_id" : name, field.GetFieldIndex().index);
+			business_fields.emplace_back(field.GetFieldIndex(), field.Type());
 		}
 		auto files = transaction.GetMetadataManager().GetExtendedFilesForTable(table, snapshot);
 		std::sort(files.begin(), files.end(),
@@ -176,9 +208,9 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 		map<string, idx_t> by_path;
 		DuckLakeVortexReadView result;
 		result.generation_guard = std::move(generation_guard);
-		result.managed_data_path = catalog.DataPath();
 		result.snapshot_id = snapshot.snapshot_id;
 		auto &fs = FileSystem::GetFileSystem(*reader.context);
+		result.managed_data_path = fs.ExpandPath(catalog.DataPath());
 		idx_t physical_rows = 0, selected_rows = 0, inventory_bytes = 0;
 		vector<DuckLakeVortexIndexFile> identities;
 		const auto row_limit = MinValue<idx_t>(options.max_rows, 64 * 1024 * 1024 / sizeof(float) / dimension);
@@ -333,6 +365,9 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			}
 			result.rows_json = oracle.Finish(expected);
 		} else {
+			// QueryEnd releases catalog pins, so own the metadata needed after the visibility scan.
+			auto table_id = table.GetTableId();
+			auto inlined_tables = table.GetInlinedDataTables();
 			auto rows = reader.SendQuery("SELECT filename,file_row_number,rowid FROM " + name + " AT (VERSION => " +
 			                             to_string(snapshot.snapshot_id) + ") LIMIT " + to_string(row_limit + 1));
 			if (rows->HasError()) {
@@ -365,9 +400,33 @@ static DuckLakeVortexReadView AcquireView(Connection &reader, const DuckLakeVort
 			checkpoint("after_visibility");
 			idx_t inline_bytes = 0;
 			for (auto &source : inline_visible) {
-				// Native metadata applies the same snapshot predicates as its inlined reader.
-				auto inlined_rows = transaction.GetMetadataManager().ReadInlinedData(
-				    snapshot, source.first, {"id", "embedding", "category", "payload", "row_id"});
+				// Resolve physical names using the source schema, as the native inlined reader does.
+				auto source_table =
+				    std::find_if(inlined_tables.begin(), inlined_tables.end(),
+				                 [&](const DuckLakeInlinedTableInfo &info) { return info.table_name == source.first; });
+				if (source_table == inlined_tables.end()) {
+					throw InvalidInputException("Visible inline source is outside the native table inventory");
+				}
+				DuckLakeSnapshot source_snapshot(
+				    catalog.GetBeginSnapshotForSchemaVersion(table_id, source_table->schema_version, transaction),
+				    source_table->schema_version, 0, 0);
+				auto source_entry = catalog.GetEntryById(transaction, source_snapshot, table_id);
+				if (!source_entry) {
+					throw InvalidInputException("Missing native inline source schema");
+				}
+				auto &source_schema = source_entry->Cast<DuckLakeTableEntry>();
+				vector<string> projections;
+				for (auto &field : business_fields) {
+					auto source_field = source_schema.GetFieldId(field.first);
+					if (!source_field || source_field->Type() != field.second) {
+						throw InvalidInputException("Native inline source field mismatch: %llu", field.first.index);
+					}
+					projections.push_back(KeywordHelper::WriteOptionallyQuoted(source_field->Name()));
+				}
+				projections.push_back("row_id");
+				// Business visibility still uses the query snapshot in the same metadata transaction.
+				auto inlined_rows =
+				    transaction.GetMetadataManager().ReadInlinedData(snapshot, source.first, projections);
 				if (inlined_rows->HasError()) {
 					inlined_rows->ThrowError();
 				}
@@ -441,12 +500,13 @@ DuckLakeVortexReadView DuckLakeVortexReadView::AcquireQuery(Connection &reader,
 DuckLakeVortexReadView DuckLakeVortexReadView::AcquireBuild(Connection &reader,
                                                             const DuckLakeVortexViewOptions &options,
                                                             const std::function<void(const string &)> &observe,
-                                                            optional_ptr<ClientContext> owner) {
+                                                            optional_ptr<ClientContext> owner,
+                                                            const DuckLakeVortexCatalogIdentity &identity) {
 	if ((options.unindexed_only || !options.merge_generations.empty()) != !options.index_name.empty() ||
 	    (options.unindexed_only && !options.merge_generations.empty())) {
 		throw InvalidInputException("Incremental/merge build capture requires a published index and one selection");
 	}
-	return AcquireView(reader, options, observe, owner, false, true);
+	return AcquireView(reader, options, observe, owner, false, true, &identity);
 }
 
 } // namespace duckdb

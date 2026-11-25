@@ -86,10 +86,15 @@ SELECT revision FROM ducklake_retire_vortex_index_segment('lake','main','items',
 ----
 3
 
-query IT
-SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0.125,0]::FLOAT[],1,category=>'B')
+query ITTII
+SELECT id,category,payload,(embedding=[0.125,0]::FLOAT[])::INTEGER,(distance=0)::INTEGER FROM ducklake_vortex_search('lake','main','items','knn',[0.125,0]::FLOAT[],1,category=>'B')
 ----
-0	NULL
+0	B	NULL	1	1
+
+query ITTII
+SELECT id,category,payload,(embedding=[511.125,0]::FLOAT[])::INTEGER,(distance=0)::INTEGER FROM ducklake_vortex_search('lake','main','items','knn',[511.125,0]::FLOAT[],1,category=>'B')
+----
+511	B	NULL	1	1
 
 query I
 SELECT count(*) FROM lake.items AT(VERSION=>getvariable('original_snapshot')) WHERE category='A' AND payload='original'

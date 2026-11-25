@@ -62,60 +62,58 @@ protocols or call SPFresh's original online-update API.
 
 ```sh
 cmake --build build/runtime --target ducklake_vortex_write_driver
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_automatic_flow.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_automatic_flow.py \
     --driver build/runtime/ducklake_vortex_write_driver \
     --output-dir /tmp/vane-vortex-automatic-proof
 ```
 
 The installed-provider workload grows four independent batches of 128 rows.
-The fourth batch requires automatic selective merge then append, preserving the
-unselected B generation unchanged. Eight subsequent rounds each replace 96
-current rows, delete 32 other IDs and insert 32 new IDs. There are always 512
-live business keys. The unchanged fixture gate is recall@10 >= 0.8; visibility,
-typed row versions, uniqueness, filters, distance and ordering are hard checks.
-The public probe checks exact native row state and named search immediately
-after each mutation and again after the background pipeline drains.
+The fourth batch merges the two smallest B segments in physical-row order
+with generation as the tie-break. It then publishes the new F file as its
+own B while preserving the unselected generation's descriptor and bytes.
+Eight subsequent rounds each replace 96 current rows, delete 32 other IDs
+and insert 32 new IDs. The live key count remains 512 during these rounds.
+
+The public probe checks exact logical rows after each mutation. It qualifies
+the four named and prepared searches against captured physical addresses
+only when the snapshot and index revision stay fixed across the sample.
+A separate frozen fixture checks strict B/F/T order for equal Float32 scores,
+including when the tie crosses top-k. The ANN recall gate remains 0.8.
+Exact scans must return the full expected top-k.
+Visibility, typed rows, uniqueness, filters, distance and ordering are checked
+independently. A child process bounds the public proof, including teardown.
 
 The native driver runs the same rolling workload alongside filtered and
-unfiltered queries. Each query records its actual ReadView snapshot. Validation
-uses the committed logical model at that snapshot, including physical-only
-snapshots between mutations, and requires coverage of every committed mutation
-phase. Stage observations prove that flush, build, selective merge, source
-rewrite and source deletion all happened automatically.
+unfiltered queries. Each query records the actual ReadView snapshot and
+routes. Each committed phase waits for both query variants to observe it,
+while queries continue during maintenance. The native oracle accumulates in
+Float64 and uses distinct final Float32 scores. The first seed pauses before flush
+and before build to verify inline T, scanned F and published B ANN routes.
 
 A separate native case pauses the worker before flush with a full inline
-budget. Another write must fail with `RESOURCE_EXHAUSTED`, leaving neither rows
-nor a request receipt. Queries still return the exact committed versions. Once
-the worker is released, the client resubmits that same request explicitly and
-replays its receipt. The fixture waits for database references to expire before
-process exit, as the existing catalog fixture does. Background observation
-callbacks own their state for the worker's lifetime.
+budget. Another write must fail with `RESOURCE_EXHAUSTED`, leaving zero rows
+or receipts for that request. Queries still return the exact committed
+versions. Once the worker is released, the client resubmits that request
+explicitly. The fixture waits for database references to expire before exit.
 
-Four real SIGKILLs interrupt the flow after native mutation commit before its
-response, before B publication commit, after B publication commit, and after a
-source-deletion intent commits. Every case requires a nonempty native metadata
-WAL. Recovery runs through installed Vane in a fresh Python process, reconstructs
-the exact logical model from durable receipts and the predeclared requests,
-then explicitly resumes optimizer and maintenance. Restart alone cannot start
-work. A published B is not rebuilt after its lost response. Old exact request
-replays cannot restore deleted or superseded row versions.
+Four SIGKILLs interrupt the flow after native mutation commit before its
+response, before B publication commit, after B publication commit, and after
+a source-deletion intent commits. Each case requires a nonempty metadata WAL.
+The driver saves client receipts and the observed committed state before the
+checkpoint. Fresh installed Vane must recover the same receipts, index
+publication and deletion intent. After explicit resume, the first pending
+B is published once, an already committed B keeps its generation, and the
+registered retired file is reclaimed. Replay verifies the exact receipt,
+DuckLake snapshot and current logical rows after every request.
 
 The client may explicitly resubmit the same request on a native conflict or
-write-budget rejection. Unexpected errors and a failed worker fail the probe;
-the runtime still has zero implicit commit retries. There is no added
-compatibility layer or fallback.
+write-budget rejection. The runtime uses zero implicit commit retries for
+these mutations. Unexpected errors fail the probe.
 
-Local qualification completed 20 public phases and 80 oracle comparisons with
-minimum recall 1.0. The native workload completed 575 snapshot-matched
-concurrent queries with minimum recall 1.0. All six native/recovery cases passed,
-including the four real SIGKILLs. Related managed-write and append probes passed 28 and 16 oracle
-comparisons respectively, plus their existing 13 and seven native/recovery
-cases. All 23 new SQL assertion blocks and the existing 108 managed-write,
-retention and append blocks passed through installed Vane. The standard native
-SQLLogicTest harness runs in CI. Separate Vane release processes passed 1,222
-non-Ray and 32 Ray tests, with 15 optional-dependency skips. Formatting and the
-Vane source/native copyleft checks passed. These test-only changes use the
-existing signed provider bytes and the rebuilt native test driver.
+The default Python run covers 20 public phases, a frozen tie fixture and six
+native and recovery cases. The Vane native Vortex providers workflow runs
+this proof alongside managed-write, append and source-retention proofs. It
+retains the report, driver logs and recovery evidence for the tested commit.
 
 For isolated-process load measurements and the subsequent flush coordination
 regression, see [sustained mixed load](native-vortex-sustained-load.md).
@@ -129,8 +127,9 @@ active publication, with at most three B segments, no retired directories and
 no registered build scratch. Registered artifact bytes are checked separately
 from each generation's manifest bytes.
 
-The fixed-live-row workload bounds retained physical source rows and records
-source/index bytes after each round. Native metadata, WAL, durable request
+The probe verifies that each rolling round retires prior source IDs and
+reclaims retired files. It records retained rows and source and index bytes
+after each round. Native metadata, WAL, durable request
 receipts and caller-owned reference JSON are reported separately; their
 lifetimes are not governed by source/generation GC. The existing request ledger
 has a hard limit and no automatic receipt expiry. This test does not claim a
@@ -139,6 +138,5 @@ writer fencing.
 
 `test/sql/vortex/native_vortex_automatic_flow.test` covers the public
 configuration, current T query and exact retry without timing-dependent waits.
-The Vane native workflow runs the complete installed proof and retains its
-report, native driver logs and recovery logs. It reuses the pinned
-Vane/Vortex/SPFresh closure and signed provider build.
+The Native Vortex validation workflow runs this SQL fixture. The installed
+proof uses the pinned Vane/Vortex/SPFresh closure and signed provider build.
