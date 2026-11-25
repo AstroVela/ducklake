@@ -100,10 +100,7 @@ struct Policy {
 	idx_t keep, age;
 };
 
-Policy Load(DuckLakeTransaction &transaction) {
-	auto result = VortexIndex::Query(
-	    transaction, "SELECT enabled,keep_snapshots,min_age_seconds FROM {METADATA_CATALOG}." + string(POLICY));
-	auto row = result->Fetch();
+Policy ReadPolicy(optional_ptr<DataChunk> row) {
 	if (!row || row->size() != 1) {
 		throw InvalidInputException("Vortex source retention is not initialized");
 	}
@@ -113,6 +110,13 @@ Policy Load(DuckLakeTransaction &transaction) {
 		throw InvalidInputException("Invalid Vortex source retention policy");
 	}
 	return p;
+}
+
+Policy Load(DuckLakeTransaction &transaction) {
+	auto result = VortexIndex::Query(
+	    transaction, "SELECT enabled,keep_snapshots,min_age_seconds FROM {METADATA_CATALOG}." + string(POLICY));
+	auto row = result->Fetch();
+	return ReadPolicy(row.get());
 }
 
 string Eligible(const Policy &p) {
@@ -433,7 +437,10 @@ bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, 
 	if (!policy.enabled || Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction, true)) {
 		return false;
 	}
-	if (Count(transaction, "SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy))) {
+	auto eligible =
+	    VortexIndex::Query(transaction, "SELECT EXISTS(SELECT 1 FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " +
+	                                        Eligible(policy) + ")");
+	if (eligible->Fetch()->GetValue(0, 0).GetValue<bool>()) {
 		return true;
 	}
 	try {
@@ -477,19 +484,24 @@ vector<vector<Value>> DuckLakeVortexSourceRetention::Status(ClientContext &conte
 	DuckLakeVortexReadCaptureScope capture(*owner.context);
 	try {
 		auto &transaction = VortexIndex::Begin(owner, catalog, &identity);
-		auto policy = Load(transaction);
-		auto counts = VortexIndex::Query(
+		auto policy_result = VortexIndex::Query(
 		    transaction,
-		    "SELECT expired_snapshots,collected_files,collected_bytes FROM {METADATA_CATALOG}." + string(POLICY));
-		auto values = counts->Fetch();
+		    "SELECT enabled,keep_snapshots,min_age_seconds,expired_snapshots,collected_files,collected_bytes "
+		    "FROM {METADATA_CATALOG}." + string(POLICY));
+		auto values = policy_result->Fetch();
+		auto policy = ReadPolicy(values.get());
 		vector<Value> row {Value::BOOLEAN(policy.enabled), Value::UBIGINT(policy.keep), Value::UBIGINT(policy.age)};
-		for (idx_t col = 0; col < 3; col++) {
+		for (idx_t col = 3; col < 6; col++) {
 			row.push_back(Value::UBIGINT(values->GetValue(col, 0).GetValue<idx_t>()));
 		}
-		for (auto &sql : {"SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy),
-		                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(SCHEDULED),
-		                  "SELECT count(*) FROM {METADATA_CATALOG}." + string(DELETIONS)}) {
-			row.push_back(Value::UBIGINT(Count(transaction, sql)));
+		// Constants from the validated policy preserve TOP_N and snapshot age pruning.
+		auto counts_result = VortexIndex::Query(
+		    transaction, "SELECT (SELECT count(*) FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy) +
+		                     "),(SELECT count(*) FROM {METADATA_CATALOG}." + string(SCHEDULED) +
+		                     "),(SELECT count(*) FROM {METADATA_CATALOG}." + string(DELETIONS) + ")");
+		auto counts = counts_result->Fetch();
+		for (idx_t col = 0; col < 3; col++) {
+			row.push_back(Value::UBIGINT(counts->GetValue(col, 0).GetValue<idx_t>()));
 		}
 		row.push_back(
 		    Value::BOOLEAN(Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction, false)));

@@ -3,6 +3,7 @@
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_search.hpp"
@@ -10,6 +11,7 @@
 #include "storage/ducklake_vortex_write.hpp"
 #include "vortex_extension.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <iostream>
 #include <map>
@@ -204,7 +206,7 @@ struct ProfileSnapshot {
 
 ProfileSnapshot ReadMaintenanceProfile(Connection &reader) {
 	auto rows = SQL(reader, PROFILE_SQL);
-	Require(rows->RowCount() == 15, "Missing fixed maintenance profile stages");
+	Require(rows->RowCount() == 17, "Missing fixed maintenance profile stages");
 	ProfileSnapshot profile;
 	profile.id = rows->GetValue(0, 0).GetValue<string>();
 	for (idx_t i = 0; i < rows->RowCount(); i++) {
@@ -216,6 +218,112 @@ ProfileSnapshot ReadMaintenanceProfile(Connection &reader) {
 		        "Invalid maintenance profile identity or counters");
 	}
 	return profile;
+}
+
+void SourceMetadataProbes(Fixture &f) {
+	constexpr idx_t max_bytes = 64 * 1024 * 1024;
+	const string metadata = "__ducklake_metadata_lake.";
+	const string snapshots = metadata + "ducklake_snapshot";
+	SQL(f.writer, "CREATE TABLE lake.checkpoints(i INTEGER);"
+	              "INSERT INTO lake.checkpoints VALUES (1);"
+	              "INSERT INTO lake.checkpoints VALUES (2);"
+	              "INSERT INTO lake.checkpoints VALUES (3)");
+	SQL(f.writer, "UPDATE " + snapshots + " SET snapshot_time=now()-INTERVAL '2 hours';"
+	              "UPDATE " + snapshots + " SET snapshot_time=now() WHERE snapshot_id=(SELECT min(snapshot_id) FROM " +
+	                  snapshots + ")");
+	const auto snapshot_count = f.Count(snapshots);
+	Require(snapshot_count > 3, "The fixture needs retained, young and eligible snapshots");
+
+	auto statements = std::make_shared<vector<string>>();
+	f.writer.BeginTransaction();
+	auto &catalog = Catalog::GetCatalog(*f.writer.context, "lake").Cast<DuckLakeCatalog>();
+	f.writer.Commit();
+	catalog.SetQueryCallback([statements](const string &sql, std::chrono::steady_clock::duration) {
+		if (StringUtil::Contains(sql, "ducklake_vortex_source_retention_v1") ||
+		    StringUtil::Contains(sql, "snapshot_id NOT IN") ||
+		    StringUtil::Contains(sql, "ducklake_files_scheduled_for_deletion") ||
+		    StringUtil::Contains(sql, "ducklake_vortex_source_deletions_v1")) {
+			statements->push_back(sql);
+		}
+	});
+	auto ready = [&] {
+		Connection owner(f.database);
+		auto &transaction = VortexIndex::Begin(owner, "lake");
+		const auto result = Source::WorkReady(transaction, max_bytes);
+		owner.Commit();
+		return result;
+	};
+	f.Policy(2, 10800);
+	Require(!ready(), "Readiness ignored the minimum snapshot age");
+	f.Policy(100000, 3600);
+	Require(!ready(), "Readiness ignored the retained snapshot count");
+	f.Policy(2, 3600);
+	statements->clear();
+	Require(ready(), "Readiness missed eligible snapshots");
+	Require(std::any_of(statements->begin(), statements->end(),
+	                    [](const string &sql) {
+		                    return StringUtil::StartsWith(sql, "SELECT EXISTS(") &&
+		                           StringUtil::Contains(sql, "snapshot_id NOT IN");
+	                    }),
+	        "Source readiness must probe for existence");
+
+	SQL(f.writer, "UPDATE " + metadata + "ducklake_vortex_source_retention_v1 "
+	              "SET expired_snapshots=7,collected_files=3,collected_bytes=4096;"
+	              "INSERT INTO " + metadata + "ducklake_files_scheduled_for_deletion VALUES "
+	              "(101,'queued-a',true,now()),(102,'queued-b',true,now());"
+	              "INSERT INTO " + metadata + "ducklake_vortex_source_deletions_v1 VALUES "
+	              "(101,'queued-a',true,4096,1,2,'fixture')");
+	Connection held(f.database);
+	held.BeginTransaction();
+	SQL(held, "SELECT count(*) FROM lake.checkpoints");
+	Require(!ready(), "Readiness crossed an ordinary DuckLake transaction");
+
+	statements->clear();
+	auto status = SQL(f.writer, "SELECT * FROM ducklake_vortex_source_retention_status('lake')");
+	catalog.SetQueryCallback({});
+	Require(status->RowCount() == 1 && status->ColumnCount() == 10 && status->GetValue(0, 0).GetValue<bool>() &&
+	            status->GetValue(9, 0).GetValue<bool>(),
+	        "Source status lost the enabled or transaction blocker flag");
+	const idx_t expected[] = {2, 3600, 7, 3, 4096, snapshot_count - 3, 2, 1};
+	for (idx_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+		Require(status->GetValue(i + 1, 0).GetValue<idx_t>() == expected[i],
+		        "Source status changed a retention field or exact count");
+	}
+	held.Commit();
+	std::cout << "Source status retention statements: " << statements->size() << std::endl;
+	Require(statements->size() == 2, "Source status must read retention metadata in two statements");
+	auto plan = SQL(f.writer, "EXPLAIN " + statements->back())->GetValue(1, 0).GetValue<string>();
+	Require(StringUtil::Contains(plan, "TOP_N") && !StringUtil::Contains(plan, "ORDER_BY"),
+	        "Source status must retain snapshots with a bounded TOP_N");
+}
+
+void MaintenanceIdleWait(Fixture &f) {
+	f.Policy(1, 315360000);
+	DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024);
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	auto profile = ReadMaintenanceProfile(f.writer);
+	while (!profile.stages.at("loop_wait_timeout").calls) {
+		Require(std::chrono::steady_clock::now() < deadline, "Idle worker did not report a timed-out wait");
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		profile = ReadMaintenanceProfile(f.writer);
+	}
+	const auto timeout = profile.stages.at("loop_wait_timeout");
+	const auto minimum_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(100)).count();
+	Require(timeout.max_ns >= idx_t(minimum_ns), "The timeout did not include the completed wait");
+
+	const auto previous_wakes = profile.stages.at("loop_wait_wake").calls;
+	const auto id = profile.id;
+	deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	do {
+		Require(std::chrono::steady_clock::now() < deadline, "Worker did not report a wait ending with a wake");
+		f.Policy(1, 315360000);
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		profile = ReadMaintenanceProfile(f.writer);
+	} while (profile.stages.at("loop_wait_wake").calls == previous_wakes);
+	const auto wake = profile.stages.at("loop_wait_wake");
+	Require(profile.id == id && wake.total_ns && wake.max_ns, "The wake lost its elapsed time or profile identity");
+	std::cout << "Worker wait timeout max ns: " << timeout.max_ns << ", wake max ns: " << wake.max_ns << std::endl;
+	DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
 }
 
 idx_t DiskBytes(FileSystem &fs, const string &path) {
@@ -1015,6 +1123,10 @@ int main(int argc, char **argv) {
 			InlineOnlyRetention(f);
 			return 0;
 		}
+		if (mode == "source-metadata-probes") {
+			SourceMetadataProbes(f);
+			return 0;
+		}
 		f.Seed();
 		if (mode == "maintenance-fairness-1" || mode == "maintenance-fairness-2") {
 			MaintenanceFairness(f, mode == "maintenance-fairness-1" ? 1 : 2);
@@ -1022,6 +1134,10 @@ int main(int argc, char **argv) {
 		}
 		if (mode == "optimizer-profile") {
 			OptimizerProfile(f);
+			return 0;
+		}
+		if (mode == "maintenance-idle-wait") {
+			MaintenanceIdleWait(f);
 			return 0;
 		}
 		if (mode == "concurrent") {

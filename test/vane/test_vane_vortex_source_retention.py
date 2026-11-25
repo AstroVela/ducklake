@@ -272,6 +272,8 @@ def native_cases(driver, root, report):
         "maintenance-fairness-1",
         "maintenance-fairness-2",
         "optimizer-profile",
+        "source-metadata-probes",
+        "maintenance-idle-wait",
         "fail-source_expiry_committed",
         "fail-source_delete_intent_committed",
         "fail-source_unlinked_before_sync",
