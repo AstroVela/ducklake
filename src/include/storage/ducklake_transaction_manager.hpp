@@ -32,7 +32,7 @@ public:
 	                          const std::function<void()> &on_end = nullptr);
 
 private:
-	std::function<void()> RemoveTransaction(Transaction &transaction);
+	void RemoveTransaction(Transaction &transaction);
 	DuckLakeCatalog &ducklake_catalog;
 	mutex transaction_lock;
 	reference_map_t<Transaction, shared_ptr<DuckLakeTransaction>> transactions;
