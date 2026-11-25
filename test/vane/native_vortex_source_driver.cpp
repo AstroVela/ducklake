@@ -3,6 +3,7 @@
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "duckdb/main/db_instance_cache.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -16,6 +17,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
+#include <future>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -81,8 +84,8 @@ struct Fixture {
 	DuckDB database;
 	Connection writer;
 	DuckLakeVortexIndex index;
-	Fixture(const string &root_p, const string &data_path, bool initialize)
-	    : root(root_p), database(nullptr), writer(database) {
+	Fixture(const string &root_p, const string &data_path, bool initialize, DBConfig *config = nullptr)
+	    : root(root_p), database(nullptr, config), writer(database) {
 		database.LoadStaticExtension<DucklakeExtension>();
 		database.LoadStaticExtension<VortexExtension>();
 		SQL(writer, "SET threads=2; LOAD parquet; ATTACH " +
@@ -647,27 +650,61 @@ void MaintenanceFairness(Fixture &f, idx_t objects) {
 	Require(SQL(reader, PROFILE_SQL)->RowCount() == 0, "A reattached catalog inherited a stale profile");
 }
 
-void OptimizerProfile(Fixture &f) {
-	Require(SQL(f.writer, PROFILE_SQL)->RowCount() == 0, "Profile appeared before maintenance registration");
-	DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024);
-	auto probes = std::make_shared<idx_t>(0);
-	auto second_probe = std::make_shared<Pause>();
-	ReleasePause release {*second_probe};
-	DuckLakeVortexOptimizer::Resume(*f.writer.context, "lake", "main", "items", "knn",
-	                                [probes, second_probe](const string &stage) {
-		                                if (stage == "optimizer_before_probe" && ++*probes == 2) {
-			                                second_probe->Stop();
-		                                }
-	                                });
-	second_probe->Wait();
-	auto profile = ReadMaintenanceProfile(f.writer);
-	for (auto stage : {"optimizer_total", "optimizer_probe", "optimizer_metadata"}) {
-		auto sample = profile.stages.at(stage);
-		Require(sample.calls && sample.total_ns, "Missing measured optimizer stage " + string(stage));
+void OptimizerProfile(const string &root) {
+	struct Probe {
+		idx_t calls = 0;
+		Pause second;
+		std::promise<void> worker_exit;
+	};
+	auto probe = std::make_shared<Probe>();
+	auto worker_exit = probe->worker_exit.get_future();
+	weak_ptr<DatabaseCacheEntry> database_close;
+	std::exception_ptr failure;
+	try {
+		DBConfig config;
+		// DuckDB releases its cache entry at the end of database teardown.
+		config.db_cache_entry = make_shared_ptr<DatabaseCacheEntry>();
+		database_close = config.db_cache_entry;
+		Fixture f(root, root + "/data", true, &config);
+		f.Seed();
+		Require(SQL(f.writer, PROFILE_SQL)->RowCount() == 0, "Profile appeared before maintenance registration");
+		DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024);
+		DuckLakeVortexOptimizer::Resume(*f.writer.context, "lake", "main", "items", "knn",
+		                                [probe](const string &stage) {
+			                                if (stage != "optimizer_before_probe") {
+				                                return;
+			                                }
+			                                if (++probe->calls == 1) {
+				                                probe->worker_exit.set_value_at_thread_exit();
+			                                } else if (probe->calls == 2) {
+				                                probe->second.Stop();
+			                                }
+		                                });
+		probe->second.Wait();
+		auto profile = ReadMaintenanceProfile(f.writer);
+		for (auto stage : {"optimizer_total", "optimizer_probe", "optimizer_metadata"}) {
+			auto sample = profile.stages.at(stage);
+			Require(sample.calls && sample.total_ns, "Missing measured optimizer stage " + string(stage));
+		}
+		DuckLakeVortexOptimizer::Cancel(*f.writer.context, "lake", "main", "items", "knn");
+		DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+	} catch (...) {
+		failure = std::current_exception();
 	}
-	DuckLakeVortexOptimizer::Cancel(*f.writer.context, "lake", "main", "items", "knn");
-	DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
-	second_probe->Release();
+	// The paused worker owns the database after the last client has closed.
+	const bool database_held = !database_close.expired();
+	const bool worker_running = worker_exit.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+	probe->second.Release();
+	probe.reset();
+	Require(worker_exit.wait_for(std::chrono::seconds(20)) == std::future_status::ready,
+	        "Optimizer worker did not exit after closing the profile fixture");
+	if (failure) {
+		std::rethrow_exception(failure);
+	}
+	worker_exit.get();
+	Require(database_held && worker_running, "Profile fixture did not close with its optimizer probe in flight");
+	Require(database_close.expired(), "Database teardown was incomplete after the optimizer thread exited");
+	std::cout << "optimizer-profile worker exited and database teardown completed" << std::endl;
 }
 
 string AddParquet(Fixture &f, const string &table, const string &name) {
@@ -1364,6 +1401,10 @@ int main(int argc, char **argv) {
 	try {
 		Require(argc == 3, "Usage: ducklake_vortex_source_driver ROOT MODE");
 		string root = argv[1], mode = argv[2];
+		if (mode == "optimizer-profile") {
+			OptimizerProfile(root);
+			return 0;
+		}
 		Fixture f(root, mode == "shared-source" ? root + "//./data" : root + "/data",
 		          mode != "prepared-native-cleanup" && mode != "cleanup-init-order" && mode != "inline-only");
 		if (mode == "shared-source") {
@@ -1409,10 +1450,6 @@ int main(int argc, char **argv) {
 	}
 		if (mode == "maintenance-fairness-1" || mode == "maintenance-fairness-2") {
 			MaintenanceFairness(f, mode == "maintenance-fairness-1" ? 1 : 2);
-			return 0;
-		}
-		if (mode == "optimizer-profile") {
-			OptimizerProfile(f);
 			return 0;
 		}
 		if (mode == "maintenance-idle-wait") {

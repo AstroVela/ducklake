@@ -293,6 +293,12 @@ def native_cases(driver, root, report):
         with (case / "driver.log").open("w") as log:
             result = subprocess.run([str(driver), str(case), mode], stdout=log, stderr=subprocess.STDOUT, timeout=120)
         require(result.returncode == 0, f"Native {mode} failed: {(case / 'driver.log').read_text()}")
+        if mode == "optimizer-profile":
+            receipt = "optimizer-profile worker exited and database teardown completed"
+            require(
+                receipt in (case / "driver.log").read_text().splitlines(),
+                "Native optimizer-profile did not confirm worker exit and database teardown",
+            )
         cases.append(mode)
         print(f"Native source case passed: {mode}", flush=True)
     for mode in [
