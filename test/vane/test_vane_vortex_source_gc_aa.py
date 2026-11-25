@@ -94,7 +94,7 @@ def run(args):
     code_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in tracked}
     private = root / "private"
     private.mkdir(mode=0o700)
-    env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local-fast")
+    env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local")
     env.pop("VORTEX_SPFRESH_NATIVE", None)
     rounds = RULE["profiles"][args.profile]
     report = {
@@ -103,6 +103,7 @@ def run(args):
         "rule": RULE,
         "driver": str(driver),
         "driver_sha256": {label: driver_hash for label in LABELS},
+        "ducklake_extension_version": source["ducklake_extension_version"],
         "inputs_report_sha256": hashlib.sha256(inputs.read_bytes()).hexdigest(),
         "code_sha256": code_hashes,
         "host": {
@@ -168,6 +169,7 @@ def run(args):
         old_data, new_data = ({p for p in m if p.startswith("data/")} for m in (before, after))
         deleted = {Path(p).relative_to(work).as_posix() for p in sample["deleted_paths"]}
         assert old_data - new_data == deleted and not new_data - old_data
+        assert sample["bytes"] == sum(before[p]["bytes"] for p in deleted)
         assert all(before[p] == after[p] for p in new_data)
         assert all(after.get(p) == value for p, value in before.items() if p.startswith("indexes/"))
         sample.update(

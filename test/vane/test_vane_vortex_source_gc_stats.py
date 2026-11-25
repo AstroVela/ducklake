@@ -30,13 +30,14 @@ class SourceGCEvidenceTests(unittest.TestCase):
             "delete_files": 0,
         }
         after = dict(before, snapshots=11, first_snapshot=7, scheduled=2, expired_total=7, data_files=1)
-        expected = dict(before, task="expire", history=8, history_storage="inline")
+        expected = dict(before, task="expire", history=8, history_storage="inline", ducklake_extension_version="test")
         sample = {
             "before": before,
             "after": after,
             "task": "expire",
             "history": 8,
             "history_storage": "inline",
+            "ducklake_extension_version": "test",
             "diagnostic": False,
             "complete_source_gc_ns": 100,
             "expired": 2,
@@ -61,6 +62,9 @@ class SourceGCEvidenceTests(unittest.TestCase):
         sample["after"]["first_snapshot"] += 1
         with self.assertRaises(AssertionError):
             BENCH.validate_sample(sample, expected, False)
+        expected.update(snapshots=sample["before"]["snapshots"], first_snapshot=sample["before"]["first_snapshot"])
+        with self.assertRaisesRegex(AssertionError, "snapshot inventory"):
+            BENCH.validate_sample(sample, expected, False)
 
     def test_zero_progress_is_rejected(self):
         sample, expected = self.sample()
@@ -78,19 +82,28 @@ class SourceGCEvidenceTests(unittest.TestCase):
 
     def test_images_reject_hard_links_and_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory) / "work"
+            root.mkdir()
+            image = Path(directory) / "image"
             first = root / "input"
             first.write_bytes(b"same bytes, shared inode")
             before = BENCH.manifest(root)
             os.link(first, root / "linked")
             with self.assertRaises(RuntimeError):
                 BENCH.manifest(root)
+            with self.assertRaises(RuntimeError):
+                BENCH.seal_input(root, image)
+            self.assertFalse(image.exists())
             (root / "linked").unlink()
             (root / "symlink").symlink_to(first)
             with self.assertRaises(RuntimeError):
                 BENCH.manifest(root)
+            with self.assertRaises(RuntimeError):
+                BENCH.seal_input(root, image)
+            self.assertFalse(image.exists())
             (root / "symlink").unlink()
             self.assertEqual(BENCH.manifest(root), before)
+            self.assertEqual(BENCH.seal_input(root, image), before)
 
     def test_nested_commit_is_not_counted_twice(self):
         sample = {
