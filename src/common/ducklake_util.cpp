@@ -366,7 +366,17 @@ void DuckLakeUtil::ValidateNoInlinedSystemColumns(const ColumnList &columns, con
 }
 
 string DuckLakeUtil::ReplaceSkippingQuotes(const string &sql, const string &from, const string &to) {
-	if (from.empty()) {
+	return ReplaceSkippingQuotes(sql, {{from, to}});
+}
+
+string DuckLakeUtil::ReplaceSkippingQuotes(const string &sql, const vector<pair<string, string>> &replacements) {
+	string prefixes;
+	for (auto &entry : replacements) {
+		if (!entry.first.empty() && prefixes.find(entry.first.front()) == string::npos) {
+			prefixes += entry.first.front();
+		}
+	}
+	if (sql.find_first_of(prefixes) == string::npos) {
 		return sql;
 	}
 
@@ -400,16 +410,28 @@ string DuckLakeUtil::ReplaceSkippingQuotes(const string &sql, const string &from
 		// If inside a quoted range, copy verbatim to its end
 		if (range_idx < no_replace_ranges.size() && pos >= no_replace_ranges[range_idx].first) {
 			idx_t end = no_replace_ranges[range_idx].second;
-			result += sql.substr(pos, end - pos);
+			result.append(sql, pos, end - pos);
 			pos = end;
 			range_idx++;
 			continue;
 		}
 
-		// If not inside a quoted range, check for a match of `from`
-		if (sql.compare(pos, from.size(), from) == 0) {
-			result += to;
-			pos += from.size();
+		auto next_quote = range_idx < no_replace_ranges.size() ? no_replace_ranges[range_idx].first : sql.size();
+		auto prefix = std::find_first_of(sql.begin() + pos, sql.begin() + next_quote, prefixes.begin(), prefixes.end());
+		auto next_prefix = static_cast<idx_t>(prefix - sql.begin());
+		result.append(sql, pos, next_prefix - pos);
+		pos = next_prefix;
+		if (pos == next_quote) {
+			continue;
+		}
+		auto replacement =
+		    std::find_if(replacements.begin(), replacements.end(), [&](const pair<string, string> &entry) {
+			    return !entry.first.empty() && entry.first.size() <= next_quote - pos &&
+			           sql.compare(pos, entry.first.size(), entry.first) == 0;
+		    });
+		if (replacement != replacements.end()) {
+			result += replacement->second;
+			pos += replacement->first.size();
 			continue;
 		}
 

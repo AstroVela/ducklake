@@ -1,6 +1,6 @@
 # Consume the unrestricted SPFresh posting-radius correction
 
-The preceding consumer qualifies native shutdown, the original long workload's
+The original preceding qualification at `22ad1191` covers native shutdown, the original long workload's
 liveness and its canary. Two recall results remain below their existing targets:
 the 4,096-row/128D cost canary reaches 0.7, and the longer automatic workload's
 exploration lower bound reaches 0.6. Both targets remain 0.8.
@@ -35,8 +35,8 @@ native bundle file sets remain byte-identical.
 ## Exact consumer closure
 
 Pin the native SDK source gate, query library, standalone probe and tracked root
-lockfile to Vortex `122b63e0408a187a9d0ecdd129f1cbe12b6b46b2`. Pin the adapter
-to `7eca1d48632d2e9d5c20d83a139f28241de98797`, the paired
+lockfile to Vortex `42beeb3a72769869a3d3d16887a011ee7f922362`. Pin the adapter
+to `4f922e73c0201bd98d73007261d097d00aa8b2c3`, the squash of
 [duckdb-vortex #40](https://github.com/AstroVela/duckdb-vortex/pull/40), and update
 CI's checkouts to the same revisions. Both adapter workspaces and strict source
 validation accept exactly this one Vortex revision.
@@ -53,9 +53,12 @@ Canary and exploration results are reported independently against their existing
 0.8 targets. The 90-second drain gate, 480-second long worker watchdog and query
 pacing remain unchanged.
 
-## Installed-provider regression checks
+## Historical installed-provider regression checks
 
-The new isolated provider pair passes all five public flows: 172 query-oracle
+The results below and in the long-load section were recorded at `c2c205a1` on the original
+Draft PR dependency pair. The final squash pins above identify the current provider build.
+
+The historical isolated provider pair passes all five public flows: 172 query-oracle
 comparisons with a minimum recall of 0.9, seven write-recovery cases,
 twenty-four source cases, thirteen keyed cases and nine automatic native cases.
 Thirteen standalone maintenance fault/budget cases and ten SQL fixtures with
@@ -74,7 +77,7 @@ processes, with fifteen optional-dependency skips. Formatting, locked source
 metadata, shell syntax, copyleft and diff checks pass. The original longer
 workload is evaluated separately as follows.
 
-## Original long-load acceptance
+## Historical long-load acceptance
 
 The 60-second-per-phase, four-reader automatic workload passes 6,872 typed
 query-window checks on this exact installed provider pair. Canary recall has a

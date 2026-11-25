@@ -93,6 +93,13 @@ pub(crate) async fn prepare(
         },
         rows: Arc::clone(&rows),
     });
+    let check_prepared = |stage: &str| {
+        check(if stage == "generation_sealed" {
+            "rewrite_prepared_sealed"
+        } else {
+            stage
+        })
+    };
     let (snapshot, descriptor) = build_generation_at(
         recorded,
         source.field.clone(),
@@ -103,7 +110,7 @@ pub(crate) async fn prepare(
             scratch: &scratch,
         },
         session,
-        check,
+        &check_prepared,
     )
     .await?;
     let rows = std::mem::take(

@@ -34,10 +34,12 @@ bound; binding does not assume a canonical scan order.
 
 Once private construction finishes, the source is linked to its registered path
 using the existing exclusive same-filesystem operation. The final phase holds
-write admission and exclusive publication, validates selected inputs, and rebases
-the dedicated native transaction to the freshly checked commit snapshot. Its
-`next_file_id` is now the actual replacement ID, even if concurrent flushes used
-the provisional ID during construction.
+write admission and exclusive publication before opening the actual metadata
+write transaction. That transaction validates the selected inputs, supplies the
+commit snapshot and final file ID, and commits publication. A writer admitted
+ahead of the rewrite is visible to validation and commit in both deferred and
+immediate transaction modes. Concurrent flushes can consume the provisional
+file ID during construction.
 
 Binding authenticates the prepared generation, obtains verified private native
 artifact copies, and uses the existing public `import_bundle` interface to retain
@@ -65,6 +67,11 @@ snapshot retention. Restart starts neither rewrite nor collection implicitly.
 Old private query views remain usable after index GC, native snapshot expiry and
 canonical source-file cleanup.
 
+Private preparation and final sealing have distinct checkpoints. The build
+registry remains `building` during both phases and records `published` in the
+transaction that publishes the final generation. Recovery rechecks published
+ownership before collecting the registered workspace.
+
 ```sh
 python3 -I test/vane/test_native_vortex_rewrite_append.py \
     --duckdb build/index-shell/duckdb \
@@ -83,38 +90,49 @@ Additional cases cover selected-input delete/update conflicts, alias conflicts,
 target-schema rejection, unrelated schema commits, writers waiting at final
 publication, failure/cancellation at binding boundaries, corrupt prepared bytes,
 and SIGKILL before/after final seal, reference staging and metadata commit with
-acknowledged concurrent appends. The existing #46 proof retains full-capacity
-reclamation and its earlier atomicity/recovery checks, with its independent
-append expectations updated to the new behavior.
+acknowledged concurrent appends. In both transaction modes the proof queues the
+rewrite behind an already-admitted writer and checks that the exact appended row
+survives. It checks the build registry around both kinds of seal and the atomic
+publication. The #46 proof exercises full-capacity reclamation, cancellation and
+recovery with the late-binding implementation.
 
-### Local result (2026-10-29)
+### Local qualification (2026-11-18)
 
-The new proof passed 28 checks and 124 gated query comparisons with minimum
-fixture recall 1.0. Five staged append/rewrite rounds advanced revision 3 to 8
-and ended with 549 physical source rows, preserving every committed append.
-Their provisional-to-final file IDs were 7→10, 12→15, 17→20, 22→25 and 27→30.
-A separate writer executed three T/flush/T rounds concurrently with native
-construction; its final file ID advanced 6→15. The five staged rounds and the live-writer case each recorded one native
-construction and one binding; their six final native artifact digests matched
-the prepared artifacts. Both unselected B generations kept their bytes
-and mtimes. Snapshot row counts and distinct logical row IDs also matched.
+Linux used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`, native wrapper
+`84cef204` and the static SPFresh SDK qualified by #46. The append/rewrite
+proof at `70d4fba2` passed 31 checks in
+76.7 seconds under the 180-second budget. All
+132 gated queries attained recall 1.0.
 
-All seven SIGKILL cases retained acknowledged appends, exposed one complete old
-or new source/index state, and required explicit maintenance resumption. The
-same-length prepared-file corruption case failed its checksum before binding.
+The queued-writer regression preserved the exact committed row in deferred and
+immediate transaction modes. Five staged rounds reached revision 8 at 549
+physical rows. The provisional-to-final file IDs were 7→10, 12→15, 17→20, 22→25, 27→30.
+The separate writer completed three T/flush/T rounds during construction and
+advanced the final binding from 6 to 15.
+Each rewrite built native bytes once and bound once. Both unselected B
+generations kept their bytes and modification times. The prepared and published
+native artifact digests matched in every checked round.
 
-- All 16 prior native process proofs passed, including the updated #46 proof.
-- ON passed 17 Vortex SQL cases / 630 assertions, including 35 assertions for
-  indexed rewrite. ON and OFF each passed 86 base cases / 3,582 assertions with
-  13 optional-extension skips, plus Parquet recovery; ON passed Vortex recovery.
-- Audit passed 122 assertions. Rewrite/orphan groups passed 16 cases / 854
-  assertions with two ICU skips.
-- Four isolated cost cases passed nine queries each, minimum recall 1.0;
-  timings remain informational. Formatting, Rust formatting, Clippy with
-  `--all-targets -- -D warnings`, and diff checks passed.
+All seven crash cases retained acknowledged appends and recovered through
+explicit maintenance. The registry remained building after private preparation
+and final sealing, then published with the committed source and index. Old
+private search and delayed typed fetch passed after both kinds of GC. The
+indexed rewrite suite passed 21 checks and
+88 gated queries.
 
-The qualified catalog driver SHA-256 is
-`8f35048f4bb8cf8127a75d58dbf85aaaa896fbb34be04ee5ea0a4cd15628588c`.
+All 17 native process suites and 19 functional checks passed.
+Native ON passed 26 Vortex SQL cases with 1,031
+assertions. Rewrite/orphan SQL passed 17 cases and
+881 assertions. ON and OFF each passed 86 base cases with
+3,582 assertions and 13 optional skips. ABI passed 32 checks.
+Rust formatting, Clippy and workspace tests passed. The four query-cost cases
+passed with minimum fixture recall 1.0. The catalog driver SHA-256
+was `aaf3d1368e3698e1484e92079f19ba4dd32390823b772314e92c79ea2bc87c61`.
+
+Earlier generation GC attempts reached the existing native call and suite
+deadlines. The failure causes are undetermined. The rerun passed in
+70.8 seconds. The matrix
+resumed using the same binaries and limits.
 
 Scope remains native DuckDB metadata, one local POSIX owner, exclusive managed
 namespaces, one selected B, one nonempty output, one named index and an installed
