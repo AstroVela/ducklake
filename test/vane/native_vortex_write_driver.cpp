@@ -3,6 +3,7 @@
 #include "native_vortex_automatic_fixture.hpp"
 #include "native_vortex_epoch_fixture.hpp"
 #include "native_vortex_lifecycle_fixture.hpp"
+#include "native_vortex_capacity_fixture.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -135,6 +136,10 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 		}
 		Require(canceled && !setup.TableInfo("__ducklake_metadata_lake", "main", "ducklake_vortex_write_requests_v2"),
 		        "Canceled initialization created the request table");
+		return 0;
+	}
+	if (StringUtil::StartsWith(mode, "capacity-")) {
+		RunCapacityFixture(database, setup, root, mode);
 		return 0;
 	}
 	if (StringUtil::StartsWith(mode, "lifecycle-")) {
