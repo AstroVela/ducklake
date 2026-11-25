@@ -682,7 +682,7 @@ def main():
         report.update(stale_error_after_resume(driver, root, checks))
         report.update(initialize_preserves_transaction(driver, root, checks))
         report.update(completion_cancel(driver, root, checks))
-        require(list(scratch.iterdir()) == [], "Optimizer leaked private staging")
+        BASE.assert_query_scratch_released(scratch)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

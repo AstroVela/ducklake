@@ -279,12 +279,30 @@ inline void LifecycleGuards(LifecycleFixture &f) {
 	DuckLakeVortexOptimizer::ConfigureSourceRetention(*f.setup.context, "lake", false, 1, 0);
 }
 
-inline void RunLifecycleFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
-	LifecycleFixture f(database, setup, root);
+inline unique_ptr<MaterializedQueryResult> LifecycleSeedHits(Connection &setup) {
 	auto retained_rows = SQL(setup, "SELECT id,embedding,category,payload,"
 	                                "(embedding[1]*embedding[1]+embedding[2]*embedding[2])::FLOAT AS distance "
 	                                "FROM lake.items ORDER BY distance,id LIMIT 3");
 	Require(retained_rows->RowCount() == 3, "The old-view fixture needs three typed seed rows");
+	return retained_rows;
+}
+
+inline void CheckLifecycleSeedHits(const DuckLakeVortexSearchResult &previous, MaterializedQueryResult &retained) {
+	Require(previous.rows.size() == retained.RowCount(), "Old private ReadView lost a seed hit");
+	for (idx_t row = 0; row < previous.rows.size(); row++) {
+		Require(previous.rows[row].size() == retained.ColumnCount(), "Old private ReadView changed the shape of a seed hit");
+		for (idx_t column = 0; column < retained.ColumnCount(); column++) {
+			auto expected = retained.GetValue(column, row);
+			auto &actual = previous.rows[row][column];
+			Require(actual.type() == expected.type() && actual == expected,
+			        "Old private ReadView changed a typed seed hit after cleanup and checkpoint");
+		}
+	}
+}
+
+inline void RunLifecycleFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
+	LifecycleFixture f(database, setup, root);
+	auto retained_rows = LifecycleSeedHits(setup);
 	Pause pause;
 	Connection reader(database);
 	auto held = std::async(std::launch::async, [&] {
@@ -351,18 +369,7 @@ inline void RunLifecycleFixture(DuckDB &database, Connection &setup, const strin
 	}
 	f.Checkpoint();
 	pause.Release();
-	auto previous = held.get();
-	Require(previous.rows.size() == retained_rows->RowCount(), "Old private ReadView lost a seed hit");
-	for (idx_t row = 0; row < previous.rows.size(); row++) {
-		Require(previous.rows[row].size() == retained_rows->ColumnCount(),
-		        "Old private ReadView changed the shape of a seed hit");
-		for (idx_t column = 0; column < retained_rows->ColumnCount(); column++) {
-			auto expected = retained_rows->GetValue(column, row);
-			auto &actual = previous.rows[row][column];
-			Require(actual.type() == expected.type() && actual == expected,
-			        "Old private ReadView changed a typed seed hit after cleanup and checkpoint");
-		}
-	}
+	CheckLifecycleSeedHits(held.get(), *retained_rows);
 	f.CheckNames(true);
 	f.Save("complete");
 }

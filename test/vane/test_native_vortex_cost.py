@@ -240,7 +240,7 @@ def main():
                     if original is not None:
                         require(samples[0]["hits"] == original, "optimized query changed baseline ranked results")
                     original = samples[0]["hits"]
-                    require(list(private.iterdir()) == [], "benchmark query leaked source/index staging")
+                    BASE.assert_query_scratch_released(private)
                     case["variants"][label] = {
                         **summarize(samples),
                         "recall_min": min(recalls),

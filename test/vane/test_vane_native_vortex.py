@@ -29,7 +29,7 @@ def query(connection, sql):
     return [dict(zip(names, row)) for row in result.fetchall()]
 
 
-def connect(root, extension_directory, create=False):
+def connect(root, extension_directory, create=False, *, data_path=None):
     import vane
 
     connection = vane.connect(
@@ -56,7 +56,7 @@ def connect(root, extension_directory, create=False):
         "ATTACH "
         + quote("ducklake:" + str(root / "metadata.ducklake"))
         + " AS lake (DATA_PATH "
-        + quote(root / "data")
+        + quote(root / "data" if data_path is None else data_path)
         + ", DATA_INLINING_ROW_LIMIT 1000)"
     )
     if create:

@@ -130,7 +130,7 @@ def exercise(native, root, cycles, reopens, checks):
 
     def released(label):
         observations.append({"operation": label, **settled(native, context_references)})
-        require(not list((root / "private").iterdir()), f"{label} retained private leases")
+        BASE.assert_query_scratch_released(root / "private")
 
     for i in range(cycles):
         native.sql("SET threads=" + str(1 + i % 2) + ";")
@@ -256,7 +256,7 @@ def main():
         checks.append("published-but-unassigned foreign contexts expose only safe shared-owner counts")
         report.update(exercise(native, root, args.cycles, args.reopens, checks))
         native.finish()
-        require(not list(scratch.iterdir()), "Native database close retained private leases")
+        BASE.assert_query_scratch_released(scratch)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

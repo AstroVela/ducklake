@@ -41,6 +41,17 @@ struct DuckLakeVortexQueryRow {
 	uint8_t payload_null;
 };
 struct DuckLakeVortexQueryOutput;
+struct DuckLakeVortexScratchInput {
+	const uint8_t *data_path;
+	uint64_t data_path_len;
+	const uint8_t *root;
+	uint64_t root_len;
+	uint64_t max_objects;
+	uint64_t max_bytes;
+	uint8_t (*control)(void *, const uint8_t *, uint64_t);
+	void *context;
+};
+DuckLakeVortexQueryOutput *ducklake_vortex_collect_query_scratch(const DuckLakeVortexScratchInput *input);
 struct DuckLakeVortexPrepared;
 struct DuckLakeVortexBindInput {
 	const DuckLakeVortexPrepared *prepared;
