@@ -1,7 +1,7 @@
 //! Registered native-query scratch; only explicit, authenticated collection reclaims crashed owners.
 use crate::LIMITS;
 #[cfg(not(test))]
-use rustix::fs::fsync as sync_directory;
+use rustix::fs::fsync as sync_fd;
 use rustix::fs::{self as posix, AtFlags, FlockOperation, Mode, OFlags, Stat};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 #[cfg(test)]
-use tests::sync_directory;
+use tests::sync_fd;
 use vortex::error::{VortexResult, vortex_bail, vortex_err};
 use vortex_index::file::file_version;
 
@@ -359,7 +359,7 @@ impl Root {
         };
         root.validate_bindings()?;
         // An earlier publisher may have stopped after rename but before syncing this parent.
-        sync_directory(&parent).map_err(std::io::Error::from)?;
+        sync_fd(&parent).map_err(std::io::Error::from)?;
         // Only an authenticated root may discard its reserved metadata staging slot.
         if let Some(stat) = exists(&root.directory, ".record.tmp")? {
             validate_stat(&stat, false, true)?;
@@ -431,8 +431,8 @@ impl Root {
         self.sync_record_publication(directory)
     }
     fn sync_record_publication(&self, directory: &OwnedFd) -> VortexResult<()> {
-        sync_directory(directory).map_err(std::io::Error::from)?;
-        sync_directory(&self.directory).map_err(std::io::Error::from)?;
+        sync_fd(directory).map_err(std::io::Error::from)?;
+        sync_fd(&self.directory).map_err(std::io::Error::from)?;
         Ok(())
     }
     fn save(&self, record: &Record) -> VortexResult<()> {
@@ -551,12 +551,19 @@ fn parent_fd(payload: &OwnedFd, path: &str) -> VortexResult<(OwnedFd, String)> {
     Ok((directory, parts[parts.len() - 1].into()))
 }
 
-fn inventory(directory: &OwnedFd) -> VortexResult<Vec<Entry>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InventoryMode {
+    Inspect,
+    Freeze,
+}
+
+fn inventory(directory: &OwnedFd, mode: InventoryMode) -> VortexResult<Vec<Entry>> {
     fn visit(
         dir: &OwnedFd,
         prefix: &str,
         result: &mut Vec<Entry>,
         bytes: &mut usize,
+        mode: InventoryMode,
     ) -> VortexResult<()> {
         for name in names(dir)? {
             let path = if prefix.is_empty() {
@@ -590,20 +597,32 @@ fn inventory(directory: &OwnedFd) -> VortexResult<Vec<Entry>> {
             if *bytes > LIMITS.max_manifest_bytes {
                 vortex_bail!("Scratch ownership inventory exceeds manifest budget");
             }
-            if directory {
-                visit(&child(dir, &name)?, &path, result, bytes)?;
+            if directory || mode == InventoryMode::Freeze {
+                let flags = if directory { DIRECTORY } else { FILE_READ };
+                let fd = posix::openat(dir, name.as_str(), flags, Mode::empty())
+                    .map_err(std::io::Error::from)?;
+                validate_payload_entry(&posix::fstat(&fd).map_err(std::io::Error::from)?, &entry)?;
+                if directory {
+                    visit(&fd, &path, result, bytes, mode)?;
+                } else {
+                    sync_fd(&fd).map_err(std::io::Error::from)?;
+                }
             }
             result.push(entry);
+        }
+        // A frozen plan depends on each child's size and on its name in this directory.
+        if mode == InventoryMode::Freeze {
+            sync_fd(dir).map_err(std::io::Error::from)?;
         }
         Ok(())
     }
     let mut result = vec![];
-    visit(directory, "", &mut result, &mut 0)?;
+    visit(directory, "", &mut result, &mut 0, mode)?;
     Ok(result)
 }
 
 fn validate_plan(payload: &OwnedFd, plan: &[Entry]) -> VortexResult<()> {
-    let current = inventory(payload)?;
+    let current = inventory(payload, InventoryMode::Inspect)?;
     let mut actual: BTreeMap<_, _> = current.into_iter().map(|e| (e.path.clone(), e)).collect();
     let mut seen = BTreeSet::new();
     for entry in plan {
@@ -629,11 +648,11 @@ fn validate_plan(payload: &OwnedFd, plan: &[Entry]) -> VortexResult<()> {
     Ok(())
 }
 
-fn validate_unlink_entry(stat: &Stat, entry: &Entry) -> VortexResult<()> {
+fn validate_payload_entry(stat: &Stat, entry: &Entry) -> VortexResult<()> {
     validate_stat(stat, entry.directory, false)?;
     if identity(stat) != entry.identity || (!entry.directory && stat.st_size as u64 != entry.bytes)
     {
-        vortex_bail!("Scratch unlink identity changed");
+        vortex_bail!("Scratch payload entry identity or size changed");
     }
     Ok(())
 }
@@ -668,10 +687,10 @@ fn finish(
         root.unlink(&root.work, &record.owner, AtFlags::REMOVEDIR)?;
     }
     // A previous attempt may have removed the owner before its parent was synced.
-    sync_directory(&root.work).map_err(std::io::Error::from)?;
+    sync_fd(&root.work).map_err(std::io::Error::from)?;
     root.registration_checkpoint(record, "scratch_after_remove_view", check)?;
     root.unlink(&root.registry, &record.owner, AtFlags::empty())?;
-    posix::fsync(&root.registry).map_err(std::io::Error::from)?;
+    sync_fd(&root.registry).map_err(std::io::Error::from)?;
     Ok(())
 }
 
@@ -770,6 +789,8 @@ pub fn collect(
     }
     check("scratch_collect_start")?;
     let mut root = Root::open(path, data_path, false, None)?;
+    // Under the namespace lock, stabilize prior renames and unlinks before consuming this registry.
+    root.sync_record_publication(&root.registry)?;
     let (registered_views, ordered) = registered_window(
         &root.registry,
         &root.registration.cursor,
@@ -816,8 +837,6 @@ pub fn collect(
             result.collected_objects += 1;
             result.removed_views += 1;
         } else if record.state == State::Finishing {
-            // A recovered intent must be durable before any registered controls are removed.
-            root.sync_record_publication(&root.registry)?;
             finish(&root, &record, check)?;
             result.collected_objects += 1;
             result.removed_views += 1;
@@ -827,7 +846,7 @@ pub fn collect(
                 .ok_or_else(|| vortex_err!("Scratch work directory required"))?;
             let payload = child(work, "payload")?;
             if record.state == State::Live {
-                record.plan = inventory(&payload)?;
+                record.plan = inventory(&payload, InventoryMode::Freeze)?;
                 record.state = State::Collecting;
                 root.save(&record)?;
                 root.registration_checkpoint(&record, "scratch_plan_published", check)?;
@@ -850,7 +869,7 @@ pub fn collect(
                 }
                 let (parent, component) = parent_fd(&payload, &entry.path)?;
                 if let Some(stat) = exists(&parent, &component)? {
-                    validate_unlink_entry(&stat, &entry)?;
+                    validate_payload_entry(&stat, &entry)?;
                     if entry.bytes > max_bytes - result.collected_bytes {
                         if entry.progress == Progress::Pending {
                             break;
@@ -883,7 +902,7 @@ pub fn collect(
                     let stat = exists(&current_parent, &component)?.ok_or_else(|| {
                         vortex_err!("Scratch unlink entry disappeared after its checkpoint")
                     })?;
-                    validate_unlink_entry(&stat, &entry)?;
+                    validate_payload_entry(&stat, &entry)?;
                     root.unlink(
                         &current_parent,
                         &component,
@@ -893,14 +912,14 @@ pub fn collect(
                             AtFlags::empty()
                         },
                     )?;
-                    sync_directory(&current_parent).map_err(std::io::Error::from)?;
+                    sync_fd(&current_parent).map_err(std::io::Error::from)?;
                     result.collected_objects += 1;
                     result.collected_files += u64::from(!entry.directory);
                     result.collected_bytes += entry.bytes;
                     root.registration_checkpoint(&record, "scratch_after_unlink", check)?;
                 } else if entry.progress == Progress::Pending {
                     // Make the prior unlink durable before acknowledging it in the manifest.
-                    sync_directory(&parent).map_err(std::io::Error::from)?;
+                    sync_fd(&parent).map_err(std::io::Error::from)?;
                 } else {
                     vortex_bail!("Scratch file vanished without a deletion intent");
                 }
@@ -1016,6 +1035,8 @@ impl OwnedScratch {
                 "Closing scratch still owns unexpected payload; explicit collection required"
             );
         }
+        // The SDK may have just removed its last working directory.
+        sync_fd(&payload).map_err(std::io::Error::from)?;
         record.state = State::Finishing;
         root.save(&record)?;
         finish(&root, &record, &|_| Ok(()))
@@ -1028,31 +1049,180 @@ mod tests {
     use std::cell::Cell;
 
     thread_local! {
-        static FAIL_DIRECTORY_SYNC: Cell<Option<Identity>> = const { Cell::new(None) };
+        static FAIL_SYNC: Cell<Option<Identity>> = const { Cell::new(None) };
     }
 
-    pub(super) fn sync_directory(directory: &OwnedFd) -> rustix::io::Result<()> {
-        if FAIL_DIRECTORY_SYNC.get() == Some(identity(&posix::fstat(directory)?)) {
+    pub(super) fn sync_fd(fd: &OwnedFd) -> rustix::io::Result<()> {
+        if FAIL_SYNC.get() == Some(identity(&posix::fstat(fd)?)) {
             return Err(rustix::io::Errno::IO);
         }
-        posix::fsync(directory)
+        posix::fsync(fd)
     }
 
     fn expect_sync_error<T>(
-        directory: &Path,
+        path: &Path,
         operation: impl FnOnce() -> VortexResult<T>,
     ) -> VortexResult<()> {
-        let stat = posix::stat(directory).map_err(std::io::Error::from)?;
-        FAIL_DIRECTORY_SYNC.set(Some(identity(&stat)));
+        let stat = posix::stat(path).map_err(std::io::Error::from)?;
+        FAIL_SYNC.set(Some(identity(&stat)));
         let result = operation();
-        FAIL_DIRECTORY_SYNC.set(None);
+        FAIL_SYNC.set(None);
+        assert_sync_error(result);
+        Ok(())
+    }
+
+    fn assert_sync_error<T>(result: VortexResult<T>) {
         let error = result
             .err()
-            .expect("operation succeeded without syncing the expected directory");
+            .expect("operation succeeded without syncing the expected entry");
         assert!(
             error
                 .to_string()
                 .contains(&std::io::Error::from(rustix::io::Errno::IO).to_string())
+        );
+    }
+
+    #[test]
+    fn freezing_plan_syncs_sdk_files_and_directories_before_publication() -> VortexResult<()> {
+        let parent = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let view = OwnedScratch::create(parent.path(), data.path(), &|_| Ok(()))?;
+        let root = view.root().to_owned();
+        let registration = root.join("registry").join(&view.owner);
+        let live = std::fs::read(&registration)?;
+        let payload = view.path().to_owned();
+        let outer = payload.join("generation");
+        let inner = outer.join("segments");
+        let file = inner.join("index.bin");
+        std::fs::create_dir_all(&inner)?;
+        std::fs::write(&file, b"1234567")?;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400))?;
+        drop(view);
+
+        let run = |objects, bytes| collect(data.path(), &root, objects, bytes, &|_| Ok(()));
+        for path in [&file, &inner, &outer, &payload] {
+            expect_sync_error(path, || run(1, 1))?;
+            assert_eq!(std::fs::read(&registration)?, live);
+            assert_eq!(std::fs::read(&file)?, b"1234567");
+        }
+        let frozen = run(1, 1)?;
+        assert_eq!(
+            (
+                frozen.collected_objects,
+                frozen.collected_bytes,
+                frozen.remaining_views
+            ),
+            (0, 0, 1)
+        );
+        let saved: Record = serde_json::from_slice(&std::fs::read(&registration)?).unwrap();
+        assert!(saved.state == State::Collecting && saved.plan.len() == 3);
+        assert_eq!(saved.plan[0].path, "generation/segments/index.bin");
+        assert_eq!(saved.plan[0].bytes, 7);
+        assert!(
+            saved
+                .plan
+                .iter()
+                .all(|entry| entry.progress == Progress::Present)
+        );
+        let first = run(1, 7)?;
+        assert_eq!(
+            (
+                first.collected_objects,
+                first.collected_files,
+                first.collected_bytes
+            ),
+            (1, 1, 7)
+        );
+        let rest = run(3, 1)?;
+        assert_eq!(
+            (
+                rest.collected_objects,
+                rest.collected_files,
+                rest.collected_bytes
+            ),
+            (3, 0, 0)
+        );
+        assert_eq!((rest.removed_views, rest.remaining_views), (1, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn normal_close_syncs_empty_payload_before_finishing() -> VortexResult<()> {
+        let parent = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let view = OwnedScratch::create(parent.path(), data.path(), &|_| Ok(()))?;
+        let root = view.root().to_owned();
+        let payload = view.path().to_owned();
+        let registration = root.join("registry").join(&view.owner);
+        let live = std::fs::read(&registration)?;
+        let sdk = tempfile::tempdir_in(&payload)?;
+        std::fs::write(sdk.path().join("index.bin"), b"index")?;
+        sdk.close()?;
+
+        expect_sync_error(&payload, || view.close(&|_| Ok(())))?;
+        assert_eq!(std::fs::read(&registration)?, live);
+        assert_eq!(std::fs::read_dir(&payload)?.count(), 0);
+        let recover = || collect(data.path(), &root, 1, 1, &|_| Ok(()));
+        expect_sync_error(&payload, recover)?;
+        assert_eq!(std::fs::read(&registration)?, live);
+        let pass = recover()?;
+        assert_eq!(
+            (
+                pass.collected_objects,
+                pass.collected_files,
+                pass.collected_bytes
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!((pass.removed_views, pass.remaining_views), (1, 0));
+        assert!(!registration.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_registry_syncs_prior_unlink_before_reporting_zero() -> VortexResult<()> {
+        let parent = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let view = OwnedScratch::create(parent.path(), data.path(), &|_| Ok(()))?;
+        let root = view.root().to_owned();
+        let registry = root.join("registry");
+        let registry_id = identity(&posix::stat(&registry).map_err(std::io::Error::from)?);
+        let work = root.join("work").join(&view.owner);
+        drop(view);
+
+        // Arm the failure immediately before the last registration is unlinked.
+        let armed = Cell::new(false);
+        let result = collect(data.path(), &root, 1, 1, &|stage| {
+            if stage == "scratch_after_remove_view" {
+                armed.set(true);
+                FAIL_SYNC.set(Some(registry_id));
+            }
+            Ok(())
+        });
+        FAIL_SYNC.set(None);
+        assert!(armed.get());
+        assert_sync_error(result);
+        assert!(!work.exists());
+        assert_eq!(std::fs::read_dir(&registry)?.count(), 0);
+
+        let retry = || collect(data.path(), &root, 1, 1, &|_| Ok(()));
+        expect_sync_error(&registry, retry)?;
+        let empty = retry()?;
+        assert_eq!(
+            (
+                empty.registered_views,
+                empty.examined_views,
+                empty.remaining_views
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            (
+                empty.removed_views,
+                empty.collected_objects,
+                empty.collected_bytes
+            ),
+            (0, 0, 0)
         );
         Ok(())
     }
@@ -1134,6 +1304,9 @@ mod tests {
 
         let collect_one = |bytes| collect(&data, &root, 1, bytes, &|_| Ok(()));
         let record = || Root::open(&root, &data, false, None)?.load(&owner);
+        // Isolate removal failures from the initial synchronization of the payload.
+        assert_eq!(collect_one(1)?.collected_objects, 0);
+        assert!(record()?.state == State::Collecting);
         // First fail after unlink, then fail again on recovery of the already absent file.
         for bytes in [7, 1] {
             expect_sync_error(&payload, || collect_one(bytes))?;
@@ -1295,12 +1468,12 @@ mod tests {
             bytes: 0,
             progress: Progress::Pending,
         };
-        validate_unlink_entry(&actual, &plan)?;
+        validate_payload_entry(&actual, &plan)?;
         plan.identity.inode ^= 1;
-        assert!(validate_unlink_entry(&actual, &plan).is_err());
+        assert!(validate_payload_entry(&actual, &plan).is_err());
         plan.identity = identity(&actual);
         plan.bytes = 1;
-        assert!(validate_unlink_entry(&actual, &plan).is_err());
+        assert!(validate_payload_entry(&actual, &plan).is_err());
         Ok(())
     }
 }

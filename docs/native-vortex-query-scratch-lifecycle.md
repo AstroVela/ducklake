@@ -29,7 +29,7 @@ payload 是登记时独占委托给 SDK 的工作树。在首次回收计划发�
 
 ## 查询与活跃保护
 
-查询先持命名空间锁，durably 写入 `allocating` 记录，再创建目录及 owner.lock，持有文件锁后发布 `live`。正常结束、取消和可返回错误都先释放 ReadView／SDK lease，再关闭登记。分配和关闭等待命名空间锁时都会检查查询取消。关闭期间如果等锁被取消，释放 owner 锁并保留登记，后续显式回收可接手。正常关闭要求 payload 已由 SDK 释放；异常残留会明确报错并保留登记，交给显式回收。
+查询先持命名空间锁，durably 写入 `allocating` 记录，再创建目录及 owner.lock，持有文件锁后发布 `live`。正常结束、取消和可返回错误都先释放 ReadView／SDK lease，再关闭登记。分配和关闭等待命名空间锁时都会检查查询取消。关闭期间如果等锁被取消，释放 owner 锁并保留登记，后续显式回收可接手。正常关闭先确认 SDK 已清空 payload，再 fsync 该目录，使 SDK 删除的目录项持久化后才发布 `finishing`。遇到残留文件或同步失败时，保留 `live` 登记供显式回收。
 
 文件锁随进程退出由内核释放，不根据 PID、时间戳或目录年龄猜测查询是否结束。回收对活跃 owner 的锁使用 try-lock，返回 `blocked_views`，不读取其 payload。已打开的旧 ReadView 在规范源／generation GC 及 metadata checkpoint 后仍持有私有副本和文件锁。
 
@@ -57,7 +57,7 @@ SELECT * FROM ducklake_collect_vortex_query_scratch(
 | collected_files／collected_bytes | 已实际删除的 payload 普通文件数和文件字节 |
 | removed_views | 已完成清理的登记数 |
 
-同一次调用共享预算，不能按文件或 owner 放大。遍历登记名时统计总数，内存中只保留本轮游标所需的候选名。最多检查对象预算数量的 owner，持久游标轮转，避免前 16 个活跃 owner 长期阻塞后面的死 owner。命名空间锁被分配或另一回收持有时，显式调用返回 busy，由调用方决定下一次调用；没有内部重试。
+同一次调用共享预算，不能按文件或 owner 放大。回收器取得命名空间锁后，先同步 `registry` 和登记暂存文件所在的命名空间根，再枚举登记。即使最后一条登记的删除在上轮中断时已经可见，重试也要等同步成功才可报告剩余为零。遍历登记名时统计总数，内存中只保留本轮游标所需的候选名。最多检查对象预算数量的 owner，持久游标轮转，避免前 16 个活跃 owner 长期阻塞后面的死 owner。命名空间锁被分配或另一回收持有时，显式调用返回 busy，由调用方决定下一次调用；没有内部重试。
 
 每个文件仍受既有 64 MiB artifact 限制，删除清单受既有 1 MiB manifest 限制；路径长度及深度也有限制。协议元数据、清单遍历、校验及 fsync 开销不计作 payload 字节；这些预算不构成总 I/O、RSS、延迟或磁盘空间的上界。
 
@@ -69,7 +69,7 @@ SELECT * FROM ducklake_collect_vortex_query_scratch(
 
 检查点回调返回后、写入清理记录和删除文件前，回收器沿授权路径重新核对父目录、命名空间根、同级锁文件、`registry` 和 `work` 的身份。绑定变化会终止本轮回收，已经持久化的清理进度可用于恢复。
 
-1. 发布 `collecting` 清单并 fsync。
+1. 首次接管 `live` owner 时，核对每个 SDK 普通文件的身份和大小并 fsync 文件。按子目录到父目录的顺序一直同步到 payload 根，使清单依赖的目录项也持久化，再发布 `collecting`。同步失败时保留原 `live` 登记。后续轮次按已冻结清单核对和删除，计费仍以本轮实际删除的对象和字节为准。
 2. 每项检查身份及剩余预算，写唯一 `pending` 意图并 fsync，再从登记目录核对待删项的身份、类型及大小，unlink 后 fsync 父目录并确认 `removed`。
 3. 中断后，仅 pending 项允许已经消失；此前无意图的缺失、未知新增或身份变化均失败。
 4. 未完成的 `pending` 项优先恢复。若它尚在且超过本次字节预算，保留原意图。若文件或目录已消失，先 fsync 其父目录，成功后才记为 `removed`。同步失败时保留 `pending`，重试只对当轮实际删除的对象和字节计费。
