@@ -22,8 +22,17 @@ SELECT * FROM ducklake_resume_vortex_maintenance('lake');
 ```
 
 One maintenance policy covers all registered build roots and retired generations
-in that native catalog, including registered manual builds. Duplicate enable,
-missing initialization, invalid budgets and resume while running fail explicitly.
+in that native catalog, including registered manual builds. Enable, cancel and
+resume require autocommit and a writable attachment. Status can be read from a
+read-only attachment. Duplicate enable, missing initialization, invalid budgets
+and resume while running fail explicitly.
+The runtime binds each registration to the attached DuckLake and DuckDB
+metadata instances. Calls using different casing find the same registration.
+The controls check attachments retained by the calling transaction, including
+the native metadata connection of an existing DuckLake transaction. Each
+collector transaction verifies both identities before using catalog data.
+Reattaching a lake requires explicit resume for the new attachment. A caller
+retaining the earlier attachment is rejected.
 Caller reference JSON and unregistered directories remain outside GC ownership.
 The policy uses the existing database optimizer worker, with at most 16 registered
 maintenance catalogs and no additional background threads or build concurrency.
@@ -31,7 +40,10 @@ maintenance catalogs and no additional background threads or build concurrency.
 Maintenance has its own enabled flag, run ID, stage, error and progress counters.
 Disabling or cancelling an indexing policy does not cancel already authorized
 cleanup. Cancelling maintenance interrupts its current native checkpoints and
-stops further cleanup until explicit resume. A maintenance error is recorded
+stops further cleanup until explicit resume. Cancel and resume update the durable
+policy and worker registration in the same serialized transition. Completion
+records its last state and clears the running task within that boundary.
+A maintenance error is recorded
 and disables that policy; indexing and maintenance do not retry failed tasks.
 
 Restart preserves configuration and durable stages but starts neither indexing
@@ -52,8 +64,9 @@ The single worker serializes indexing and independent maintenance phases:
    published generations and deletes only registered owned leftovers.
 4. Persist `collecting_generations` and pass the remaining object/byte budget
    to the existing retired-generation collector.
-5. Refresh backlog counts and persist `idle`. Budget-limited unfinished work
-   can continue on a later worker pass; failed work requires explicit resume.
+5. Refresh backlog counts and persist `idle` or `blocked`. Budget-limited
+   unfinished work can continue on a later worker pass when it fits a full
+   pass. Failed work requires explicit resume.
 
 The object budget is 1–16 completed collections across both collectors per pass;
 reconciliation separately visits at most that many pending records. The byte
@@ -61,8 +74,13 @@ budget is 1–64 MiB shared across the two collection phases, using their existi
 accounting: reclaimed logical build-file lengths plus registered retired
 artifact bytes. Manifest verification, directory operations and metadata reads
 are not physical I/O quotas. The existing 4,096-entry build traversal limit and
-bounded partial truncation apply unchanged. A generation that cannot fit the
-remaining budget stays registered for another pass. Budgets never expand.
+bounded partial truncation apply unchanged. Generation selection excludes
+entries that exceed the available bytes before applying the object limit.
+Items whose combined size exceeds the budget stay registered for a later pass.
+When all remaining generations are referenced or exceed the entire pass
+budget, maintenance reports `blocked`. The worker observes backlog without
+opening empty runs or rewriting progress. Operators can collect explicitly with
+an allowed budget that fits a larger generation. Background budgets never expand.
 
 Both collectors retain their existing publication/admission locks, authenticated
 generation checks, POSIX descriptor operations, fsync and durable deletion
@@ -93,14 +111,17 @@ view, delayed typed fetch, unchanged B1 generations/hashes/mtimes and unchanged
 source bytes. It retains write quotas and rejects excess F while work is paused.
 Build failure/cancellation leave indexing stopped while maintenance cleans its
 registered leftovers. GC failure disables maintenance and requires explicit
-resume. Shared count/byte limits and cancellation of a 65 MiB partial scratch
-file exercise bounded continuation.
+resume. Count and byte fixtures observe both collectors after one completed
+pass. A 65 MiB partial scratch file exercises bounded continuation. The proof
+also covers a reattach while GC waits, cancellation at completion, a resumed
+policy surviving an old completion callback, and a blocked generation behind
+which smaller work fits.
 
 SIGKILL covers both sides of index publication and seven maintenance boundaries:
 before recovery, deletion ownership, partial unlink, partial truncation,
 retired-generation deletion, files removed before final progress, and coordinator
-completion. Explicit resume refreshes stale backlog counts without starting an
-empty cleanup run. Restart alone performs
+completion. Explicit resume refreshes stale backlog counts while the worker
+is busy and without starting an empty cleanup run. Restart alone performs
 no cleanup; explicit resume reconciles committed output before deletion and
 continues without rebuilding a winning merge. Existing SQL, recovery, lifecycle,
 index and GC proofs remain in CI, and the new proof's evidence is uploaded.
@@ -114,16 +135,26 @@ An [explicit indexed-source rewrite](native-vortex-index-rewrite-proof.md)
 provides a separate data-compaction and atomic index-handoff path; registered
 leftovers from that operation use the same maintenance worker and collector.
 
-Local qualification kept DuckDB v1.5.5 (`d8cdaa33`), Vortex `65dab44f`, native
-wrapper `b819cc03` and the qualified static SPFresh SDK unchanged from #44.
-The final catalog driver SHA-256 was
-`94bc584ac92bdf55338fdf1b0db586d2b4b13fec8d91f329189a0d26e2d9447e`.
-The process proof passed 16 checks and 97 fixture queries with recall 1.0,
-finishing seven merge/append/GC rounds at revision 17 with three active
-generations and no registered build/retirement backlog. ON passed 16 Vortex SQL
-cases (595 assertions) and Vortex recovery. ON/OFF each passed 86 base cases
-(3,582 assertions; 13 optional-dependency skips) and Parquet recovery. Audit
-passed 122 assertions; all 14 existing native process proofs passed. The isolated
-cost proof passed four cases with nine queries each and recall 1.0; timings
-remain informational. `make format-fix`, Rust formatting checks and
-`git diff --check` passed.
+Local qualification used DuckDB v1.5.5 (`d8cdaa33`), Vortex `b20e34c2`,
+native wrapper `84cef204` and the static SPFresh SDK qualified by #44. The
+Linux build from `ae132d32` passed 21 maintenance checks in
+64.3 seconds against the 180-second budget. All
+97 fixture queries achieved recall 1.0. Seven merge/append/GC
+rounds reached revision 17 with three active generations and empty build and
+retirement registries. The catalog driver SHA-256 was
+`0a4e86c4057bbdf15a23122b4a85ef491af4c08ba7f3e0076e954679d71effab`.
+
+All 15 native process suites and 18 functional gates passed. Native ON passed
+25 Vortex SQL cases with 990 assertions. ON and OFF each passed
+86 base cases with 3,582 assertions and 13 optional-dependency skips. All
+32 ABI checks passed. Four isolated query-cost cases passed with minimum
+fixture recall 1.0. Rust formatting, Clippy, workspace tests and the
+changed-file formatting and diff checks passed.
+
+The first matrix run for `2416e8b7` reached the existing 60-second native RPC limit while
+creating the initial B1 for the stored-ownership fixture. SPFresh scratch
+existed and the new generation's artifact directory was empty. The cause is
+undetermined. With the same driver and limits, the isolated build-ownership
+suite passed in 35.7 seconds and the complete matrix rerun passed that
+suite in 35.5 seconds. The current matrix also passed the
+build-ownership suite in 35.0 seconds.

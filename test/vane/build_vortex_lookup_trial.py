@@ -9,7 +9,7 @@ from pathlib import Path
 import shlex
 import subprocess
 
-BASE_SOURCE_SHA256 = "97a4b1cf7d1a00c7846a974fee77647649c8b18c7ae6ae254097b9d474ffe96e"
+BASE_SOURCE_SHA256 = "9e0f21ed12467bfa4c194dab7518f7f5994198379fe35f7483fdc5382b286c2b"
 
 
 def run(args):
@@ -54,6 +54,8 @@ def run(args):
     subprocess.run(["patch", "--batch", "--forward", "--fuzz=0", "-p1", "--input", str(patch)], cwd=root, check=True)
     metadata = root / "lookup.o"
     compile_source("/ducklake_metadata_manager.cpp", generated, metadata)
+    baseline_metadata = root / "baseline.o"
+    compile_source("/ducklake_metadata_manager.cpp", source, baseline_metadata)
     report = {
         "baseline_source_sha256": BASE_SOURCE_SHA256,
         "candidate_source_sha256": hashlib.sha256(generated.read_bytes()).hexdigest(),
@@ -63,10 +65,12 @@ def run(args):
         ).hexdigest(),
         "executables": {},
     }
-    for variant in ("baseline", "lookup"):
-        link = list(command)
-        if variant == "lookup":
-            link.insert(position + 1, str(metadata))
+    for variant, obj in (("baseline", baseline_metadata), ("lookup", metadata)):
+        link = [
+            f"-Wl,--dependency-file={root / (variant + '.d')}" if arg.startswith("-Wl,--dependency-file=") else arg
+            for arg in command
+        ]
+        link.insert(position + 1, str(obj))
         output = root / variant
         link[link.index("-o") + 1] = str(output)
         subprocess.run(link, cwd=build, check=True)

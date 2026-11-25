@@ -37,16 +37,31 @@ def exercise(proof, native, root, checks, workers):
     )
     native.call("init")
     native.call("optimizer-init")
-    native.sql(f"SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn',{BASE.quote(artifacts)},8)")
+    create = f"SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn',{BASE.quote(artifacts)},8)"
+    statement = root / "create.sql"
+    statement.write_text(create)
+    native.call("cancel-create-lock", statement)
+    native.sql(
+        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Canceled create published a definition') END "
+        "FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1"
+    )
+    native.sql(create)
     head = native.call("head", "knn")
     require(head["revision"] == 1 and not SEG.segments(head), "Empty definition fabricated an ANN generation")
     require(not native.call("build-status") and not native.call("generation-status"), "Definition invoked ANN build")
     recalls, phases = [], []
+    native_rows = "SELECT rowid,id,embedding,category,payload FROM lake.items"
+
+    def require_same_native_rows(expected, message):
+        native.sql(
+            f"SELECT CASE WHEN count(*)=0 THEN true ELSE error({BASE.quote(message)}) END FROM "
+            f"(({native_rows} EXCEPT ALL {expected}) UNION ALL ({expected} EXCEPT ALL {native_rows}))"
+        )
 
     def query(label, count):
         core, rows = M.qualify(native, label, recalls, count)
         phases.append({"phase": label, "rows": len(rows), "routes": core["diagnostics"]["routes"]})
-        return core, rows
+        return core, sorted(rows, key=lambda row: row["id"])
 
     query("empty", 0)
     native.call("optimizer-enable", artifacts, 64, 4194304, 128, RW.LIMIT, "build_started", "pause")
@@ -77,7 +92,7 @@ def exercise(proof, native, root, checks, workers):
         and next(r for r in committed if r["id"] == 1003)["payload"] == "原子更新",
         "Committed batch did not atomically replace visible row versions",
     )
-    native.sql("CREATE TABLE basic_expected AS SELECT rowid,id,embedding,category,payload FROM lake.items")
+    native.sql(f"CREATE TABLE basic_expected AS {native_rows}")
     native.sql("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
     core, flushed = query("flushed-small-F", 0)
     require(
@@ -88,11 +103,7 @@ def exercise(proof, native, root, checks, workers):
         and not native.call("build-status"),
         "Small F required an ANN generation or changed visible rows/row IDs",
     )
-    native.sql(
-        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('flush changed native rows or row IDs') END FROM "
-        "((SELECT rowid,id,embedding,category,payload FROM lake.items EXCEPT ALL SELECT * FROM basic_expected) "
-        "UNION ALL (SELECT * FROM basic_expected EXCEPT ALL SELECT rowid,id,embedding,category,payload FROM lake.items))"
-    )
+    require_same_native_rows("SELECT * FROM basic_expected", "flush changed native rows or row IDs")
     insert(native, 2000, 112)
     native.call("optimizer-wait")
     state = OPT.status(native)
@@ -132,6 +143,8 @@ def exercise(proof, native, root, checks, workers):
         worker.fetch("old", [CAT.MIXED.ref(r) for r in wanted]) == [CAT.MIXED.READ.business(r) for r in wanted],
         "Old T view lost original versions after flush and indexing",
     )
+    restart_rows = BASE.quote(root / "before-restart.parquet")
+    native.sql(f"COPY ({native_rows}) TO {restart_rows} (FORMAT PARQUET)")
     wal = native.root / "metadata.ducklake.wal"
     require(wal.is_file() and wal.stat().st_size > 0, "Recovery did not exercise an uncheckpointed metadata WAL")
     native.process.kill()
@@ -141,20 +154,22 @@ def exercise(proof, native, root, checks, workers):
     native.start("resume")
     require(not OPT.status(native)["running"], "Restart implicitly started optimizer work")
     _, recovered = query("reopened-B-plus-T", 2)
-    require(recovered == before_restart, "Recovery changed current typed rows or stable row IDs")
+    require(recovered == before_restart, "Recovery changed current captured rows or their source addresses")
+    require_same_native_rows(f"SELECT * FROM read_parquet({restart_rows})", "recovery changed native rows or row IDs")
     require(worker.search("old", M.VECTOR) == baseline, "Native restart changed a retained T view")
     worker.close_view("old")
     worker.finish(eof=True)
     native.finish()
     checks.extend(
         [
+            "cancelling create in the publication lock wait leaves no committed index definition",
             "empty table creates an explicit zero-B definition without native ANN artifacts",
             "one named query sees committed T immediately and hides uncommitted vector/business mutations",
             "small F is queryable before ANN; background threshold builds first B while F/T remain visible",
             "B/F/T queries filter stale/deleted row versions and match the native oracle",
             "a later threshold appends a second B without changing the first generation or artifact bytes",
             "old T views preserve original typed rows through updates, flush, indexing and native restart",
-            "SIGKILL with a nonempty metadata WAL recovers identical B/T rows without implicit optimizer replay",
+            "SIGKILL and WAL recovery preserve native row IDs and typed B/T values without implicit optimizer replay",
         ]
     )
     return {"phases": phases, "fixture_recalls": recalls, "minimum_recall": min(recalls)}
