@@ -11,16 +11,21 @@ protocol: initialize an atomic stop flag, publish stop and notify while holding
 the queue mutex, then release that mutex before joining workers. An independent
 test of the real pool reproduces the old join/condition-wait hang. The exact new
 regression reports races against the old helper and passes against the fix.
-The fixed helper completes 100,000 shutdowns; focused Helgrind and
-ThreadSanitizer checks report no errors. Five C++ groups, twenty native Rust
+The original Vortex #34 qualification at `4b396b4e88909cd7c87e3b27af733947fe8e8808` recorded
+100,000 shutdowns. Focused Helgrind and ThreadSanitizer checks reported no
+errors. Five C++ groups, twenty native Rust
 tests, two non-native tests and repeated concurrent lifetime checks pass.
 
 Pin the native SDK source gate, query library, standalone probe and tracked root
-lockfile to Vortex `4b396b4e88909cd7c87e3b27af733947fe8e8808`. Pin the adapter
-to `4ddaeeecf64a659cfb6b691bd3b917f4f189f2a2`, the paired
-[duckdb-vortex #39](https://github.com/AstroVela/duckdb-vortex/pull/39), which
+lockfile to Vortex `54b2bde9255e24c21f936f5623fd4a66e4a7ede0`, the squash merge of Vortex #34.
+Pin the adapter to `e8d2d520299508ba98687a5553e7cd41384e9c90`, the squash merge of
+[DuckDB-Vortex #39](https://github.com/AstroVela/duckdb-vortex/pull/39), which
 updates both independent workspaces and strict provider-source validation.
 Update CI's checkout revisions with these same exact pins.
+The root lockfile also records the merged SPFresh crate's dependencies on
+rand, rand_distr 0.6.0 and tracing.
+DuckLake explicitly selects the existing unquantized SPFresh build through
+the merged build-options API.
 
 The bridge's serialization, source-admission rules, read views, ANN search
 budgets, write/maintenance budgets and load deadlines remain unchanged. There
@@ -30,9 +35,12 @@ is no compatibility layer, additional accepted revision, retry or fallback.
 
 Native helper qualification isolates a shutdown defect; the installed provider
 pair must separately exercise the complete automatic flow and long load.
-Rebuild and sign both provider wheels because the Vortex source revision changes
-their dependency closure. Preserve the existing Vane base wheel and qualify in
-a new isolated installed environment.
+Build the runtime and both signed provider wheels against Vane
+`14b4fc6a45f9c0a593202f1eb32f1062d365703e`. This pin includes the numeric
+parameter binding fix in [Vane #1148](https://github.com/AstroVela/vane/pull/1148).
+Qualify the exact installed wheel closure in a new isolated environment.
+In the sustained-load verifier, the existing status monitor and the final
+catalog and footprint checks share one 90-second deadline.
 
 The original retained 4,096-row/128D cost canary has a 0.7 lower bound under the
 unchanged 0.8 gate. Offline replay confirms failures even at a single committed
@@ -49,7 +57,13 @@ correction is qualified in [Vortex #35](https://github.com/AstroVela/vortex/pull
 and is not part of this consumer pin. The cost gate and original uncaptured
 silent stop remain separate from the qualified native shutdown regression.
 
-## Installed-provider qualification
+## Historical installed-provider qualification
+
+The results in this section and the original long-load section were recorded
+in DuckLake #67 at `22ad1191` using the original Vortex and DuckDB-Vortex
+revisions `4b396b4e88909cd7c87e3b27af733947fe8e8808` and `4ddaeeecf64a659cfb6b691bd3b917f4f189f2a2`.
+The merged dependency pair uses the installed-provider and long-load checks
+described here for its own qualification.
 
 The new isolated environment contains the unchanged Vane base wheel and newly
 signed Vortex and DuckLake test-only wheels with an exact dependency closure.

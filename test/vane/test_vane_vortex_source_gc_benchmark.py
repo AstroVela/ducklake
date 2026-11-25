@@ -27,7 +27,7 @@ CONTRACT = {
     "diagnostic": "separate restored processes; SQL/post-plan callbacks and checkpoints; excluded from primary statistics",
     "order": "rotate cases each round, reverse odd rounds; warmups excluded",
     "interpretation": "baseline attribution only; no runtime candidate, A/B improvement or sustained throughput claim",
-    "reference": "2a9377062cddc0c222d8dd99e4d5efee3a298c76",
+    "historical_measurement_commit": "0fb0fbd58d881d0fbac02cba3e04b42d8847be5f",
 }
 
 
@@ -54,13 +54,24 @@ def fingerprint(entries):
     return hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def seal_input(work, image):
+    prepared = manifest(work)
+    shutil.copytree(work, image, symlinks=True, copy_function=shutil.copy2)
+    assert manifest(image) == prepared, "sealed image differs from prepared input"
+    return prepared
+
+
 def validate_sample(sample, expected, diagnostic):
     before, after = sample["before"], sample["after"]
     assert before == {
-        k: v for k, v in expected.items() if k not in ("task", "history", "history_storage")
+        k: v for k, v in expected.items() if k not in ("task", "history", "history_storage", "ducklake_extension_version")
     }, "restored task input changed"
     assert sample["history"] == expected["history"] and sample["task"] == expected["task"]
     assert sample["history_storage"] == expected["history_storage"]
+    assert sample["ducklake_extension_version"] == expected["ducklake_extension_version"] != ""
+    assert before["snapshots"] == sample["history"] + (
+        5 if sample["task"] == "expire" else 3
+    ), "unexpected input snapshot inventory"
     assert sample["diagnostic"] is diagnostic
     assert before["intents"] == after["intents"] == 0
     assert sample["complete_source_gc_ns"] > 0
@@ -71,10 +82,11 @@ def validate_sample(sample, expected, diagnostic):
     assert after["bytes_total"] == before["bytes_total"] + sample["bytes"]
     if sample["task"] == "expire":
         assert (sample["expired"], sample["files"], sample["bytes"]) == (2, 0, 0)
-        assert after["snapshots"] == before["snapshots"] - 2 and after["scheduled"] >= 2
+        assert after["snapshots"] == before["snapshots"] - 2 and after["scheduled"] == 2
         assert before["scheduled"] == 0 and sample["deleted_paths"] == []
     else:
         assert (sample["expired"], sample["files"]) == (0, 2) and sample["bytes"] > 0
+        assert before["scheduled"] == 2
         assert after["snapshots"] == before["snapshots"] and after["scheduled"] == before["scheduled"] - 2
         assert len(sample["deleted_paths"]) == len(set(sample["deleted_paths"])) == 2
     assert [p["stage"] for p in sample["phases"]] == ["wait", "metadata", "expire", "artifact", "unlink"]
@@ -149,7 +161,7 @@ def run(args):
     root.mkdir(mode=0o700)
     private = root / "private"
     private.mkdir(mode=0o700)
-    env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local-fast")
+    env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local")
     env.pop("VORTEX_SPFRESH_NATIVE", None)
     driver = args.driver.resolve()
     contract = dict(
@@ -207,6 +219,7 @@ def run(args):
         data_after = {p for p in after if p.startswith("data/")}
         expected_deleted = {Path(p).relative_to(work).as_posix() for p in sample["deleted_paths"]}
         assert data_before - data_after == expected_deleted and not data_after - data_before
+        assert sample["bytes"] == sum(restored[p]["bytes"] for p in expected_deleted)
         assert all(restored[p] == after[p] for p in data_after), "GC changed a retained physical source"
         assert all(
             after.get(p) == info for p, info in restored.items() if p.startswith("indexes/")
@@ -237,8 +250,10 @@ def run(args):
             }
             command(case, "prepare", False, "prepare.log")
             case["input"] = json.loads((work / "input.json").read_text())
-            shutil.copytree(work, image, copy_function=shutil.copy2)
-            entries = manifest(image)
+            extension_version = case["input"]["ducklake_extension_version"]
+            recorded_version = report.setdefault("ducklake_extension_version", extension_version)
+            assert extension_version and extension_version == recorded_version
+            entries = seal_input(work, image)
             case["input_image_sha256"] = fingerprint(entries)
             save(case_root / "input-manifest.json", entries)
             report["cases"].append(case)

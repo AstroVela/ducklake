@@ -20,7 +20,8 @@ inclusive and must be met. Configuration requires an existing optimizer policy;
 enabling it also requires an installed write budget selecting the same index.
 It does not resume a cancelled/stopped optimizer, authorize catalog maintenance,
 expire snapshots or change write/scan/index budgets. Configure only when no
-optimizer task is running; use the existing cancel/resume API for active work.
+optimizer task is running. Configuration and resume use the caller's writable
+catalog and metadata attachments in autocommit.
 
 Fresh explicit optimizer initialization creates the task columns required by
 this prototype. Serialized policy format 2 includes the enable flag and two
@@ -30,9 +31,17 @@ legacy decoder, compatibility layer or fallback.
 ## Candidate selection and bounded scheduling
 
 The planner reads current file, delete-file and inlined-deletion metadata for
-the named index's active files. It reads counts rather than vector data or all
-historical deletion row IDs. The selected B is the eligible generation with the
-greatest reclaimable-row count; equal counts use generation-name ordering.
+the named index's active files. Counts suffice for files with one deletion
+representation. For files with both, the planner subtracts overlapping positions
+from the active masks under the source read guard and existing byte ceiling. The
+selected B has the greatest reclaimable-row count among eligible generations.
+Generation-name order breaks ties.
+Scans consume every delete record at each position. When an active file has both
+mask types, metadata reports that an exact count is unavailable. SQL aggregates
+use visible rows, and rewrite publication skips the optional global-statistics
+refresh that requires an exact metadata count. The compactor stores disjoint
+masks in its commit record so its source row checks also use the unique deletion
+count.
 
 A nonempty source rewrite needs deletions, both thresholds, at least 65 remaining physical
 rows for the unchanged static SPFresh options, a nonempty rewrite output and
@@ -50,7 +59,9 @@ source inventory and index references. The [sparse-B follow-up](native-vortex-sp
 rewrites complete 1–64-row B inputs into explicitly admitted F. Larger indexed
 rewrites still require nonempty output.
 
-An eligible source rewrite takes priority over flush/index work at planning.
+An eligible source rewrite takes priority at the initial probe and at the probe
+after a committed flush. If a candidate becomes eligible during flush, the
+worker completes the flush and selects the rewrite before index work.
 One worker pass creates one durable `rewrite` task with one selected generation,
 captured index revision and unique reference path. It enters `rewriting`, calls
 the existing #47 rewrite protocol, then persists its final generation and
@@ -69,14 +80,17 @@ threads or native build concurrency.
 ## Failure, cancellation and retention
 
 Real input/index conflicts and failures stop the optimizer with a recorded
-error. Cancellation uses existing native checkpoints. A lost acknowledgement
-whose publication is confirmed retains the committed source/index and records
-`published`, but pauses the optimizer for explicit inspection/resume.
-Failed or cancelled tasks do not retry automatically.
+error. Probe results and pre-task failures are applied only to the policy that
+requested the probe. Cancellation uses existing native checkpoints. A successful
+rewrite records the task's run, generation and revision in the same metadata
+commit as the source and index. Each policy retains one such receipt, including
+after a newer index publication or GC. A lost acknowledgement with a matching
+receipt records `published` and pauses the optimizer for explicit inspection
+and resume.
 
-Restart starts no optimizer/maintenance work. Explicit optimizer resume checks
-whether an interrupted task already published; committed work is retained,
-otherwise future work is freshly planned against current metadata. The
+Restart starts no optimizer or maintenance work. On explicit resume, the receipt
+confirms a committed rewrite. For an interrupted rewrite without a receipt,
+the worker plans future work from current metadata. The
 independently enabled maintenance policy recovers registered builds and collects
 workspaces and retired index generations under its existing shared count/byte
 budget. Open private query views retain search and delayed typed fetch after GC.
@@ -101,42 +115,41 @@ The proof runs repeated background rewrites with concurrent T/flush/T commits,
 current B/F/T query comparisons, unchanged unselected generations and old private
 views surviving both index GC and explicit source snapshot expiry/cleanup.
 Other cases cover default opt-out, exact row/percentage thresholds, mixed delete
-file/inlined counts, single-B priority, inspectable unsupported candidates,
+file and inline overlap in Parquet and Puffin, post-flush priority, superseded
+probes, caller attachment binding, and inspectable unsupported candidates,
 100,000-row capacity recovery, the complete rewrite/flush/merge/index pipeline,
-input conflicts, cancellation, injected failures and SIGKILL task boundaries.
+input conflicts, cancellation, and SIGKILL task boundaries. A newer explicit
+index publication can supersede the rewrite before acknowledgement or restart,
+including after collection of the retired generation.
 The supported native metadata, local POSIX, managed namespace, fixed-schema,
 single-output and static SPFresh scope remains unchanged; online updates and
 dependency-pin changes are not introduced.
 
-### Historical #48 result (2026-10-29)
+### Local verification against #47
 
-The new proof passed 22 checks and 120 gated query comparisons with minimum
-fixture recall 1.0. Five controlled background rewrites advanced revision 3 to 8,
-retained concurrent appends and reduced current physical rows to 549. One
-enable/resume also drove four successive delete/append rounds without per-round
-intervention, ending at 643 physical rows. The unchanged 100,000-row capacity
-case released 3,968 slots while retaining its 95,904-row F and admitted a new
-write. A single worker completed source rewrite, T flush, selective index merge,
-F indexing and authorized maintenance. Unselected B generations stayed unchanged
-through each source rewrite, and held private views survived index and explicit
-source GC.
+The native ON and OFF builds were qualified on DuckLake `78d7040f` with
+DuckDB `d8cdaa33`, Vortex `b20e34c2`, and the
+DuckDB Vortex wrapper `84cef204`. Both sets of pins match #47
+at `1c775d8a`.
 
-Five SIGKILL cases distinguish interrupted from committed work and require
-explicit optimizer/maintenance resumption. Failure, input conflict, cancellation
-and committed acknowledgement loss pause work without automatic retry. The two
-unsupported active-input samples retain the existing ANN and report recall 0.2
-(below minimum) and 0.7 (empty output) separately; their visibility/typed-row
-checks pass and they do not replace or weaken the gated query comparisons.
+- The background proof passed 30 checks and 124
+  gated query comparisons, with minimum fixture recall 1.0.
+  It completed in 93.45 seconds within the existing 180-second budget.
+- The Parquet and Puffin cases each reclaimed 128 unique positions. The
+  dense-overlap case retained 66 live rows through publication. The
+  post-flush case reclaimed 63 rows before index merge. A later explicit
+  publication and subsequent GC did not erase the committed rewrite's result.
+- All 18 native process proofs, 19
+  functional gates and 32 ABI checks passed. Native ON passed
+  27 Vortex SQL cases with 1,080
+  assertions, including the new case with 49 assertions.
+- Native ON and OFF each passed 86 base cases with
+  3,582 assertions and 13
+  optional-extension skips. Parquet and Vortex recovery, deletion-inlining,
+  cleanup, and the four informational cost cases passed.
+- C++ and Python formatting, Rust formatting, Clippy, workspace tests, and
+  the Git diff check passed.
 
-- All 17 prior native process proofs passed.
-- ON passed 18 Vortex SQL cases / 664 assertions, including the new 34-assertion
-  configuration case. ON and OFF each passed 86 base cases / 3,582 assertions
-  with 13 optional-extension skips and Parquet recovery; ON passed Vortex recovery.
-- Audit passed 122 assertions. Rewrite/orphan groups passed 16 cases / 854
-  assertions with two ICU-dependent skips.
-- Four isolated cost cases passed nine queries each with minimum recall 1.0;
-  timing remains informational. Formatting, Rust formatting and diff checks
-  passed. Rust sources, native dependencies and their pins are unchanged.
-
-The qualified catalog driver SHA-256 is
-`d07aefd474c59ba2d1f348afce19bc723021437be500a11b5df9183e0c56a821`.
+A native suite reached its existing timeout on an earlier attempt. Its retry passed with the same binaries and limits.
+The catalog driver SHA-256 is
+`f3c63c3e574908f36c7d0ccfa8e63265b2d20b5dade7b766e1ca429e178c39a8`.

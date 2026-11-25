@@ -14,7 +14,7 @@ WITH events AS (
     ) AS snapshot_before_end
     FROM events
 )
-SELECT f.data_file_id, f.table_id, f.path, f.path_is_relative
-FROM ducklake_data_file f
-LEFT JOIN file_predecessors p ON p.file_id = f.data_file_id
-WHERE {forced} (f.end_snapshot IS NOT NULL AND NOT COALESCE(p.snapshot_before_end >= f.begin_snapshot, false));
+SELECT data.data_file_id, data.table_id, data.path, data.path_is_relative{marker}
+FROM ducklake_data_file data
+LEFT JOIN file_predecessors p ON p.file_id = data.data_file_id
+WHERE {forced} (data.end_snapshot IS NOT NULL AND NOT COALESCE(p.snapshot_before_end >= data.begin_snapshot, false));

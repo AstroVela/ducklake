@@ -8,6 +8,12 @@ actual guarded source-collector call with the existing two-object/64-MiB budget.
 Production sources, transaction protection, ownership/reference checks and
 deletion protocols are unchanged.
 
+The original measurements and installed-provider qualification below used the
+November 6, 2026 stack. The port to the development branch retains the
+restored-input fixture and four-case functional smoke. The archived commit
+identifies the code used for the full measurement matrix.
+[Original experiment at `0fb0fbd5`](https://github.com/AstroVela/ducklake/blob/0fb0fbd58d881d0fbac02cba3e04b42d8847be5f/docs/native-vortex-source-gc-cost.md)
+
 ## Inputs and exact work
 
 Preparation writes two 64-row Vortex files, builds a 128-row static B, deletes
@@ -51,10 +57,11 @@ The native process checks all 96 typed business rows, the history table and the
 current named ANN query outside timing. Before each measured call, an ordinary
 transaction must defer collection without changing snapshots, queues, counters
 or index references. After rollback, the measured call must complete its exact
-two-object task. It must leave no deletion intent, preserve current business
-rows/index references and advance durable counters by the reported progress.
-The runner independently checks the actual deleted paths, unchanged retained
-source contents and unchanged index artifacts.
+two-object task. The queue and deletion checks use the two retired Vortex paths
+from the original seed index. The runner checks actual deleted paths, reported
+bytes against the input manifest, retained source contents and index artifacts.
+The collector must leave no deletion intent and advance durable counters by
+the reported progress while preserving business rows and index references.
 
 Copying, hashing, opening, validation and the deferral check are excluded from
 collector timing. They warm the local files and metadata. These are warm local
@@ -106,11 +113,11 @@ env -u VORTEX_SPFRESH_NATIVE python -I test/vane/test_vane_vortex_source_gc_benc
 
 The output directory must be new. The benchmark retains the sealed input
 images, exact manifests, per-process logs, raw samples, contract and aggregate
-report. CI runs both storage modes and tasks at history 8, two primary samples,
+report with the driver digest and linked DuckLake extension version. CI runs both storage modes and tasks at history 8, two primary samples,
 one warmup and one diagnostic per task. It preserves evidence without applying
 local latency thresholds to shared runners.
 
-## Local observations on 2026-11-06
+## Historical observations on 2026-11-06
 
 All twelve cases completed: 192 primary collector calls, 24 excluded warmups and
 36 separate diagnostics. Input manifests, ordinary-transaction deferral, exact
@@ -159,7 +166,7 @@ live vector rows and two-object work. It still does not establish the complete
 cause of the thirty-minute backlog: concurrent writes/readers, worker mix and
 other metadata histories are excluded.
 
-## Follow-up and qualification
+## Follow-up and historical qualification
 
 Retain this baseline and first validate an equivalent ended-data-file candidate
 query. Correctness must include snapshot gaps, interval boundaries, remaining
