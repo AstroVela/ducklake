@@ -214,7 +214,8 @@ void SaveMaintenance(Metadata &meta, const Maintenance &m, const string &previou
 	meta.Commit();
 }
 
-bool MaintenanceBacklog(Metadata &meta, Maintenance &m) {
+bool MaintenanceBacklog(Metadata &meta, Maintenance &m, const std::function<void()> &on_transaction_end = nullptr,
+                        optional_ptr<bool> source_blocked = nullptr) {
 	auto result = meta.Query("SELECT (SELECT count(*) FROM "
 	                         "{METADATA_CATALOG}.ducklake_vortex_builds_v1),"
 	                         "count(*),min(g.artifact_bytes) FILTER (WHERE " +
@@ -227,7 +228,8 @@ bool MaintenanceBacklog(Metadata &meta, Maintenance &m) {
 	auto min_generation_bytes = chunk->GetValue(2, 0);
 	m.min_generation_bytes =
 	    min_generation_bytes.IsNull() ? optional_idx() : optional_idx(min_generation_bytes.GetValue<idx_t>());
-	m.source_work = DuckLakeVortexSourceRetention::WorkReady(meta.transaction, m.max_bytes);
+	m.source_work = DuckLakeVortexSourceRetention::WorkReady(meta.transaction, m.max_bytes, on_transaction_end,
+	                                                        source_blocked);
 	return m.remaining_builds || m.min_generation_bytes.IsValid() || m.source_work;
 }
 
@@ -883,6 +885,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 	std::mutex lock, io;
 	std::condition_variable changed, finished;
 	bool started = false, stopping = false, done = false;
+	uint64_t source_wake_epoch = 0;
 	std::thread::id worker_id;
 	std::map<Key, std::shared_ptr<Pending>> policies;
 	std::set<Key> cancelled;
@@ -984,6 +987,27 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		std::lock_guard<std::mutex> guard(lock);
 		auto entry = maintenance.find(id);
 		return entry == maintenance.end() ? nullptr : entry->second->profile;
+	}
+	std::function<void()> SourceWake(const std::shared_ptr<PendingMaintenance> &pending) {
+		std::weak_ptr<Runtime> weak_runtime = shared_from_this();
+		std::weak_ptr<PendingMaintenance> weak_registration = pending;
+		return [weak_runtime, weak_registration] {
+			auto runtime = weak_runtime.lock();
+			auto registration = weak_registration.lock();
+			if (!runtime || !registration) {
+				return;
+			}
+			std::lock_guard<std::mutex> guard(runtime->lock);
+			const auto id = registration->catalog.Id();
+			auto entry = runtime->maintenance.find(id);
+			if (runtime->stopping || entry == runtime->maintenance.end() || entry->second != registration ||
+			    runtime->maintenance_cancelled.count(id)) {
+				return;
+			}
+			PhaseTimer timer(registration->profile.get(), Phase::SOURCE_TRANSACTION_WAKE);
+			runtime->source_wake_epoch++;
+			runtime->changed.notify_all();
+		};
 	}
 	bool IsMaintenanceActive(const MaintenanceId &id) {
 		std::lock_guard<std::mutex> guard(lock);
@@ -1108,6 +1132,8 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 		auto profile = pending->profile.get();
 		PhaseTimer total(profile, Phase::MAINTENANCE_TOTAL);
 		Maintenance m;
+		auto on_transaction_end = SourceWake(pending);
+		bool source_blocked = false;
 		unique_ptr<Connection> job;
 		{
 			PhaseTimer phase(profile, Phase::MAINTENANCE_METADATA);
@@ -1125,7 +1151,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			auto generations = m.remaining_generations;
 			auto state = m.state;
 			phase.Switch(Phase::MAINTENANCE_PROBE);
-			const auto actionable = MaintenanceBacklog(meta, m);
+			const auto actionable = MaintenanceBacklog(meta, m, on_transaction_end, &source_blocked);
 			phase.Switch(Phase::MAINTENANCE_METADATA);
 			if (!actionable) {
 				SetMaintenanceReadyState(m, false);
@@ -1134,19 +1160,25 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 				} else {
 					meta.Commit();
 				}
-				return false;
+			} else {
+				CheckMaintenance(catalog.Id());
+				job = make_uniq<Connection>(db);
+				auto previous = m.run;
+				m.run = UUID::ToString(UUID::GenerateRandomUUID());
+				m.state = "recovering";
+				m.error.clear();
+				m.runs++;
+				SaveMaintenance(meta, m, previous);
+				std::lock_guard<std::mutex> guard_runtime(lock);
+				active_maintenance = pending;
+				context = job->context;
 			}
-			CheckMaintenance(catalog.Id());
-			job = make_uniq<Connection>(db);
-			auto previous = m.run;
-			m.run = UUID::ToString(UUID::GenerateRandomUUID());
-			m.state = "recovering";
-			m.error.clear();
-			m.runs++;
-			SaveMaintenance(meta, m, previous);
-			std::lock_guard<std::mutex> guard_runtime(lock);
-			active_maintenance = pending;
-			context = job->context;
+		}
+		if (!job) {
+			if (source_blocked && pending->observe) {
+				pending->observe("maintenance_source_deferred");
+			}
+			return false;
 		}
 		string error;
 		idx_t collected_objects = 0, collected_bytes = 0;
@@ -1207,7 +1239,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 						StoreMaintenance(db, catalog, m, "collecting_sources");
 						phase.Switch(Phase::SOURCE_GC);
 						auto source = DuckLakeVortexSourceRetention::Collect(*job->context, catalog.name, objects, bytes,
-						                                                     check, &catalog.identity, profile);
+					                                                     check, &catalog.identity, profile, on_transaction_end);
 						m.bytes += source.bytes;
 						collected_objects += source.expired + source.files;
 						collected_bytes += source.bytes;
@@ -1511,11 +1543,13 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			vector<std::shared_ptr<Pending>> work;
 			vector<std::shared_ptr<PendingMaintenance>> cleanup;
 			bool progressed = false;
+			uint64_t observed_wake_epoch;
 			{
 				std::lock_guard<std::mutex> guard(lock);
 				if (stopping) {
 					break;
 				}
+				observed_wake_epoch = source_wake_epoch;
 				for (auto &entry : policies) {
 					if (!cancelled.count(entry.first)) {
 						work.push_back(entry.second);
@@ -1572,7 +1606,7 @@ struct Runtime : public std::enable_shared_from_this<Runtime> {
 			if (stopping || weak.expired()) {
 				break;
 			}
-			if (!progressed) {
+			if (!progressed && observed_wake_epoch == source_wake_epoch) {
 				const auto started_wait = std::chrono::steady_clock::now();
 				const auto outcome = changed.wait_for(guard, std::chrono::milliseconds(100));
 				const auto elapsed = std::chrono::steady_clock::now() - started_wait;
@@ -2265,7 +2299,7 @@ vector<vector<Value>> DuckLakeVortexOptimizer::MaintenanceProfile(ClientContext 
 	    "optimizer_total",      "optimizer_probe", "optimizer_metadata", "maintenance_total", "maintenance_probe",
 	    "maintenance_metadata", "build_recovery",  "build_gc",           "generation_gc",     "source_gc",
 	    "source_wait",          "source_metadata", "source_expire",      "source_artifact",   "source_unlink",
-	    "loop_wait_timeout",    "loop_wait_wake"};
+	    "loop_wait_timeout",    "loop_wait_wake",      "source_transaction_wake"};
 	static_assert(sizeof(names) / sizeof(names[0]) == idx_t(Phase::COUNT), "Missing Vortex profile stage name");
 	auto samples = profile->Snapshot();
 	for (idx_t i = 0; i < samples.size(); i++) {

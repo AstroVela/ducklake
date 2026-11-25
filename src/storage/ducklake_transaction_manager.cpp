@@ -42,22 +42,56 @@ Transaction &DuckLakeTransactionManager::StartTransaction(ClientContext &context
 	return result;
 }
 
-bool DuckLakeTransactionManager::HasOtherTransactions(const DuckLakeTransaction *exclude,
-                                                      bool exclude_vortex_captures) {
+bool DuckLakeTransactionManager::HasOtherTransactions(const DuckLakeTransaction *exclude, bool exclude_vortex_captures,
+                                                      const std::function<void()> &on_end) {
 	lock_guard<mutex> guard(transaction_lock);
-	for (auto &entry : transactions) {
-		if (exclude_vortex_captures) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
-			if (entry.second->IsVortexReadCapture()) {
-				continue;
-			}
+	std::unordered_set<const DuckLakeTransaction *> blockers;
+#else
+	(void)exclude_vortex_captures;
+	(void)on_end;
 #endif
+	for (auto &entry : transactions) {
+		auto transaction = entry.second.get();
+		if (transaction == exclude) {
+			continue;
 		}
-		if (entry.second.get() != exclude) {
-			return true;
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (exclude_vortex_captures && transaction->IsVortexReadCapture()) {
+			continue;
 		}
+		if (on_end) {
+			blockers.insert(transaction);
+			continue;
+		}
+#endif
+		return true;
 	}
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	if (!blockers.empty()) {
+		vortex_gc_wake = on_end;
+		vortex_gc_blockers = std::move(blockers);
+		return true;
+	}
+#endif
 	return false;
+}
+
+void DuckLakeTransactionManager::RemoveTransaction(Transaction &transaction) {
+	std::function<void()> wake;
+	{
+		lock_guard<mutex> guard(transaction_lock);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		if (vortex_gc_blockers.erase(&transaction.Cast<DuckLakeTransaction>())) {
+			wake = std::move(vortex_gc_wake);
+			vortex_gc_blockers.clear();
+		}
+#endif
+		transactions.erase(transaction);
+	}
+	if (wake) {
+		wake();
+	}
 }
 
 ErrorData DuckLakeTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
@@ -73,16 +107,14 @@ ErrorData DuckLakeTransactionManager::CommitTransaction(ClientContext &context, 
 			error.Merge(ErrorData(rollback_error));
 		}
 	}
-	lock_guard<mutex> l(transaction_lock);
-	transactions.erase(transaction);
+	RemoveTransaction(transaction);
 	return error;
 }
 
 void DuckLakeTransactionManager::RollbackTransaction(Transaction &transaction) {
 	auto &ducklake_transaction = transaction.Cast<DuckLakeTransaction>();
 	ducklake_transaction.Rollback();
-	lock_guard<mutex> l(transaction_lock);
-	transactions.erase(transaction);
+	RemoveTransaction(transaction);
 }
 
 } // namespace duckdb
