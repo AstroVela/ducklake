@@ -72,8 +72,8 @@ SELECT * FROM ducklake_collect_vortex_query_scratch(
 1. 发布 `collecting` 清单并 fsync。
 2. 每项检查身份及剩余预算，写唯一 `pending` 意图并 fsync，再从登记目录核对待删项的身份、类型及大小，unlink 后 fsync 父目录并确认 `removed`。
 3. 中断后，仅 pending 项允许已经消失；此前无意图的缺失、未知新增或身份变化均失败。
-4. 未完成 pending 优先恢复。若它尚在且超过本次字节预算，保持一个 pending，不另外创建意图；若已 unlink，则只确认状态，不重复收费。
-5. 所有 payload 项删除后，先发布 `finishing` 意图，再删除空 payload、owner.lock、工作目录，最后复核登记的文件身份和内容再移除登记。崩溃后的工作目录缺失只有这一持久意图可以授权。
+4. 未完成的 `pending` 项优先恢复。若它尚在且超过本次字节预算，保留原意图。若文件或目录已消失，先 fsync 其父目录，成功后才记为 `removed`。同步失败时保留 `pending`，重试只对当轮实际删除的对象和字节计费。
+5. 所有 payload 项删除后，先发布 `finishing` 意图，再删除空 payload、owner.lock 和工作目录。即使重试时工作目录已经消失，也要先 fsync 其父目录 `work`，再复核登记的文件身份和内容并移除登记。同步失败时保留 `finishing` 登记供下一轮恢复。
 
 协议预留的 `.record.tmp` 是根锁串行化的有界元数据暂存槽；下次认证打开可丢弃它。它不存放查询副本，也不授权接管其他未知文件。
 

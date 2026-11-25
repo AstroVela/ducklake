@@ -1,5 +1,7 @@
 //! Registered native-query scratch; only explicit, authenticated collection reclaims crashed owners.
 use crate::LIMITS;
+#[cfg(not(test))]
+use rustix::fs::fsync as sync_removal_parent;
 use rustix::fs::{self as posix, AtFlags, FlockOperation, Mode, OFlags, Stat};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,6 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+#[cfg(test)]
+use tests::sync_removal_parent;
 use vortex::error::{VortexResult, vortex_bail, vortex_err};
 use vortex_index::file::file_version;
 
@@ -658,8 +662,9 @@ fn finish(
             posix::fsync(&work).map_err(std::io::Error::from)?;
         }
         root.unlink(&root.work, &record.owner, AtFlags::REMOVEDIR)?;
-        posix::fsync(&root.work).map_err(std::io::Error::from)?;
     }
+    // A previous attempt may have removed the owner before its parent was synced.
+    sync_removal_parent(&root.work).map_err(std::io::Error::from)?;
     root.registration_checkpoint(record, "scratch_after_remove_view", check)?;
     root.unlink(&root.registry, &record.owner, AtFlags::empty())?;
     posix::fsync(&root.registry).map_err(std::io::Error::from)?;
@@ -882,12 +887,15 @@ pub fn collect(
                             AtFlags::empty()
                         },
                     )?;
-                    posix::fsync(&current_parent).map_err(std::io::Error::from)?;
+                    sync_removal_parent(&current_parent).map_err(std::io::Error::from)?;
                     result.collected_objects += 1;
                     result.collected_files += u64::from(!entry.directory);
                     result.collected_bytes += entry.bytes;
                     root.registration_checkpoint(&record, "scratch_after_unlink", check)?;
-                } else if entry.progress != Progress::Pending {
+                } else if entry.progress == Progress::Pending {
+                    // Make the prior unlink durable before acknowledging it in the manifest.
+                    sync_removal_parent(&parent).map_err(std::io::Error::from)?;
+                } else {
                     vortex_bail!("Scratch file vanished without a deletion intent");
                 }
                 record.plan[i].progress = Progress::Removed;
@@ -1011,6 +1019,100 @@ impl OwnedScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_PARENT_SYNC: Cell<Option<Identity>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn sync_removal_parent(parent: &OwnedFd) -> rustix::io::Result<()> {
+        if FAIL_PARENT_SYNC.get() == Some(identity(&posix::fstat(parent)?)) {
+            return Err(rustix::io::Errno::IO);
+        }
+        posix::fsync(parent)
+    }
+
+    #[test]
+    fn recovery_syncs_missing_entries_before_acknowledging_them() -> VortexResult<()> {
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("scratch");
+        let data = temp.path().join("data");
+        std::fs::create_dir(&parent)?;
+        std::fs::create_dir(&data)?;
+        let view = OwnedScratch::create(&parent, &data, &|_| Ok(()))?;
+        let root = view.root().to_owned();
+        let owner = view.owner.clone();
+        let payload = view.path().to_owned();
+        std::fs::write(payload.join("first"), b"1234567")?;
+        std::fs::write(payload.join("second"), b"1234")?;
+        drop(view);
+
+        let collect_one = |bytes| collect(&data, &root, 1, bytes, &|_| Ok(()));
+        let record = || Root::open(&root, &data, false, None)?.load(&owner);
+        let fail_sync = |directory: &Path, bytes| -> VortexResult<()> {
+            let stat = posix::stat(directory).map_err(std::io::Error::from)?;
+            FAIL_PARENT_SYNC.set(Some(identity(&stat)));
+            let result = collect_one(bytes);
+            FAIL_PARENT_SYNC.set(None);
+            let error = result
+                .err()
+                .expect("collector acknowledged removal without syncing its parent");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&std::io::Error::from(rustix::io::Errno::IO).to_string())
+            );
+            Ok(())
+        };
+
+        // First fail after unlink, then fail again on recovery of the already absent file.
+        for bytes in [7, 1] {
+            fail_sync(&payload, bytes)?;
+            assert!(!payload.join("first").exists());
+            assert_eq!(std::fs::read(payload.join("second"))?, b"1234");
+            let saved = record()?;
+            assert!(saved.state == State::Collecting);
+            assert_eq!(saved.plan.len(), 2);
+            assert!(saved.plan[0].path == "first" && saved.plan[0].progress == Progress::Pending);
+            assert!(saved.plan[1].path == "second" && saved.plan[1].progress == Progress::Present);
+        }
+        let pass = collect_one(4)?;
+        assert_eq!(
+            (
+                pass.collected_objects,
+                pass.collected_files,
+                pass.collected_bytes
+            ),
+            (1, 1, 4)
+        );
+        assert_eq!((pass.removed_views, pass.remaining_views), (0, 1));
+        assert!(
+            record()?
+                .plan
+                .iter()
+                .all(|e| e.progress == Progress::Removed)
+        );
+
+        // Repeat at owner-directory removal, before the registration can be retired.
+        let work = root.join("work");
+        for _ in 0..2 {
+            fail_sync(&work, 1)?;
+            assert!(!work.join(&owner).exists());
+            assert!(record()?.state == State::Finishing);
+        }
+        let pass = collect_one(1)?;
+        assert_eq!(
+            (
+                pass.collected_objects,
+                pass.collected_files,
+                pass.collected_bytes
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!((pass.removed_views, pass.remaining_views), (1, 0));
+        assert_eq!(collect_one(1)?.collected_objects, 0);
+        Ok(())
+    }
 
     fn registration() -> Record {
         Record {
