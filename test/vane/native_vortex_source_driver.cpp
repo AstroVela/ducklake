@@ -121,13 +121,13 @@ struct Fixture {
 		index = VortexIndex::BuildAndPublish(*writer.context, "lake", "main", "items", "knn", root + "/indexes/" + name,
 		                                     2, revision, nullptr, "", {}, DuckLakeVortexIndexOperation::APPEND);
 	}
-	void Seed() {
+	void SeedRows() {
 		WriteBatch(0, "seed");
 		Build(1, "seed.json");
 		old_source = index.files[0].uri;
-		SQL(writer, "SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn'," +
-		                Value(root + "/indexes").ToSQLString() +
-		                ",2,100000,4194304,100000,67108864);"
+	}
+	void FinishSeed(const string &enable_sql) {
+		SQL(writer, enable_sql +
 		                "SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn');"
 		                "SELECT * FROM "
 		                "ducklake_set_vortex_write_budget('lake','main','items','knn',1000,4194304,4096,67108864)");
@@ -136,6 +136,11 @@ struct Fixture {
 			Require(std::chrono::steady_clock::now() < deadline, "Seed optimizer did not stop");
 			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		}
+	}
+	void Seed() {
+		SeedRows();
+		FinishSeed("SELECT * FROM ducklake_enable_vortex_optimizer('lake','main','items','knn'," +
+		           Value(root + "/indexes").ToSQLString() + ",2,100000,4194304,100000,67108864);");
 	}
 	void Rewrite() {
 		SQL(writer, "DELETE FROM lake.items WHERE id<32");
@@ -650,37 +655,68 @@ void MaintenanceFairness(Fixture &f, idx_t objects) {
 	Require(SQL(reader, PROFILE_SQL)->RowCount() == 0, "A reattached catalog inherited a stale profile");
 }
 
-void OptimizerProfile(const string &root) {
+void OptimizerProfile(const string &root, bool missing_policy) {
 	struct Probe {
 		idx_t calls = 0;
-		Pause second;
-		std::promise<void> worker_exit;
+		Pause pending;
+		bool registered = false; // Accessed only by the optimizer worker.
+		std::promise<void> registered_exit, worker_exit;
 	};
 	auto probe = std::make_shared<Probe>();
+	auto registered_exit = probe->registered_exit.get_future();
 	auto worker_exit = probe->worker_exit.get_future();
 	weak_ptr<DatabaseCacheEntry> database_close;
 	std::exception_ptr failure;
+	bool worker_started = false, paused = false;
 	try {
 		DBConfig config;
 		// DuckDB releases its cache entry at the end of database teardown.
 		config.db_cache_entry = make_shared_ptr<DatabaseCacheEntry>();
 		database_close = config.db_cache_entry;
 		Fixture f(root, root + "/data", true, &config);
-		f.Seed();
+		f.SeedRows();
+		// Install the receipt on the first worker before enabling maintenance or resuming a policy.
+		DuckLakeVortexOptimizerConfig seed;
+		seed.catalog = "lake";
+		seed.schema = "main";
+		seed.table = "items";
+		seed.index = "knn";
+		seed.root = root + "/indexes";
+		seed.dimension = 2;
+		seed.flush_rows = seed.index_rows = 100000;
+		seed.flush_bytes = 4194304;
+		seed.index_bytes = 67108864;
+		DuckLakeVortexOptimizer::Enable(*f.writer.context, seed, [probe](const string &) {
+			if (!probe->registered) {
+				probe->worker_exit.set_value_at_thread_exit();
+				probe->registered = true;
+				probe->registered_exit.set_value();
+			}
+		});
+		worker_started = true;
+		Require(registered_exit.wait_for(std::chrono::seconds(15)) == std::future_status::ready,
+		        "Seed optimizer did not register its thread exit");
+		registered_exit.get();
+		f.FinishSeed("");
 		Require(SQL(f.writer, PROFILE_SQL)->RowCount() == 0, "Profile appeared before maintenance registration");
-		DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024);
-		DuckLakeVortexOptimizer::Resume(*f.writer.context, "lake", "main", "items", "knn",
+		DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024,
+		                                           [probe, missing_policy](const string &stage) {
+			                                           if (missing_policy && stage == "maintenance_complete") {
+				                                           probe->pending.Stop();
+			                                           }
+		                                           });
+		if (missing_policy) {
+			probe->pending.Wait();
+			paused = true;
+		}
+		DuckLakeVortexOptimizer::Resume(*f.writer.context, "lake", "main", "items", missing_policy ? "missing" : "knn",
 		                                [probe](const string &stage) {
-			                                if (stage != "optimizer_before_probe") {
-				                                return;
-			                                }
-			                                if (++probe->calls == 1) {
-				                                probe->worker_exit.set_value_at_thread_exit();
-			                                } else if (probe->calls == 2) {
-				                                probe->second.Stop();
+			                                if (stage == "optimizer_before_probe" && ++probe->calls == 2) {
+				                                probe->pending.Stop();
 			                                }
 		                                });
-		probe->second.Wait();
+		probe->pending.Wait();
+		paused = true;
 		auto profile = ReadMaintenanceProfile(f.writer);
 		for (auto stage : {"optimizer_total", "optimizer_probe", "optimizer_metadata"}) {
 			auto sample = profile.stages.at(stage);
@@ -694,17 +730,22 @@ void OptimizerProfile(const string &root) {
 	// The paused worker owns the database after the last client has closed.
 	const bool database_held = !database_close.expired();
 	const bool worker_running = worker_exit.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
-	probe->second.Release();
-	probe.reset();
-	Require(worker_exit.wait_for(std::chrono::seconds(20)) == std::future_status::ready,
-	        "Optimizer worker did not exit after closing the profile fixture");
+	probe->pending.Release();
+	if (worker_started) {
+		Require(worker_exit.wait_for(std::chrono::seconds(20)) == std::future_status::ready,
+		        "Optimizer worker did not exit after closing the profile fixture");
+		worker_exit.get();
+	}
+	Require(database_close.expired(), "Database teardown was incomplete after closing the profile fixture");
+	if (paused) {
+		Require(database_held && worker_running, "Profile fixture did not close with background work in flight");
+	}
+	if (worker_started) {
+		std::cout << "optimizer-profile worker exited and database teardown completed" << std::endl;
+	}
 	if (failure) {
 		std::rethrow_exception(failure);
 	}
-	worker_exit.get();
-	Require(database_held && worker_running, "Profile fixture did not close with its optimizer probe in flight");
-	Require(database_close.expired(), "Database teardown was incomplete after the optimizer thread exited");
-	std::cout << "optimizer-profile worker exited and database teardown completed" << std::endl;
 }
 
 string AddParquet(Fixture &f, const string &table, const string &name) {
@@ -1401,8 +1442,8 @@ int main(int argc, char **argv) {
 	try {
 		Require(argc == 3, "Usage: ducklake_vortex_source_driver ROOT MODE");
 		string root = argv[1], mode = argv[2];
-		if (mode == "optimizer-profile") {
-			OptimizerProfile(root);
+		if (mode == "optimizer-profile" || mode == "optimizer-profile-missing-policy") {
+			OptimizerProfile(root, mode == "optimizer-profile-missing-policy");
 			return 0;
 		}
 		Fixture f(root, mode == "shared-source" ? root + "//./data" : root + "/data",

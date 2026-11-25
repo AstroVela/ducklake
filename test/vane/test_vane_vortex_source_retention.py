@@ -273,6 +273,7 @@ def native_cases(driver, root, report):
         "maintenance-fairness-1",
         "maintenance-fairness-2",
         "optimizer-profile",
+        "optimizer-profile-missing-policy",
         "source-metadata-probes",
         "maintenance-idle-wait",
         "transaction-wake-guards",
@@ -292,13 +293,17 @@ def native_cases(driver, root, report):
         case.mkdir(mode=0o700)
         with (case / "driver.log").open("w") as log:
             result = subprocess.run([str(driver), str(case), mode], stdout=log, stderr=subprocess.STDOUT, timeout=120)
-        require(result.returncode == 0, f"Native {mode} failed: {(case / 'driver.log').read_text()}")
-        if mode == "optimizer-profile":
+        log_text = (case / "driver.log").read_text()
+        missing_policy = mode == "optimizer-profile-missing-policy"
+        require(result.returncode == (1 if missing_policy else 0), f"Unexpected native {mode} exit: {log_text}")
+        if mode == "optimizer-profile" or missing_policy:
             receipt = "optimizer-profile worker exited and database teardown completed"
-            require(
-                receipt in (case / "driver.log").read_text().splitlines(),
-                "Native optimizer-profile did not confirm worker exit and database teardown",
-            )
+            lines = log_text.splitlines()
+            require(receipt in lines, f"Native {mode} did not confirm worker exit and database teardown")
+            if missing_policy:
+                error = "No Vortex optimizer policy with this table identity"
+                require(any(error in line for line in lines[lines.index(receipt) + 1:]),
+                        "Native optimizer-profile did not preserve the setup error after teardown")
         cases.append(mode)
         print(f"Native source case passed: {mode}", flush=True)
     for mode in [
