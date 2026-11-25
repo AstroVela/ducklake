@@ -37,6 +37,7 @@ fn build_options(snapshot: &Snapshot, dimension: u32) -> VortexResult<SpFreshBui
         head_count: heads as u32,
         posting_page_limit: POSTING_PAGE_LIMIT,
         replicas: replicas as u32,
+        rabitq: None,
     })
 }
 pub async fn build_generation(

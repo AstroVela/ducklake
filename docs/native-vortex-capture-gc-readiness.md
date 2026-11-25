@@ -1,9 +1,10 @@
 # Schedule source GC around finite native captures
 
-The [capture-order fix](native-vortex-capture-gc-order.md) removes the cycle
-between capture admission and transaction entry. Its longer four-reader test
-still missed the unchanged 90-second drain deadline: T/F and the artifact
-backlog reached zero, while 238 eligible historical snapshots remained.
+The [capture-order fix](native-vortex-capture-gc-order.md) resolves the cycle
+between capture admission and transaction entry. The original #63 at
+`6e05e831` missed its 90-second drain deadline in a four-reader test. T/F and
+the artifact backlog reached zero while 238 eligible historical snapshots
+remained.
 
 ## Readiness and deletion admission
 
@@ -13,11 +14,12 @@ transaction while copying its snapshot, source bytes and inline rows. Continuous
 readers therefore made this readiness check discard work that the collector
 could safely perform after waiting for the finite capture.
 
-Mark only the dedicated native capture transaction, after acquiring shared
-capture admission and before reading its snapshot. The mark is an atomic,
-in-memory transaction property. It ends with that transaction; it is not a
-connection flag, durable catalog field or user transaction option. Acquisition
-still commits before releasing admission, or rolls back on failure.
+After acquiring shared capture admission, the dedicated ReadView connection
+registers a scoped marker before `BEGIN`. The transaction manager records
+the capture property on every DuckLake transaction created in that scope,
+including each transaction opened by eager `BEGIN`. The property is fixed
+before registration in the manager. The dedicated connection commits or rolls
+back before removing the marker and releasing admission.
 
 Only the readiness probe excludes these marked captures. An ordinary
 transaction still makes readiness false. When dispatched, the collector closes
@@ -33,31 +35,31 @@ physical progress, it retains the existing 100 ms wait. Recovery counters alone
 do not count as progress. Failed or cancelled work still stops and requires
 explicit resume; there is no failure retry.
 
-The object and byte budgets, source/version ownership, retained private views,
-crash checkpoints, recall gate, drain deadline and workload remain unchanged.
-There is no compatibility branch, retry, fallback or new storage format.
+Each pass enforces the existing object and byte budgets and the source/version
+ownership checks before snapshot expiration or unlinking.
 
 ## Regression
 
-The native `capture-readiness` case holds a real query after snapshot capture.
-With an ordinary DuckLake transaction also held, readiness must be false. After
-committing just that ordinary transaction, readiness must become true while the
-native capture remains paused. Releasing the capture must preserve its original
-query winner. The preceding library fails because it continues returning false
-for the finite capture alone.
+The native `capture-readiness` cases pause a real query after snapshot capture.
+An ordinary DuckLake transaction also invokes ANN. Readiness stays false until
+the ordinary transaction commits, then becomes true while the first capture
+remains paused. Status continues to count the paused capture.
 
-A minimal SQL check holds an ordinary reader, invokes native ANN on that same
-connection, and verifies that collection still reports the ordinary transaction
-as a blocker. The internal query capture must not reclassify the outer user
-transaction. Existing source cases continue covering old private views, ordinary
-transaction deferral without idle maintenance churn, locked deletion admission,
-cancellation and SIGKILL recovery.
+With eager transactions and two attached lakes, the second lake's background
+collector reaches its admission wait during a capture on the first lake. When
+the capture finishes, its query returns the expected row and the collector
+expires exactly one snapshot in a pass with an object budget of one.
+
+The SQL fixture exercises collection deferral while an ordinary reader that
+invoked ANN is still open. The source suite also covers old private views,
+ordinary transaction deferral, deletion admission, cancellation and SIGKILL
+recovery.
 
 The longer four-reader workload and its original 90-second drain gate remain
 the separate convergence acceptance. The filtered native recall miss and the
 original silent stop remain open until their own evidence supports a fix.
 
-## Intermediate evidence
+## Classification-only experiment
 
 Transaction classification alone passed the native readiness regression, all
 23 source native/recovery cases, 260 SQL assertion blocks, and the automatic
@@ -67,7 +69,7 @@ That drain included 317 scheduling rounds, each followed by the fixed 100 ms
 wait even when reclamation advanced. This intermediate failure is preserved;
 progress-based scheduling is qualified separately below.
 
-## Final candidate qualification
+## Qualification recorded at `6788956b`
 
 The rebuilt, signed provider passed all 23 source native/recovery cases and
 sixteen source query comparisons. Ten SQL fixtures passed 260 assertion blocks.
@@ -84,7 +86,7 @@ skips. Formatting, syntax, local documentation links and copyleft checks passed;
 the updated transaction manager also compiled with native Vortex disabled and
 warnings treated as errors.
 
-The final candidate's separate 60-second/four-reader run still exceeded the
+The separate 60-second/four-reader run at `6788956b` exceeded the
 unchanged 90-second drain deadline. It reached T = F = 0 and an empty artifact
 backlog, with 116 eligible historical snapshots and two scheduled source files
 remaining. Queries continued and the watchdog did not expire. Write counts

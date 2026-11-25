@@ -8,7 +8,8 @@ fi
 vortex_source=${VORTEX_SOURCE_DIR:?Set the pinned Vortex source directory}
 zstd_library=${ZSTD_STATIC_LIBRARY:?Set the PIC static zstd archive}
 zstd_include=${ZSTD_INCLUDE_DIR:?Set the qualified zstd include directory}
-[[ $(git -C "$vortex_source" rev-parse HEAD) == 122b63e0408a187a9d0ecdd129f1cbe12b6b46b2 ]]
+vortex_revision=42beeb3a72769869a3d3d16887a011ee7f922362
+[[ $(git -C "$vortex_source" rev-parse HEAD) == "$vortex_revision" ]]
 git -C "$vortex_source" diff --quiet HEAD
 [[ "$zstd_library" == /*.a && -f "$zstd_library" && -f "$zstd_include/zstd.h" ]]
 mkdir -p "$1"
@@ -82,3 +83,4 @@ cmake -S "$vortex_source/vortex-index-spfresh/native" -B "$sdk_root/build" \
     -DOpenMP_CXX_LIB_NAMES=omp -DOpenMP_omp_LIBRARY="$openmp_library"
 bash "$vortex_source/vortex-index-spfresh/native/build.sh" "$sdk_root"
 printf '%s\n' "$openmp_library" > "$sdk_root/build/vane-openmp-library.txt"
+printf '%s\n' "$vortex_revision" > "$sdk_root/build/vane-vortex-revision.txt"

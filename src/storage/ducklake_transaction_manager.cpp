@@ -3,7 +3,8 @@
 #include "duckdb/main/settings.hpp"
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_source_retention.hpp"
-#include "duckdb/storage/storage_lock.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
+#include "storage/ducklake_vortex_read_view.hpp"
 #endif
 
 namespace duckdb {
@@ -14,12 +15,20 @@ DuckLakeTransactionManager::DuckLakeTransactionManager(AttachedDatabase &db_p, D
 
 Transaction &DuckLakeTransactionManager::StartTransaction(ClientContext &context) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
-	unique_ptr<StorageLockKey> gate;
+	unique_ptr<DuckLakeVortexCollectionLock::Key> gate;
 	if (!DuckLakeVortexSourceRetention::IsCollector(context)) {
-		gate = DuckLakeVortexSourceRetention::TransactionGate().GetSharedLock();
+		gate = DuckLakeVortexSourceRetention::TransactionGate().GetSharedLock([&] {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+		});
 	}
 #endif
 	auto transaction = make_shared_ptr<DuckLakeTransaction>(ducklake_catalog, *this, context);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	// Classify every transaction created by the dedicated capture before it is registered.
+	transaction->vortex_read_capture = DuckLakeVortexReadView::IsCapturing(context);
+#endif
 	transaction->Start();
 	if (Settings::Get<ImmediateTransactionModeSetting>(context) && get_snapshot) {
 		get_snapshot = false;
@@ -36,51 +45,53 @@ Transaction &DuckLakeTransactionManager::StartTransaction(ClientContext &context
 bool DuckLakeTransactionManager::HasOtherTransactions(const DuckLakeTransaction *exclude, bool exclude_vortex_captures,
                                                       const std::function<void()> &on_end) {
 	lock_guard<mutex> guard(transaction_lock);
-	bool found = false;
 #ifdef DUCKLAKE_ENABLE_VORTEX
 	std::unordered_set<const DuckLakeTransaction *> blockers;
 #else
+	(void)exclude_vortex_captures;
 	(void)on_end;
 #endif
 	for (auto &entry : transactions) {
-		if (exclude_vortex_captures) {
-#ifdef DUCKLAKE_ENABLE_VORTEX
-			if (entry.second->IsVortexReadCapture()) {
-				continue;
-			}
-#endif
+		auto transaction = entry.second.get();
+		if (transaction == exclude) {
+			continue;
 		}
-		if (entry.second.get() != exclude) {
-			found = true;
 #ifdef DUCKLAKE_ENABLE_VORTEX
-			if (on_end) {
-				blockers.insert(entry.second.get());
-				continue;
-			}
-#endif
-			return true;
+		if (exclude_vortex_captures && transaction->IsVortexReadCapture()) {
+			continue;
 		}
+		if (on_end) {
+			blockers.insert(transaction);
+			continue;
+		}
+#endif
+		return true;
 	}
 #ifdef DUCKLAKE_ENABLE_VORTEX
-	if (found && on_end) {
-		vortex_gc_blockers = std::move(blockers);
+	if (!blockers.empty()) {
 		vortex_gc_wake = on_end;
+		vortex_gc_blockers = std::move(blockers);
+		return true;
 	}
 #endif
-	return found;
+	return false;
 }
 
-std::function<void()> DuckLakeTransactionManager::RemoveTransaction(Transaction &transaction) {
+void DuckLakeTransactionManager::RemoveTransaction(Transaction &transaction) {
 	std::function<void()> wake;
-	lock_guard<mutex> guard(transaction_lock);
+	{
+		lock_guard<mutex> guard(transaction_lock);
 #ifdef DUCKLAKE_ENABLE_VORTEX
-	if (vortex_gc_blockers.erase(&transaction.Cast<DuckLakeTransaction>())) {
-		wake = std::move(vortex_gc_wake);
-		vortex_gc_blockers.clear();
-	}
+		if (vortex_gc_blockers.erase(&transaction.Cast<DuckLakeTransaction>())) {
+			wake = std::move(vortex_gc_wake);
+			vortex_gc_blockers.clear();
+		}
 #endif
-	transactions.erase(transaction);
-	return wake;
+		transactions.erase(transaction);
+	}
+	if (wake) {
+		wake();
+	}
 }
 
 ErrorData DuckLakeTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
@@ -96,20 +107,14 @@ ErrorData DuckLakeTransactionManager::CommitTransaction(ClientContext &context, 
 			error.Merge(ErrorData(rollback_error));
 		}
 	}
-	auto wake = RemoveTransaction(transaction);
-	if (wake) {
-		wake();
-	}
+	RemoveTransaction(transaction);
 	return error;
 }
 
 void DuckLakeTransactionManager::RollbackTransaction(Transaction &transaction) {
 	auto &ducklake_transaction = transaction.Cast<DuckLakeTransaction>();
 	ducklake_transaction.Rollback();
-	auto wake = RemoveTransaction(transaction);
-	if (wake) {
-		wake();
-	}
+	RemoveTransaction(transaction);
 }
 
 } // namespace duckdb

@@ -76,7 +76,7 @@ provider fails its build statement with the mapped-ID coverage error.
 The installed mixed-load probe retains the baseline workload and oracle:
 
 ```sh
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_sustained_load.py \
     --fixtures automatic cost --rows 4096 32768 --dimensions 8 128 --seconds 12 \
     --output-dir /tmp/vane-vortex-posting-matrix
 ```
