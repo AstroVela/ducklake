@@ -4,6 +4,8 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_metadata_manager.hpp"
+#include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_transaction_manager.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
@@ -778,6 +780,41 @@ void LinkedNativeCleanup(Fixture &f) {
 	        "Native cleanup conflated independent hard links");
 }
 
+void FilenameReference(Fixture &f) {
+	auto target = AddParquet(f, "filename_reference", "registered.parquet");
+	auto alias = f.root + "/data/different-name.parquet";
+	auto loop = f.root + "/data/cyclic-name.parquet";
+	Require(symlink(target.c_str(), alias.c_str()) == 0 && symlink(loop.c_str(), loop.c_str()) == 0,
+	        "Could not create the filename reference fixtures");
+	Require(f.Count("__ducklake_metadata_lake.ducklake_data_file") == 1,
+	        "Filename oracle requires exactly one native source");
+
+	Connection owner(f.database);
+	auto &transaction = VortexIndex::Begin(owner, "lake");
+	auto change_path = [&](const string &path) {
+		VortexIndex::Query(transaction, "UPDATE {METADATA_CATALOG}.ducklake_data_file SET path=" +
+		                                    Value(path).ToSQLString() + ",path_is_relative=false");
+	};
+	auto &metadata = transaction.GetMetadataManager();
+	change_path(alias);
+	Require(metadata.HasFileReference(target, "/", false), "A differently named leaf alias lost its target reference");
+	Require(!metadata.HasFileReference(f.root + "/data/unreferenced.parquet", "/", false),
+	        "The filename oracle accepted an unreferenced path");
+
+	change_path(loop);
+	bool raised = false;
+	try {
+		metadata.HasFileReference(target, "/", false);
+	} catch (const IOException &error) {
+		raised = StringUtil::Contains(error.what(), "Cannot resolve native Vortex source reference: " + loop);
+	}
+	Require(raised, "The cyclic leaf must report its resolution error");
+	owner.Rollback();
+	Require(f.Count("lake.filename_reference") == 1 &&
+	            f.Count("__ducklake_metadata_lake.ducklake_data_file WHERE suffix(path, 'registered.parquet')") == 1,
+	        "The filename oracle changed its original registration");
+}
+
 void SeparateLeafLinks(Fixture &f) {
 	auto path = AddParquet(f, "regular_source", "regular-source.parquet");
 	auto alias = f.root + "/data/leaf-link.parquet";
@@ -1335,6 +1372,10 @@ int main(int argc, char **argv) {
 		}
 		if (mode == "linked-native-cleanup") {
 			LinkedNativeCleanup(f);
+			return 0;
+		}
+		if (mode == "filename-reference") {
+			FilenameReference(f);
 			return 0;
 		}
 		if (mode == "leaf-link") {
