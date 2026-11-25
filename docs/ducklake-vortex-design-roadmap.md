@@ -257,7 +257,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
-| R5 容量与产品契约 | **当前优先项，部分完成**。inline 浮点序列化和密集 L2 已修复，新增四维度确定性功能矩阵，已接入持久 request epoch 和显式回执回收 | 继续 reference／WAL 管理、容量 admission。更大数据、质量、延迟和吞吐仍需验证 |
+| R5 容量与产品契约 | **当前优先项，部分完成**。inline 浮点序列化和密集 L2 已修复，新增四维度确定性功能矩阵，已接入持久 request epoch 和显式回执回收，确定性用例覆盖 reference 所有权和 native WAL 恢复 | 继续容量 admission。更大数据、质量、延迟和吞吐仍需验证 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
@@ -291,7 +291,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 4. 选择一个有测量证据的热点做验证性改动，沿用现有格式和出错语义。候选达到预设收益后保留，未达门槛时记录结果并撤回改动。
 5. 30 分钟稳态验证继续暂缓。当前长测工具按三个阶段运行，通过查询前后的提交水位进行验证。恢复前先让长测使用查询实际捕获的 ReadView 快照，对齐历史稳态阶段和写入节奏，并将 canary 与 exploration 的 recall ≥0.8 都设为通过条件。保留 90 秒 drain、最终行和旧回执检查。用更长且重复的运行检查后半程积压斜率、清理速率和资源增长，确认维护能跟上持续写入。[当前长测工具](../test/vane/test_vane_vortex_sustained_load.py)
 
-稳定负载下的 R4 和 R5 性能验证继续暂缓。R5 已接入回执生命周期，继续验证 reference／WAL 和容量 admission 的确定性契约。R6 需要独立的远程与分布式设计，R7 按收益证据决定。
+稳定负载下的 R4 和 R5 性能验证继续暂缓。R5 已接入回执生命周期，并验证 reference 所有权和 native WAL 边界。下一步验证容量 admission 的确定性契约。R6 需要独立的远程与分布式设计，R7 按收益证据决定。
 
 ## 12. 文档与实现导航
 
@@ -313,6 +313,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | [文件名预筛选](native-vortex-filename-prefilter.md) | 历史 A/B 撤回及当前路径身份回归 |
 | [确定性维度与查询契约](native-vortex-functional-matrix.md) | 数值回归、四维度 B/F/T、过滤、实际 ReadView 与拒绝检查 |
 | [请求 epoch 与回执生命周期](native-vortex-request-epochs.md) | 每表显式推进、原子释放旧回执、重试与 WAL 恢复 |
+| [引用文件与 WAL 生命周期](native-vortex-reference-wal-lifecycle.md) | 调用方 JSON、generation 双引用、事务保护与 checkpoint 恢复 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。
