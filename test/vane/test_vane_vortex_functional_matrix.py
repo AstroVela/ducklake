@@ -26,6 +26,7 @@ def load(name, filename):
 KEYED = load("matrix_keyed", "test_vane_vortex_keyed_writes.py")
 PIN = load("matrix_affinity", "test_vane_vortex_source_gc_affinity.py")
 BASE, WRITE = KEYED.BASE, KEYED.WRITE
+MIXED = BASE.SEARCH.CAT.MIXED
 query, require, quote = BASE.query, BASE.require, BASE.quote
 DIMENSIONS = (1, 8, 128, 4096)
 FILTERS = (None, "A", "a", "", "稀有-'类别", "absent")
@@ -53,24 +54,41 @@ def rows(start, count, dimension):
     ]
 
 
-def ranked(model, target, category, k):
+def score(row, target):
+    exact = math.fsum((a - b) ** 2 for a, b in zip(row["embedding"], target))
+    return MIXED.BASE.float32_vector([exact])[0]
+
+
+def ranked(model, target, category, k, addresses):
     eligible = [r for r in model.values() if category is None or r["category"] == category]
-    return sorted(eligible, key=lambda r: (math.fsum((a - b) ** 2 for a, b in zip(r["embedding"], target)), r["id"]))[
-        :k
-    ]
+    return sorted(eligible, key=lambda r: (score(r, target), addresses[r["id"]]))[:k]
 
 
-def check_hits(hits, model, target, category, k, exact):
-    expected = ranked(model, target, category, k)
+def captured_addresses(connection, model):
+    captured = BASE.raw(connection)
+    actual = sorted((MIXED.READ.business(row) for row in captured), key=lambda row: row["id"])
+    require(actual == sorted(model.values(), key=lambda row: row["id"]), "Native rows diverged from client model")
+    return {row["id"]: MIXED.key(MIXED.ref(row)) for row in captured}
+
+
+def check_hits(hits, model, target, category, k, exact, addresses):
+    expected = ranked(model, target, category, k, addresses)
     require(len(hits) <= k and len({r["id"] for r in hits}) == len(hits), "Excess or duplicate hits")
+    ranking = []
     for hit in hits:
         source = model.get(hit["id"])
         require(source is not None and all(hit[key] == source[key] for key in BUSINESS), "Wrong visible typed version")
         require(category is None or source["category"] == category, "Filter applied after top-k")
         require(len(hit["embedding"]) == len(target), "Returned vector dimension changed")
-        distance = math.fsum((a - b) ** 2 for a, b in zip(source["embedding"], target))
-        require(math.isclose(hit["distance"], distance, rel_tol=1e-5, abs_tol=1e-4), "Squared-L2 mismatch")
-    require([r["distance"] for r in hits] == sorted(r["distance"] for r in hits), "Unranked results")
+        distance = hit["distance"]
+        require(
+            0 <= distance and math.isclose(distance, score(source, target), rel_tol=1e-5, abs_tol=1e-4),
+            "Squared-L2 mismatch",
+        )
+        ranking.append((distance, addresses[hit["id"]]))
+    require(ranking == sorted(ranking), "Unranked results")
+    if exact:
+        require([r["id"] for r in hits] == [r["id"] for r in expected], "Incorrect exact top-k order")
     recall = len({r["id"] for r in hits} & {r["id"] for r in expected}) / len(expected) if expected else 1.0
     require(recall >= (1.0 if exact else 0.8), f"Recall contract failed: {recall}")
     require(bool(expected) or not hits, "Empty eligible set returned hits")
@@ -97,10 +115,15 @@ def inline_roundtrip(root):
         os.chdir(root)
         connection.execute("LOAD parquet")
         vane.load_installed_extension("ducklake", connection=connection)
-        sql = INLINE_SQL.read_text().replace("__WORKING_DIRECTORY__", str(root)).replace("__TEST_DIR__", "fixtures")
+        sql = (
+            INLINE_SQL.read_text()
+            .replace("${DUCKLAKE_CONNECTION}", "__TEST_DIR__/float_exact_roundtrip.ducklake")
+            .replace("__WORKING_DIRECTORY__", str(root))
+            .replace("__TEST_DIR__", "fixtures")
+        )
         for block in sql.split("\n\n"):
             lines = [line for line in block.splitlines() if line and not line.startswith("#")]
-            if not lines or lines[0].startswith("require "):
+            if not lines or lines[0].startswith(("require ", "test-env ")):
                 continue
             header = lines[0]
             require(header in ("statement ok", "query I"), "Unexpected inline regression directive")
@@ -112,7 +135,7 @@ def inline_roundtrip(root):
                     "Inline floating round-trip regression",
                 )
             checked += 1
-        require(checked == 11, "Incomplete inline regression fixture")
+        require(checked == 12, "Incomplete inline regression fixture")
         return {
             "status": "passed",
             "assertion_blocks": checked,
@@ -142,7 +165,7 @@ def dense_l2(root):
             len(result) == 2 and all(r["distance"] == expected for r in result),
             "Dense L2 lost small terms or depended on component order",
         )
-        check_hits(result, model, target, None, 2, exact=True)
+        check_hits(result, model, target, None, 2, exact=True, addresses=captured_addresses(connection, model))
         diagnostic = search(connection, target, 2, diagnostics=True)
         require(len(diagnostic) == 1 and diagnostic[0]["hits"] == result, "Dense L2 diagnostics changed hits")
         WRITE.rejected(lambda: search(connection, [3.4028234663852886e38] * 4096, 2), "Squared L2 distance overflow")
@@ -170,9 +193,7 @@ def search(connection, target, k, category=None, diagnostics=False):
 
 
 def qualify(connection, model, dimension, phase, segments, report, scratch):
-    require(
-        BASE.raw(connection) == sorted(model.values(), key=lambda r: r["id"]), "Native rows diverged from client model"
-    )
+    addresses = captured_addresses(connection, model)
     require(len(BASE.head(connection)["reference"]["segments"]) == segments, "Unexpected B count")
     snapshot = query(connection, "SELECT max(snapshot_id) AS n FROM __ducklake_metadata_lake.ducklake_snapshot")[0]["n"]
     samples = []
@@ -186,7 +207,7 @@ def qualify(connection, model, dimension, phase, segments, report, scratch):
             require(details["native_capture"]["snapshot_id"] == snapshot, "Query used a different committed snapshot")
             routes = details["routes"]
             require(routes["ann_calls"] == segments, "Wrong ANN route count")
-            recall = check_hits(hits, model, target, category, k, exact=segments == 0)
+            recall = check_hits(hits, model, target, category, k, exact=segments == 0, addresses=addresses)
             samples.append({"category": category, "k": k, "ids": [r["id"] for r in hits], "recall": recall})
             require(not list(scratch.iterdir()), "SQL search retained private query staging")
     require(
@@ -210,7 +231,7 @@ def qualify(connection, model, dimension, phase, segments, report, scratch):
 
 def bootstrap(root, dimension):
     (root / "indexes").mkdir(mode=0o700)
-    connection = BASE.connect(root)
+    connection = BASE.connect(root, root / "extensions")
     for sql in (
         "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)",
         "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')",
@@ -267,7 +288,7 @@ def rejections(connection, dimension, model, report):
         WRITE.rejected(lambda: KEYED.mutate(connection, name, changed, deleted), message)
         WRITE.check_no_request(connection, name)
     require(
-        BASE.raw(connection) == sorted(model.values(), key=lambda r: r["id"]), "Rejected operation changed current rows"
+        KEYED.business_rows(connection) == sorted(model.values(), key=lambda r: r["id"]), "Rejected operation changed current rows"
     )
     report["rejections"] = len(failures) + 4
 
@@ -321,14 +342,14 @@ def exercise(root, dimension, report, scratch):
         reader = connection.cursor()
         try:
             reader.execute("BEGIN")
-            old = BASE.raw(reader)
+            old = KEYED.business_rows(reader)
             changed = [
                 dict(rows(0, 1, dimension)[0], embedding=vector(300, dimension), payload="B1新版本"),
                 dict(rows(130, 1, dimension)[0], embedding=vector(64.125, dimension), payload="F新版本"),
                 dict(rows(90000, 1, dimension)[0], embedding=vector(64.0625, dimension), category=None),
             ]
             mutate("replace-delete", changed, [1, 65, 131, 135])
-            require(BASE.raw(reader) == old, "Mutation changed an existing native transaction")
+            require(KEYED.business_rows(reader) == old, "Mutation changed an existing native transaction")
             reader.execute("COMMIT")
         finally:
             reader.close()
@@ -343,7 +364,7 @@ def exercise(root, dimension, report, scratch):
             require(KEYED.mutate(connection, request, changed, removed) == receipt, "Replay changed a receipt")
         qualify_phase("old-request-replays", 2)
         connection.close()
-        connection = BASE.connect(root)
+        connection = BASE.connect(root, root / "extensions")
         qualify_phase("reopened", 2)
         report.update(
             status="passed",
@@ -397,7 +418,7 @@ def main():
         Path(vane.__file__).resolve().is_relative_to(Path(sysconfig.get_path("purelib")).resolve()),
         "Expected non-editable installed Vane",
     )
-    require(runners.get_or_infer_runner_type() == "local-fast", "Expected local-fast runner")
+    require(runners.get_or_infer_runner_type() == "local", "Expected local runner")
     native = Path(vane._native.__file__).resolve()
     tracked = [
         Path(__file__),
@@ -405,6 +426,7 @@ def main():
         Path(WRITE.__file__),
         Path(BASE.__file__),
         Path(BASE.SEARCH.__file__),
+        Path(MIXED.__file__),
         Path(PIN.__file__),
         INLINE_SQL,
         Path(__file__).resolve().parents[2] / "src/common/ducklake_util.cpp",

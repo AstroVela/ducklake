@@ -6,6 +6,13 @@ first-sixteen-round audit passes in 2/12. All 3,200 primary calls, 56 excluded
 warmups and 28 separate diagnostics pass functional/input checks. No runtime
 change is adopted and previous A/B withdrawal decisions remain unchanged.
 
+The formal observations and installed-provider qualification below refer to
+the November 6, 2026 stack. The current development port uses the same
+precision rule, verifies reported reclamation bytes against the restored
+manifest, and records the linked extension version alongside both driver
+digests. Its shared-CI smoke exercises the functional contract.
+[Original experiment at `e1e60f65`](https://github.com/AstroVela/ducklake/blob/e1e60f65aaf9a94f8cddfb00e57cbaad9367be76/docs/native-vortex-source-gc-aa.md)
+
 This protocol follows the [withdrawn ordered lookup](native-vortex-expiry-lookup.md).
 Its two materialized-expiry targets improved, while two file-unlink controls
 exceeded the predeclared 2% regression gate without executing the changed
@@ -240,7 +247,7 @@ write/query/maintenance stability. A later accepted runtime candidate still
 needs the unchanged thirty-minute actual-ReadView/quality/drain/final-row/receipt
 checks, followed by repeated longer backlog/resource observations for R4 exit.
 
-## Final local qualification
+## Historical qualification
 
 The ten A/A analysis regressions and four unchanged A/B analysis regressions
 pass. The four-case, two-round native smoke completes with `smoke_only`; it

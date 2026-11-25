@@ -19,7 +19,7 @@ struct EpochFixture {
 	    : database(database), setup(setup), root(std::move(root)) {
 		SQL(setup, "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
 		Connection owner(database);
-		DuckLakeVortexWriteBatch::Manage(owner, "lake", "main", "items", "knn");
+		DuckLakeVortexWriteBatch::Manage(owner, *setup.context, "lake", "main", "items", "knn");
 		seed = SQL(setup, "SELECT [{'id':1::BIGINT,'embedding':[1,0]::FLOAT[],'category':'A'::VARCHAR,"
 		                  "'payload':'seed-1'::VARCHAR},{'id':2::BIGINT,'embedding':[2,0]::FLOAT[],"
 		                  "'category':'B'::VARCHAR,'payload':'seed-2'::VARCHAR}]")
@@ -30,23 +30,26 @@ struct EpochFixture {
 		late = SQL(setup, "SELECT [{'id':3::BIGINT,'embedding':[3,0]::FLOAT[],'category':'B'::VARCHAR,"
 		                  "'payload':'late'::VARCHAR}]")
 		           ->GetValue(0, 0);
-		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "seed", seed,
+		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "seed", seed,
 		                                 Value::LIST(LogicalType::BIGINT, {}), 1);
-		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "latest", latest,
+		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "latest", latest,
 		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(2)}), 1);
 	}
 
 	DuckLakeVortexRequestStatus Status() {
 		Connection owner(database);
-		return DuckLakeVortexWriteBatch::RequestStatus(owner, "lake", "main", "items", "knn");
+		Connection caller(database);
+		return DuckLakeVortexWriteBatch::RequestStatus(owner, *caller.context, "lake", "main", "items", "knn");
 	}
 
 	DuckLakeVortexRequestAdvance Advance(Connection &owner, const std::function<void(const string &)> &observe = {}) {
-		return DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, "lake", "main", "items", "knn", 1, observe);
+		Connection caller(database);
+		return DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, *caller.context, "lake", "main", "items", "knn", 1, observe);
 	}
 
 	DuckLakeVortexWriteResult Late(Connection &owner, const std::function<void(const string &)> &observe = {}) {
-		return DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "late", late,
+		Connection caller(database);
+		return DuckLakeVortexWriteBatch::Mutate(owner, *caller.context, "lake", "main", "items", "knn", "late", late,
 		                                        Value::LIST(LogicalType::BIGINT, {}), 1, observe);
 	}
 
@@ -69,21 +72,59 @@ inline void EpochWait(std::future<void> &ready) {
 	ready.get();
 }
 
+template <class T>
+bool EpochWriterQueued(std::future<T> &operation, idx_t previous_waiters) {
+	auto &lock = DuckLakeVortexWriteBatch::WriterLock();
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+	while (lock.WaitingWriterCount() <= previous_waiters && std::chrono::steady_clock::now() < deadline) {
+		if (operation.wait_for(std::chrono::milliseconds(1)) == std::future_status::ready) {
+			return false;
+		}
+	}
+	return lock.WaitingWriterCount() > previous_waiters;
+}
+
 inline void RunEpochFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
 	EpochFixture f(database, setup, root);
+	if (mode == "epoch-rebind-before-commit") {
+		auto attach = [&](const string &file, const string &data) {
+			SQL(setup, "DETACH lake; ATTACH " + Value("ducklake:" + root + "/" + file).ToSQLString() +
+			               " AS lake(DATA_PATH " + Value(root + "/" + data).ToSQLString() + ")");
+		};
+		bool switched = false;
+		bool rejected = false;
+		{
+			Connection writer(database);
+			try {
+				f.Advance(writer, [&](const string &stage) {
+					if (stage == "before_commit") {
+						attach("replacement.ducklake", "replacement-data");
+						switched = true;
+					}
+				});
+			} catch (const std::exception &error) {
+				Require(StringUtil::Contains(error.what(), "attachment changed"), error.what());
+				rejected = true;
+			}
+		}
+		Require(switched && rejected, "Epoch retirement committed through a stale catalog attachment");
+		attach("metadata.ducklake", "data");
+		auto status = f.Status();
+		Require(status.request_epoch == 1 && status.retained_requests == 2 && status.catalog_requests == 2,
+		        "Canceled stale retirement changed the durable epoch or its receipt ledger");
+		f.CurrentRows();
+		return;
+	}
 	if (mode == "epoch-write-first" || mode == "epoch-advance-first") {
-		std::promise<void> held, waiting, release;
-		auto held_future = held.get_future(), waiting_future = waiting.get_future();
+		std::promise<void> held, release;
+		auto held_future = held.get_future();
+		const auto previous_waiters = DuckLakeVortexWriteBatch::WriterLock().WaitingWriterCount();
 		auto released = release.get_future().share();
 		auto pause = [&](const string &stage) {
 			if (stage == "after_lookup") {
 				held.set_value();
-				released.wait();
-			}
-		};
-		auto entered = [&](const string &stage) {
-			if (stage == "waiting") {
-				waiting.set_value();
+				Require(released.wait_for(std::chrono::seconds(60)) == std::future_status::ready,
+				        "Epoch fixture did not release the first operation");
 			}
 		};
 		if (mode == "epoch-write-first") {
@@ -94,12 +135,11 @@ inline void RunEpochFixture(DuckDB &database, Connection &setup, const string &r
 			EpochWait(held_future);
 			auto advance = std::async(std::launch::async, [&] {
 				Connection owner(database);
-				return f.Advance(owner, entered);
+				return f.Advance(owner);
 			});
-			EpochWait(waiting_future);
-			Require(advance.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
-			        "Advance passed a reserved writer");
+			auto queued = EpochWriterQueued(advance, previous_waiters);
 			release.set_value();
+			Require(queued, "Advance did not queue behind a reserved writer");
 			Require(writer.get().request_epoch == 1 && advance.get().expired_requests == 3,
 			        "Advance did not include the preceding committed receipt");
 			f.CurrentRows(2);
@@ -112,16 +152,15 @@ inline void RunEpochFixture(DuckDB &database, Connection &setup, const string &r
 			auto writer = std::async(std::launch::async, [&] {
 				Connection owner(database);
 				try {
-					f.Late(owner, entered);
+					f.Late(owner);
 				} catch (std::exception &error) {
 					return string(error.what());
 				}
 				return string();
 			});
-			EpochWait(waiting_future);
-			Require(writer.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
-			        "Writer passed an epoch advance reservation");
+			auto queued = EpochWriterQueued(writer, previous_waiters);
 			release.set_value();
+			Require(queued, "Writer did not queue behind an epoch advance");
 			Require(advance.get().expired_requests == 2 && writer.get().find("EXPIRED_REQUEST") != string::npos,
 			        "An old writer crossed the committed epoch fence");
 			f.CurrentRows();
@@ -204,7 +243,7 @@ inline void RunEpochFixture(DuckDB &database, Connection &setup, const string &r
 	advanced = f.Advance(retry);
 	Require(advanced.previous_epoch == 1 && advanced.request_epoch == 2 && advanced.expired_requests == 2,
 	        "Advance recovery changed the retired receipt count");
-	auto fresh = DuckLakeVortexWriteBatch::Mutate(retry, "lake", "main", "items", "knn", "new-window", f.late,
+	auto fresh = DuckLakeVortexWriteBatch::Mutate(retry, *setup.context, "lake", "main", "items", "knn", "new-window", f.late,
 	                                              Value::LIST(LogicalType::BIGINT, {}), 2);
 	EpochFixture::Same(advanced, f.Advance(retry));
 	Require(fresh.request_epoch == 2 && f.Status().retained_requests == 1, "Advance retry deleted a newer receipt");

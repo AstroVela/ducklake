@@ -7,11 +7,12 @@ or remain in flight when the collector finished waiting for query captures and
 checked all other transactions. Frequent status polling could therefore defer
 otherwise eligible cleanup.
 
-Acquire shared admission before opening the status owner and mark only that
-owner as a finite native read capture. Its existing commit completes before the
-admission guard is released. On an exception, the owner connection is destroyed
-and rolls back before the guard is released. An ordinary caller transaction is
-separate and keeps its original classification.
+The status owner acquires interruptible shared admission before starting a
+transaction. It uses the same connection-scoped registration as a ReadView, so
+the transaction manager classifies its transactions as finite captures at
+creation. The owner commits on success and explicitly rolls back on exceptions
+while it still holds shared admission.
+The ordinary caller transaction keeps its original classification.
 
 Readiness alone excludes these marked captures. Collection still closes
 admission, waits for finite readers, freezes new transaction entry, and checks
@@ -19,8 +20,7 @@ all other transactions before expiration or deletion. Status itself still counts
 all other transactions. Its fields, source/version ownership, object and byte
 budgets, cancellation and explicit-resume rules remain unchanged.
 
-There are two production lines, using the existing admission lock and capture
-mark. There is no new schema, API, compatibility layer, retry or fallback.
+Status and ReadView capture share the existing admission lock and registration.
 The Vane, wrapper, Vortex and native SDK revisions remain the exact versions
 qualified in [the preceding consumer change](native-vortex-spfresh-fixes.md).
 
@@ -39,11 +39,19 @@ private policy table, source collection and the current ANN winner must remain
 valid. The preceding library fails with `Source readiness discarded finite
 status work`.
 
+The native `status-error-rollback` case retains a connection-list snapshot
+while the public status call fails its policy read. The same observer stays
+alive through source collection, which must expire one snapshot within a
+one-object budget. The observed status transaction must also be idle when
+exclusive admission becomes available.
+
 The SQL fixture additionally invokes source status from the already-held
 ordinary reader connection. It must still report that user transaction as a
 blocker, and physical collection must still defer. Existing cases retain the
 capture/gate ordering, cancellation, old private views after GC, registered-file
-ownership and real crash-recovery coverage.
+ownership and real crash-recovery coverage. The eager two-lake fixture queues a
+status read behind source GC and checks the snapshot count before releasing the
+active capture. The queued status then observes the single budgeted expiry.
 
 ## Convergence acceptance
 
@@ -62,7 +70,8 @@ routing, its budget or its oracle.
 
 ## Signed-provider regression qualification
 
-The fixed native regression passes against the rebuilt source driver. The
+In the original #66 qualification, the native regression passed against the
+rebuilt source driver. The
 isolated installed environment contains the byte-identical Vane and Vortex
 wheels from the preceding qualification and a newly signed DuckLake provider
 with that exact Vortex wheel dependency.

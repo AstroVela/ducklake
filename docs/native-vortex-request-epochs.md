@@ -10,8 +10,13 @@ request is created and retained on retries. Identity is
 `(table_uuid, request_epoch, request_id)`. New tables start at epoch 1. An exact
 retry in the current epoch returns its original receipt; changed content fails.
 Earlier epochs fail with `EXPIRED_REQUEST`, including IDs never seen before.
-Future epochs fail too. A client must never fetch the latest epoch and relabel
-an old request: that explicitly creates a different operation identity.
+Future epochs fail too. Relabeling an old request with a new epoch creates a
+different operation identity.
+
+This contract applies within a stable table incarnation. The SQL function
+resolves the current qualified name at execution. A same-name drop and recreate
+starts a new scope at epoch 1. Coordinate such DDL with outstanding requests.
+Explicit caller-supplied table UUID fencing is a separate lifecycle change.
 
 ```sql
 SELECT * FROM ducklake_vortex_request_status('lake','main','items','knn');
@@ -23,15 +28,21 @@ SELECT * FROM ducklake_advance_vortex_request_epoch('lake','main','items','knn',
 ```
 
 Status returns `table_uuid, request_epoch, retained_requests, catalog_requests`
-from one native transaction. Advancing compares the expected epoch, deletes only
+from one native transaction. Status and advance bind the lake and metadata
+attachment before waiting for the existing writer lock. Advance requires a
+writable catalog, and both operate in autocommit from the caller. The new
+advance uses the receipt commit guard to recheck the attachment, table and index
+under write admission through commit. Advancing compares the expected epoch, deletes only
 that table's current-epoch receipts and persists the next epoch in **one native
 metadata transaction**. It never changes business rows, index generations or
 other tables' receipt windows. Operators advance only after accepting that
 current-epoch requests lose their retry window, including pending requests.
 
 Advance returns `table_uuid, previous_epoch, request_epoch, expired_requests`.
-One compact row per table retains the current epoch and last transition's expired
-count. Retrying the last transition returns the same result even after new
+One compact row per table retains the current epoch, last transition's expired
+count and whether any batch ever committed. Receipt retirement preserves that
+history for managed-write enrollment. Advancing a table with no batches keeps
+it eligible for enrollment. Retrying the last transition returns the same result even after new
 requests commit, without clearing their receipts or advancing again. Once a
 later transition commits, older transition retries fail; the status still
 identifies the durable current window. uint64 exhaustion fails without reset.
@@ -75,7 +86,10 @@ future, zero and overflowing epochs; old upsert/delete replay; exact last-advanc
 retry after lost ACK and newer writes; native ordinary-reader isolation; both
 writer/advance orders and simultaneous identical advances; cancellation, native
 metadata conflict, failure before/after fence staging and actual SIGKILL before
-and after commit. Reopen through the installed matching providers and assert
+and after commit. The integrated proof also rebinds the catalog just before
+commit, checks read-only status and advance, and verifies the managed enrollment
+precondition across multiple advances and a reopen. Reopen through the installed
+matching providers and assert
 that epoch, receipts and business data recover together. An old managed layout
 must remain protected even while new write APIs reject it.
 
@@ -89,7 +103,7 @@ matching test providers as in the [native build workflow](vane-native-vortex-pro
 run the proof with the matching write driver:
 
 ```bash
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_request_epochs.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_request_epochs.py \
     --driver /path/to/build/ducklake_vortex_write_driver \
     --cpus 6,7,8,9,10,11 --output-dir /tmp/vortex-request-epochs
 ```
@@ -98,9 +112,9 @@ The [native-provider CI workflow](../.github/workflows/VaneNativeVortex.yml) run
 the same probe using a CPU available on its runner and retains the report,
 native/recovery logs and crash checkpoints. This is functional qualification.
 
-## Result
+## Historical qualification on 2026-11-06
 
-The installed-provider [lifecycle proof](../test/vane/test_vane_vortex_request_epochs.py)
+The original [#85 source](https://github.com/AstroVela/ducklake/commit/f67dd3bfe31278bf425435e9a3822d07d04b9774) ran the installed-provider [lifecycle proof](../test/vane/test_vane_vortex_request_epochs.py), which
 passed **8 public contract groups** and **14 native/fault/recovery cases**:
 
 - Current-epoch exact retry, content mismatch, newer business versions, table

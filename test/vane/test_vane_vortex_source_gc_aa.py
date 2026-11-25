@@ -38,7 +38,7 @@ RULE = {
     "precision": "Every case has its complete 95% interval and each consecutive 16-round block median inside [0.98,1.02].",
     "prefix": "Report the first 16 full-matrix rounds separately; compute all analyses after fixed sampling ends.",
     "order": AB.RULE["order"],
-    "sampling": "Each requested profile runs its fixed count; stop only for execution, semantic or integrity failure. No adaptive sampling or rerun-until-pass. A parent protocol declares phase advancement.",
+    "sampling": "Each requested profile runs its fixed count. A parent protocol declares phase advancement. Execution, semantic or integrity failures stop sampling.",
     "interpretation": "Per-case descriptive equivalence of this aggregate protocol; no runtime adoption, old-result reclassification or sustained-stability claim.",
 }
 COUNTERS = ("ru_utime", "ru_stime", "ru_minflt", "ru_majflt", "ru_nvcsw", "ru_nivcsw")
@@ -94,7 +94,7 @@ def run(args):
     code_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in tracked}
     private = root / "private"
     private.mkdir(mode=0o700)
-    env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local-fast")
+    env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local")
     env.pop("VORTEX_SPFRESH_NATIVE", None)
     rounds = RULE["profiles"][args.profile]
     report = {
@@ -103,6 +103,7 @@ def run(args):
         "rule": RULE,
         "driver": str(driver),
         "driver_sha256": {label: driver_hash for label in LABELS},
+        "ducklake_extension_version": source["ducklake_extension_version"],
         "inputs_report_sha256": hashlib.sha256(inputs.read_bytes()).hexdigest(),
         "code_sha256": code_hashes,
         "host": {
@@ -168,6 +169,7 @@ def run(args):
         old_data, new_data = ({p for p in m if p.startswith("data/")} for m in (before, after))
         deleted = {Path(p).relative_to(work).as_posix() for p in sample["deleted_paths"]}
         assert old_data - new_data == deleted and not new_data - old_data
+        assert sample["bytes"] == sum(before[p]["bytes"] for p in deleted)
         assert all(before[p] == after[p] for p in new_data)
         assert all(after.get(p) == value for p, value in before.items() if p.startswith("indexes/"))
         sample.update(
