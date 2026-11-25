@@ -252,6 +252,7 @@ def native_cases(driver, root, report):
         "mixed-size",
         "shared-source",
         "linked-native-cleanup",
+        "filename-reference",
         "leaf-link",
         "prepared-native-cleanup",
         "cleanup-init-order",
