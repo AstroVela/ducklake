@@ -254,7 +254,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R1 实时基本链路 | **已实现并验证**：零 B、即时 T/F 查询、受管 upsert/delete、回执、ReadView、写入背压 | 固定 schema／单进程范围内已有端到端及恢复证据 |
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
-| R4 长期维护稳态 | **当前优先项，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。128 次历史诊断发现大输入存在较多 SQL 范围外时间 | 拆分同事务引用检查的 Fetch 与路径归一化，保留持续清理与开放停滞验收。当前基线的 30 分钟稳态验证暂缓 |
+| R4 长期维护稳态 | **当前优先项，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 核对候选能否保留当前路径身份与错误语义，继续验证持续清理与开放停滞。当前基线的 30 分钟稳态验证暂缓 |
 | R5 容量与产品契约 | **待完成**：更大／更高维／更广过滤负载、质量与延迟、生命周期 | 明确回执保留及过期请求、reference／WAL 管理、容量 admission；按目标负载决定 schema／度量／过滤扩展 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
@@ -265,7 +265,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 ## 11. R4 下一步验证
 
-**下一项稳定环境下的诊断是拆分同事务的 `HasFileReference` 耗时。** 从可重放输入核对回收结果，分别观测结果 Fetch 与路径归一化、比较的开销。
+**候选先验证当前路径身份和错误语义。** 历史文件名预筛选针对旧的词法规范化。当前实现会解析本地符号链接，异名链接仍可引用同一文件。受控 A/B 只接受保留目录项身份、访问检查及出错行为的候选。
 
 旧堆栈 #76 在 12 个场景采集 192 个主样本。4,096 次更新时，两快照过期中位耗时为逐次落盘 197.127 ms、inline 31.230 ms。独立诊断指向 `DeleteSnapshots` 中判断旧数据文件是否仍被保留快照引用的区间查询。开发分支上的基准入口先复验输入恢复与实际回收语义。[历史基准结果](native-vortex-source-gc-cost.md#historical-observations-on-2026-11-06)
 
@@ -277,7 +277,9 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 旧堆栈 #80 固定 CPU 6–11，采集 128 个重点主样本。两个重点场景的中位比值在 2% 带内，完整区间分别为 [0.982032, 1.020075] 和 [1.002638, 1.038184]，都未达门槛，完整矩阵按预设规则未启动。当前开发分支上的 affinity smoke 用于核对继承、恢复和回收语义。[固定 CPU 实验归档](native-vortex-source-gc-affinity.md)
 
-旧堆栈 #81 完成 128 次独立诊断及 8 次预热。大输入 collector 均值为 84.165 ms，其中引用 SQL 23.360 ms、COMMIT 6.958 ms、SQL 范围外 36.763 ms。范围外部分包含多个 C++ 环节，待适配更细的观测。开发分支用 smoke 核对当前 SQL 与 checkpoint 清单。[元数据诊断归档](native-vortex-source-gc-metadata.md)
+旧堆栈 #81 完成 128 次独立诊断及 8 次预热。大输入 collector 均值为 84.165 ms，其中引用 SQL 23.360 ms、COMMIT 6.958 ms、SQL 范围外 36.763 ms。范围外部分包含多个 C++ 环节。开发分支用 smoke 核对当前 SQL 与 checkpoint 清单。[元数据诊断归档](native-vortex-source-gc-metadata.md)
+
+旧堆栈 #82 在固定 CPU 6–11 上完成 128 次引用诊断、8 次预热和 8 项语义检查。大输入的历史 collector 均值为 83.773 ms，其中路径取值、归一化和比较循环占 30.637 ms，结果 Fetch 占 0.774 ms。历史数据来自修正扩展构建配置后的独立运行。当前私有诊断构建观测已合入的路径身份实现，以 smoke 核对当前语义和计时分解。[引用诊断归档](native-vortex-reference-diagnostics.md)
 
 1. 从同一检查点恢复独立的元数据和文件副本，保持受管路径与文件身份有效。固定事务时序，核对实际执行 `DeleteSnapshots` 的候选快照、受保护快照、文件队列、删除意图与回收结果。
 2. 沿用普通事务、旧 ReadView、取消、崩溃及所有权检查，保持现有对象／字节、T/F 和查询预算。按不同历史规模重放时固定逻辑数据、文件、保留策略和任务输入。
@@ -303,6 +305,7 @@ R4 关闭后再扩大 R5 的负载／容量范围；R6 需要独立远程与分�
 | [相同二进制 A/A](native-vortex-source-gc-aa.md) | 固定采样协议、区间和分段精度、当前 CI smoke |
 | [固定 CPU 的 A/A](native-vortex-source-gc-affinity.md) | affinity 继承与恢复、重点阶段历史结果及完整矩阵的启动门槛 |
 | [元数据重复诊断](native-vortex-source-gc-metadata.md) | 诊断样本、SQL 守恒分类与范围外开销 |
+| [引用检查内部诊断](native-vortex-reference-diagnostics.md) | 私有诊断构建、Fetch 与路径循环、历史结果及当前 smoke |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。
