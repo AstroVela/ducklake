@@ -40,7 +40,7 @@ struct KeyedFixture {
 		                ->GetValue(0, 0);
 		Connection owner(database);
 		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "seed", seed,
-		                                 Value::LIST(LogicalType::BIGINT, {}));
+		                                 Value::LIST(LogicalType::BIGINT, {}), 1);
 		SQL(setup, "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");
 		index = DuckLakeVortexIndex::BuildAndPublish(*setup.context, "lake", "main", "items", "knn",
 		                                             root + "/indexes/seed.json", 2, 1, nullptr, "", {},
@@ -59,14 +59,14 @@ struct KeyedFixture {
 	}
 	DuckLakeVortexWriteResult Mutate(Connection &owner, const std::function<void(const string &)> &observe = {}) {
 		return DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "change", rows,
-		                                        deletes, observe);
+		                                        deletes, 1, observe);
 	}
 	DuckLakeVortexWriteResult DeleteMissing(Connection &owner, ClientContext &caller,
 	                                        const std::function<void(const string &)> &observe = {}) {
 		return DuckLakeVortexWriteBatch::Mutate(
 		    owner, caller, "lake", "main", "items", "knn", "absent",
 		    Value::LIST(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), {}),
-		    Value::LIST(LogicalType::BIGINT, {Value::BIGINT(99999)}), observe);
+		    Value::LIST(LogicalType::BIGINT, {Value::BIGINT(99999)}), 1, observe);
 	}
 	DuckLakeVortexSearchResult Search(Connection &reader, const std::function<void(const string &)> &observe = {}) {
 		DuckLakeVortexViewOptions options {};
@@ -87,7 +87,7 @@ struct KeyedFixture {
 		        "Mutation exposed a partial version");
 		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 256,
 		        "Mutation duplicated or lost current keys");
-		Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1 "
+		Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2 "
 		                   "WHERE request_id='change'")
 		                ->GetValue(0, 0)
 		                .GetValue<idx_t>() == (changed ? 1 : 0),
@@ -139,7 +139,7 @@ inline void CheckKeyedRebind(KeyedFixture &fixture, bool receipt_only) {
 	attach("metadata.ducklake", "data");
 	Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 0,
 	        "Stale ordinary writer changed managed rows");
-	Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1")
+	Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2")
 	                ->GetValue(0, 0)
 	                .GetValue<idx_t>() == 0,
 	        "Stale missing-key delete committed a request receipt");
@@ -166,7 +166,7 @@ inline void CheckKeyedImmediateAttachments(KeyedFixture &fixture) {
 	        "Missing-key receipt changed with another attached lake");
 
 	auto append = DuckLakeVortexWriteBatch::Append(owner, *setup.context, "neighbor", "main", "items", "knn", "append",
-	                                               fixture.rows);
+	                                               fixture.rows, 1);
 	Require(append.row_count == 2 &&
 	            SQL(setup, "SELECT count(*) FROM neighbor.items")->GetValue(0, 0).GetValue<idx_t>() == 2,
 	        "An unrelated lake blocked append in immediate transaction mode");
@@ -174,7 +174,7 @@ inline void CheckKeyedImmediateAttachments(KeyedFixture &fixture) {
 	        "Append or missing-key deletion changed the wrong lake");
 	for (auto name : {"lake", "neighbor"}) {
 		Require(SQL(setup,
-		            "SELECT count(*) FROM __ducklake_metadata_" + string(name) + ".ducklake_vortex_write_requests_v1")
+		            "SELECT count(*) FROM __ducklake_metadata_" + string(name) + ".ducklake_vortex_write_requests_v2")
 		                ->GetValue(0, 0)
 		                .GetValue<idx_t>() == 1,
 		        "The attached catalogs did not retain their own receipts");

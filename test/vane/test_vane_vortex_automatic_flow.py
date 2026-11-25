@@ -244,7 +244,10 @@ def replay(connection, receipts, model):
     expected = [model[key] for key in sorted(model)]
     require(KEYED.business_rows(connection) == expected, "Rows diverged before exact receipt replay")
     for request, rows, deletes, receipt in receipts:
-        require(KEYED.mutate(connection, request, rows, deletes) == receipt, f"Retry changed receipt: {request}")
+        require(
+            KEYED.mutate(connection, request, rows, deletes, epoch=receipt["request_epoch"]) == receipt,
+            f"Retry changed receipt: {request}",
+        )
         require(
             current_stamp(connection) == before and KEYED.business_rows(connection) == expected,
             f"Retry changed the snapshot, index or current rows: {request}",
