@@ -34,10 +34,21 @@ SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','unmanage
 ----
 managed write mode
 
+statement ok
+SET GLOBAL default_collation='nocase'
+
+statement error
+SELECT * FROM ducklake_manage_vortex_writes('lake','main','items','KNN')
+----
+No published Vortex index
+
 query I
 SELECT managed::INTEGER FROM ducklake_manage_vortex_writes('lake','main','items','knn')
 ----
 1
+
+statement ok
+RESET GLOBAL default_collation
 
 query TI
 SELECT request_id,row_count FROM ducklake_mutate_vortex_batch('lake','main','items','knn','seed',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],[]::BIGINT[])
@@ -88,6 +99,44 @@ statement error
 SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','empty',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],[]::BIGINT[])
 ----
 1 to 1000 operations
+
+query III
+SELECT count(*),count(DISTINCT id),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items
+----
+2	2	1
+
+statement ok
+BEGIN
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'items')
+
+statement ok
+DELETE FROM lake.items WHERE id=1
+
+statement error
+COMMIT
+----
+Managed Vortex tables require
+
+query III
+SELECT count(*),count(DISTINCT id),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items
+----
+2	2	1
+
+statement ok
+BEGIN
+
+statement ok
+CALL ducklake_flush_inlined_data('lake',table_name=>'items')
+
+statement ok
+DELETE FROM lake.items WHERE id IN (1,2)
+
+statement error
+COMMIT
+----
+Managed Vortex tables require
 
 query III
 SELECT count(*),count(DISTINCT id),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1) FROM lake.items

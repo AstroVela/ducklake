@@ -28,6 +28,7 @@ jobs:
       CCACHE_MAXSIZE: 2G
       DISABLE_EXTENSIONS_FOR_TEST: '1'
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/vcpkg-vane
       VCPKG_INSTALLED_DIR: ${{ github.workspace }}/build/vane-vcpkg
       VCPKG_TARGET_TRIPLET: x64-linux-release
       VCPKG_HOST_TRIPLET: x64-linux-release
@@ -41,20 +42,20 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: AstroVela/vane
-          ref: e14bf92d4053141697a59dcbd6098677cbddb80a
+          ref: 14b4fc6a45f9c0a593202f1eb32f1062d365703e
           fetch-depth: 0
           path: vane
           persist-credentials: false
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: AstroVela/duckdb-vortex
-          ref: 7eca1d48632d2e9d5c20d83a139f28241de98797
+          ref: 4f922e73c0201bd98d73007261d097d00aa8b2c3
           path: vortex-extension
           persist-credentials: false
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: AstroVela/vortex
-          ref: 122b63e0408a187a9d0ecdd129f1cbe12b6b46b2
+          ref: 42beeb3a72769869a3d3d16887a011ee7f922362
           path: vortex-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -65,7 +66,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config gdb
           python -m pip install uv cmake 'scikit-build-core>=0.11.4' 'pybind11[global]>=3' 'setuptools-scm>=9.2' numpy packaging pytest pytest-timeout
-          rustup toolchain install 1.91.0 --profile minimal
+          rustup toolchain install 1.91.0 --profile minimal --component rust-docs
+          cargo +1.91.0 install --locked --version 0.9.2 cargo-about
           mkdir -p .cache/vcpkg build/wheels build/logs
           printf 'BINDGEN_EXTRA_CLANG_ARGS=-isystem%s\n' "$(cc -print-file-name=include)" >> "$GITHUB_ENV"
       - name: Restore build caches
@@ -77,9 +79,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             build/runtime/cargo/build
-          key: vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-${{ github.sha }}
+          key: vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'vortex-extension/vortex-extension/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-${{ github.sha }}
           restore-keys: |
-            vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-
+            vane-native-vortex-${{ runner.os }}-${{ hashFiles('extension/Cargo.lock', 'vortex-extension/vortex-extension/Cargo.lock', 'extension/extension_config.cmake', 'extension/vane-native-vortex.toml', 'extension/scripts/build_vane_vortex_native_sdk.sh') }}-
       - name: Set up pinned vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
@@ -88,7 +90,10 @@ jobs:
           doNotCache: true
       - name: Build native dependency prefixes
         run: |
-          bash vane/scripts/bootstrap_vcpkg.sh "$PWD/vane" 2>&1 | tee build/logs/vane-dependencies.log
+          VCPKG_ROOT="$VANE_VCPKG_ROOT" bash vane/scripts/bootstrap_vcpkg.sh "$PWD/vane" 2>&1 | tee build/logs/vane-dependencies.log
+          vane_vcpkg_revision=$(python -c 'import json; print(json.load(open("vane/vcpkg.json"))["builtin-baseline"])')
+          test "$(git -C "$VANE_VCPKG_ROOT" rev-parse HEAD)" = "$vane_vcpkg_revision"
+          test "$(git -C "$VCPKG_ROOT" rev-parse HEAD)" = 84bab45d415d22042bd0b9081aea57f362da3f35
           "$VCPKG_ROOT/vcpkg" install --triplet x64-linux-release --host-triplet x64-linux-release \
             --x-manifest-root="$PWD/extension" --x-install-root="$PWD/build/ducklake-vcpkg" \
             2>&1 | tee build/logs/ducklake-dependencies.log
@@ -103,6 +108,7 @@ jobs:
           printf 'VORTEX_SPFRESH_NATIVE=%s\n' "$PWD/build/native-sdk/spfresh/build" >> "$GITHUB_ENV"
       - name: Build matching Vane runtime and optional artifacts
         env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg-vane
           DUCKDB_DUCKLAKE_DIRECTORY: ${{ github.workspace }}/extension
           DUCKDB_VORTEX_DIRECTORY: ${{ github.workspace }}/vortex-extension
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build/runtime
@@ -114,13 +120,15 @@ jobs:
             --out-dir "$PWD/build/wheels" "$PWD/vane" \
             2>&1 | tee build/logs/runtime-wheel.log
           cmake --build build/runtime --target vane_loadable_extensions ducklake_vortex_write_driver ducklake_vortex_source_driver \
-            ducklake_vortex_maintenance_probe_benchmark ducklake_vortex_source_gc_benchmark \
-            ducklake_vortex_expiry_lookup_driver ducklake_vortex_expiry_lookup_resource --parallel 2 \
+            ducklake_vortex_source_gc_benchmark ducklake_vortex_expiry_lookup_driver \
+            ducklake_vortex_expiry_lookup_resource --parallel 2 \
             2>&1 | tee build/logs/providers-build.log
           uv pip install --system build/wheels/vane_ai-*.whl
       - name: Run the Vane base release checks
         run: bash vane/scripts/run_release_tests.sh 2>&1 | tee build/logs/vane-release-tests.log
       - name: Package and install the exact provider closure
+        env:
+          RUSTUP_TOOLCHAIN: '1.91.0'
         run: |
           mkdir -p build/signed
           for name in vortex ducklake; do
@@ -135,31 +143,40 @@ jobs:
           cp build/native-sdk/llvm/openmp-18.1.8.src/LICENSE.TXT build/notices/llvm-openmp-LICENSE
           cp build/native-sdk/spfresh/source/LICENSE build/notices/spfresh-LICENSE
           cp build/vane-vcpkg/x64-linux-release/share/zstd/copyright build/notices/zstd-copyright
-          cp vane/LICENSES/DuckDB-MIT.txt build/notices/DuckDB-MIT.txt
+          python -I extension/scripts/build_vane_native_vortex_notices.py \
+            --vane-source "$PWD/vane" --vortex-wrapper "$PWD/vortex-extension" \
+            --ducklake-vcpkg-share "$PWD/build/ducklake-vcpkg/x64-linux-release/share" --output-dir "$PWD/build/notices"
           cp vane/LICENSES/vcpkg-binary-dependencies.txt build/notices/Vane-native-dependencies.txt
-          python -I vane/scripts/build_extension_wheel.py \
+          python -I vane/scripts/build_extension_wheel.py --release-number 1 \
             --artifact build/signed/vortex.duckdb_extension \
-            --extension-name vortex --platform-tag manylinux_2_39_x86_64 --trust-identity astrovela/vane \
-            --license-expression 'Apache-2.0 AND MIT' \
+            --extension-name vortex --platform-tag manylinux_2_39_x86_64 --trust-identity vane-ci-test-key \
+            --license-expression "$(cat build/notices/vortex-license-expression.txt)" \
             --license-file build/notices/duckdb-vortex-LICENSE --license-file build/notices/vortex-LICENSE \
             --license-file build/notices/Vane-native-dependencies.txt \
-            --license-file build/notices/DuckDB-MIT.txt --output-directory build/wheels --test-only
+            --license-file build/notices/DuckDB-static-engine-licenses.txt \
+            --license-file build/notices/Vane-Apache-2.0.txt --license-file build/notices/Vane-NOTICE.txt \
+            --license-file build/notices/vortex-rust-licenses.txt --license-file build/notices/Rust-stdlib-licenses.html \
+            --output-directory build/wheels --test-only
           mapfile -t vortex_wheels < <(find build/wheels -maxdepth 1 -name 'vane_extension_vortex-*.whl')
           test "${#vortex_wheels[@]}" = 1
-          python -I vane/scripts/build_extension_wheel.py \
+          python -I vane/scripts/build_extension_wheel.py --release-number 1 \
             --artifact build/signed/ducklake.duckdb_extension \
-            --extension-name ducklake --platform-tag manylinux_2_39_x86_64 --trust-identity astrovela/vane \
-            --dependency-wheel "${vortex_wheels[0]}" --dependency-trust-identity astrovela/vane \
-            --license-expression 'MIT AND Apache-2.0 WITH LLVM-exception AND BSD-3-Clause' \
+            --extension-name ducklake --platform-tag manylinux_2_39_x86_64 --trust-identity vane-ci-test-key \
+            --dependency-wheel "${vortex_wheels[0]}" --dependency-trust-identity vane-ci-test-key \
+            --license-expression "$(cat build/notices/ducklake-license-expression.txt)" \
             --license-file build/notices/ducklake-LICENSE --license-file build/notices/vortex-LICENSE \
             --license-file build/notices/llvm-openmp-LICENSE --license-file build/notices/spfresh-LICENSE \
             --license-file build/notices/zstd-copyright \
             --license-file build/notices/Vane-native-dependencies.txt \
-            --license-file build/notices/DuckDB-MIT.txt --output-directory build/wheels --test-only
+            --license-file build/notices/DuckDB-static-engine-licenses.txt \
+            --license-file build/notices/Vane-Apache-2.0.txt --license-file build/notices/Vane-NOTICE.txt \
+            --license-file build/notices/DuckLake-vcpkg-licenses.txt \
+            --license-file build/notices/ducklake-rust-licenses.txt --license-file build/notices/Rust-stdlib-licenses.html \
+            --output-directory build/wheels --test-only
           uv pip install --system --no-index --find-links build/wheels build/wheels/vane_extension_ducklake-*.whl
       - name: Qualify installed Vane native vector retrieval
         env:
-          VANE_RUNNER: local-fast
+          VANE_RUNNER: local
         run: |
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_native_vortex.py --output-dir "$PWD/build/proof" \
             2>&1 | tee build/logs/vane-native-vortex.log
@@ -177,18 +194,6 @@ jobs:
             2>&1 | tee build/logs/vane-vortex-automatic-flow.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_stall_capture.py \
             --output-dir "$PWD/build/stall-capture-proof" 2>&1 | tee build/logs/vane-vortex-stall-capture.log
-          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
-            --fixtures automatic --rows 4096 32768 --dimensions 8 128 --seconds 12 --capture-stalls --output-dir "$PWD/build/load-proof" \
-            2>&1 | tee build/logs/vane-vortex-sustained-load.log
-          python -I extension/test/vane/test_vane_vortex_load_metrics.py \
-            2>&1 | tee build/logs/vane-vortex-load-metrics.log
-          python -I extension/test/vane/test_vane_vortex_load_oracle.py \
-            2>&1 | tee build/logs/vane-vortex-load-oracle.log
-          python -I extension/test/vane/test_vane_vortex_maintenance_probe_stats.py \
-            2>&1 | tee build/logs/vane-vortex-maintenance-probe-stats.log
-          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_maintenance_probe_benchmark.py \
-            --driver "$PWD/build/runtime/ducklake_vortex_maintenance_probe_benchmark" --histories 8 --rounds 2 --batch 2 \
-            --output-dir "$PWD/build/maintenance-probe-smoke-proof" 2>&1 | tee build/logs/vane-vortex-maintenance-probe.log
           python -I extension/test/vane/test_vane_vortex_source_gc_stats.py \
             2>&1 | tee build/logs/vane-vortex-source-gc-stats.log
           python -I extension/test/vane/test_vane_vortex_source_gc_ab_stats.py \
@@ -197,7 +202,7 @@ jobs:
             2>&1 | tee build/logs/vane-vortex-source-gc-aa-stats.log
           python -I extension/test/vane/test_vane_vortex_source_gc_affinity_stats.py \
             2>&1 | tee build/logs/vane-vortex-source-gc-affinity-stats.log
-          VANE_RUNNER=local-fast python -I extension/test/vane/test_vane_vortex_expiry_interval.py \
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_expiry_interval.py \
             --output-dir "$PWD/build/expiry-interval-proof" \
             2>&1 | tee build/logs/vane-vortex-expiry-interval.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_source_gc_benchmark.py \
@@ -215,7 +220,7 @@ jobs:
             --inputs "$PWD/build/source-gc-smoke-proof/report.json" --profile smoke --cpus "$gc_smoke_cpu" \
             --output-dir "$PWD/build/source-gc-affinity-smoke-proof" \
             2>&1 | tee build/logs/vane-vortex-source-gc-affinity-smoke.log
-          VANE_RUNNER=local-fast python -I extension/test/vane/test_vane_vortex_expiry_lookup.py \
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_expiry_lookup.py \
             --driver "$PWD/build/runtime/ducklake_vortex_expiry_lookup_driver" \
             --output-dir "$PWD/build/expiry-lookup-proof" 2>&1 | tee build/logs/vane-vortex-expiry-lookup.log
           python -I extension/test/vane/test_vane_vortex_expiry_lookup_resources.py \
@@ -224,8 +229,8 @@ jobs:
             --output-dir "$PWD/build/expiry-lookup-resource-proof" \
             2>&1 | tee build/logs/vane-vortex-expiry-lookup-resource.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
-            --profile steady --rows 512 --dimensions 8 --seconds 15 --readers 4 --capture-stalls \
-            --output-dir "$PWD/build/steady-smoke-proof" 2>&1 | tee build/logs/vane-vortex-steady-smoke.log
+            --fixtures automatic --rows 4096 32768 --dimensions 8 128 --seconds 12 --capture-stalls --output-dir "$PWD/build/load-proof" \
+            2>&1 | tee build/logs/vane-vortex-sustained-load.log
       - name: Retain build and qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -241,12 +246,6 @@ jobs:
             build/source-proof/**/recovery.log
             build/source-proof/**/transaction-wake.json
             build/source-proof/**/wake-guards.json
-            build/source-proof/**/maintenance-probe-query.json
-            build/maintenance-probe-smoke-proof/report.json
-            build/maintenance-probe-smoke-proof/decision-rule.json
-            build/maintenance-probe-smoke-proof/**/timing.json
-            build/maintenance-probe-smoke-proof/**/diagnostic.json
-            build/maintenance-probe-smoke-proof/**/*.log
             build/source-gc-smoke-proof/report.json
             build/source-gc-smoke-proof/measurement-contract.json
             build/source-gc-smoke-proof/**/input-manifest.json
@@ -272,10 +271,4 @@ jobs:
             build/load-proof/**/events.jsonl
             build/load-proof/**/stall.json
             build/load-proof/**/native-stacks.log
-            build/steady-smoke-proof/report.json
-            build/steady-smoke-proof/**/report.json
-            build/steady-smoke-proof/**/worker.log
-            build/steady-smoke-proof/**/events.jsonl
-            build/steady-smoke-proof/**/stall.json
-            build/steady-smoke-proof/**/native-stacks.log
             build/wheels

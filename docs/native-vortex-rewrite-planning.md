@@ -10,37 +10,27 @@ masked the rest before the rewrite captured its input.
 
 ## Reservation scope
 
-The optimizer previously selected its rewrite plan before acquiring the
-existing managed-writer reservation. Moving that reservation before the
-planning probe keeps candidate selection, durable task selection, source
-capture and physical publication serialized with managed mutations. The
-planner's existing remaining-row checks can then select indexed rewrite,
-small-output rewrite to F, prune or empty-segment retirement against stable
-managed input.
+An initial probe determines whether there is physical work. When it finds a
+rewrite or flush, the optimizer acquires the existing managed-writer reservation
+and probes again before recording a task. The second probe accounts for managed
+writes that committed while the optimizer waited. The planner then selects
+indexed rewrite, small-output rewrite to F, prune or empty-segment retirement
+using the current row counts.
 
-The nonempty indexed-rewrite guard stays intact. There is no empty-index
-fallback, error-message retry, additional reservation, compatibility mode or
-budget change. Query snapshots retain their existing visibility and ownership
-rules. Ordinary SQL mutations outside the managed API retain the existing
-identity and snapshot checks.
-
-When no physical rewrite is selected, the worker releases the reservation
-after the probe. Flush keeps its existing reservation around the physical
-change; independent B construction and merge still run without the managed
-writer reservation. Every initial probe now holds the managed-writer
-reservation. A physical rewrite retains it from planning through publication, so
-foreground ACK latency includes that work. This change establishes input
-stability; it does not qualify production write latency.
+A physical task holds the reservation from the second probe through commit
+or rollback. Managed writers can commit during independent B construction and
+merge. The nonempty indexed-rewrite check applies during capture, and ordinary
+SQL mutations are checked against the captured identity and snapshot.
 
 ## Regression coverage
 
-The native `automatic-planning-serialization` case pauses immediately after
-durable rewrite selection, before source capture. A managed mutation tries to
-delete every remaining row of that selected B. It must reach admission and
-remain blocked until the rewrite publishes. Queries captured before and after
-the mutation are checked against complete committed row versions. A subsequent
-fresh plan must retire the now fully masked segment, and exact receipt replay
-must preserve logical rows.
+The native `automatic-planning-serialization` case masks half of a single
+256-row source file and pauses after durable indexed rewrite selection, before
+source capture. A managed mutation reaches admission and waits to delete the
+remaining 128 rows. The test checks that the writer acquires the reservation
+after the rewrite commits and that the query results reflect the committed
+deletion. A subsequent plan retires the fully masked segment. Exact receipt
+replay checks the final logical rows.
 
 The same test against the preceding optimizer failed with `Managed writer
 entered a physical-maintenance snapshot`. It releases the paused worker before
@@ -53,7 +43,10 @@ checks typed F/T results, retires the fully masked B, checks the historical
 snapshot, builds the new F as B, and replays the first receipt. It complements
 the native checkpoint test, which exercises the concurrent planning window.
 
-## Local qualification on 2026-11-03
+## Local qualification of the original PR on 2026-11-03
+
+The measurements and test counts below came from the original PR head
+`33a0a62c` with its planning and validation code.
 
 The new native checkpoint failed against the preceding `86435518` optimizer
 and passed after the reservation change. The signed DuckLake provider was
@@ -113,7 +106,7 @@ pre-termination capture and records further investigation without closing the
 original stop.
 
 ```sh
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_sustained_load.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_sustained_load.py \
     --fixtures automatic --rows 512 4096 32768 --dimensions 8 128 --seconds 12 \
     --output-dir /tmp/vane-vortex-rewrite-planning
 ```

@@ -54,6 +54,7 @@ struct DuckLakeFunctionInfo : public TableFunctionInfo {
 	//! Start snapshot - only set for DuckLakeScanType::SCAN_INSERTIONS and DuckLakeScanType::SCAN_DELETIONS
 	unique_ptr<DuckLakeSnapshot> start_snapshot;
 
+	void SetScanType(TableFunction &function, DuckLakeScanType type);
 	shared_ptr<DuckLakeTransaction> GetTransaction();
 };
 
