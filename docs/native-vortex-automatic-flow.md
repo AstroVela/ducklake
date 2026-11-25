@@ -32,13 +32,13 @@ connection.execute("SELECT * FROM ducklake_enable_vortex_maintenance('lake',2,67
 
 mutation = (
     "SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn',?,"
-    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT)"
+    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT,?::VARCHAR)"
 )
 rows = [{'id': 1, 'embedding': [0.125, 0.0], 'category': 'A', 'payload': '实时向量'}]
-epoch = connection.execute(
-    "SELECT * FROM ducklake_vortex_request_status('lake','main','items','knn')"
-).fetchone()[1]
-request = ['request-1', rows, [], epoch]  # Retain this identity on retries.
+table_uuid, epoch = connection.execute(
+    "SELECT table_uuid, request_epoch FROM ducklake_vortex_request_status('lake','main','items','knn')"
+).fetchone()
+request = ['request-1', rows, [], epoch, table_uuid]  # Retain this identity on retries.
 receipt = connection.execute(mutation, request).fetchone()
 nearest = connection.execute(
     "SELECT * FROM ducklake_vortex_search('lake','main','items','knn',[0,0]::FLOAT[],10)"

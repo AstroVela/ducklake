@@ -26,8 +26,8 @@ def mutate(connection, request, rows, deletes=(), table="items", epoch=1):
     return WRITE.query_parameters(
         connection,
         "SELECT * FROM ducklake_mutate_vortex_batch('lake','main',?,'knn',?,"
-        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT)",
-        [table, request, rows, list(deletes), epoch],
+        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT,?::VARCHAR)",
+        [table, request, rows, list(deletes), epoch, WRITE.table_uuid(connection, table)],
     )[0]
 
 

@@ -800,6 +800,7 @@ void DuckLakeTransaction::Commit() {
 #ifdef DUCKLAKE_ENABLE_VORTEX
 		unique_ptr<DuckLakeVortexCollectionLock::Key> publication_guard, write_admission;
 		auto client = context.lock();
+		auto retirement = DuckLakeVortexTableRetirement::Get(*client, ducklake_catalog);
 		// A complete delete of a freshly flushed file can leave only staged metadata changes.
 		// A missing-key mutation also commits its receipt without adding a snapshot.
 		if (changes_made || !state->local_file_deletes.empty() ||
@@ -809,6 +810,10 @@ void DuckLakeTransaction::Commit() {
 #endif
 		if (changes_made) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
+			if (retirement) {
+				DuckLakeVortexOptimizer::CheckTableRetirement(*client, *this, *retirement);
+				retirement->Stage(*this);
+			}
 			if (DuckLakeVortexRewriteState::Get(*client)) {
 				DuckLakeVortexIndex::CheckRewriteCommit(*client, *this);
 			} else {
@@ -1540,6 +1545,10 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		if (rewrite) {
 			rewrite->check("rewrite_before_native_commit");
 		}
+		auto retirement = DuckLakeVortexTableRetirement::Get(*this->context.lock(), ducklake_catalog);
+		if (retirement) {
+			retirement->check("retire_before_native_commit");
+		}
 		auto write_batch = DuckLakeVortexWriteBatchState::Get(*this->context.lock(), ducklake_catalog);
 		if (write_batch && write_batch->caller.IsInterrupted()) {
 			throw InterruptException();
@@ -1549,6 +1558,12 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 	context.commit_connection = [&]() {
 		auto &metadata_catalog = Catalog::GetCatalog(*connection->context, ducklake_catalog.MetadataDatabaseName());
 		state->CommitMetadataConnection(*connection, metadata_catalog);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+		auto retirement = DuckLakeVortexTableRetirement::Get(*this->context.lock(), ducklake_catalog);
+		if (retirement) {
+			DuckLakeVortexOptimizer::FinishTableRetirement(*this->context.lock(), *retirement);
+		}
+#endif
 	};
 	context.try_rollback = [&]() {
 		if (connection->context->transaction.HasActiveTransaction()) {

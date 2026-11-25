@@ -26,12 +26,24 @@ DRIVER_ROWS = [
 ]
 
 
+def table_uuid(connection, table="items"):
+    result = query_parameters(
+        connection,
+        "SELECT t.table_uuid::VARCHAR AS uuid FROM __ducklake_metadata_lake.ducklake_table t "
+        "JOIN __ducklake_metadata_lake.ducklake_schema s ON t.schema_id=s.schema_id "
+        "WHERE t.table_name=? AND s.schema_name='main' AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL",
+        [table],
+    )
+    require(len(result) == 1, "Fixture requires one current table UUID")
+    return result[0]["uuid"]
+
+
 def batch(connection, request_id, rows, table="items", epoch=1):
     return query_parameters(
         connection,
         "SELECT * FROM ducklake_write_vortex_batch('lake','main',?,'knn',?,"
-        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::UBIGINT)",
-        [table, request_id, rows, epoch],
+        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::UBIGINT,?::VARCHAR)",
+        [table, request_id, rows, epoch, table_uuid(connection, table)],
     )[0]
 
 

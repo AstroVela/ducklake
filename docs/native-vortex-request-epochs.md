@@ -13,18 +13,18 @@ Earlier epochs fail with `EXPIRED_REQUEST`, including IDs never seen before.
 Future epochs fail too. Relabeling an old request with a new epoch creates a
 different operation identity.
 
-This contract applies within a stable table incarnation. The SQL function
-resolves the current qualified name at execution. A same-name drop and recreate
-starts a new scope at epoch 1. Coordinate such DDL with outstanding requests.
-Explicit caller-supplied table UUID fencing is a separate lifecycle change.
+Save the table UUID and epoch together when creating a request. Append, mutate
+and advance verify that UUID after resolving the qualified name. A recreated
+table starts at epoch 1 with a new UUID. Submitting the saved UUID to that table
+returns `STALE_TABLE`. [Table UUID lifecycle](native-vortex-table-uuid-lifecycle.md)
 
 ```sql
 SELECT * FROM ducklake_vortex_request_status('lake','main','items','knn');
 SELECT * FROM ducklake_mutate_vortex_batch(
     'lake','main','items','knn','request-1',
     [{'id':1,'embedding':[1,0]::FLOAT[],'category':'A','payload':'value'}],
-    []::BIGINT[],1::UBIGINT);
-SELECT * FROM ducklake_advance_vortex_request_epoch('lake','main','items','knn',1::UBIGINT);
+    []::BIGINT[],1::UBIGINT,'<saved-table-uuid>');
+SELECT * FROM ducklake_advance_vortex_request_epoch('lake','main','items','knn',1::UBIGINT,'<saved-table-uuid>');
 ```
 
 Status returns `table_uuid, request_epoch, retained_requests, catalog_requests`
@@ -52,8 +52,8 @@ existing T/F and source/index budgets, writer serialization, managed ownership,
 transaction protection and zero internal commit retries remain. A current
 receipt can still be retried at full capacity; explicit retirement releases
 logical receipt slots. This does not claim immediate file/WAL shrinkage or an
-overall metadata/RSS bound. Epoch rows follow table UUIDs and are not erased by
-receipt cleanup; table/reference/WAL lifecycles remain separate R5 work.
+overall metadata/RSS bound. Advancing an epoch retains its row. Explicit table
+retirement releases that UUID’s epoch and receipts in the table DROP transaction.
 
 ## Native layout and API
 

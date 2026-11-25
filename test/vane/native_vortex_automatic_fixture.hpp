@@ -12,6 +12,8 @@
 #include "storage/ducklake_vortex_write.hpp"
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -49,6 +51,8 @@ struct AutomaticObservation {
 struct AutomaticEvents {
 	std::mutex lock;
 	std::map<string, idx_t> stages;
+	std::condition_variable failed;
+	std::exception_ptr optimizer_failure;
 };
 
 inline duckdb_yyjson::yyjson_mut_val *AutomaticReceipts(vortex_detail::ViewJSON &json,
@@ -108,6 +112,7 @@ struct AutomaticFixture {
 	DuckDB &database;
 	Connection &setup;
 	string root;
+	const string table_uuid;
 	Model model;
 	std::map<idx_t, Model> models;
 	vector<AutomaticPlan> plans;
@@ -116,7 +121,7 @@ struct AutomaticFixture {
 	bool configured = false;
 
 	AutomaticFixture(DuckDB &db, Connection &connection, const string &path)
-	    : database(db), setup(connection), root(path) {
+	    : database(db), setup(connection), root(path), table_uuid(TableUUID(setup)) {
 		models.emplace(0, Model {});
 		SaveAcknowledged();
 	}
@@ -224,9 +229,9 @@ struct AutomaticFixture {
 		while (true) {
 			Connection owner(database);
 			try {
-				pending.receipt =
-				    DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", request,
-				                                     Rows(pending.rows), Deletes(pending.deletes), 1, observe);
+				pending.receipt = DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items",
+				                                                   "knn", request, Rows(pending.rows),
+				                                                   Deletes(pending.deletes), 1, table_uuid, observe);
 				break;
 			} catch (std::exception &error) {
 				auto message = StringUtil::Lower(error.what());
@@ -410,7 +415,7 @@ struct AutomaticFixture {
 			Connection owner(database);
 			auto result = DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn",
 			                                               plan.request, Rows(plan.rows), Deletes(plan.deletes),
-			                                               plan.receipt.request_epoch);
+			                                               plan.receipt.request_epoch, plan.receipt.table_uuid);
 			Require(result.snapshot_id == plan.receipt.snapshot_id &&
 			            result.payload_hash == plan.receipt.payload_hash &&
 			            result.table_uuid == plan.receipt.table_uuid && result.request_id == plan.receipt.request_id &&
@@ -543,6 +548,10 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		{
 			std::lock_guard<std::mutex> guard(events->lock);
 			events->stages[stage]++;
+			if (stage == "optimizer_before_error") {
+				events->optimizer_failure = std::current_exception();
+				events->failed.notify_all();
+			}
 		}
 		if (mode == "automatic-live" && stage == "optimizer_before_flush") {
 			before_flush->Stop();
@@ -604,36 +613,32 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		    "SELECT build_id,state,keep_generation FROM __ducklake_metadata_lake.ducklake_vortex_builds_v1 ORDER BY 1";
 		auto before = SQL(setup, builds)->ToString();
 		SQL(setup, "DETACH lake");
+		auto wait_for_failure = [&] {
+			std::unique_lock<std::mutex> guard(events->lock);
+			Require(events->failed.wait_until(guard, deadline, [&] { return bool(events->optimizer_failure); }),
+			        "Stale optimizer did not reject the rebound catalog");
+			return events->optimizer_failure;
+		};
 		if (nonlake_capture) {
 			SQL(setup, "ATTACH ':memory:' AS lake");
 			before_build->Release();
-			while (true) {
-				{
-					std::lock_guard<std::mutex> guard(events->lock);
-					if (events->stages["optimizer_before_error"]) {
-						break;
-					}
-				}
-				Require(std::chrono::steady_clock::now() < deadline,
-				        "Build capture accepted a non-DuckLake attachment");
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			}
+			wait_for_failure();
 			SQL(setup, "DETACH lake");
 		}
 		Attach(setup, root);
 		before_build->Release();
 		writer.reset();
-		while (true) {
-			auto p = DuckLakeVortexOptimizer::Status(*setup.context, "lake")[0];
-			if (StringUtil::Contains(p[14].ToString(), "catalog attachment changed")) {
-				Require(!p[16].GetValue<bool>() && p[15].GetValue<idx_t>() == (rebound_waiter ? 0 : 1) &&
-				            f.Index().revision == 1 && SQL(setup, builds)->ToString() == before,
-				        "Stale optimizer claimed, reconciled or published a build in the rebound catalog");
-				break;
-			}
-			Require(std::chrono::steady_clock::now() < deadline, "Stale optimizer did not reject the rebound catalog");
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		auto failure = wait_for_failure();
+		try {
+			std::rethrow_exception(failure);
+		} catch (const std::exception &error) {
+			Require(StringUtil::Contains(error.what(), "catalog attachment changed"), error.what());
 		}
+		auto p = DuckLakeVortexOptimizer::Status(*setup.context, "lake")[0];
+		Require(p[14].ToString().empty() && !p[16].GetValue<bool>() &&
+		            p[15].GetValue<idx_t>() == (rebound_waiter ? 0 : 1) && f.Index().revision == 1 &&
+		            SQL(setup, builds)->ToString() == before,
+		        "Rebound catalog inherited a stale optimizer task, error or publication");
 		f.Stop();
 		f.Replay();
 		std::cout << mode << ": optimizer rejected a new OID for the same bound metadata" << std::endl;
@@ -828,7 +833,7 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		bool rejected = false;
 		try {
 			DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "blocked",
-			                                 f.Rows({f.Row(10000, 1)}), f.Deletes({}), 1);
+			                                 f.Rows({f.Row(10000, 1)}), f.Deletes({}), 1, f.table_uuid);
 		} catch (std::exception &error) {
 			rejected = string(error.what()).find("RESOURCE_EXHAUSTED") != string::npos;
 		}

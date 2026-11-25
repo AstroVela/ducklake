@@ -3,7 +3,9 @@
 #include "duckdb/main/connection.hpp"
 #include "common/index.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
+#include "storage/ducklake_vortex_optimizer.hpp"
 #include <functional>
+#include <mutex>
 
 namespace duckdb {
 class ExtensionLoader;
@@ -42,6 +44,23 @@ struct DuckLakeVortexWriteBatchState : public ClientContextState {
 	bool keyed;
 };
 
+struct DuckLakeVortexTableRetirement : public ClientContextState {
+	DuckLakeVortexTableRetirement(DatabaseInstance &db, DuckLakeVortexCatalogIdentity identity, string uuid,
+	                              std::function<void(const string &)> check);
+	static shared_ptr<DuckLakeVortexTableRetirement> Get(ClientContext &context, const DuckLakeCatalog &catalog);
+	void Stage(DuckLakeTransaction &transaction) const;
+
+	DuckLakeVortexCatalogIdentity identity;
+	TableIndex table_id;
+	string uuid;
+	vector<DuckLakeVortexPolicyKey> optimizer_registrations;
+	std::function<void(const string &)> check;
+
+private:
+	unique_ptr<DuckLakeVortexCollectionLock::Key> write_admission, publication;
+	std::unique_lock<std::mutex> optimizer_metadata;
+};
+
 struct DuckLakeVortexWriteBatch {
 	static LogicalType RowsType();
 	static DuckLakeVortexCollectionLock &WriterLock();
@@ -54,23 +73,28 @@ struct DuckLakeVortexWriteBatch {
 	static DuckLakeVortexRequestAdvance AdvanceRequestEpoch(Connection &owner, ClientContext &caller,
 	                                                        const string &catalog, const string &schema,
 	                                                        const string &table, const string &index,
-	                                                        uint64_t expected_epoch,
+	                                                        uint64_t expected_epoch, const string &expected_table_uuid,
 	                                                        const std::function<void(const string &)> &observe = {});
 	static DuckLakeVortexWriteResult Append(Connection &owner, ClientContext &caller, const string &catalog,
 	                                        const string &schema, const string &table, const string &index,
 	                                        const string &request_id, const Value &rows, uint64_t request_epoch,
+	                                        const string &expected_table_uuid,
 	                                        const std::function<void(const string &)> &observe = {});
 	static DuckLakeVortexWriteResult Mutate(Connection &owner, ClientContext &caller, const string &catalog,
 	                                        const string &schema, const string &table, const string &index,
 	                                        const string &request_id, const Value &upserts, const Value &deletes,
-	                                        uint64_t request_epoch,
+	                                        uint64_t request_epoch, const string &expected_table_uuid,
 	                                        const std::function<void(const string &)> &observe = {});
+
+	static string RetireTable(Connection &owner, ClientContext &caller, const string &catalog, const string &schema,
+	                          const string &table, const string &expected_table_uuid,
+	                          const std::function<void(const string &)> &observe = {});
 
 private:
 	static DuckLakeVortexWriteResult Write(Connection &owner, ClientContext &caller, const string &catalog,
 	                                       const string &schema, const string &table, const string &index,
 	                                       const string &request_id, const Value &rows, const Value &deletes,
-	                                       bool mutate, uint64_t request_epoch,
+	                                       bool mutate, uint64_t request_epoch, const string &expected_table_uuid,
 	                                       const std::function<void(const string &)> &observe);
 };
 

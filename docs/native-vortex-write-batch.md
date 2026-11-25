@@ -19,17 +19,17 @@ native DuckDB-backed DuckLake catalog:
 connection.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
 write_sql = (
     "SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn',?,"
-    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::UBIGINT)"
+    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::UBIGINT,?::VARCHAR)"
 )
 rows = [
     {'id': 1, 'embedding': [0.125, 0.0], 'category': 'A', 'payload': '实时向量'},
     {'id': 2, 'embedding': [0.25, 0.0], 'category': None, 'payload': None},
 ]
-# Read once when creating a new request; persist this epoch with the request.
-epoch = connection.execute(
-    "SELECT * FROM ducklake_vortex_request_status('lake','main','items','knn')"
-).fetchone()[1]
-request = ['request-1', rows, epoch]
+# Save the table UUID and epoch when creating a request.
+table_uuid, epoch = connection.execute(
+    "SELECT table_uuid, request_epoch FROM ducklake_vortex_request_status('lake','main','items','knn')"
+).fetchone()
+request = ['request-1', rows, epoch, table_uuid]
 receipt = connection.execute(write_sql, request).fetchone()
 assert connection.execute(write_sql, request).fetchone() == receipt
 ```
@@ -52,7 +52,7 @@ new writes.
 
 For one table incarnation, request identity is `(table_uuid, request_epoch, request_id)`
 across aliases and renames. The lifecycle contract also covers
-[same-name table recreation](native-vortex-request-epochs.md#contract). Request IDs
+[same-name table recreation](native-vortex-table-uuid-lifecycle.md). Request IDs
 are compared byte for byte under the database's
 collation settings. A matching identity with different canonical content fails
 with `request_id payload mismatch`. An independent table may use the same

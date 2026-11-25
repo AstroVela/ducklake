@@ -18,10 +18,11 @@ struct KeyedFixture {
 	DuckDB &database;
 	Connection &setup;
 	string root;
+	const string table_uuid;
 	DuckLakeVortexIndex index;
 	Value rows, deletes;
 	KeyedFixture(DuckDB &db, Connection &connection, const string &path)
-	    : database(db), setup(connection), root(path),
+	    : database(db), setup(connection), root(path), table_uuid(TableUUID(setup)),
 	      rows(SQL(setup, "SELECT [{'id':0::BIGINT,'embedding':[0.125,0]::FLOAT[],'category':'A'::VARCHAR,"
 	                      "'payload':'更新'::VARCHAR},{'id':10000::BIGINT,'embedding':[0.25,0]::FLOAT[],"
 	                      "'category':NULL::VARCHAR,'payload':NULL::VARCHAR}]")
@@ -40,7 +41,7 @@ struct KeyedFixture {
 		                ->GetValue(0, 0);
 		Connection owner(database);
 		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "seed", seed,
-		                                 Value::LIST(LogicalType::BIGINT, {}), 1);
+		                                 Value::LIST(LogicalType::BIGINT, {}), 1, table_uuid);
 		SQL(setup, "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");
 		index = DuckLakeVortexIndex::BuildAndPublish(*setup.context, "lake", "main", "items", "knn",
 		                                             root + "/indexes/seed.json", 2, 1, nullptr, "", {},
@@ -59,14 +60,14 @@ struct KeyedFixture {
 	}
 	DuckLakeVortexWriteResult Mutate(Connection &owner, const std::function<void(const string &)> &observe = {}) {
 		return DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "change", rows,
-		                                        deletes, 1, observe);
+		                                        deletes, 1, table_uuid, observe);
 	}
 	DuckLakeVortexWriteResult DeleteMissing(Connection &owner, ClientContext &caller,
 	                                        const std::function<void(const string &)> &observe = {}) {
 		return DuckLakeVortexWriteBatch::Mutate(
 		    owner, caller, "lake", "main", "items", "knn", "absent",
 		    Value::LIST(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), {}),
-		    Value::LIST(LogicalType::BIGINT, {Value::BIGINT(99999)}), 1, observe);
+		    Value::LIST(LogicalType::BIGINT, {Value::BIGINT(99999)}), 1, table_uuid, observe);
 	}
 	DuckLakeVortexSearchResult Search(Connection &reader, const std::function<void(const string &)> &observe = {}) {
 		DuckLakeVortexViewOptions options {};
@@ -166,7 +167,7 @@ inline void CheckKeyedImmediateAttachments(KeyedFixture &fixture) {
 	        "Missing-key receipt changed with another attached lake");
 
 	auto append = DuckLakeVortexWriteBatch::Append(owner, *setup.context, "neighbor", "main", "items", "knn", "append",
-	                                               fixture.rows, 1);
+	                                               fixture.rows, 1, TableUUID(owner, "neighbor"));
 	Require(append.row_count == 2 &&
 	            SQL(setup, "SELECT count(*) FROM neighbor.items")->GetValue(0, 0).GetValue<idx_t>() == 2,
 	        "An unrelated lake blocked append in immediate transaction mode");
