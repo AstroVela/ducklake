@@ -1,0 +1,290 @@
+# DuckLake＋Vortex 总设计与 roadmap
+
+本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，以 **2026-11-25 的开发基线**为准。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
+
+本文是随代码维护的仓库总纲。初稿阅读副本见 [ChatGPT Page](https://chatgpt.com/space/page_0c2fa263e4dc81919bfaea100e8008cd)。
+
+**当前结论：本地原生基本链路已实现并通过端到端验证；持续写入下的长期维护稳态尚未完成。** 已支持提交后即时查询、后台 flush、独立 B 段构建、选择性合并、数据重写、受事务保护的 GC 和崩溃恢复。当前没有接入 SPFresh 原生在线增删改，也没有完成云端或分布式向量查询。
+
+## 1. 基线与设计范围
+
+实现基线为 `dev/ducklake-vortex` 的 `d0c3a5f7ffb9fa71591ac7b9b5a9de0ba517993b`。#71（`ff367dbd`）合入实际查询快照和维护计时，#72（`deb91458`）合入源保留查询优化和 worker 等待计时，#73（`dfd6bd30`）合入事务结束后的 GC 唤醒。#74 已将 policy/backlog 查询合并的撤回结论和历史证据链接合入开发分支，其生产 `src/` 与 `dfd6bd30` 一致。安装态回归及长测各自对应的提交见第 9 节。[开发基线](https://github.com/AstroVela/ducklake/commit/d0c3a5f7ffb9fa71591ac7b9b5a9de0ba517993b)
+
+当前限定：单进程独占 native DuckDB 元数据目录、本地受管 POSIX 文件、无分区／未加密的固定业务 schema、Float32 有限向量、平方 L2 距离。并发客户端与后台维护位于这一所有权范围内；多进程写者、跨主机 fencing、远程对象存储和分布式 ANN 不在当前验证范围。
+
+```sql
+CREATE TABLE lake.items (
+    id BIGINT,
+    embedding FLOAT[],
+    category VARCHAR,
+    payload VARCHAR
+);
+```
+
+受管写入要求非 NULL `id`；`category`、`payload` 可以为 NULL。当前不是任意 schema、距离度量或 SQL 谓词的通用向量优化器。
+
+本设计继承[原 Iceberg＋Vortex RFC](https://chatgpt.com/space/page_5ee0f8c698d08191a17198d45d152362)中“可查询增量＋不可变文件＋异步索引”的方向，以及参考 Qdrant 的 segment 生命周期和后台 optimizer 分工。实际落地改用 DuckLake 原生事务、inline 数据、删除可见性和元数据 WAL；原 RFC 的独立 WAL、HotVersions、Iceberg 物化与 ServingManifest 不能据此标为已实现。
+
+## 2. 总体架构与职责
+
+| 组件 | 当前职责 |
+| --- | --- |
+| DuckLake | 业务行与删除版本、事务快照、inline 数据、文件清单、写入回执、索引与维护元数据 |
+| Vortex 文件 | 保存落盘后的向量和业务列；保留可验证的物理文件身份 |
+| vortex-index／SPFresh | 从不可变物理输入构建、封存和查询静态 ANN generation |
+| ReadView | 固定一次查询的原生快照、B/F/T 分区、可见性及资源所有权 |
+| optimizer／maintenance | 阈值触发 flush、建索引、合并、重写，以及受预算限制的恢复与回收 |
+| Vane 原生 provider | 通过安装后的 `vane.connect()` 暴露 SQL 入口；C++ 经 Rust ABI 调用 Vortex 查询核心 |
+
+```mermaid
+flowchart TD
+    W[受管 upsert / delete 批次] --> D[DuckLake 原子提交：行、删除版本、回执]
+    D --> T[T：已提交 inline 向量]
+    D -->|直接落盘| F
+    T -->|后台 flush| F[F：尚无 ANN 的 Vortex 文件]
+    F -->|独立静态构建与原子发布| B[B1、B2、B3：已索引不可变段]
+    D --> R[捕获一个 committed ReadView]
+    T --> R
+    F --> R
+    B --> R
+    R --> Q[按同一可见性和 category 条件检索]
+    Q --> A[B：ANN；F/T：精确距离]
+    A --> K[统一排序、全局 top-k、同视图取业务列]
+    B --> C[选择性合并 / 数据重写 / 退休]
+    C --> G[事务与所有权保护下的 GC]
+```
+
+T/F/B 是**同一份逻辑数据在某个 ReadView 下的物理分区**，不要求客户端切换查询 API，也不要求最新写入等待 ANN 建成。F/T 的精确计算是预定查询路径；ANN 出错或结果不足不会触发扫描重试。
+
+## 3. 数据状态与身份
+
+| 状态 | 含义 | 查询方式 | 后台变化 |
+| --- | --- | --- | --- |
+| T | 已提交、尚未 flush 的 inline 数据 | 原始向量精确计算 | 达到策略阈值后 flush 到 F |
+| F | 已落 Vortex 文件、尚未被当前 B 覆盖 | 原始向量精确计算 | 达到阈值且至少 65 个物理行后构建 B |
+| B | 被已发布静态 generation 覆盖的文件集合 | 对可见且匹配的行执行 ANN，候选重新计算距离 | 选择性合并、数据重写、退休 |
+
+命名索引允许 **零 B**。空表、只有 T、只有小 F、首次构建中和多 B/F/T 都使用同一个命名查询。小尾部可以继续留在 T/F；不会为了建 ANN 填充数据或放宽 65 行下限。
+
+需要区分四种身份：
+
+- 业务 `id` 表示逻辑键；受管写入中每个键只有一个当前版本。
+- DuckLake `snapshot_id` 决定查询可见的逻辑版本，也包括只改变物理布局的快照。
+- 文件 ID、URI、内容摘要、物理行数及行地址标识实际索引输入；绑定还校验表 UUID、向量字段 ID、类型、维度和距离度量。
+- 索引 catalog revision 与 generation 标识索引发布状态；它们不等于业务快照号，也不使索引自动拥有最新删除可见性。
+
+当前 catalog 使用严格的 manifest-v3 表示，支持零 B；格式或绑定不匹配直接失败，不提供旧格式兼容解码。详见[基本链路](native-vortex-basic-flow.md)、[多 B 段](native-vortex-segments-proof.md)及[原生 ReadView 实现](../src/storage/ducklake_vortex_read_view.cpp)。
+
+## 4. 写入、ACK 与幂等
+
+推荐业务入口是显式注册后的受管 mutation API：
+
+1. 初始化索引、optimizer 和写入 catalog，在空表建立带维度的零 B 定义。
+2. 调用 `ducklake_manage_vortex_writes` 注册空表所有权；配置写入预算与后台策略。
+3. 调用 `ducklake_mutate_vortex_batch`，提交请求 ID、完整 upsert 行和待删除 ID。
+4. 在同一原生事务内删除旧版本、插入 upsert 新行并登记回执，提交后返回 ACK。原生内联策略决定新行在提交时位于 T，还是直接落盘进入 F。仅删除的批次处理删除与回执。
+
+upsert 是整行替换。一个批次内 upsert/delete 的 ID 必须非 NULL 且互不重复。同一个 ID 同时出现在两类操作中会失败。回执包含 `table_uuid, request_id, payload_hash, row_count, snapshot_id`；`row_count` 是请求操作数，删除不存在的键也计入。没有实际数据变化的删除可沿用当前快照号，但回执仍持久提交。
+
+幂等身份为 `(table_uuid, request_id)`。相同内容重试返回原回执；更改内容复用请求 ID 会失败。重放旧 upsert 不会复活后来删除的数据，重放旧 delete 不会删除后来新写入的版本。提交冲突向客户端返回，内部提交重试次数为零；客户端可在新事务中显式重提同一请求。
+
+受管表拒绝普通 SQL INSERT/UPDATE/DELETE、append API，以及 schema、rename、drop 变更；flush、重写与回收通过已有内部授权路径执行。非受管表保留普通 SQL／append 语义。这里复用 DuckLake 原生 MVCC 和元数据 WAL，没有第二份写入 WAL 或独立的逐键版本目录。
+
+回执记录上限为**每个元数据 catalog 合计 100,000 条**，没有自动过期。快照过期和源文件 GC 不会删除回执；必须在扩大长期写入范围前确定回执保留与过期请求的语义。详见[受管写入](native-vortex-keyed-writes.md)和[写入实现](../src/storage/ducklake_vortex_write.cpp)。
+
+## 5. 一次查询如何覆盖 B/F/T
+
+查询捕获一个独立的 committed ReadView。该视图一次固定源文件、已提交 T 行、原生删除可见性、B generation 和资源所有权。查询使用请求中的业务条件过滤该视图。
+
+执行顺序：
+
+1. 校验当前索引定义与物理输入绑定，把源数据划分为互不重叠的 B、F、T。
+2. 在各分支 top-k **之前**应用该快照的删除可见性和业务过滤条件。
+3. 每个 B 查询静态 ANN；F/T 对原始向量计算平方 L2 距离。
+4. 用所持有的向量重新计算 B 候选距离，与 F/T 合成一个全局 top-k，按稳定物理行顺序打破距离相同的平局。
+5. 从同一个 ReadView 取回类型化业务列，避免向量来自旧版本而 payload 来自新版本。
+
+例如，B 中旧 `id=7` 被 upsert 后，旧物理行先被可见性过滤，新行在它所在的 T 或 F 分区参与检索。该机制保证版本与过滤正确性，ANN 召回率仍需要独立测量，结果可以少于 k。
+
+```sql
+SELECT id, embedding, category, payload, distance
+FROM ducklake_vortex_search(
+    'lake', 'main', 'items', 'knn', [0,0]::FLOAT[], 10,
+    category => 'A');
+```
+
+当前只有命名参数 `category` 的区分大小写等值条件是原生业务预过滤；外层 SQL `WHERE` 只过滤已返回命中，不等价于任意谓词下推后的 top-k。
+
+`ducklake_vortex_search_diagnostics` 使用同一执行结果，固定返回一行，由 JSON 文本 `diagnostics` 和类型化 `hits` 列表组成。即使零命中也能记录实际 `native_capture.snapshot_id`，供验证 oracle 选择本次调用捕获的版本。普通 search 返回上面的五个业务／距离列。[实际查询快照回归](../test/vane/test_vane_native_vortex.py)
+
+已捕获视图持有源字节、T 行和私有 generation lease。规范路径上的文件或索引经过 GC 后，旧视图仍可查询和延迟取列；新视图必须重新验证当前文件。当前会持有／复制受限输入，尚未完成大规模完全 out-of-core ANN 查询。详见[原生 ReadView 验证](native-vortex-read-view-proof.md)及[SQL 查询入口](../src/functions/ducklake_vortex_search_function.cpp)。
+
+## 6. 后台索引与物理维护
+
+### 6.1 独立构建与原子发布
+
+普通追加只把新 F 构建为 B₂，保留 B₁ 的 generation、描述符、产物内容和修改时间。B₁ 的身份校验仍有读取成本；“不重建旧 B”不表示发布过程完全不访问旧 B。
+
+重型构建在元数据事务和发布锁之外执行。候选 generation 经过封存、输入／产物校验，再以 expected revision CAS 原子发布完整段集合。失败、取消或并发发布冲突不会暴露半套索引。发布成功但响应丢失时，恢复检查持久发布身份，不重复构建已经提交的 generation。
+
+### 6.2 三段预算下的选择性合并
+
+当前最多三个 B，所有段共享物理行、源字节、向量字节与产物预算。optimizer 先处理符合策略的重写、裁剪或退休，其次处理达到阈值的 flush，再检查 F 是否达到建索引条件。进入建索引阶段时，如果段槽已满，先选择两个最小 B 做独立合并，未选中的 B 保持不变。后续任务重新检查输入，再将 F 构建成新 B。
+
+索引合并保留源文件与物理行地址，因此**不会释放已删除版本占用的源物理容量**。显式全量重建仍可由操作员调用；普通增量路径不依赖每次重建全部 B。
+
+### 6.3 数据重写、稀疏段与退休
+
+启用数据 compaction 策略后，按已有阈值选择可回收候选：
+
+| 选中 B 的剩余可见行 | 计划 |
+| --- | --- |
+| 0 | 退休该 B；源文件继续遵守原生快照保留规则 |
+| 1–64 | 显式重写为 F，不构建 SPFresh generation |
+| 至少 65 | 重写可见源数据并构建替代 B |
+
+整文件已不可见时还可走已验证的文件裁剪路径。原生文件清单和索引引用在同一发布事务更新，未选中 B 不变。`rewrite_f` 在规划时显式选择，不由 ANN 失败触发。
+
+flush 或物理重写先取得现有受管写者 reservation，再重新探测和登记任务，持有至提交或回滚。这样既能计入等待期间提交的 mutation，也能保护重新选定的输入。该范围会影响前台 ACK 等待。独立 B 构建和索引合并允许受管写者继续提交。当前没有生产写延迟保证。
+
+详见[选择性合并](native-vortex-segment-merge-proof.md)、[索引与数据重写](native-vortex-index-rewrite-proof.md)、[稀疏 B→F](native-vortex-sparse-rewrite-proof.md)、[文件裁剪](native-vortex-prune-files-proof.md)及[规划串行化](native-vortex-rewrite-planning.md)。
+
+## 7. GC、事务保护与崩溃恢复
+
+### 7.1 三类回收与共享预算
+
+maintenance 复用现有单 worker，对 build 恢复／回收、退休 generation、源快照／文件回收共享每轮对象与字节预算，并轮换首先服务的类别。预算计算完成的回收对象／字节，不是所有校验读取、WAL 写入、线程数或进程 RSS 的上限。文件大于剩余字节预算时继续待处理，不绕过预算删除。
+
+源保留策略默认关闭，显式开启后是 **catalog 范围**，会影响同 catalog 的非向量 DuckLake 表。快照保留数量与最小年龄必须按业务设置；测试中的保留两个快照、年龄零不属于生产建议。
+
+### 7.2 删除前重新检查
+
+源 collector 按以下顺序关闭入口：**publication exclusive → ReadView capture admission exclusive → transaction-start gate exclusive → 普通事务检查**。readiness 探测不能代替删除前的独立检查；仍有普通事务就暂缓，不穿透长事务删除文件。
+
+源保留启用后，worker 用 `EXISTS` 探测是否有可过期快照、排队文件或持久删除意图。就绪检查排除有限 ReadView 和 source-status capture 的私有事务。实际回收仍会收紧 capture admission，等正在进行的 capture 结束，再保护事务入口并重新检查。[有限 status 读取](native-vortex-status-read-admission.md)
+
+只回收原生删除队列和持久删除意图登记的受管文件，不扫描目录后猜测 orphan。删除前校验受管根目录、路径／文件类型、引用、文件身份、大小与 SHA-256，拒绝符号链接等不满足所有权条件的对象。意图先提交，再 unlink 并同步父目录，最后原子确认队列、意图和统计。仅已登记意图允许恢复时处理“文件已不存在”。
+
+### 7.3 事务结束后的唤醒
+
+#73 在观察到阻塞事务时原子登记一次性回调。观察到的事务首次结束后，在事务管理器锁外通知 worker；通知只请求重新探测，不授权 GC。新的／剩余事务、引用和文件身份仍需重新检查。
+
+回调绑定弱 runtime 引用和 maintenance profile 身份，取消或被新 registration 取代后忽略。wake epoch 防止通知发生在探测结束与进入等待之间而丢失；既有 100 ms idle wait 和预算保持不变。
+
+### 7.4 维护观测
+
+源保留 status 在同一事务内先读取策略，再汇总可过期快照、排队文件和删除意图。按 #74 的 A/B 结论，maintenance policy 与实际 build/generation backlog 在同一元数据事务内由两条语句分别读取。[维护查询 A/B 决策](native-vortex-maintenance-probe-ab.md)
+
+`ducklake_vortex_maintenance_profile('lake')` 按湖与元数据挂载标识读取进程内计数。已有 profile 时返回 18 个阶段，包含维护各阶段、`loop_wait_timeout`、`loop_wait_wake` 和 `source_transaction_wake`，每行给出 `profile_id`、`stage`、`calls`、`total_ns` 与 `max_ns`。事务结束唤醒在完成事务的线程上计时，可与 worker 活动重叠。父阶段也包含子阶段耗时，用这些指标可定位耗时来源。[维护阶段实现](../src/storage/ducklake_vortex_optimizer.cpp)
+
+### 7.5 持久状态与恢复边界
+
+原生元数据保存命名索引、generation／引用、build／rewrite 所有权、optimizer／maintenance 策略、写预算、受管表、请求回执、源保留策略和删除意图。候选产物与删除意图遵守持久登记协议，不把任意残留目录当作可接管工作。
+
+提交前失败回滚，提交后丢失 ACK 通过回执／发布身份核对。原生元数据 WAL 恢复已提交状态；进程重启本身不启动后台工作，需要显式 `ducklake_resume_vortex_optimizer` 和 `ducklake_resume_vortex_maintenance`。错误或取消停止对应调度；resume 重新检查持久状态和输入，不静默重放失败任务。
+
+详见[源保留与删除协议](native-vortex-source-retention.md)、[事务完成唤醒](native-vortex-transaction-gc-wakeup.md)、[自动全链路与 SIGKILL](native-vortex-automatic-flow.md)。早期 proof 中被后续更改的锁顺序、段数或 manifest 版本，以本基线代码及后续文档为准。
+
+## 8. 资源边界与运行入口
+
+以下是当前原型的硬边界，不是生产容量承诺：
+
+| 项目 | 当前边界 |
+| --- | --- |
+| 向量 | Float32，有限分量，维度 1–4096，平方 L2 |
+| 查询 k | 1–64 |
+| 新建 SPFresh B | 65–100,000 个物理行，并满足其他全局预算 |
+| B 段数 | 每个命名计划最多 3 个 |
+| 物理行／向量 | 全局最多 100,000 行、64 MiB 向量；维度 d 的行上限还受 `floor(64 MiB / (4*d))` 约束 |
+| 编码源／索引产物 | 分别全局 64 MiB，不按 B 段数倍增 |
+| catalog manifest | 1 MiB |
+| mutation 批次 | 1–1,000 个操作，规范化内容最多 4 MiB |
+| 请求回执 | 每个元数据 catalog 合计 100,000 条，不自动过期 |
+| T/F 写入配额 | 显式配置；提交前对现有物理输入和保留 inline 版本重新 admission |
+
+没有扩大预算就支持无限数据增长的结论。源／索引 GC 排空也不等于总磁盘有界：回执、原生元数据／WAL、调用方 reference JSON 有独立生命周期。上述输入限额同样不构成进程 RSS 上限。
+
+安装后入口、provider 组合及完整配置步骤见 [Vane 原生接入](vane-native-vortex-proof.md)和[自动链路示例](native-vortex-automatic-flow.md)。当前验证使用非 editable 安装、匹配的 Vane／DuckLake／Vortex providers 和显式 `VANE_RUNNER=local`。本向量路径使用原生 C++／Rust 调用，不为每次查询启动 Python 子进程或进行 JSON 文件交接。普通 DuckLake 的其他 Ray 读路径不等于本设计的分布式 ANN 已接通。
+
+当前依赖身份以 [`vane-native-vortex.toml`](../vane-native-vortex.toml)、[Rust 依赖](../src/vortex_query/Cargo.toml)及 [native CI workflow](../.github/workflows/VaneNativeVortex.yml)为准。历史 proof 的 pin 表对应当次验证。B 段的 ANN 使用 `feat/vortex-index` 分支演进出的 `vortex-index`／`vortex-index-spfresh` 实现。
+
+## 9. 已有验证与仍未关闭的问题
+
+### 9.1 当前实现的确定性验证
+
+#73 的移植候选 `7d8714f8` 使用测试签名 provider 完成安装态验证，包括 59 个 native source 用例、13 个 maintenance 用例及 99 项 maintenance、optimizer 和 source retention SQL fixture 检查。基本链路、批量写入、受管写入、自动维护和停滞诊断套件也通过。候选与合入提交 `dfd6bd30` 的代码树一致，后续 `d0c3a5f7` 的差异仅涉及文档。[#73 确定性检查](native-vortex-transaction-gc-wakeup.md#deterministic-checks)
+
+项目的分项验证覆盖独立 B₂ 构建并保留 B₁、原子发布竞争、取消、实际 SIGKILL、提交后丢 ACK、旧请求重放、普通事务阻止 GC，以及旧 ReadView 在规范文件／generation GC 后继续查询。#73 另外覆盖等待前提交与回滚、剩余阻塞、就绪后新读者、取消与替换 registration。对应入口见第 12 节。
+
+### 9.2 历史安装验证与 30 分钟观察
+
+旧堆栈提交 `2a937706` 在撤回查询合并后完成当时的安装态验证，包括 38 个 native source 用例、13 个 maintenance 用例、261 个 SQL assertion block、11 个快照／计时 oracle 测试、5 个文件计量测试和 4 个 A/B 分析测试。同一次资格验证的 Vane base launcher 分进程通过 1,222 个非 Ray 和 32 个 Ray 测试，另有 15 个可选依赖跳过。[历史安装验证](https://github.com/AstroVela/ducklake/blob/2a9377062cddc0c222d8dd99e4d5efee3a298c76/docs/native-vortex-maintenance-probe-ab.md#final-installed-qualification-after-withdrawal)
+
+下表对应旧堆栈提交 `9819016e` 的独立本地 trace。配置为 512 个活跃键、8D、4 个读者，maintenance 每轮 2 对象／64 MiB，T/F 配额分别为 256／1,024 行与 4／64 MiB。当前开发基线的 30 分钟稳态验证继续暂缓。[历史长测](https://github.com/AstroVela/ducklake/blob/9819016e841ea79c8eea054415f4724fa2270e85/docs/native-vortex-transaction-gc-wakeup.md#complete-thirty-minute-observation)
+
+| 指标 | 观察 |
+| --- | --- |
+| 实际写入阶段 | 1,800.275 秒 |
+| 成功批次／mutation 操作 | 1,633／261,280，无拒绝尝试 |
+| 查询 | steady 76,160；含 drain 76,595 |
+| 实际 ReadView 快照／跨提交窗口查询 | 4,900／4,948 |
+| Canary／exploration 最低召回 | 1.0／0.9，均通过既有 0.8 门槛 |
+| 停写后 drain | 63.003 秒，通过 90 秒门槛；源快照／删除队列／意图排空 |
+| 最终逻辑行／旧请求重放 | 512 行，均通过 |
+| 写入结束 eligible snapshot 积压／峰值 | 613／614 |
+| 写入阶段积压拟合斜率 | **+16.95 个快照／分钟** |
+
+该次历史长测在停写后排空，写入阶段的 eligible snapshot 积压仍在增长，**长期维护稳态仍待验证**。写入期间 source GC 的 wall time 为 192.593 秒，元数据和快照过期计时分别为 73.707 秒和 70.551 秒。父阶段覆盖子阶段的执行时间，各项用于定位后续实验需要测量的工作。
+
+### 9.3 已撤回实验与开放故障
+
+#74 在旧堆栈的同一只读元数据与任务输入下做 6 个 case、3,840 次主要探测的交替配对 A/B。中／大规模四个 case 的完整读探测中位收益只有 0.17%–1.26%，未满足预设保留标准。开发分支采用撤回结论，完整基准、测试和原候选的长测留在各自归档提交。实际 `DeleteSnapshots` 和整轮 maintenance 的成本需要在执行回收的实验中测量。[受控 A/B 的判定及归档](native-vortex-maintenance-probe-ab.md)
+
+一份早期 512 行／8D 混合负载发生无完成事件的停滞，缺少失败现场栈，仍待定位。后续重放及历史长测完成，原始停滞需要失败栈或确定性回归才能关闭。现有受控栈采集和 watchdog 负责保留现场证据。[开放停滞诊断](native-vortex-stall-diagnostics.md)
+
+当前没有与 Turbopuff 同数据／同硬件／同质量门槛的对照结果，也不能把这些小规模 fixture 的召回推广为任意数据集的质量保证。
+
+## 10. 统一 roadmap
+
+本表按 DuckLake 实际路线编号。R0–R3 已合入 `dev/ducklake-vortex`，验证范围以第 1、8、9 节为准。R4 的退出条件包括持续写入期间的清理进展。
+
+| 阶段 | 目标与当前状态 | 退出条件／剩余工作 |
+| --- | --- | --- |
+| R0 原生文件与静态索引 | **已实现并验证**：Vortex 文件、物理身份、静态 SPFresh、原生 ABI、命名索引 | 保持 provider 与依赖闭包可重建，产品发布单独验收 |
+| R1 实时基本链路 | **已实现并验证**：零 B、即时 T/F 查询、受管 upsert/delete、回执、ReadView、写入背压 | 固定 schema／单进程范围内已有端到端及恢复证据 |
+| R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
+| R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
+| R4 长期维护稳态 | **当前优先项，未完成**。已合入查询实际快照诊断、确定性快照验证、维护阶段观测和事务结束唤醒。历史长测通过停写后 drain，写入期积压仍在增长 | 验证历史增长下实际 GC 的成本和持续写入时的清理速率，关闭历史开放停滞。当前基线的 30 分钟稳态验证暂缓 |
+| R5 容量与产品契约 | **待完成**：更大／更高维／更广过滤负载、质量与延迟、生命周期 | 明确回执保留及过期请求、reference／WAL 管理、容量 admission；按目标负载决定 schema／度量／过滤扩展 |
+| R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
+| R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
+
+原 RFC 的静态索引、实时可见、B/F/T、compaction／GC 目标在 R0–R3 有对应实现；其 Iceberg 专属物化、云端 fencing 和分布式 serving 并未因 DuckLake 本地链路通过而完成。保留原 RFC 作为历史来源，本文件作为 DuckLake 路线的总纲。
+
+可增量接收业务更新的链路已实现。新版本提交后位于 T 或 F，T 经 flush 进入 F，F 可构建成独立的静态 B。SPFresh 原生在线更新是 R7 的候选路线。
+
+## 11. R4 下一步验证
+
+**先验证实际 source GC 的可重放输入和回收结果，再测 `DeleteSnapshots` 的完整成本。** #74 的结果适用于只读探测，实际回收会修改输入。
+
+1. 从同一检查点恢复独立的元数据和文件副本，保持受管路径与文件身份有效。固定事务时序，核对实际执行 `DeleteSnapshots` 的候选快照、受保护快照、文件队列、删除意图与回收结果。
+2. 沿用普通事务、旧 ReadView、取消、崩溃及所有权检查，保持现有对象／字节、T/F 和查询预算。按不同历史规模重放时固定逻辑数据、文件、保留策略和任务输入。
+3. 在负载稳定时按预先声明的顺序和计时区间比较。记录候选选择、可见性／引用 SQL、快照过期、意图提交、产物校验、unlink／sync、最终确认及整轮耗时。按现有 profile 解释父子阶段的重叠，区分性能主样本和附加诊断。
+4. 选择一个有测量证据的热点做验证性改动，沿用现有格式和出错语义。候选达到预设收益后保留，未达门槛时记录结果并撤回改动。
+5. 30 分钟稳态验证继续暂缓。当前长测工具按三个阶段运行，通过查询前后的提交水位进行验证。恢复前先让长测使用查询实际捕获的 ReadView 快照，对齐历史稳态阶段和写入节奏，并将 canary 与 exploration 的 recall ≥0.8 都设为通过条件。保留 90 秒 drain、最终行和旧回执检查。用更长且重复的运行检查后半程积压斜率、清理速率和资源增长，确认维护能跟上持续写入。[当前长测工具](../test/vane/test_vane_vortex_sustained_load.py)
+
+R4 关闭后再扩大 R5 的负载／容量范围；R6 需要独立远程与分布式设计，R7 按收益证据决定。此处不以调整保留策略、提高预算或降低质量门槛代替完成验证。
+
+## 12. 文档与实现导航
+
+| 入口 | 用途 |
+| --- | --- |
+| [基本链路](native-vortex-basic-flow.md)／[安装态入口](vane-native-vortex-proof.md) | 从空表到 T/F/B 的命名 SQL 查询 |
+| [受管写入](native-vortex-keyed-writes.md)／[自动全链路](native-vortex-automatic-flow.md) | 业务 mutation、配置、幂等与自动维护 |
+| [多 B](native-vortex-segments-proof.md)／[选择性合并](native-vortex-segment-merge-proof.md) | 静态索引的增量组织与段预算 |
+| [数据重写](native-vortex-index-rewrite-proof.md)／[稀疏重写](native-vortex-sparse-rewrite-proof.md) | 回收被替换／删除版本的物理容量 |
+| [源保留](native-vortex-source-retention.md)／[事务唤醒](native-vortex-transaction-gc-wakeup.md) | 文件删除、读者保护、确定性回归与历史长测入口 |
+| [查询快照回归](../test/vane/test_vane_native_vortex.py)／[计时 SQL 入口](../src/functions/ducklake_vortex_optimizer_function.cpp)／[A/B 决策](native-vortex-maintenance-probe-ab.md) | 实际查询版本、当前阶段观测与已撤回实验 |
+| [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
+
+后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。
