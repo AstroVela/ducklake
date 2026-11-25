@@ -95,7 +95,7 @@ public:
 	void SetSortData(unique_ptr<DuckLakeSort> sort_data);
 	shared_ptr<DuckLakeTableStats> GetTableStats(ClientContext &context);
 	shared_ptr<DuckLakeTableStats> GetTableStats(DuckLakeTransaction &transaction);
-	idx_t GetNetDataFileRowCount(DuckLakeTransaction &transaction);
+	optional_idx GetExactDataFileRowCount(DuckLakeTransaction &transaction);
 	idx_t GetNetInlinedRowCount(DuckLakeTransaction &transaction);
 
 	//! Gets the top-level not-null fields

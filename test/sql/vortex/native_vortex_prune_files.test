@@ -72,7 +72,13 @@ SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',ge
 Invalid Vortex rewrite revision
 
 statement ok
+CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')
+
+statement ok
 DELETE FROM lake.items WHERE id=128
+
+statement ok
+SET VARIABLE prune_delete_start=(SELECT max(snapshot_id) FROM lake.snapshots())
 
 statement error
 SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/partial.json',2)
@@ -91,18 +97,94 @@ statement ok
 DELETE FROM lake.items WHERE id>=128 AND id<256
 
 statement ok
-CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')
-
-statement ok
 INSERT INTO lake.items VALUES(9999,[0.0625,0],'A','实时-T')
 
 statement ok
 CREATE TABLE prune_expected AS SELECT rowid,id,embedding,category,payload FROM lake.items
 
+statement ok
+SET VARIABLE prune_before=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+statement ok
+CREATE TEMP TABLE prune_changes_before AS SELECT * FROM ducklake_table_changes('lake','main','items',getvariable('prune_delete_start'),getvariable('prune_before'))
+
+query II
+SELECT count(*) FILTER (WHERE change_type='delete'),count(*) FILTER (WHERE change_type='insert') FROM prune_changes_before
+----
+128	1
+
+statement ok
+BEGIN TRANSACTION
+
+statement error
+SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/pruned.json',2)
+----
+Vortex prune controls require autocommit
+
+statement ok
+ROLLBACK
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_prune.ducklake' AS lake (READ_ONLY)
+
+statement error
+SELECT * FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/pruned.json',2)
+----
+Vortex prune controls require a writable DuckLake attachment
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_prune.ducklake' AS lake (DATA_INLINING_ROW_LIMIT 100)
+
+query IIIII
+SELECT revision,(SELECT max(snapshot_id) FROM lake.snapshots())=getvariable('prune_before'),
+    (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL),
+    (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_builds_v1),
+    (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1)
+FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1
+----
+2	true	3	0	0
+
 query I
 SELECT revision FROM ducklake_prune_vortex_index_segment('lake','main','items','knn',getvariable('prune_generations')[1],'__WORKING_DIRECTORY__/__TEST_DIR__/pruned.json',2)
 ----
 3
+
+statement ok
+SET VARIABLE prune_snapshot=(SELECT max(snapshot_id) FROM lake.snapshots())
+
+query III
+SELECT
+    (SELECT count(*) FROM ducklake_table_insertions('lake','main','items',getvariable('prune_snapshot'),getvariable('prune_snapshot'))),
+    (SELECT count(*) FROM ducklake_table_deletions('lake','main','items',getvariable('prune_snapshot'),getvariable('prune_snapshot'))),
+    (SELECT count(*) FROM ducklake_table_changes('lake','main','items',getvariable('prune_snapshot'),getvariable('prune_snapshot')))
+----
+0	0	0
+
+query I
+WITH prune_changes_after AS (
+    SELECT * FROM ducklake_table_changes('lake','main','items',getvariable('prune_delete_start'),getvariable('prune_snapshot'))
+)
+SELECT count(*) FROM (
+    (SELECT * FROM prune_changes_before EXCEPT ALL SELECT * FROM prune_changes_after)
+    UNION ALL
+    (SELECT * FROM prune_changes_after EXCEPT ALL SELECT * FROM prune_changes_before)
+)
+----
+0
+
+query III
+SELECT
+    (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1 WHERE data_file_id=1),
+    (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file WHERE data_file_id=1 AND end_snapshot=getvariable('prune_snapshot')),
+    (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file WHERE data_file_id=1 AND end_snapshot IS NULL)
+----
+1	1	0
 
 query II
 SELECT sum(record_count),count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL
