@@ -1,16 +1,40 @@
-# Filename prefilter: path oracle and matched-object A/B
+# Filename prefilter experiment and current reference identity
+
+The historical [matched-object A/B](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/docs/native-vortex-filename-prefilter.md#result-withdraw-the-candidate)
+withdrew the candidate. The two target cases improved, while the
+4,096-inline expiry control regressed by 3.8398% against a 2% limit. The
+archived candidate and runner remain at the original PR revision.
+
+## Current reference identity
+
+The current `HasFileReference` resolves local paths and checks access before
+comparing directory-entry identity. A metadata reference with a different
+filename can resolve through a leaf symlink to the same target. Resolution
+can also raise an error. A filename check on the unresolved path would skip
+both outcomes.
+
+The installed [source retention suite](../test/vane/test_vane_vortex_source_retention.py)
+runs a deterministic `filename-reference` case in the
+[native driver](../test/vane/native_vortex_source_driver.cpp). It replaces a
+single stored source path in a temporary metadata transaction. With only a
+differently named leaf alias in metadata, the current handler finds the
+reference. A distinct nonexistent path returns false. With a differently
+named cyclic link in metadata, the handler propagates the resolution error.
+Rollback restores the original registration, which remains queryable.
+The existing source-collection cases continue to exercise ownership,
+reader protection, cancellation, recovery and the object/byte budgets.
+
+## Historical trial
 
 The [reference-call diagnostic](native-vortex-reference-diagnostics.md) measured
-30.637 ms in path extraction/canonicalization/comparison for the large file-GC
-input. This trial adds a necessary filename-suffix condition before the existing
-full canonical-path equality check. It preserves each transaction's full metadata
-query, historical/native/delete/index references, ownership, deletion intents,
-ordinary-reader deferral and object/byte budgets. No reference cache or error
-fallback is introduced.
+30.637 ms in path extraction, lexical canonicalization and comparison for its
+historical large file-GC input. That work motivated the candidate below on the
+old lexical path implementation. The current proof above exercises the
+integrated filesystem semantics.
 
-## Candidate and independent oracle
+### Candidate and independent oracle
 
-The [helper](../test/vane/common/ducklake_filename_prefilter.hpp) handles remote
+The [helper](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/test/vane/common/ducklake_filename_prefilter.hpp) handles remote
 paths with their existing identity semantics before requesting a filesystem
 separator. For local paths it obtains that filesystem's separator and inspects
 the final raw component. Empty, `.` and `..` endings remain eligible for the
@@ -19,14 +43,14 @@ canonical target; otherwise equality is impossible. A suffix match is only a
 necessary condition, never sufficient proof of a reference. This conservative
 form also preserves unusual separator/root-prefix behavior.
 
-The [private patch](../test/vane/filename_prefilter.patch) inserts this condition
+The [private patch](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/test/vane/filename_prefilter.patch) inserts this condition
 in the actual `HasFileReference` loop. Retained rows still execute the original
-canonicalization/equality expression. The production implementation is unchanged
-in this validation Draft; the trial supplies a concrete candidate for review.
+canonicalization/equality expression. The trial compiled the candidate in a private executable. The production
+implementation retained the original check.
 
-The [compiled oracle](../test/vane/native_vortex_filename_oracle.cpp) compares the
+The [compiled oracle](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/test/vane/native_vortex_filename_oracle.cpp) compares the
 helper plus original check against DuckDB's native canonicalizer. The
-[independent Python model](../test/vane/test_vane_vortex_filename_oracle.py) derives
+[independent Python model](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/test/vane/test_vane_vortex_filename_oracle.py) derives
 expected canonical paths without using the prefilter. The frozen case generator
 produces **53,322 raw/target/separator cases per executable**, including relative
 and absolute paths, aliases, repeated filenames, empty paths, `.`, `..`, trailing
@@ -48,10 +72,10 @@ During oracle development the independent model initially missed native
 change. The accepted full oracle completes in 25.400 seconds. No performance
 samples were collected before the oracle passed.
 
-## Protocol frozen before A/B sampling
+### Protocol frozen before A/B sampling
 
 Commit this protocol, trial builder, oracle, sampler and analysis checks before
-the one formal run. The [builder](../test/vane/build_vortex_filename_trial.py)
+the one formal run. The [builder](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/test/vane/build_vortex_filename_trial.py)
 requires exact original metadata-source SHA-256
 `97a4b1cf7d1a00c7846a974fee77647649c8b18c7ae6ae254097b9d474ffe96e`.
 It compiles complete baseline/candidate metadata objects with the same compiler,
@@ -62,14 +86,14 @@ archives. Benchmark, oracle and native source-guard binaries share these objects
 This removes the old archive-versus-explicit-object difference between sides.
 
 Use explicit local provider directories and `DISABLE_EXTENSIONS_FOR_TEST=1` as
-in [CI](../.github/workflows/VaneNativeVortex.yml). Require the six default base
+in [CI](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/.github/workflows/VaneNativeVortex.yml). Require the six default base
 extensions plus explicitly linked DuckLake/Vortex and reject cached source roots.
 Record compiler/link commands and all source/header/patch/archive/binary hashes.
 The original sealed producer and report remain unchanged, SHA-256
 `168562ccee3d4cc66659d4bb8b18a5b891a33ecbdd2424f99736a22e0ec0f400` and
 `48855d42a60fd423caf0df052e46bb95050003e61f0ac83b570f03be3f5cf042` respectively.
 
-The [A/B sampler](../test/vane/test_vane_vortex_filename_ab.py) requires a passed
+The [A/B sampler](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/test/vane/test_vane_vortex_filename_ab.py) requires a passed
 oracle tied to that exact build and input report. Formal sampling is one full
 twelve-case matrix: histories 8/512/4,096, inline/materialized storage, and
 expiry/file-unlink tasks. Fix **sixteen paired rounds per case**, four calls per
@@ -92,7 +116,7 @@ two-object/64-MiB budget and keep-two/min-age-zero policy. Primary timings use
 only the existing collector/phase timers; SQL callbacks stay in separate restored
 diagnostics and never enter primary statistics.
 
-## Predeclared decision
+### Predeclared decision
 
 Only the two **materialized-history file-unlink** cases at 512 and 4,096 updates
 are targets. The other ten cases are controls. Preserve the previous numerical
@@ -105,14 +129,14 @@ Otherwise withdraw the candidate. Reuse the existing paired-sum/median bootstrap
 Passing qualifies the private candidate for subsequent runtime review; it does
 not automatically alter the production reference implementation. The four-case,
 two-round CI smoke is functional only and cannot qualify a candidate. The
-[analysis checks](../test/vane/test_vane_vortex_filename_stats.py) reject missing
+[analysis checks](https://github.com/AstroVela/ducklake/blob/3017bc59382bb7ab8915c2bf173c16b4b597966d/test/vane/test_vane_vortex_filename_stats.py) reject missing
 or duplicate cases, short runs, target-gate failures and any control regression.
 Preserve all tails and report exact per-case intervals, winning rounds and native
 phases. The bootstrap is descriptive, without family-wide or serial-noise claims.
 Earlier failed A/A precision studies remain unchanged; this trial does not prove
 2% measurement equivalence or 30-minute/sustained-write stability. R4 stays open.
 
-## Reproduce
+### Reproduce
 
 After configuring the matching runtime with explicit local source roots and the
 default-extension profile:
@@ -137,7 +161,7 @@ Use new output directories. Retain the build manifest, exact oracle streams,
 per-call native JSON/logs, decision rule and final report. CI runs the same
 oracle and a functional A/B smoke on its history-8 corpus and uploads artifacts.
 
-## Result: withdraw the candidate
+### Result: withdraw the candidate
 
 The one precommitted formal run completed all sixteen rounds in **687.653 s**:
 768 primary calls, 48 excluded warmups and 24 independent diagnostics. All
@@ -192,9 +216,8 @@ study, not proof of either a code regression or measurement noise. Its bootstrap
 interval includes 1. Matching object/link positions removes the earlier
 archive-versus-explicit-object asymmetry but does not prove identical execution
 layout or 2% precision. Do not waive this control or extend sampling after seeing
-its result. The next narrow study should predeclare an identical-baseline A/A
-for this control and attribute the unchanged expiry phases before another
-runtime candidate is considered. R4 remains open; no new 30-minute run is claimed.
+its result. The historical report proposed an identical-baseline A/A for this control. A
+new candidate also needs equivalence against current reference identity. R4 remains open; no new 30-minute run is claimed.
 
 ### Qualification and evidence
 
