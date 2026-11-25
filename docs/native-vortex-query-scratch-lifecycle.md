@@ -67,6 +67,8 @@ SELECT * FROM ducklake_collect_vortex_query_scratch(
 
 死 owner 的 payload 按后序清单冻结，记录相对路径、类型、device／inode、大小和 `present/pending/removed` 状态。删除始终使用已打开的目录 FD 与 `openat(O_NOFOLLOW)`／`unlinkat`。
 
+检查点回调返回后、写入清理记录和删除文件前，回收器沿授权路径重新核对父目录、命名空间根、同级锁文件、`registry` 和 `work` 的身份。绑定变化会终止本轮回收，已经持久化的清理进度可用于恢复。
+
 1. 发布 `collecting` 清单并 fsync。
 2. 每项检查身份及剩余预算，写唯一 `pending` 意图并 fsync，再从登记目录核对待删项的身份、类型及大小，unlink 后 fsync 父目录并确认 `removed`。
 3. 中断后，仅 pending 项允许已经消失；此前无意图的缺失、未知新增或身份变化均失败。

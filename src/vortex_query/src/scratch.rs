@@ -58,8 +58,16 @@ fn validate_stat(stat: &Stat, directory: bool, private: bool) -> VortexResult<()
 }
 fn same(fd: &OwnedFd, expected: Identity, directory: bool, private: bool) -> VortexResult<()> {
     let stat = posix::fstat(fd).map_err(std::io::Error::from)?;
-    validate_stat(&stat, directory, private)?;
-    if identity(&stat) != expected {
+    validate_identity(&stat, expected, directory, private)
+}
+fn validate_identity(
+    stat: &Stat,
+    expected: Identity,
+    directory: bool,
+    private: bool,
+) -> VortexResult<()> {
+    validate_stat(stat, directory, private)?;
+    if identity(stat) != expected {
         vortex_bail!("Scratch filesystem identity changed");
     }
     Ok(())
@@ -191,6 +199,9 @@ struct Record {
 }
 
 struct Root {
+    parent_path: PathBuf,
+    name: String,
+    registration: RootRecord,
     directory: OwnedFd,
     registry: OwnedFd,
     work: OwnedFd,
@@ -332,40 +343,73 @@ impl Root {
         }
         let registry = child(&directory, "registry")?;
         let work = child(&directory, "work")?;
-        validate_stat(
-            &posix::fstat(&registry).map_err(std::io::Error::from)?,
-            true,
-            true,
-        )?;
-        validate_stat(
-            &posix::fstat(&work).map_err(std::io::Error::from)?,
-            true,
-            true,
-        )?;
         same(&registry, record.registry, true, true)?;
         same(&work, record.work, true, true)?;
-        // Only an authenticated root may discard its reserved metadata staging slot.
-        if let Some(stat) = exists(&directory, ".record.tmp")? {
-            validate_stat(&stat, false, true)?;
-            if stat.st_size < 0 || stat.st_size as usize > LIMITS.max_manifest_bytes {
-                vortex_bail!("Invalid scratch metadata staging size");
-            }
-            posix::unlinkat(&directory, ".record.tmp", AtFlags::empty())
-                .map_err(std::io::Error::from)?;
-            posix::fsync(&directory).map_err(std::io::Error::from)?;
-        }
-        Ok(Self {
+        let root = Self {
+            parent_path: parent_path.to_owned(),
+            name: name.to_owned(),
+            registration: record,
             directory,
             registry,
             work,
             _lock: lock,
-        })
+        };
+        root.validate_bindings()?;
+        // Only an authenticated root may discard its reserved metadata staging slot.
+        if let Some(stat) = exists(&root.directory, ".record.tmp")? {
+            validate_stat(&stat, false, true)?;
+            if stat.st_size < 0 || stat.st_size as usize > LIMITS.max_manifest_bytes {
+                vortex_bail!("Invalid scratch metadata staging size");
+            }
+            root.unlink(&root.directory, ".record.tmp", AtFlags::empty())?;
+            posix::fsync(&root.directory).map_err(std::io::Error::from)?;
+        }
+        Ok(root)
+    }
+    fn validate_bindings(&self) -> VortexResult<()> {
+        let registered = &self.registration;
+        let parent = posix::open(&self.parent_path, DIRECTORY, Mode::empty())
+            .map_err(std::io::Error::from)?;
+        if self.parent_path.canonicalize()? != self.parent_path
+            || identity(&posix::fstat(&parent).map_err(std::io::Error::from)?) != registered.parent
+        {
+            vortex_bail!("Scratch namespace parent changed");
+        }
+        // Open FDs pin objects. Their names must still designate those objects at the authorized path.
+        let check_name = |parent: &OwnedFd, name: &str, expected: Identity, directory| {
+            let stat = posix::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(std::io::Error::from)?;
+            validate_identity(&stat, expected, directory, true)
+        };
+        check_name(&parent, &self.name, registered.directory, true)?;
+        check_name(
+            &parent,
+            &format!("{}.lock", self.name),
+            registered.lock,
+            false,
+        )?;
+        check_name(&self.directory, "registry", registered.registry, true)?;
+        check_name(&self.directory, "work", registered.work, true)
+    }
+    fn checkpoint(
+        &self,
+        stage: &str,
+        check: &dyn Fn(&str) -> VortexResult<()>,
+    ) -> VortexResult<()> {
+        check(stage)?;
+        self.validate_bindings()
+    }
+    fn unlink(&self, parent: &OwnedFd, name: &str, flags: AtFlags) -> VortexResult<()> {
+        self.validate_bindings()?;
+        posix::unlinkat(parent, name, flags).map_err(std::io::Error::from)?;
+        Ok(())
     }
     fn write<T: Serialize>(&self, directory: &OwnedFd, name: &str, record: &T) -> VortexResult<()> {
         let bytes = serde_json::to_vec(record).map_err(|e| vortex_err!("{e}"))?;
         if bytes.len() > LIMITS.max_manifest_bytes {
             vortex_bail!("Scratch deletion manifest exceeds byte budget");
         }
+        self.validate_bindings()?;
         let fd = posix::openat(
             &self.directory,
             ".record.tmp",
@@ -376,6 +420,7 @@ impl Root {
         let mut file = File::from(fd);
         file.write_all(&bytes)?;
         file.sync_all()?;
+        self.validate_bindings()?;
         posix::renameat(&self.directory, ".record.tmp", directory, name)
             .map_err(std::io::Error::from)?;
         posix::fsync(directory).map_err(std::io::Error::from)?;
@@ -385,6 +430,10 @@ impl Root {
     fn save(&self, record: &Record) -> VortexResult<()> {
         self.write(&self.registry, &record.owner, record)
     }
+    fn advance_cursor(&mut self, name: String) -> VortexResult<()> {
+        self.registration.cursor = name;
+        self.write(&self.directory, "root.json", &self.registration)
+    }
     fn registration_checkpoint(
         &self,
         record: &Record,
@@ -392,7 +441,7 @@ impl Root {
         check: &dyn Fn(&str) -> VortexResult<()>,
     ) -> VortexResult<()> {
         let original = open_record(&self.registry, &record.owner)?;
-        check(stage)?;
+        self.checkpoint(stage, check)?;
         let current = open_record(&self.registry, &record.owner)?;
         verify_registration(&original, current, record)
     }
@@ -601,25 +650,28 @@ fn finish(
             if !names(&payload)?.is_empty() {
                 vortex_bail!("Finishing scratch payload is not empty");
             }
-            posix::unlinkat(&work, "payload", AtFlags::REMOVEDIR).map_err(std::io::Error::from)?;
+            root.unlink(&work, "payload", AtFlags::REMOVEDIR)?;
             posix::fsync(&work).map_err(std::io::Error::from)?;
         }
         if exists(&work, "owner.lock")?.is_some() {
-            posix::unlinkat(&work, "owner.lock", AtFlags::empty()).map_err(std::io::Error::from)?;
+            root.unlink(&work, "owner.lock", AtFlags::empty())?;
             posix::fsync(&work).map_err(std::io::Error::from)?;
         }
-        posix::unlinkat(&root.work, &record.owner, AtFlags::REMOVEDIR)
-            .map_err(std::io::Error::from)?;
+        root.unlink(&root.work, &record.owner, AtFlags::REMOVEDIR)?;
         posix::fsync(&root.work).map_err(std::io::Error::from)?;
     }
     root.registration_checkpoint(record, "scratch_after_remove_view", check)?;
-    posix::unlinkat(&root.registry, &record.owner, AtFlags::empty())
-        .map_err(std::io::Error::from)?;
+    root.unlink(&root.registry, &record.owner, AtFlags::empty())?;
     posix::fsync(&root.registry).map_err(std::io::Error::from)?;
     Ok(())
 }
 
-fn finish_allocation(root: &Root, record: &mut Record) -> VortexResult<()> {
+fn finish_allocation(
+    root: &Root,
+    record: &mut Record,
+    check: &dyn Fn(&str) -> VortexResult<()>,
+) -> VortexResult<()> {
+    root.validate_bindings()?;
     if let Some(_) = exists(&root.work, &record.owner)? {
         let work = child(&root.work, &record.owner)?;
         validate_work(&work, record, false)?;
@@ -638,7 +690,7 @@ fn finish_allocation(root: &Root, record: &mut Record) -> VortexResult<()> {
     }
     record.state = State::Finishing;
     root.save(record)?;
-    finish(root, record, &|_| Ok(()))
+    finish(root, record, check)
 }
 
 fn registered_window(
@@ -708,17 +760,13 @@ pub fn collect(
         vortex_bail!("Invalid scratch collection budgets");
     }
     check("scratch_collect_start")?;
-    let root = Root::open(path, data_path, false, None)?;
-    let mut info: RootRecord = read_json(&root.directory, "root.json")?;
-    if !info.cursor.is_empty()
-        && uuid::Uuid::parse_str(&info.cursor)
-            .map(|u| u.to_string() != info.cursor)
-            .unwrap_or(true)
-    {
-        vortex_bail!("Invalid scratch collection cursor");
-    }
-    let (registered_views, ordered) =
-        registered_window(&root.registry, &info.cursor, max_objects as usize, check)?;
+    let mut root = Root::open(path, data_path, false, None)?;
+    let (registered_views, ordered) = registered_window(
+        &root.registry,
+        &root.registration.cursor,
+        max_objects as usize,
+        &|stage| root.checkpoint(stage, check),
+    )?;
     let mut result = Collection {
         root: path.into(),
         registered_views,
@@ -728,7 +776,7 @@ pub fn collect(
         if result.collected_objects == max_objects {
             break;
         }
-        check("scratch_collect_owner")?;
+        root.checkpoint("scratch_collect_owner", check)?;
         let mut record = root.load(&name)?;
         result.examined_views += 1;
         let work = if exists(&root.work, &name)?.is_some() {
@@ -745,8 +793,7 @@ pub fn collect(
                     Ok(()) => held = Some(lock),
                     Err(rustix::io::Errno::WOULDBLOCK) => {
                         result.blocked_views += 1;
-                        info.cursor = name;
-                        root.write(&root.directory, "root.json", &info)?;
+                        root.advance_cursor(name)?;
                         continue;
                     }
                     Err(error) => return Err(std::io::Error::from(error).into()),
@@ -756,7 +803,7 @@ pub fn collect(
             vortex_bail!("Registered scratch work directory is missing");
         }
         if record.state == State::Allocating {
-            finish_allocation(&root, &mut record)?;
+            finish_allocation(&root, &mut record, check)?;
             result.collected_objects += 1;
             result.removed_views += 1;
         } else if record.state == State::Finishing {
@@ -826,7 +873,7 @@ pub fn collect(
                         vortex_err!("Scratch unlink entry disappeared after its checkpoint")
                     })?;
                     validate_unlink_entry(&stat, &entry)?;
-                    posix::unlinkat(
+                    root.unlink(
                         &current_parent,
                         &component,
                         if entry.directory {
@@ -834,8 +881,7 @@ pub fn collect(
                         } else {
                             AtFlags::empty()
                         },
-                    )
-                    .map_err(std::io::Error::from)?;
+                    )?;
                     posix::fsync(&current_parent).map_err(std::io::Error::from)?;
                     result.collected_objects += 1;
                     result.collected_files += u64::from(!entry.directory);
@@ -858,9 +904,9 @@ pub fn collect(
             }
         }
         drop(held);
-        info.cursor = name;
-        root.write(&root.directory, "root.json", &info)?;
+        root.advance_cursor(name)?;
     }
+    root.validate_bindings()?;
     result.remaining_views = registered_views - result.removed_views;
     Ok(result)
 }
@@ -895,7 +941,7 @@ impl OwnedScratch {
         }
         root.save(&record)?;
         let initialized = (|| {
-            check("scratch_allocated")?;
+            root.checkpoint("scratch_allocated", check)?;
             posix::mkdirat(&root.work, &record.owner, PRIVATE).map_err(std::io::Error::from)?;
             let work = child(&root.work, &record.owner)?;
             posix::mkdirat(&work, "payload", PRIVATE).map_err(std::io::Error::from)?;
@@ -922,7 +968,7 @@ impl OwnedScratch {
             Ok(lock) => lock,
             Err(error) => {
                 // No provider can write payload before registration completes.
-                finish_allocation(&root, &mut record)?;
+                finish_allocation(&root, &mut record, &|_| Ok(()))?;
                 return Err(error);
             }
         };
@@ -980,6 +1026,49 @@ mod tests {
             lock: None,
             plan: Vec::new(),
         }
+    }
+
+    #[test]
+    fn checkpoints_and_mutations_require_both_registered_directories() -> VortexResult<()> {
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("scratch");
+        let data = temp.path().join("data");
+        std::fs::create_dir(&parent)?;
+        std::fs::create_dir(&data)?;
+        let path = namespace(&parent, &data)?;
+        let mut root = Root::open(&path, &data, true, None)?;
+        let record = Record {
+            root: root.registration.directory,
+            ..registration()
+        };
+        root.save(&record)?;
+        root.registration_checkpoint(&record, "verify", &|_| Ok(()))?;
+        let header = std::fs::read(path.join("root.json"))?;
+        let registered_owner = path.join("registry").join(&record.owner);
+        let contents = std::fs::read(&registered_owner)?;
+        let registry = root.registration.registry;
+        let work = root.registration.work;
+        assert_ne!(registry, work);
+        // Vary the expected identities in memory while the fixture and its permissions stay fixed.
+        for (expected_registry, expected_work) in [(work, work), (registry, registry)] {
+            root.registration.registry = expected_registry;
+            root.registration.work = expected_work;
+            let checked = std::cell::Cell::new(false);
+            let checkpoint = root.registration_checkpoint(&record, "verify", &|_| {
+                checked.set(true);
+                Ok(())
+            });
+            assert!(checked.get() && checkpoint.is_err());
+            assert!(root.advance_cursor(record.owner.clone()).is_err());
+            assert!(
+                root.unlink(&root.registry, &record.owner, AtFlags::empty())
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(path.join("root.json"))?, header);
+            assert_eq!(std::fs::read(&registered_owner)?, contents);
+            assert!(!path.join(".record.tmp").exists());
+        }
+        Ok(())
     }
 
     #[test]
