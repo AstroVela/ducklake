@@ -581,7 +581,7 @@ def main():
         checks.append(
             "context filesystem dispatch rejects disabled LocalFileSystem before native writes, including source_pinned and build_started revocation"
         )
-        require(list(scratch.iterdir()) == [], "build/search leaked private staging")
+        BASE.assert_query_scratch_released(scratch)
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

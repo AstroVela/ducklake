@@ -23,12 +23,11 @@ Caller cleanup must be based on its own known output and confirmed publication;
 uncertain or failed publication requires reconciliation first.
 
 Query scratch lives under the caller-selected temporary root, outside managed
-data. Normal completion removes it; process SIGKILL cannot run destructors.
-Native metadata recovery and managed collectors neither adopt nor sweep these
-unregistered private copies. The crash fixtures retain and authenticate them in
-their own isolated temporary namespaces. Owner-controlled temporary-root cleanup
-after process termination is a separate lifecycle from metadata checkpoint and
-managed generation GC; this proof does not introduce a crash-scratch sweeper.
+data. Normal completion releases the payload and its active registration. SIGKILL
+can leave the registered payload for explicit collection using the diagnostic
+`scratch_root`. The crash fixtures verify metadata recovery and managed collectors
+preserve these private copies. The separate [query scratch protocol](native-vortex-query-scratch-lifecycle.md)
+covers ownership and bounded cleanup after the query process exits.
 
 ## Checkpoint scope and protection
 

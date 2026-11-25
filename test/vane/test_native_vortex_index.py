@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -14,6 +15,13 @@ import time
 
 
 VORTEX_REVISION = "42beeb3a72769869a3d3d16887a011ee7f922362"
+
+SCRATCH_SPEC = importlib.util.spec_from_file_location(
+    "native_scratch_model", Path(__file__).with_name("vortex_query_scratch_model.py")
+)
+SCRATCH = importlib.util.module_from_spec(SCRATCH_SPEC)
+SCRATCH_SPEC.loader.exec_module(SCRATCH)
+assert_query_scratch_released = SCRATCH.assert_released
 
 
 def quote(value: object) -> str:

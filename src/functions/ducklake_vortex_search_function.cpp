@@ -114,7 +114,62 @@ static void ExecuteSearch(ClientContext &context, TableFunctionInput &input, Dat
 	state.offset += count;
 }
 
+struct VortexScratchBind : public TableFunctionData {
+	string catalog;
+	string root;
+	idx_t max_objects;
+	idx_t max_bytes;
+};
+
+static unique_ptr<FunctionData> BindScratch(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                            vector<string> &names) {
+	for (auto &value : input.inputs) {
+		if (value.IsNull()) {
+			throw InvalidInputException("Vortex query scratch collection arguments cannot be NULL");
+		}
+	}
+	auto count = input.inputs[2].GetValue<int64_t>(), bytes = input.inputs[3].GetValue<int64_t>();
+	if (count < 1 || count > 16 || bytes < 1 || bytes > 64 * 1024 * 1024) {
+		throw InvalidInputException("Invalid Vortex query scratch collection budgets");
+	}
+	auto bind = make_uniq<VortexScratchBind>();
+	bind->catalog = StringValue::Get(input.inputs[0]);
+	bind->root = StringValue::Get(input.inputs[1]);
+	bind->max_objects = idx_t(count);
+	bind->max_bytes = idx_t(bytes);
+	names = {"root",
+	         "registered_views",
+	         "examined_views",
+	         "blocked_views",
+	         "collected_objects",
+	         "collected_files",
+	         "collected_bytes",
+	         "removed_views",
+	         "remaining_views"};
+	types.assign(names.size(), LogicalType::UBIGINT);
+	types[0] = LogicalType::VARCHAR;
+	return std::move(bind);
+}
+
+static void ExecuteScratch(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<VortexSearchState>();
+	if (state.initialized) {
+		return;
+	}
+	auto &bind = input.bind_data->Cast<VortexScratchBind>();
+	auto row = DuckLakeVortexSearch::CollectScratch(context, bind.catalog, bind.root, bind.max_objects, bind.max_bytes);
+	for (idx_t i = 0; i < row.size(); i++) {
+		output.SetValue(i, 0, row[i]);
+	}
+	output.SetCardinality(1);
+	state.initialized = true;
+}
+
 void RegisterDuckLakeVortexSearch(ExtensionLoader &loader) {
+	loader.RegisterFunction(
+	    TableFunction("ducklake_collect_vortex_query_scratch",
+	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                  ExecuteScratch, BindScratch, InitSearch));
 	for (auto &name : {"ducklake_vortex_search", "ducklake_vortex_search_diagnostics"}) {
 		auto bind = string(name) == "ducklake_vortex_search" ? BindSearch : BindDiagnostics;
 		TableFunction function(name,
