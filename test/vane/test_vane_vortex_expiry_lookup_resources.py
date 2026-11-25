@@ -36,6 +36,9 @@ def run(args):
                 continue
             image = Path(case["image"])
             assert BASE.fingerprint(BASE.manifest(image)) == case["input_image_sha256"]
+            seed = json.loads((image / "indexes/seed.json").read_text())
+            expected_ids = sorted(file["id"] for file in seed["snapshot"]["files"])
+            assert len(expected_ids) == len(set(expected_ids)) == 2
             output = root / f"history-{case['history']}-{case['history_storage']}"
             output.mkdir(mode=0o700)
             samples = []
@@ -48,10 +51,12 @@ def run(args):
                         [str(args.driver.resolve()), str(catalog), variant, str(result)], check=True, timeout=90
                     )
                     sample = json.loads(result.read_text())
+                    assert sample["variant"] == variant and sample["physical_retirement_marker"]
+                    assert sample["data_files"]["columns"] == (5 if variant == "baseline" else 7)
                     sample["repeat"] = repeat
                     samples.append(sample)
                     catalog.unlink()
-            assert len({s["eligible_files"] for s in samples}) == 1
+            assert all(s["eligible_file_ids"] == expected_ids and s["eligible_files"] == 2 for s in samples)
             assert all(s["snapshot_vector_capacity_bytes"] >= s["snapshot_vector_bytes"] for s in samples)
             assert BASE.fingerprint(BASE.manifest(image)) == case["input_image_sha256"]
             report["cases"].append(

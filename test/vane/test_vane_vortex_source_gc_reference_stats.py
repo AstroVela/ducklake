@@ -66,7 +66,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(parts["reference_fetch"], 4)
         self.assertEqual(parts["reference_path_loop"], 12)
         self.assertEqual(parts["reference_remainder"], 8)
-        self.assertEqual(parts["outside_reference"], 472)
+        self.assertEqual(parts["outside_reference"], 448)
         self.assertNotIn("outside_sql", parts)
         result = REF.summarize([value, copy.deepcopy(value)])
         self.assertEqual(result["rows_per_collector"], [12])
