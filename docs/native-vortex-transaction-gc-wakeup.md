@@ -42,3 +42,7 @@ rejects the obsolete callback.
 The [original qualification](https://github.com/AstroVela/ducklake/blob/9819016e841ea79c8eea054415f4724fa2270e85/docs/native-vortex-transaction-gc-wakeup.md)
 records the sustained workload on the earlier stack. Sustained qualification
 of the port remains deferred.
+
+A follow-up on the earlier stack compared the maintenance policy and backlog
+reads and recorded the decision to keep separate statements.
+[Maintenance probe A/B decision](native-vortex-maintenance-probe-ab.md)
