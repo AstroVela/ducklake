@@ -50,10 +50,12 @@ vectors using the same Float32 squared L2 calculation. The final heap merges
 at most 3k candidates, ordered by `(distance, typed row address)`. Non-finite
 query components, dimension mismatches and distance overflow are errors.
 
-The Python exact/score/recall oracle restores Float32 inputs and rounds each
-subtraction, multiplication and left-to-right addition to Float32, matching
-the mixed metric. Equal distances use the same typed-address order. The
-existing distance tolerances and 0.8 fixture recall threshold remain unchanged.
+The current mixed metric restores Float32 inputs, computes differences,
+squares and accumulation in Float64, and rounds the final distance to Float32.
+The Python oracle follows this metric and uses the same typed-address order
+for equal returned distances. See the [numerical regression](native-vortex-functional-matrix.md).
+The original proof used Float32 at each arithmetic step. Both versions use
+the same distance tolerances and 0.8 fixture recall threshold.
 
 SPFresh remains approximate. A sparse predicate can leave it with fewer than k
 hits, including zero for a far allowed row. Visibility/filter correctness is

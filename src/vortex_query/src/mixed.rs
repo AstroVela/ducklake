@@ -131,10 +131,10 @@ impl TopK {
 }
 
 fn squared_l2(query: &[f32], vector: &[f32]) -> VortexResult<f32> {
-    let distance = query.iter().zip(vector).fold(0.0f32, |total, (a, b)| {
-        let difference = a - b;
+    let distance = query.iter().zip(vector).fold(0.0f64, |total, (a, b)| {
+        let difference = f64::from(*a) - f64::from(*b);
         total + difference * difference
-    });
+    }) as f32;
     if !distance.is_finite() {
         vortex_bail!("Squared L2 distance overflow");
     }

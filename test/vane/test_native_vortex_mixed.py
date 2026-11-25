@@ -44,12 +44,11 @@ def float32_squared_l2(query: list[float], vector: list[float]) -> float:
     query = BASE.float32_vector(query)
     vector = BASE.float32_vector(vector)
     total = 0.0
-    # Match mixed.rs: round subtraction, multiplication and each addition to f32.
+    # Match mixed.rs: accumulate from Float32 components in Float64, then round the final score.
     for left, right in zip(query, vector):
-        difference = BASE.float32_vector([left - right])[0]
-        squared = BASE.float32_vector([difference * difference])[0]
-        total = BASE.float32_vector([total + squared])[0]
-    return total
+        difference = left - right
+        total += difference * difference
+    return BASE.float32_vector([total])[0]
 
 
 def capture(proof, directory: Path, name: str) -> tuple[Path, list[dict]]:

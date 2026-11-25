@@ -420,11 +420,12 @@ struct AutomaticFixture {
 		}
 	}
 	static float Distance(const AutomaticRow &row) {
-		// Keep the Float32 arithmetic boundaries even with contraction enabled.
-		const volatile float dx = row.x - AUTOMATIC_QUERY_X;
-		const volatile float xx = dx * dx;
-		const volatile float yy = row.y * row.y;
-		return xx + yy;
+		// Keep separate Float64 products even with contraction enabled.
+		const auto dx = static_cast<double>(row.x) - static_cast<double>(AUTOMATIC_QUERY_X);
+		const auto dy = static_cast<double>(row.y);
+		const volatile double xx = dx * dx;
+		const volatile double yy = dy * dy;
+		return static_cast<float>(xx + yy);
 	}
 	float Validate(const vector<AutomaticObservation> &observations) {
 		float minimum = 1;
