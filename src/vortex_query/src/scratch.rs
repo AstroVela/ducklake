@@ -1,7 +1,7 @@
 //! Registered native-query scratch; only explicit, authenticated collection reclaims crashed owners.
 use crate::LIMITS;
 #[cfg(not(test))]
-use rustix::fs::fsync as sync_removal_parent;
+use rustix::fs::fsync as sync_directory;
 use rustix::fs::{self as posix, AtFlags, FlockOperation, Mode, OFlags, Stat};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 #[cfg(test)]
-use tests::sync_removal_parent;
+use tests::sync_directory;
 use vortex::error::{VortexResult, vortex_bail, vortex_err};
 use vortex_index::file::file_version;
 
@@ -315,7 +315,6 @@ impl Root {
             )
             .map_err(std::io::Error::from)?;
             let _ = staging.keep();
-            posix::fsync(&parent).map_err(std::io::Error::from)?;
         }
         let directory = child(&parent, name)?;
         validate_stat(
@@ -359,6 +358,8 @@ impl Root {
             _lock: lock,
         };
         root.validate_bindings()?;
+        // An earlier publisher may have stopped after rename but before syncing this parent.
+        sync_directory(&parent).map_err(std::io::Error::from)?;
         // Only an authenticated root may discard its reserved metadata staging slot.
         if let Some(stat) = exists(&root.directory, ".record.tmp")? {
             validate_stat(&stat, false, true)?;
@@ -427,8 +428,11 @@ impl Root {
         self.validate_bindings()?;
         posix::renameat(&self.directory, ".record.tmp", directory, name)
             .map_err(std::io::Error::from)?;
-        posix::fsync(directory).map_err(std::io::Error::from)?;
-        posix::fsync(&self.directory).map_err(std::io::Error::from)?;
+        self.sync_record_publication(directory)
+    }
+    fn sync_record_publication(&self, directory: &OwnedFd) -> VortexResult<()> {
+        sync_directory(directory).map_err(std::io::Error::from)?;
+        sync_directory(&self.directory).map_err(std::io::Error::from)?;
         Ok(())
     }
     fn save(&self, record: &Record) -> VortexResult<()> {
@@ -664,7 +668,7 @@ fn finish(
         root.unlink(&root.work, &record.owner, AtFlags::REMOVEDIR)?;
     }
     // A previous attempt may have removed the owner before its parent was synced.
-    sync_removal_parent(&root.work).map_err(std::io::Error::from)?;
+    sync_directory(&root.work).map_err(std::io::Error::from)?;
     root.registration_checkpoint(record, "scratch_after_remove_view", check)?;
     root.unlink(&root.registry, &record.owner, AtFlags::empty())?;
     posix::fsync(&root.registry).map_err(std::io::Error::from)?;
@@ -812,6 +816,8 @@ pub fn collect(
             result.collected_objects += 1;
             result.removed_views += 1;
         } else if record.state == State::Finishing {
+            // A recovered intent must be durable before any registered controls are removed.
+            root.sync_record_publication(&root.registry)?;
             finish(&root, &record, check)?;
             result.collected_objects += 1;
             result.removed_views += 1;
@@ -887,14 +893,14 @@ pub fn collect(
                             AtFlags::empty()
                         },
                     )?;
-                    sync_removal_parent(&current_parent).map_err(std::io::Error::from)?;
+                    sync_directory(&current_parent).map_err(std::io::Error::from)?;
                     result.collected_objects += 1;
                     result.collected_files += u64::from(!entry.directory);
                     result.collected_bytes += entry.bytes;
                     root.registration_checkpoint(&record, "scratch_after_unlink", check)?;
                 } else if entry.progress == Progress::Pending {
                     // Make the prior unlink durable before acknowledging it in the manifest.
-                    sync_removal_parent(&parent).map_err(std::io::Error::from)?;
+                    sync_directory(&parent).map_err(std::io::Error::from)?;
                 } else {
                     vortex_bail!("Scratch file vanished without a deletion intent");
                 }
@@ -1022,14 +1028,93 @@ mod tests {
     use std::cell::Cell;
 
     thread_local! {
-        static FAIL_PARENT_SYNC: Cell<Option<Identity>> = const { Cell::new(None) };
+        static FAIL_DIRECTORY_SYNC: Cell<Option<Identity>> = const { Cell::new(None) };
     }
 
-    pub(super) fn sync_removal_parent(parent: &OwnedFd) -> rustix::io::Result<()> {
-        if FAIL_PARENT_SYNC.get() == Some(identity(&posix::fstat(parent)?)) {
+    pub(super) fn sync_directory(directory: &OwnedFd) -> rustix::io::Result<()> {
+        if FAIL_DIRECTORY_SYNC.get() == Some(identity(&posix::fstat(directory)?)) {
             return Err(rustix::io::Errno::IO);
         }
-        posix::fsync(parent)
+        posix::fsync(directory)
+    }
+
+    fn expect_sync_error<T>(
+        directory: &Path,
+        operation: impl FnOnce() -> VortexResult<T>,
+    ) -> VortexResult<()> {
+        let stat = posix::stat(directory).map_err(std::io::Error::from)?;
+        FAIL_DIRECTORY_SYNC.set(Some(identity(&stat)));
+        let result = operation();
+        FAIL_DIRECTORY_SYNC.set(None);
+        let error = result
+            .err()
+            .expect("operation succeeded without syncing the expected directory");
+        assert!(
+            error
+                .to_string()
+                .contains(&std::io::Error::from(rustix::io::Errno::IO).to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reopening_namespace_syncs_parent_before_owner_registration() -> VortexResult<()> {
+        let parent = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let root = namespace(parent.path(), data.path())?;
+        let create = || OwnedScratch::create(parent.path(), data.path(), &|_| Ok(()));
+        assert!(!root.exists());
+        // First fail immediately after root publication; the second open sees the existing root.
+        for _ in 0..2 {
+            expect_sync_error(parent.path(), create)?;
+            assert!(root.join("root.json").is_file());
+            assert_eq!(std::fs::read_dir(root.join("registry"))?.count(), 0);
+            assert_eq!(std::fs::read_dir(root.join("work"))?.count(), 0);
+        }
+        let view = create()?;
+        assert!(view.path().is_dir());
+        let saved = Root::open(&root, data.path(), false, None)?.load(&view.owner)?;
+        assert!(saved.state == State::Live);
+        view.close(&|_| Ok(()))?;
+        assert_eq!(std::fs::read_dir(root.join("registry"))?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resuming_finishing_syncs_published_intent_before_removal() -> VortexResult<()> {
+        let parent = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let view = OwnedScratch::create(parent.path(), data.path(), &|_| Ok(()))?;
+        let root = view.root().to_owned();
+        let registry = root.join("registry");
+        let record_path = registry.join(&view.owner);
+        let work = root.join("work").join(&view.owner);
+        expect_sync_error(&registry, || view.close(&|_| Ok(())))?;
+        let finishing = std::fs::read(&record_path)?;
+        let saved: Record = serde_json::from_slice(&finishing).unwrap();
+        assert!(saved.state == State::Finishing);
+
+        let recover = || collect(data.path(), &root, 1, 1, &|_| Ok(()));
+        // Both directories of the cross-directory rename must be synced before the first unlink.
+        for directory in [&registry, &root] {
+            expect_sync_error(directory, recover)?;
+            assert_eq!(std::fs::read(&record_path)?, finishing);
+            assert!(work.join("payload").is_dir());
+            assert!(work.join("owner.lock").is_file());
+        }
+        let pass = recover()?;
+        assert_eq!(
+            (
+                pass.removed_views,
+                pass.remaining_views,
+                pass.collected_objects
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!((pass.collected_files, pass.collected_bytes), (0, 0));
+        assert!(!work.exists() && !record_path.exists());
+        assert_eq!(recover()?.collected_objects, 0);
+        Ok(())
     }
 
     #[test]
@@ -1049,25 +1134,9 @@ mod tests {
 
         let collect_one = |bytes| collect(&data, &root, 1, bytes, &|_| Ok(()));
         let record = || Root::open(&root, &data, false, None)?.load(&owner);
-        let fail_sync = |directory: &Path, bytes| -> VortexResult<()> {
-            let stat = posix::stat(directory).map_err(std::io::Error::from)?;
-            FAIL_PARENT_SYNC.set(Some(identity(&stat)));
-            let result = collect_one(bytes);
-            FAIL_PARENT_SYNC.set(None);
-            let error = result
-                .err()
-                .expect("collector acknowledged removal without syncing its parent");
-            assert!(
-                error
-                    .to_string()
-                    .contains(&std::io::Error::from(rustix::io::Errno::IO).to_string())
-            );
-            Ok(())
-        };
-
         // First fail after unlink, then fail again on recovery of the already absent file.
         for bytes in [7, 1] {
-            fail_sync(&payload, bytes)?;
+            expect_sync_error(&payload, || collect_one(bytes))?;
             assert!(!payload.join("first").exists());
             assert_eq!(std::fs::read(payload.join("second"))?, b"1234");
             let saved = record()?;
@@ -1096,7 +1165,7 @@ mod tests {
         // Repeat at owner-directory removal, before the registration can be retired.
         let work = root.join("work");
         for _ in 0..2 {
-            fail_sync(&work, 1)?;
+            expect_sync_error(&work, || collect_one(1))?;
             assert!(!work.join(&owner).exists());
             assert!(record()?.state == State::Finishing);
         }
