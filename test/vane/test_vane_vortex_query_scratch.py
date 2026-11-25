@@ -761,7 +761,12 @@ def native(driver, root, report):
     for mode in ("normal", "query-cancel", "allocation-cancel", "wait-cancel", "query-fail", "held"):
         case = new_case("native-" + mode)
         process = start(case, "scratch-" + mode)
-        require(process.wait(timeout=120) == 0, "Native scratch case failed: " + str(case))
+        try:
+            require(process.wait(timeout=120) == 0, "Native scratch case failed: " + str(case))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=20)
         require(
             (case / "checkpoint").read_text() == "scratch-complete",
             "Native case incomplete",
