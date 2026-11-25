@@ -4,6 +4,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_transaction_manager.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_search.hpp"
@@ -202,11 +203,14 @@ struct ProfileSample {
 struct ProfileSnapshot {
 	string id;
 	std::map<string, ProfileSample> stages;
+	idx_t CompletedLoopWaits() const {
+		return stages.at("loop_wait_timeout").calls + stages.at("loop_wait_wake").calls;
+	}
 };
 
-ProfileSnapshot ReadMaintenanceProfile(Connection &reader) {
-	auto rows = SQL(reader, PROFILE_SQL);
-	Require(rows->RowCount() == 17, "Missing fixed maintenance profile stages");
+ProfileSnapshot ReadMaintenanceProfile(Connection &reader, const string &catalog = "lake") {
+	auto rows = SQL(reader, "SELECT * FROM ducklake_vortex_maintenance_profile(" + Value(catalog).ToSQLString() + ")");
+	Require(rows->RowCount() == 18, "Missing fixed maintenance profile stages");
 	ProfileSnapshot profile;
 	profile.id = rows->GetValue(0, 0).GetValue<string>();
 	for (idx_t i = 0; i < rows->RowCount(); i++) {
@@ -324,6 +328,232 @@ void MaintenanceIdleWait(Fixture &f) {
 	Require(profile.id == id && wake.total_ns && wake.max_ns, "The wake lost its elapsed time or profile identity");
 	std::cout << "Worker wait timeout max ns: " << timeout.max_ns << ", wake max ns: " << wake.max_ns << std::endl;
 	DuckLakeVortexOptimizer::CancelMaintenance(*f.writer.context, "lake");
+}
+
+void WakeGuards(Fixture &f) {
+	f.Rewrite();
+	f.Policy();
+	Connection first(f.database), second(f.database), owner(f.database), capture(f.database), unrelated(f.database);
+	first.BeginTransaction();
+	second.BeginTransaction();
+	SQL(first, "SELECT count(*) FROM lake.items");
+	SQL(second, "SELECT count(*) FROM lake.items");
+	auto admission = DuckLakeVortexReadView::AdmissionLock().GetSharedLock([] {});
+	DuckLakeVortexReadCaptureScope capture_scope(*capture.context);
+	auto &finite = VortexIndex::Begin(capture, "lake");
+	Require(finite.IsVortexReadCapture(), "The fixture did not register a finite capture");
+	auto &transaction = VortexIndex::Begin(owner, "lake");
+	auto &manager = TransactionManager::Get(transaction.GetCatalog().GetAttached()).Cast<DuckLakeTransactionManager>();
+	struct Notifications {
+		idx_t count = 0;
+		bool saw_other = false;
+	};
+	auto notifications = std::make_shared<Notifications>();
+	auto wake = [&manager, notifications] {
+		notifications->count++;
+		// Reentering the manager checks that delivery happens after transaction_lock is released.
+		notifications->saw_other = manager.HasOtherTransactions(nullptr, false);
+	};
+	Require(!Source::WorkReady(transaction, 64 * 1024 * 1024, wake), "Wake registration ignored held transactions");
+	capture.Commit();
+	admission.reset();
+	owner.Commit();
+	unrelated.BeginTransaction();
+	SQL(unrelated, "SELECT count(*) FROM lake.items");
+	unrelated.Commit();
+	Require(notifications->count == 0, "Finishing an unobserved transaction sent a source notification");
+	first.Commit();
+	Require(notifications->count == 1 && notifications->saw_other,
+	        "Commit did not notify outside the lock while another transaction remained");
+	Require(f.Collect().blocked && FileSystem::GetFileSystem(*f.writer.context).FileExists(f.old_source),
+	        "A notification bypassed another ordinary transaction");
+	auto &retry = VortexIndex::Begin(owner, "lake");
+	Require(!Source::WorkReady(retry, 64 * 1024 * 1024, wake), "Remaining blocker was not rechecked");
+	owner.Commit();
+	second.Rollback();
+	Require(notifications->count == 2 && !notifications->saw_other, "Rollback did not notify after removing the blocker");
+
+	const auto expired = f.Collect(16, 1);
+	auto status = Source::Status(*f.writer.context, "lake");
+	Require(expired.expired && !expired.files && !status[0][6].GetValue<idx_t>() && status[0][7].GetValue<idx_t>(),
+	        "The fixture needs queued source files without eligible snapshots");
+	second.BeginTransaction();
+	SQL(second, "SELECT count(*) FROM lake.items");
+	auto &queued = VortexIndex::Begin(owner, "lake");
+	bool blocked = false;
+	Require(!Source::WorkReady(queued, 64 * 1024 * 1024, wake, &blocked) && blocked,
+	        "Queued files did not register a source transaction blocker");
+	owner.Commit();
+	second.Commit();
+	Require(notifications->count == 3 && !notifications->saw_other, "Queued source files lost their blocker notification");
+	f.Drain();
+	f.CheckReclaimed();
+
+	second.BeginTransaction();
+	SQL(second, "SELECT count(*) FROM lake.items");
+	auto &idle = VortexIndex::Begin(owner, "lake");
+	blocked = true;
+	Require(!Source::WorkReady(idle, 64 * 1024 * 1024, wake, &blocked) && !blocked,
+	        "An idle source probe subscribed without pending work");
+	owner.Commit();
+	second.Commit();
+	Require(notifications->count == 3, "An idle source probe registered a wake");
+	vortex_detail::ViewJSON json;
+	auto facts = json.Object();
+	json.Number(facts, "notifications", notifications->count);
+	Write(f.root + "/wake-guards.json", json.Finish(facts));
+}
+
+void WakeRuntime(Fixture &f, const string &mode) {
+	f.Rewrite();
+	f.Policy();
+	VortexIndex::CollectBuilds(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+	VortexIndex::Collect(*f.writer.context, "lake", 16, 64 * 1024 * 1024);
+	const bool late_reader = mode == "transaction-wake-late-reader";
+	const bool new_reader = mode == "transaction-wake-new-reader";
+	const bool replaced = mode == "transaction-wake-replaced";
+	const bool cancelled = replaced || mode == "transaction-wake-cancel";
+	if (replaced) {
+		SQL(f.writer, "ATTACH " + Value("ducklake:" + f.root + "/mirror.ducklake").ToSQLString() +
+		                  " AS mirror (DATA_PATH " + Value(f.root + "/mirror-data").ToSQLString() + ");"
+		                  "SELECT * FROM ducklake_initialize_vortex_indexes('mirror');"
+		                  "SELECT * FROM ducklake_initialize_vortex_optimizer('mirror')");
+		DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "mirror", 2, 64 * 1024 * 1024);
+	}
+	struct State {
+		Pause first, retry;
+		idx_t deferrals = 0;
+		bool progressed = false;
+		std::promise<ProfileSnapshot> first_expiry;
+	};
+	auto state = std::make_shared<State>();
+	auto progress = state->first_expiry.get_future();
+	Connection held(f.database), newcomer(f.database), control(f.database);
+	if (!late_reader) {
+		held.BeginTransaction();
+		SQL(held, "SELECT count(*) FROM lake.items");
+	}
+	weak_ptr<DatabaseInstance> database = f.database.instance;
+	auto observe = [state, database, late_reader, new_reader, replaced](const string &stage) {
+		if (late_reader && stage == "source_gc_waiting") {
+			state->first.Stop();
+		}
+		if (late_reader && stage == "source_gc_deferred") {
+			state->retry.Stop();
+		}
+		if (!late_reader && stage == "maintenance_source_deferred") {
+			state->deferrals++;
+			if (state->deferrals == 1) {
+				state->first.Stop();
+			} else if (new_reader) {
+				state->retry.Stop();
+			}
+		}
+		if (stage == "source_before_expire" && !state->progressed) {
+			state->progressed = true;
+			auto db = database.lock();
+			Require(bool(db), "Database expired before the first source expiry");
+			Connection probe(*db);
+			state->first_expiry.set_value(ReadMaintenanceProfile(probe, replaced ? "mirror" : "lake"));
+		}
+	};
+	DuckLakeVortexOptimizer::EnableMaintenance(*f.writer.context, "lake", 2, 64 * 1024 * 1024, observe);
+	ReleasePause release_first {state->first};
+	ReleasePause release_retry {state->retry};
+	state->first.Wait();
+	const auto before = ReadMaintenanceProfile(control);
+	if (late_reader) {
+		held.BeginTransaction();
+		SQL(held, "SELECT count(*) FROM lake.items");
+		state->first.Release();
+		state->retry.Wait();
+	}
+
+	auto &fs = FileSystem::GetFileSystem(*f.writer.context);
+	Require(fs.FileExists(f.old_source), "Source cleanup crossed its held ordinary transaction");
+	if (cancelled) {
+		DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
+		Require(!DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0][1].GetValue<bool>(),
+		        "Maintenance did not become disabled");
+		if (replaced) {
+			DuckLakeVortexOptimizer::ResumeMaintenance(*control.context, "lake", observe);
+		}
+	}
+	if (mode == "transaction-wake-rollback") {
+		held.Rollback();
+	} else {
+		held.Commit();
+	}
+	auto after = ReadMaintenanceProfile(control);
+	auto notifications = after.stages.at("source_transaction_wake").calls;
+	Require(notifications == (cancelled ? 0 : 1) && (after.id != before.id) == replaced,
+	        "Transaction completion did not respect maintenance registration identity");
+	Require(fs.FileExists(f.old_source), "The completion callback itself performed cleanup");
+
+	if (new_reader) {
+		newcomer.BeginTransaction();
+		SQL(newcomer, "SELECT count(*) FROM lake.items");
+	}
+	const auto mirror_waits = replaced ? ReadMaintenanceProfile(control, "mirror").CompletedLoopWaits() : 0;
+	state->first.Release();
+	if (late_reader) {
+		state->retry.Release();
+	}
+	if (new_reader) {
+		state->retry.Wait();
+		Require(f.Collect().blocked && fs.FileExists(f.old_source),
+		        "A latched wake bypassed a reader that started before the retry");
+		newcomer.Rollback();
+		notifications = ReadMaintenanceProfile(control).stages.at("source_transaction_wake").calls;
+		Require(notifications == 2, "The fresh probe did not register the new blocker");
+		state->retry.Release();
+	}
+	if (cancelled && !replaced) {
+		Require(!DuckLakeVortexOptimizer::MaintenanceStatus(*control.context, "lake")[0][1].GetValue<bool>(),
+		        "Transaction completion resumed cancelled maintenance");
+		DuckLakeVortexOptimizer::ResumeMaintenance(*control.context, "lake");
+	}
+
+	vortex_detail::ViewJSON json;
+	auto facts = json.Object();
+	json.Number(facts, "accepted_notifications", notifications);
+	if (replaced) {
+		Require(progress.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+		        "Replacement did not reach its first guarded expiry");
+		// The idle peer remembers the old iteration's wait after the lake changes profiles.
+		const auto recorded_waits = progress.get().CompletedLoopWaits() - mirror_waits;
+		json.Number(facts, "peer_waits_before_first_progress", recorded_waits);
+		Write(f.root + "/transaction-wake.json", json.Finish(facts));
+		Require(recorded_waits == 1, "An obsolete callback skipped the old iteration's wait");
+	} else if (!cancelled) {
+		Require(progress.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+		        "Transaction completion never led to guarded source progress");
+		const auto first_expiry = progress.get();
+		const auto wait_delta = first_expiry.CompletedLoopWaits() - before.CompletedLoopWaits();
+		const auto timeout_delta =
+		    first_expiry.stages.at("loop_wait_timeout").calls - before.stages.at("loop_wait_timeout").calls;
+		json.Number(facts, "waits_before_first_progress", wait_delta);
+		json.Number(facts, "timeouts_before_first_progress", timeout_delta);
+		Write(f.root + "/transaction-wake.json", json.Finish(facts));
+		Require(wait_delta == 0, "A transaction-end notification before wait was lost");
+	} else {
+		Write(f.root + "/transaction-wake.json", json.Finish(facts));
+	}
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+	while (true) {
+		auto status = Source::Status(*control.context, "lake");
+		if (!fs.FileExists(f.old_source) && !status[0][6].GetValue<idx_t>() && !status[0][7].GetValue<idx_t>() &&
+		    !status[0][8].GetValue<idx_t>()) {
+			break;
+		}
+		Require(std::chrono::steady_clock::now() < deadline, "Woken source worker did not reclaim its old source");
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "lake");
+	if (replaced) {
+		DuckLakeVortexOptimizer::CancelMaintenance(*control.context, "mirror");
+	}
+	f.CheckReclaimed();
 }
 
 idx_t DiskBytes(FileSystem &fs, const string &path) {
@@ -1128,6 +1358,14 @@ int main(int argc, char **argv) {
 			return 0;
 		}
 		f.Seed();
+	if (mode == "transaction-wake-guards") {
+		WakeGuards(f);
+		return 0;
+	}
+	if (StringUtil::StartsWith(mode, "transaction-wake-")) {
+		WakeRuntime(f, mode);
+		return 0;
+	}
 		if (mode == "maintenance-fairness-1" || mode == "maintenance-fairness-2") {
 			MaintenanceFairness(f, mode == "maintenance-fairness-1" ? 1 : 2);
 			return 0;

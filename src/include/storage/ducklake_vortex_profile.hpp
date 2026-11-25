@@ -26,6 +26,7 @@ enum class DuckLakeVortexPhase : uint8_t {
 	SOURCE_UNLINK,
 	LOOP_WAIT_TIMEOUT,
 	LOOP_WAIT_WAKE,
+	SOURCE_TRANSACTION_WAKE,
 	COUNT
 };
 

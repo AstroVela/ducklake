@@ -432,15 +432,38 @@ void DuckLakeVortexSourceRetention::Configure(ClientContext &context, const stri
 	owner.connection.Commit();
 }
 
-bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, idx_t max_bytes) {
+bool DuckLakeVortexSourceRetention::WorkReady(DuckLakeTransaction &transaction, idx_t max_bytes,
+                                              const std::function<void()> &on_transaction_end,
+                                              optional_ptr<bool> blocked_by_transactions) {
+	if (blocked_by_transactions) {
+		*blocked_by_transactions = false;
+	}
 	auto policy = Load(transaction);
-	if (!policy.enabled || Manager(transaction.GetCatalog()).HasOtherTransactions(&transaction, true)) {
+	auto &manager = Manager(transaction.GetCatalog());
+	if (!policy.enabled || (!on_transaction_end && manager.HasOtherTransactions(&transaction, true))) {
 		return false;
 	}
-	auto eligible =
-	    VortexIndex::Query(transaction, "SELECT EXISTS(SELECT 1 FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " +
-	                                        Eligible(policy) + ")");
-	if (eligible->Fetch()->GetValue(0, 0).GetValue<bool>()) {
+	auto sql = "SELECT EXISTS(SELECT 1 FROM {METADATA_CATALOG}.ducklake_snapshot WHERE " + Eligible(policy) + ")";
+	if (on_transaction_end) {
+		// Queue presence allows subscription without inspecting files while a read transaction is active.
+		sql += ", EXISTS(SELECT 1 FROM {METADATA_CATALOG}." + string(SCHEDULED) +
+		       ") OR EXISTS(SELECT 1 FROM {METADATA_CATALOG}." + DELETIONS + ")";
+	}
+	auto result = VortexIndex::Query(transaction, sql);
+	auto work = result->Fetch();
+	const auto snapshots = work->GetValue(0, 0).GetValue<bool>();
+	if (on_transaction_end) {
+		if (!snapshots && !work->GetValue(1, 0).GetValue<bool>()) {
+			return false;
+		}
+		if (manager.HasOtherTransactions(&transaction, true, on_transaction_end)) {
+			if (blocked_by_transactions) {
+				*blocked_by_transactions = true;
+			}
+			return false;
+		}
+	}
+	if (snapshots) {
 		return true;
 	}
 	try {
@@ -517,7 +540,8 @@ DuckLakeVortexSourceGCResult
 DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &catalog_name, idx_t max_objects,
                                        idx_t max_bytes, const std::function<void(const string &)> &observe,
                                        optional_ptr<const DuckLakeVortexCatalogIdentity> identity,
-                                       DuckLakeVortexMaintenanceProfile *profile) {
+                                       DuckLakeVortexMaintenanceProfile *profile,
+                                       const std::function<void()> &on_transaction_end) {
 	if (!max_objects || max_objects > 16 || !max_bytes || max_bytes > MAX_BYTES) {
 		throw InvalidInputException("Invalid Vortex source collection budgets");
 	}
@@ -555,8 +579,14 @@ DuckLakeVortexSourceRetention::Collect(ClientContext &context, const string &cat
 	// Finish admitted captures before freezing their transaction starts.
 	auto admissions = DuckLakeVortexReadView::AdmissionLock().GetExclusiveLock(interrupt);
 	auto transactions = TransactionGate().TryGetExclusiveLock();
-	if (!transactions || Manager(catalog).HasOtherTransactions(nullptr, false)) {
+	if (!transactions || Manager(catalog).HasOtherTransactions(nullptr, false, on_transaction_end)) {
 		result.blocked = true;
+		if (transactions && on_transaction_end) {
+			transactions.reset();
+			admissions.reset();
+			publication.reset();
+			check("source_gc_deferred");
+		}
 		return result;
 	}
 	timer.Switch(Phase::SOURCE_METADATA);
