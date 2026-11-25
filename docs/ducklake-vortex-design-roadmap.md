@@ -86,13 +86,13 @@ T/F/B 是**同一份逻辑数据在某个 ReadView 下的物理分区**，不要
 3. 调用 `ducklake_mutate_vortex_batch`，提交请求 ID、完整 upsert 行和待删除 ID。
 4. 在同一原生事务内删除旧版本、插入 upsert 新行并登记回执，提交后返回 ACK。原生内联策略决定新行在提交时位于 T，还是直接落盘进入 F。仅删除的批次处理删除与回执。
 
-upsert 是整行替换。一个批次内 upsert/delete 的 ID 必须非 NULL 且互不重复。同一个 ID 同时出现在两类操作中会失败。回执包含 `table_uuid, request_id, payload_hash, row_count, snapshot_id`；`row_count` 是请求操作数，删除不存在的键也计入。没有实际数据变化的删除可沿用当前快照号，但回执仍持久提交。
+upsert 是整行替换。一个批次内 upsert/delete 的 ID 必须非 NULL 且互不重复。同一个 ID 同时出现在两类操作中会失败。回执包含 `table_uuid, request_id, payload_hash, row_count, snapshot_id, request_epoch`；`row_count` 是请求操作数，删除不存在的键也计入。没有实际数据变化的删除可沿用当前快照号，但回执仍持久提交。
 
-幂等身份为 `(table_uuid, request_id)`。相同内容重试返回原回执；更改内容复用请求 ID 会失败。重放旧 upsert 不会复活后来删除的数据，重放旧 delete 不会删除后来新写入的版本。提交冲突向客户端返回，内部提交重试次数为零；客户端可在新事务中显式重提同一请求。
+幂等身份为 `(table_uuid, request_epoch, request_id)`。同一 epoch 内，相同内容重试返回原回执；更改内容复用请求 ID 会失败。重放旧 upsert 不会复活后来删除的数据，重放旧 delete 不会删除后来新写入的版本。提交冲突向客户端返回，内部提交重试次数为零；客户端可在新事务中显式重提同一请求。
 
 受管表拒绝普通 SQL INSERT/UPDATE/DELETE、append API，以及 schema、rename、drop 变更；flush、重写与回收通过已有内部授权路径执行。非受管表保留普通 SQL／append 语义。这里复用 DuckLake 原生 MVCC 和元数据 WAL，没有第二份写入 WAL 或独立的逐键版本目录。
 
-回执记录上限为**每个元数据 catalog 合计 100,000 条**，没有自动过期。快照过期和源文件 GC 不会删除回执；必须在扩大长期写入范围前确定回执保留与过期请求的语义。详见[受管写入](native-vortex-keyed-writes.md)和[写入实现](../src/storage/ducklake_vortex_write.cpp)。
+回执记录上限为**每个元数据 catalog 合计 100,000 条**，没有自动过期。快照过期与源文件 GC 各自独立。新表从 epoch 1 开始，客户端随请求保留原 epoch。显式 advance 在同一原生事务内递增一个表的 epoch 并移除它的旧回执。旧 epoch 的请求返回 `EXPIRED_REQUEST`。详见[受管写入](native-vortex-keyed-writes.md)和[请求 epoch](native-vortex-request-epochs.md)。
 
 ## 5. 一次查询如何覆盖 B/F/T
 
@@ -201,7 +201,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | 编码源／索引产物 | 分别全局 64 MiB，不按 B 段数倍增 |
 | catalog manifest | 1 MiB |
 | mutation 批次 | 1–1,000 个操作，规范化内容最多 4 MiB |
-| 请求回执 | 每个元数据 catalog 合计 100,000 条，不自动过期 |
+| 请求回执 | 每个元数据 catalog 合计 100,000 条。显式推进目标表 epoch 释放该表的旧回执 |
 | T/F 写入配额 | 显式配置；提交前对现有物理输入和保留 inline 版本重新 admission |
 
 没有扩大预算就支持无限数据增长的结论。源／索引 GC 排空也不等于总磁盘有界：回执、原生元数据／WAL、调用方 reference JSON 有独立生命周期。上述输入限额同样不构成进程 RSS 上限。
@@ -257,7 +257,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
-| R5 容量与产品契约 | **当前优先项，部分完成**。inline 浮点序列化和密集 L2 已修复，新增四维度确定性功能矩阵 | 明确回执保留及过期请求、reference／WAL 管理、容量 admission。更大数据、质量、延迟和吞吐仍需验证 |
+| R5 容量与产品契约 | **当前优先项，部分完成**。inline 浮点序列化和密集 L2 已修复，新增四维度确定性功能矩阵，已接入持久 request epoch 和显式回执回收 | 继续 reference／WAL 管理、容量 admission。更大数据、质量、延迟和吞吐仍需验证 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
@@ -291,7 +291,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 4. 选择一个有测量证据的热点做验证性改动，沿用现有格式和出错语义。候选达到预设收益后保留，未达门槛时记录结果并撤回改动。
 5. 30 分钟稳态验证继续暂缓。当前长测工具按三个阶段运行，通过查询前后的提交水位进行验证。恢复前先让长测使用查询实际捕获的 ReadView 快照，对齐历史稳态阶段和写入节奏，并将 canary 与 exploration 的 recall ≥0.8 都设为通过条件。保留 90 秒 drain、最终行和旧回执检查。用更长且重复的运行检查后半程积压斜率、清理速率和资源增长，确认维护能跟上持续写入。[当前长测工具](../test/vane/test_vane_vortex_sustained_load.py)
 
-稳定负载下的 R4 和 R5 性能验证继续暂缓。R5 先推进回执生命周期、reference／WAL 和容量 admission 的确定性契约。R6 需要独立的远程与分布式设计，R7 按收益证据决定。
+稳定负载下的 R4 和 R5 性能验证继续暂缓。R5 已接入回执生命周期，继续验证 reference／WAL 和容量 admission 的确定性契约。R6 需要独立的远程与分布式设计，R7 按收益证据决定。
 
 ## 12. 文档与实现导航
 
@@ -312,6 +312,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | [引用检查内部诊断](native-vortex-reference-diagnostics.md) | 私有诊断构建、Fetch 与路径循环、历史结果及当前 smoke |
 | [文件名预筛选](native-vortex-filename-prefilter.md) | 历史 A/B 撤回及当前路径身份回归 |
 | [确定性维度与查询契约](native-vortex-functional-matrix.md) | 数值回归、四维度 B/F/T、过滤、实际 ReadView 与拒绝检查 |
+| [请求 epoch 与回执生命周期](native-vortex-request-epochs.md) | 每表显式推进、原子释放旧回执、重试与 WAL 恢复 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。

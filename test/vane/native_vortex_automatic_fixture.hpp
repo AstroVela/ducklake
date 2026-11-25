@@ -61,6 +61,7 @@ inline duckdb_yyjson::yyjson_mut_val *AutomaticReceipts(vortex_detail::ViewJSON 
 		json.Text(record, "payload_hash", receipt.payload_hash);
 		json.Number(record, "row_count", receipt.row_count);
 		json.Number(record, "snapshot_id", receipt.snapshot_id);
+		json.Number(record, "request_epoch", receipt.request_epoch);
 		duckdb_yyjson::yyjson_mut_arr_append(list, record);
 	}
 	return list;
@@ -69,12 +70,12 @@ inline duckdb_yyjson::yyjson_mut_val *AutomaticReceipts(vortex_detail::ViewJSON 
 inline void SaveAutomaticCheckpoint(DuckDB &database, const string &root) {
 	Connection reader(database);
 	reader.BeginTransaction();
-	auto recorded = SQL(reader, "SELECT table_uuid,request_id,payload_hash,row_count,snapshot_id FROM "
-	                            "__ducklake_metadata_lake.ducklake_vortex_write_requests_v1 ORDER BY snapshot_id");
+	auto recorded = SQL(reader, "SELECT table_uuid,request_id,payload_hash,row_count,snapshot_id,request_epoch FROM "
+	                            "__ducklake_metadata_lake.ducklake_vortex_write_requests_v2 ORDER BY snapshot_id");
 	vector<DuckLakeVortexWriteResult> receipts;
 	for (auto &row : *recorded) {
 		receipts.push_back({row.GetValue<string>(0), row.GetValue<string>(1), row.GetValue<string>(2),
-		                    row.GetValue<idx_t>(3), row.GetValue<idx_t>(4)});
+		                    row.GetValue<idx_t>(3), row.GetValue<idx_t>(4), row.GetValue<uint64_t>(5)});
 	}
 	auto index = SQL(reader, "SELECT revision,reference FROM __ducklake_metadata_lake.ducklake_vortex_indexes_v1");
 	Require(index->RowCount() == 1, "Checkpoint requires one named index");
@@ -225,7 +226,7 @@ struct AutomaticFixture {
 			try {
 				pending.receipt =
 				    DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", request,
-				                                     Rows(pending.rows), Deletes(pending.deletes), observe);
+				                                     Rows(pending.rows), Deletes(pending.deletes), 1, observe);
 				break;
 			} catch (std::exception &error) {
 				auto message = StringUtil::Lower(error.what());
@@ -408,11 +409,12 @@ struct AutomaticFixture {
 		for (auto &plan : plans) {
 			Connection owner(database);
 			auto result = DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn",
-			                                               plan.request, Rows(plan.rows), Deletes(plan.deletes));
+			                                               plan.request, Rows(plan.rows), Deletes(plan.deletes),
+			                                               plan.receipt.request_epoch);
 			Require(result.snapshot_id == plan.receipt.snapshot_id &&
 			            result.payload_hash == plan.receipt.payload_hash &&
 			            result.table_uuid == plan.receipt.table_uuid && result.request_id == plan.receipt.request_id &&
-			            result.row_count == plan.receipt.row_count,
+			            result.row_count == plan.receipt.row_count && result.request_epoch == plan.receipt.request_epoch,
 			        "Old automatic-flow request changed its receipt");
 			Require(SQL(setup, snapshot_sql)->GetValue(0, 0) == before,
 			        "Automatic receipt replay changed the snapshot");
@@ -826,12 +828,12 @@ inline void RunAutomaticFixture(DuckDB &database, Connection &setup, const strin
 		bool rejected = false;
 		try {
 			DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "blocked",
-			                                 f.Rows({f.Row(10000, 1)}), f.Deletes({}));
+			                                 f.Rows({f.Row(10000, 1)}), f.Deletes({}), 1);
 		} catch (std::exception &error) {
 			rejected = string(error.what()).find("RESOURCE_EXHAUSTED") != string::npos;
 		}
 		Require(rejected &&
-		            SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1 WHERE "
+		            SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2 WHERE "
 		                       "request_id='blocked'")
 		                    ->GetValue(0, 0)
 		                    .GetValue<idx_t>() == 0,

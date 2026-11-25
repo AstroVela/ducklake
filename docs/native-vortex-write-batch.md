@@ -4,7 +4,8 @@ This Draft extends the [installed Vane vector flow](vane-native-vortex-proof.md)
 with a bounded, append-only SQL write API. A batch and its durable request
 receipt commit in one DuckLake native metadata transaction. The original
 request result remains available after later writes, flush, ANN publication
-and restart.
+and restart while its request epoch remains current. Explicit retirement closes
+that retry window; see [request epochs](native-vortex-request-epochs.md).
 For non-NULL unique business ids with atomic upsert/delete, use the explicit
 [managed mutation mode](native-vortex-keyed-writes.md).
 
@@ -18,14 +19,19 @@ native DuckDB-backed DuckLake catalog:
 connection.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
 write_sql = (
     "SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn',?,"
-    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[])"
+    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::UBIGINT)"
 )
 rows = [
     {'id': 1, 'embedding': [0.125, 0.0], 'category': 'A', 'payload': '实时向量'},
     {'id': 2, 'embedding': [0.25, 0.0], 'category': None, 'payload': None},
 ]
-receipt = connection.execute(write_sql, ['request-1', rows]).fetchone()
-assert connection.execute(write_sql, ['request-1', rows]).fetchone() == receipt
+# Read once when creating a new request; persist this epoch with the request.
+epoch = connection.execute(
+    "SELECT * FROM ducklake_vortex_request_status('lake','main','items','knn')"
+).fetchone()[1]
+request = ['request-1', rows, epoch]
+receipt = connection.execute(write_sql, request).fetchone()
+assert connection.execute(write_sql, request).fetchone() == receipt
 ```
 
 New writes require the fixed `id BIGINT, embedding FLOAT[], category VARCHAR,
@@ -37,15 +43,17 @@ The same named search reads the committed T immediately, then F and B after
 the existing flush/index operations. Native write budgets continue to apply.
 
 The result columns are `table_uuid, request_id, payload_hash, row_count,
-snapshot_id`. The snapshot ID identifies the batch's original native commit.
+snapshot_id, request_epoch`. The snapshot ID identifies the batch's original native commit.
 Successful repeated calls return exactly that result and append no new rows.
 A later update or deletion remains visible. Retrying an older request leaves
 those changes in place and verifies the original canonical input, including
 its dimension. A full index replacement can change the required dimension for
 new writes.
 
-Request identity is `(table_uuid, request_id)`, independent of catalog aliases
-or table names. Request IDs are compared byte for byte under the database's
+For one table incarnation, request identity is `(table_uuid, request_epoch, request_id)`
+across aliases and renames. The lifecycle contract also covers
+[same-name table recreation](native-vortex-request-epochs.md#contract). Request IDs
+are compared byte for byte under the database's
 collation settings. A matching identity with different canonical content fails
 with `request_id payload mismatch`. An independent table may use the same
 request ID. The API deduplicates requests, not business IDs: append batches
@@ -72,19 +80,28 @@ The canonical byte stream has this fixed encoding:
 
 A batch has 1–1000 rows and at most 4 MiB of canonical content. A request ID
 has 1–128 bytes and contains no NUL. The request catalog admits at most 100,000
-records across its tables; existing committed requests still resolve when
-that catalog is full. Records have no implicit expiration. The API does not
+records across its tables; current-epoch committed requests still resolve when
+that catalog is full. Records have no implicit expiration. An explicit
+`ducklake_advance_vortex_request_epoch` atomically retires one table's current
+window and deletes its receipts. Earlier epochs, including unseen IDs, then
+fail with `EXPIRED_REQUEST`; future epochs also fail. Never upgrade an old
+request to a newer epoch during retry. The last advance can itself be retried
+without deleting newer receipts.  The API does not
 raise the existing source/vector, pending-write or ANN segment budgets.
 The [source retention worker](native-vortex-source-retention.md) can expire a
 receipt's original snapshot while preserving the exact receipt and retry behavior.
 
 ## Atomicity and retry
 
-`ducklake_vortex_write_requests_v1` is an explicitly initialized native
-metadata table with a real `PRIMARY KEY(table_uuid,request_id)`. It is not a
+`ducklake_vortex_write_requests_v2` is an explicitly initialized native
+metadata table with a real `PRIMARY KEY(table_uuid,request_epoch,request_id)`. It is not a
 DuckLake business table with unenforced uniqueness. Same-process WriteBatch
 calls serialize from lookup through commit, so concurrent identical requests
-return the same result and conflicting payloads have one winner.
+return the same result and conflicting payloads have one winner. Epoch advances
+share that serialization lock and native transaction. Fresh layouts add
+`ducklake_vortex_request_epochs_v1`; legacy receipt layouts are explicitly
+rejected, not migrated. The epoch argument is required; old SQL arities are not
+registered. Payload digest encoding above is unchanged.
 
 The request INSERT uses the same metadata connection/transaction as the
 batch's native snapshot and inlined/file records. There is no second WAL or

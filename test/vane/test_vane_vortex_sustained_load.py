@@ -461,7 +461,7 @@ def worker(args):
         emit("final_rows", rows=final_rows)
         recorded = query(
             connection,
-            "SELECT table_uuid,request_id,payload_hash,row_count,snapshot_id FROM "
+            "SELECT table_uuid,request_id,payload_hash,row_count,snapshot_id,request_epoch FROM "
             + REQUESTS
             + " WHERE starts_with(request_id,'steady-') ORDER BY snapshot_id",
         )
@@ -480,7 +480,7 @@ def worker(args):
                 for slot, key in changes:
                     old_keys[slot] = key
             require(
-                KEYED.mutate(connection, entry["request_id"], rows, deletes) == entry,
+                KEYED.mutate(connection, entry["request_id"], rows, deletes, epoch=entry["request_epoch"]) == entry,
                 "Retry changed its receipt",
             )
             require(

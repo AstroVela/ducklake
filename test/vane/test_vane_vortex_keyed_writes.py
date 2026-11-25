@@ -22,12 +22,12 @@ BASE = WRITE.BASE
 query, require, quote = BASE.query, BASE.require, BASE.quote
 
 
-def mutate(connection, request, rows, deletes=(), table="items"):
+def mutate(connection, request, rows, deletes=(), table="items", epoch=1):
     return WRITE.query_parameters(
         connection,
         "SELECT * FROM ducklake_mutate_vortex_batch('lake','main',?,'knn',?,"
-        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[])",
-        [table, request, rows, list(deletes)],
+        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT)",
+        [table, request, rows, list(deletes), epoch],
     )[0]
 
 

@@ -1,6 +1,7 @@
 #include "native_vortex_fixture.hpp"
 #include "native_vortex_keyed_fixture.hpp"
 #include "native_vortex_automatic_fixture.hpp"
+#include "native_vortex_epoch_fixture.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -22,7 +23,7 @@ static void CheckQueuedCancellation(DuckDB &database, Connection &setup, const V
 	auto waiting_ready = waiting.get_future();
 	auto held = std::async(std::launch::async, [&] {
 		return DuckLakeVortexWriteBatch::Append(
-		    holder, *setup.context, "lake", "main", "items", "knn", "holder", rows, [&](const string &stage) {
+		    holder, *setup.context, "lake", "main", "items", "knn", "holder", rows, 1, [&](const string &stage) {
 			    if (stage == "acquired") {
 				    acquired.set_value();
 				    Require(release_ready.wait_for(std::chrono::seconds(20)) == std::future_status::ready,
@@ -38,7 +39,7 @@ static void CheckQueuedCancellation(DuckDB &database, Connection &setup, const V
 	auto canceled = std::async(std::launch::async, [&] {
 		bool notified = false;
 		try {
-			DuckLakeVortexWriteBatch::Append(queued, *caller.context, "lake", "main", "items", "knn", "queued", rows,
+			DuckLakeVortexWriteBatch::Append(queued, *caller.context, "lake", "main", "items", "knn", "queued", rows, 1,
 			                                 [&](const string &stage) {
 				                                 if (stage == "lock_wait" && !notified) {
 					                                 notified = true;
@@ -58,7 +59,7 @@ static void CheckQueuedCancellation(DuckDB &database, Connection &setup, const V
 	Require(reached_lock && resolved_before_release && canceled.get(), "Queued writer did not cancel while locked");
 	Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 2,
 	        "Canceled writer added rows");
-	Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1")
+	Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2")
 	                ->GetValue(0, 0)
 	                .GetValue<idx_t>() == 1,
 	        "Canceled writer added a receipt");
@@ -89,7 +90,7 @@ static void CheckCommitWaitCancellation(DuckDB &database, Connection &setup,
 	lock.reset();
 	Require(waited && finished_before_release && writer.get(), "Caller could not cancel the commit publication wait");
 	Require(SQL(setup, "SELECT (SELECT count(*) FROM lake.items) + "
-	                   "(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1)")
+	                   "(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2)")
 	                ->GetValue(0, 0)
 	                .GetValue<idx_t>() == 0,
 	        "Canceled commit left data or a receipt");
@@ -131,8 +132,12 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 		} catch (const InterruptException &) {
 			canceled = true;
 		}
-		Require(canceled && !setup.TableInfo("__ducklake_metadata_lake", "main", "ducklake_vortex_write_requests_v1"),
+		Require(canceled && !setup.TableInfo("__ducklake_metadata_lake", "main", "ducklake_vortex_write_requests_v2"),
 		        "Canceled initialization created the request table");
+		return 0;
+	}
+	if (StringUtil::StartsWith(mode, "epoch-")) {
+		RunEpochFixture(database, setup, root, mode);
 		return 0;
 	}
 	if (StringUtil::StartsWith(mode, "automatic-")) {
@@ -160,7 +165,7 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 	}
 	if (mode == "cancel-commit-wait") {
 		CheckCommitWaitCancellation(database, setup, [&](Connection &writer, ClientContext &caller) {
-			DuckLakeVortexWriteBatch::Append(writer, caller, "lake", "main", "items", "knn", "waiting", rows);
+			DuckLakeVortexWriteBatch::Append(writer, caller, "lake", "main", "items", "knn", "waiting", rows, 1);
 		});
 		return 0;
 	}
@@ -214,7 +219,7 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 	};
 	try {
 		auto result = DuckLakeVortexWriteBatch::Append(owner, *setup.context, "lake", "main", "items", "knn", "request",
-		                                               rows, observer);
+		                                               rows, 1, observer);
 		if (mode == "replace-same-dimension") {
 			Require(observed && result.row_count == 2, "Same-dimension publication interrupted a valid write");
 			Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 130,
@@ -234,7 +239,7 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 			Require(StringUtil::Contains(error.what(), "index specification changed before commit"), error.what());
 			Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 128,
 			        "A stale-dimensional append changed committed rows");
-			Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1")
+			Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2")
 			                ->GetValue(0, 0)
 			                .GetValue<idx_t>() == 0,
 			        "A stale-dimensional append left a receipt");
@@ -251,13 +256,13 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 	}
 	if (observed) {
 		auto committed = mode == "fail-after_commit";
-		auto requests = SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v1");
+		auto requests = SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2");
 		Require(requests->GetValue(0, 0).GetValue<idx_t>() == (committed ? 1 : 0), "Incorrect durable request count");
 		auto count = SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>();
 		Require(count == (committed ? 2 : conflict ? 1 : 0), "Incorrect atomic batch count");
 		Connection retry(database);
 		auto result =
-		    DuckLakeVortexWriteBatch::Append(retry, *setup.context, "lake", "main", "items", "knn", "request", rows);
+		    DuckLakeVortexWriteBatch::Append(retry, *setup.context, "lake", "main", "items", "knn", "request", rows, 1);
 		Require(result.row_count == 2, "Retry changed WriteBatch result");
 		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == (conflict ? 3 : 2),
 		        "Retry duplicated or lost WriteBatch rows");
