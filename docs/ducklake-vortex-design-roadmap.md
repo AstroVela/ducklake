@@ -8,7 +8,9 @@
 
 ## 1. 基线与设计范围
 
-实现基线为 `dev/ducklake-vortex` 的 `d0c3a5f7ffb9fa71591ac7b9b5a9de0ba517993b`。#71（`ff367dbd`）合入实际查询快照和维护计时，#72（`deb91458`）合入源保留查询优化和 worker 等待计时，#73（`dfd6bd30`）合入事务结束后的 GC 唤醒。#74 已将 policy/backlog 查询合并的撤回结论和历史证据链接合入开发分支，其生产 `src/` 与 `dfd6bd30` 一致。安装态回归及长测各自对应的提交见第 9 节。[开发基线](https://github.com/AstroVela/ducklake/commit/d0c3a5f7ffb9fa71591ac7b9b5a9de0ba517993b)
+本统一设计首次合入 `dev/ducklake-vortex` 的提交为 `d0c3a5f7ffb9fa71591ac7b9b5a9de0ba517993b`。#71（`ff367dbd`）合入实际查询快照和维护计时，#72（`deb91458`）合入源保留查询优化和 worker 等待计时，#73（`dfd6bd30`）合入事务结束后的 GC 唤醒。#74 已将 policy/backlog 查询合并的撤回结论和历史证据链接合入开发分支，其生产 `src/` 与 `dfd6bd30` 一致。安装态回归及长测各自对应的提交见第 9 节。[开发基线](https://github.com/AstroVela/ducklake/commit/d0c3a5f7ffb9fa71591ac7b9b5a9de0ba517993b)
+
+#84 增加 inline FLOAT／DOUBLE 的显式浮点解析，并以 Float64 累加密集向量的平方 L2，再返回 Float32 距离。确定性测试覆盖 1／8／128／4,096 维以及 B/F/T、过滤和实际 ReadView，沿用既有资源及召回门槛。[数值修复与功能矩阵](native-vortex-functional-matrix.md)
 
 当前限定：单进程独占 native DuckDB 元数据目录、本地受管 POSIX 文件、无分区／未加密的固定业务 schema、Float32 有限向量、平方 L2 距离。并发客户端与后台维护位于这一所有权范围内；多进程写者、跨主机 fencing、远程对象存储和分布式 ANN 不在当前验证范围。
 
@@ -254,8 +256,8 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R1 实时基本链路 | **已实现并验证**：零 B、即时 T/F 查询、受管 upsert/delete、回执、ReadView、写入背压 | 固定 schema／单进程范围内已有端到端及恢复证据 |
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
-| R4 长期维护稳态 | **当前优先项，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
-| R5 容量与产品契约 | **待完成**：更大／更高维／更广过滤负载、质量与延迟、生命周期 | 明确回执保留及过期请求、reference／WAL 管理、容量 admission；按目标负载决定 schema／度量／过滤扩展 |
+| R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
+| R5 容量与产品契约 | **当前优先项，部分完成**。inline 浮点序列化和密集 L2 已修复，新增四维度确定性功能矩阵 | 明确回执保留及过期请求、reference／WAL 管理、容量 admission。更大数据、质量、延迟和吞吐仍需验证 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
@@ -289,7 +291,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 4. 选择一个有测量证据的热点做验证性改动，沿用现有格式和出错语义。候选达到预设收益后保留，未达门槛时记录结果并撤回改动。
 5. 30 分钟稳态验证继续暂缓。当前长测工具按三个阶段运行，通过查询前后的提交水位进行验证。恢复前先让长测使用查询实际捕获的 ReadView 快照，对齐历史稳态阶段和写入节奏，并将 canary 与 exploration 的 recall ≥0.8 都设为通过条件。保留 90 秒 drain、最终行和旧回执检查。用更长且重复的运行检查后半程积压斜率、清理速率和资源增长，确认维护能跟上持续写入。[当前长测工具](../test/vane/test_vane_vortex_sustained_load.py)
 
-R4 关闭后再扩大 R5 的负载／容量范围；R6 需要独立远程与分布式设计，R7 按收益证据决定。此处不以调整保留策略、提高预算或降低质量门槛代替完成验证。
+稳定负载下的 R4 和 R5 性能验证继续暂缓。R5 先推进回执生命周期、reference／WAL 和容量 admission 的确定性契约。R6 需要独立的远程与分布式设计，R7 按收益证据决定。
 
 ## 12. 文档与实现导航
 
@@ -309,6 +311,7 @@ R4 关闭后再扩大 R5 的负载／容量范围；R6 需要独立远程与分�
 | [元数据重复诊断](native-vortex-source-gc-metadata.md) | 诊断样本、SQL 守恒分类与范围外开销 |
 | [引用检查内部诊断](native-vortex-reference-diagnostics.md) | 私有诊断构建、Fetch 与路径循环、历史结果及当前 smoke |
 | [文件名预筛选](native-vortex-filename-prefilter.md) | 历史 A/B 撤回及当前路径身份回归 |
+| [确定性维度与查询契约](native-vortex-functional-matrix.md) | 数值回归、四维度 B/F/T、过滤、实际 ReadView 与拒绝检查 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。

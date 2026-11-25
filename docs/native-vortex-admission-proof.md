@@ -161,8 +161,10 @@ with 16 expected rejections. The mixed proof passed 61 SQL/probe processes and
 Float32 regression recalls were all 1.0. It builds the original B generation
 once and reports the far sparse ANN probe independently.
 
-The stepwise Float32 oracle, existing distance tolerances, 0.8 fixture recall
-threshold, transaction protection and admission budgets are preserved. Local
+The historical proof used the stepwise Float32 oracle. The current oracle
+uses Float64 accumulation and a final Float32 distance with the same
+distance tolerances and 0.8 fixture recall threshold. Transaction protection
+and admission budgets are unchanged. The historical local
 builds recompiled the affected native units and driver, reusing source- and
 artifact-verified DuckDB v1.5.5 engine objects and pinned dependencies.
 ON/default-OFF CMake configuration was checked separately. The parent

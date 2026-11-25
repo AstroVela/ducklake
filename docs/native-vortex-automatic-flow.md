@@ -82,8 +82,8 @@ independently. A child process bounds the public proof, including teardown.
 The native driver runs the same rolling workload alongside filtered and
 unfiltered queries. Each query records the actual ReadView snapshot and
 routes. Each committed phase waits for both query variants to observe it,
-while queries continue during maintenance. The native oracle uses stepwise
-Float32 arithmetic and distinct scores. The first seed pauses before flush
+while queries continue during maintenance. The native oracle accumulates in
+Float64 and uses distinct final Float32 scores. The first seed pauses before flush
 and before build to verify inline T, scanned F and published B ANN routes.
 
 A separate native case pauses the worker before flush with a full inline

@@ -109,7 +109,8 @@ the exploratory recall distribution and whether its minimum reaches 0.8;
 exploratory quality misses are not relabeled as version failures or concealed
 by lowering the canary gate. Where several logical cuts fit a public read
 window, recall is reported as the conservative minimum over those cuts.
-The oracle rounds every distance operation to Float32. When several rows tie
+The current oracle accumulates squared distances in Float64 and rounds each
+final score to Float32. When several rows tie
 at the cutoff, the report uses the lowest recall over possible physical address
 orders. The frozen automatic-flow proof checks exact physical tie order.
 

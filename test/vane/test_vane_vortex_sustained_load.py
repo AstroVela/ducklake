@@ -522,12 +522,13 @@ def valid_hits(sample, model):
     point = np.asarray(sample["vector"], dtype=np.float32)
     vectors = np.asarray([entry["embedding"] for entry in eligible], dtype=np.float32)
     require(vectors.shape == (len(eligible), len(point)), "Oracle vector dimension mismatch")
-    # Rounding each coordinate and addition matches the native Float32 distance.
-    distances = np.zeros(len(eligible), dtype=np.float32)
+    # Normalize the inputs to Float32, accumulate in Float64, and round once.
+    distances = np.zeros(len(eligible), dtype=np.float64)
     for coordinate in range(len(point)):
-        difference = vectors[:, coordinate] - point[coordinate]
+        difference = vectors[:, coordinate].astype(np.float64) - float(point[coordinate])
         distances += difference * difference
-    scores = {entry["id"]: score for entry, score in zip(eligible, distances.tolist())}
+    rounded = distances.astype(np.float32).tolist()
+    scores = {entry["id"]: score for entry, score in zip(eligible, rounded)}
     previous = 0.0
     for entry in rows:
         key = entry["id"]
@@ -546,7 +547,7 @@ def valid_hits(sample, model):
     # Public search omits physical addresses. At the cutoff, assume that omitted
     # equal-score rows precede returned rows. The frozen proof checks exact tie order.
     k = min(10, len(scores))
-    cutoff = sorted(distances.tolist())[k - 1]
+    cutoff = sorted(rounded)[k - 1]
     nearer = sum(score < cutoff for score in scores.values())
     found_nearer = sum(scores[entry["id"]] < cutoff for entry in rows)
     found_tied = sum(scores[entry["id"]] == cutoff for entry in rows)
@@ -557,7 +558,7 @@ def valid_hits(sample, model):
 def check_oracle():
     point = [0.0, 0.0, 0.0]
     model = {key: dict(id=key, embedding=[float(key), 0.0, 0.0], category="B", payload=None) for key in range(8)}
-    tied_vectors = ([4096.0, 1.0, 1.0], [4096.0, 0.0, 0.0], [4096.0, 1.0, 0.0], [4096.0, 0.0, 1.0])
+    tied_vectors = ([4096.0, 0.5, 0.5], [4096.0, 0.0, 0.0], [4096.0, 1.0, 0.0], [4096.0, 0.0, 1.0])
     for key, vector in enumerate(tied_vectors, 8):
         model[key] = dict(id=key, embedding=vector, category="B", payload=None)
     rows = [dict(model[key], distance=MIXED.float32_squared_l2(point, model[key]["embedding"])) for key in range(10)]
