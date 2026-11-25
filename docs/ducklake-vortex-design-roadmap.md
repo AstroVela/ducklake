@@ -254,7 +254,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R1 实时基本链路 | **已实现并验证**：零 B、即时 T/F 查询、受管 upsert/delete、回执、ReadView、写入背压 | 固定 schema／单进程范围内已有端到端及恢复证据 |
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
-| R4 长期维护稳态 | **当前优先项，未完成**。已合入查询实际快照诊断、确定性快照验证、维护阶段观测和事务结束唤醒。历史长测通过停写后 drain，写入期积压仍在增长 | 验证历史增长下实际 GC 的成本和持续写入时的清理速率，关闭历史开放停滞。当前基线的 30 分钟稳态验证暂缓 |
+| R4 长期维护稳态 | **当前优先项，未完成**。已合入查询实际快照诊断、确定性快照验证、维护阶段观测和事务结束唤醒。历史长测通过停写后 drain，写入期积压仍在增长。旧堆栈的[实际 GC 基准](native-vortex-source-gc-cost.md)定位了快照过期的候选区间查询 | 验证候选查询的等价性以及持续写入时的清理速率，关闭历史开放停滞。当前基线的 30 分钟稳态验证暂缓 |
 | R5 容量与产品契约 | **待完成**：更大／更高维／更广过滤负载、质量与延迟、生命周期 | 明确回执保留及过期请求、reference／WAL 管理、容量 admission；按目标负载决定 schema／度量／过滤扩展 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
@@ -266,6 +266,8 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 ## 11. R4 下一步验证
 
 **先验证实际 source GC 的可重放输入和回收结果，再测 `DeleteSnapshots` 的完整成本。** #74 的结果适用于只读探测，实际回收会修改输入。
+
+旧堆栈 #76 在 12 个场景采集 192 个主样本。4,096 次更新时，两快照过期中位耗时为逐次落盘 197.127 ms、inline 31.230 ms。独立诊断指向 `DeleteSnapshots` 中判断旧数据文件是否仍被保留快照引用的区间查询。开发分支上的基准入口先复验输入恢复与实际回收语义。[历史基准结果](native-vortex-source-gc-cost.md#historical-observations-on-2026-11-06)
 
 1. 从同一检查点恢复独立的元数据和文件副本，保持受管路径与文件身份有效。固定事务时序，核对实际执行 `DeleteSnapshots` 的候选快照、受保护快照、文件队列、删除意图与回收结果。
 2. 沿用普通事务、旧 ReadView、取消、崩溃及所有权检查，保持现有对象／字节、T/F 和查询预算。按不同历史规模重放时固定逻辑数据、文件、保留策略和任务输入。
@@ -285,6 +287,7 @@ R4 关闭后再扩大 R5 的负载／容量范围；R6 需要独立远程与分�
 | [数据重写](native-vortex-index-rewrite-proof.md)／[稀疏重写](native-vortex-sparse-rewrite-proof.md) | 回收被替换／删除版本的物理容量 |
 | [源保留](native-vortex-source-retention.md)／[事务唤醒](native-vortex-transaction-gc-wakeup.md) | 文件删除、读者保护、确定性回归与历史长测入口 |
 | [查询快照回归](../test/vane/test_vane_native_vortex.py)／[计时 SQL 入口](../src/functions/ducklake_vortex_optimizer_function.cpp)／[A/B 决策](native-vortex-maintenance-probe-ab.md) | 实际查询版本、当前阶段观测与已撤回实验 |
+| [实际 source GC 成本](native-vortex-source-gc-cost.md) | 可重放的 collector smoke、历史成本与候选区间查询定位 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。
