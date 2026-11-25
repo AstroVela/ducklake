@@ -24,9 +24,7 @@ def focus(passes):
     return {
         "status": "completed",
         "profile": "focus",
-        "decision": (
-            "precision_demonstrated" if all(passes) else "precision_not_demonstrated"
-        ),
+        "decision": ("precision_demonstrated" if all(passes) else "precision_not_demonstrated"),
         "cases": [
             {
                 "history": n,
