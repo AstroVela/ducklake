@@ -3,7 +3,8 @@
 #include "duckdb/main/settings.hpp"
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "storage/ducklake_vortex_source_retention.hpp"
-#include "duckdb/storage/storage_lock.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
+#include "storage/ducklake_vortex_read_view.hpp"
 #endif
 
 namespace duckdb {
@@ -14,12 +15,20 @@ DuckLakeTransactionManager::DuckLakeTransactionManager(AttachedDatabase &db_p, D
 
 Transaction &DuckLakeTransactionManager::StartTransaction(ClientContext &context) {
 #ifdef DUCKLAKE_ENABLE_VORTEX
-	unique_ptr<StorageLockKey> gate;
+	unique_ptr<DuckLakeVortexCollectionLock::Key> gate;
 	if (!DuckLakeVortexSourceRetention::IsCollector(context)) {
-		gate = DuckLakeVortexSourceRetention::TransactionGate().GetSharedLock();
+		gate = DuckLakeVortexSourceRetention::TransactionGate().GetSharedLock([&] {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+		});
 	}
 #endif
 	auto transaction = make_shared_ptr<DuckLakeTransaction>(ducklake_catalog, *this, context);
+#ifdef DUCKLAKE_ENABLE_VORTEX
+	// Classify every transaction created by the dedicated capture before it is registered.
+	transaction->vortex_read_capture = DuckLakeVortexReadView::IsCapturing(context);
+#endif
 	transaction->Start();
 	if (Settings::Get<ImmediateTransactionModeSetting>(context) && get_snapshot) {
 		get_snapshot = false;

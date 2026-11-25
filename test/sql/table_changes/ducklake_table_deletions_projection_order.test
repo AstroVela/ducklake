@@ -66,6 +66,12 @@ SELECT snapshot_id, rowid, k FROM ducklake_table_deletions('dl','main','d',2,3) 
 ----
 3	0	1
 
+# A predicate on the generated column runs after the per-row snapshot is assigned.
+query I
+SELECT k FROM ducklake_table_deletions('dl','main','d',2,4) WHERE snapshot_id=4
+----
+2
+
 # ---------------------------------------------------------------------------
 # table_changes: an in-place UPDATE must surface as a matched preimage/postimage
 # pair at the row's own snapshot.
