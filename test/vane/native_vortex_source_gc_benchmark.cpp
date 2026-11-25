@@ -10,7 +10,9 @@
 #include "storage/ducklake_vortex_source_retention.hpp"
 #include "vortex_extension.hpp"
 
+#include <algorithm>
 #include <iostream>
+#include <iterator>
 #include <thread>
 
 using namespace duckdb;
@@ -160,6 +162,41 @@ void CheckBusiness(Connection &connection, idx_t history) {
 	Require(hits->RowCount() == 1 && hits->GetValue(0, 0).GetValue<int64_t>() == 16, "Current named ANN query changed");
 }
 
+vector<string> RetiredSources(const string &root) {
+	std::ifstream input(root + "/indexes/seed.json", std::ios::binary);
+	Require(bool(input), "Cannot read seed index reference");
+	const string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(yyjson_read(bytes.data(), bytes.size(), 0),
+	                                                          yyjson_doc_free);
+	Require(bool(doc), "Invalid seed index reference");
+	auto files = yyjson_obj_get(yyjson_obj_get(yyjson_doc_get_root(doc.get()), "snapshot"), "files");
+	Require(yyjson_arr_size(files) == 2, "Seed index must identify two original sources");
+	vector<string> paths;
+	for (idx_t i = 0; i < 2; ++i) {
+		auto uri = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(files, i), "uri"));
+		Require(uri && StringUtil::StartsWith(uri, root + "/data/"), "Seed source is outside the fixture");
+		paths.emplace_back(uri);
+	}
+	std::sort(paths.begin(), paths.end());
+	Require(paths[0] != paths[1], "Seed index has duplicate sources");
+	return paths;
+}
+
+vector<string> QueuedSources(Connection &connection, const string &root) {
+	auto files = SQL(connection, "SELECT path,path_is_relative FROM " + string(META) +
+	                                 "ducklake_files_scheduled_for_deletion");
+	vector<string> paths;
+	for (idx_t row = 0; row < files->RowCount(); row++) {
+		auto path = files->GetValue(0, row).ToString();
+		if (files->GetValue(1, row).GetValue<bool>()) {
+			path = root + "/data/" + path;
+		}
+		paths.push_back(std::move(path));
+	}
+	std::sort(paths.begin(), paths.end());
+	return paths;
+}
+
 void Prepare(Connection &writer, const string &root, idx_t history, const string &task, const string &storage) {
 	FileSystem::GetFileSystem(*writer.context).CreateDirectory(root + "/indexes");
 	SQL(writer, "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
@@ -227,13 +264,16 @@ void Prepare(Connection &writer, const string &root, idx_t history, const string
 	        "Preparation did not retain the last two snapshots protecting old sources");
 	if (task == "files") {
 		auto expired = Source::Collect(*writer.context, "lake", 2, BYTE_BUDGET);
-		Require(!expired.blocked && expired.expired == 2 && !expired.files && State(writer).scheduled >= 2,
-		        "File task requires native expiry to schedule its sources");
+		Require(!expired.blocked && expired.expired == 2 && !expired.files &&
+		            QueuedSources(writer, root) == RetiredSources(root),
+		        "File task requires native expiry to schedule the two original Vortex sources");
 	}
 	CheckBusiness(writer, history);
 	State input(writer);
-	Require(input.intents == 0 && (task == "files" ? input.scheduled >= 2 : input.scheduled == 0),
-	        "Restorable input must have no inode-bound deletion intents");
+	Require(input.snapshots.size() == history + (task == "expire" ? 5 : 3),
+	        "History did not produce the expected native snapshot inventory");
+	Require(input.intents == 0 && input.scheduled == (task == "files" ? 2 : 0),
+	        "Restorable input must have the expected queue and no inode-bound deletion intents");
 	Require(input.data_files == (task == "expire" ? 3 : 1) + (storage == "file" ? history + 1 : 0),
 	        "History storage did not produce the expected native file inventory");
 	ViewJSON json;
@@ -241,6 +281,7 @@ void Prepare(Connection &writer, const string &root, idx_t history, const string
 	json.Number(value, "history", history);
 	json.Text(value, "task", task);
 	json.Text(value, "history_storage", storage);
+	json.Text(value, "ducklake_extension_version", DucklakeExtension().Version());
 	Write(root + "/input.json", json.Finish(value));
 }
 
@@ -248,8 +289,8 @@ void Measure(DuckDB &database, Connection &writer, const string &root, idx_t his
              const string &storage, bool diagnostic, const shared_ptr<Trace> &trace) {
 	CheckBusiness(writer, history);
 	State before(writer);
-	Require(before.snapshots.size() > 4 && before.intents == 0 &&
-	            (task == "files" ? before.scheduled >= 2 : before.scheduled == 0),
+	Require(before.snapshots.size() == history + (task == "expire" ? 5 : 3) && before.intents == 0 &&
+	            before.scheduled == (task == "files" ? 2 : 0),
 	        "Invalid restored task input");
 	{
 		Connection held(database);
@@ -261,17 +302,12 @@ void Measure(DuckDB &database, Connection &writer, const string &root, idx_t his
 		held.Rollback();
 	}
 	Require(State(writer) == before, "Deferred collection changed its input");
-	vector<string> target_paths;
+	auto retired_paths = RetiredSources(root);
 	if (task == "files") {
-		auto paths = SQL(writer, "SELECT path,path_is_relative FROM " + string(META) +
-		                             "ducklake_files_scheduled_for_deletion ORDER BY data_file_id,path LIMIT 2");
-		for (idx_t row = 0; row < paths->RowCount(); row++) {
-			auto path = paths->GetValue(0, row).ToString();
-			if (paths->GetValue(1, row).GetValue<bool>()) {
-				path = root + "/data/" + path;
-			}
+		Require(QueuedSources(writer, root) == retired_paths,
+		        "Restored deletion queue differs from the original Vortex sources");
+		for (const auto &path : retired_paths) {
 			Require(FileSystem::GetFileSystem(*writer.context).FileExists(path), "Scheduled input file is missing");
-			target_paths.push_back(std::move(path));
 		}
 	}
 	DuckLakeVortexMaintenanceProfile profile("source-gc-benchmark");
@@ -283,7 +319,7 @@ void Measure(DuckDB &database, Connection &writer, const string &root, idx_t his
 	}
 	trace->active = diagnostic;
 	auto begin = Now();
-	auto collected = Source::Collect(*writer.context, "lake", 2, BYTE_BUDGET, observe, &profile);
+	auto collected = Source::Collect(*writer.context, "lake", 2, BYTE_BUDGET, observe, nullptr, &profile);
 	auto end = Now();
 	trace->active = false;
 	Require(trace->depth == 0, "Diagnostic SQL callback was not completed");
@@ -297,8 +333,8 @@ void Measure(DuckDB &database, Connection &writer, const string &root, idx_t his
 		auto remaining = before.snapshots;
 		remaining.erase(remaining.begin(), remaining.begin() + 2);
 		Require(collected.expired == 2 && !collected.files && !collected.bytes && after.snapshots == remaining &&
-		            after.scheduled >= 2,
-		        "Expiry task did not expire exactly its two oldest snapshots and schedule old sources");
+		            QueuedSources(writer, root) == retired_paths,
+		        "Expiry did not schedule the two original Vortex sources after expiring the oldest snapshots");
 	} else {
 		Require(collected.files == 2 && !collected.expired && collected.bytes && before.snapshots == after.snapshots &&
 		            after.scheduled + 2 == before.scheduled,
@@ -310,6 +346,7 @@ void Measure(DuckDB &database, Connection &writer, const string &root, idx_t his
 	json.Text(report, "task", task);
 	json.Number(report, "history", history);
 	json.Text(report, "history_storage", storage);
+	json.Text(report, "ducklake_extension_version", DucklakeExtension().Version());
 	json.Add(report, "diagnostic", yyjson_mut_bool(json.doc.get(), diagnostic));
 	json.Add(report, "before", before.JSON(json));
 	json.Add(report, "after", after.JSON(json));
@@ -318,10 +355,12 @@ void Measure(DuckDB &database, Connection &writer, const string &root, idx_t his
 	json.Number(report, "files", collected.files);
 	json.Number(report, "bytes", collected.bytes);
 	auto targets = json.Array();
-	for (auto &path : target_paths) {
-		Require(!FileSystem::GetFileSystem(*writer.context).FileExists(path),
-		        "Completed source deletion left its file");
-		yyjson_mut_arr_append(targets, yyjson_mut_strcpy(json.doc.get(), path.c_str()));
+	if (task == "files") {
+		for (const auto &path : retired_paths) {
+			Require(!FileSystem::GetFileSystem(*writer.context).FileExists(path),
+			        "Completed source deletion left its file");
+			yyjson_mut_arr_append(targets, yyjson_mut_strcpy(json.doc.get(), path.c_str()));
+		}
 	}
 	json.Add(report, "deleted_paths", targets);
 	auto phases = json.Array();
