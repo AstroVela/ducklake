@@ -120,7 +120,8 @@ jobs:
             --out-dir "$PWD/build/wheels" "$PWD/vane" \
             2>&1 | tee build/logs/runtime-wheel.log
           cmake --build build/runtime --target vane_loadable_extensions ducklake_vortex_write_driver ducklake_vortex_source_driver \
-            ducklake_vortex_source_gc_benchmark --parallel 2 \
+            ducklake_vortex_source_gc_benchmark ducklake_vortex_expiry_lookup_driver \
+            ducklake_vortex_expiry_lookup_resource --parallel 2 \
             2>&1 | tee build/logs/providers-build.log
           uv pip install --system build/wheels/vane_ai-*.whl
       - name: Run the Vane base release checks
@@ -204,6 +205,14 @@ jobs:
             --driver "$PWD/build/runtime/ducklake_vortex_source_gc_benchmark" --histories 8 \
             --repetitions 2 --warmups 1 --diagnostics 1 --output-dir "$PWD/build/source-gc-smoke-proof" \
             2>&1 | tee build/logs/vane-vortex-source-gc-smoke.log
+          env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_expiry_lookup.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_expiry_lookup_driver" \
+            --output-dir "$PWD/build/expiry-lookup-proof" 2>&1 | tee build/logs/vane-vortex-expiry-lookup.log
+          python -I extension/test/vane/test_vane_vortex_expiry_lookup_resources.py \
+            --driver "$PWD/build/runtime/ducklake_vortex_expiry_lookup_resource" \
+            --inputs "$PWD/build/source-gc-smoke-proof/report.json" \
+            --output-dir "$PWD/build/expiry-lookup-resource-proof" \
+            2>&1 | tee build/logs/vane-vortex-expiry-lookup-resource.log
           env -u VORTEX_SPFRESH_NATIVE python -I extension/test/vane/test_vane_vortex_sustained_load.py \
             --fixtures automatic --rows 4096 32768 --dimensions 8 128 --seconds 12 --capture-stalls --output-dir "$PWD/build/load-proof" \
             2>&1 | tee build/logs/vane-vortex-sustained-load.log
@@ -230,6 +239,8 @@ jobs:
             build/source-gc-smoke-proof/**/diagnostic-*.json
             build/source-gc-smoke-proof/**/*.log
             build/expiry-interval-proof
+            build/expiry-lookup-proof
+            build/expiry-lookup-resource-proof
             build/keyed-proof/report.json
             build/keyed-proof/**/driver.log
             build/keyed-proof/**/recovery.log
