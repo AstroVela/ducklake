@@ -8,6 +8,14 @@ repeats separate callback-enabled diagnostics to describe where collector time
 and variation occur. It changes no runtime code and cannot reclassify earlier
 primary measurements or establish sustained-write stability. R4 remains open.
 
+The fixed 128-call study below was recorded on the November 6, 2026 stack.
+The development port checks 44 outer SQL statements per file-unlink call,
+including four composite queue-key checks and the current intent checks. It
+also observes the checkpoint between unlink and directory sync. The port's
+smoke verifies this trace shape and the archived report identifies the measured
+binary and inputs.
+[Original experiment at `3eeddc4b`](https://github.com/AstroVela/ducklake/blob/3eeddc4b574d0860530eab2eb41f121cdefc453d/docs/native-vortex-source-gc-metadata.md)
+
 ## Protocol frozen before formal sampling
 
 Commit this protocol, [runner](../test/vane/test_vane_vortex_source_gc_metadata.py)
@@ -73,20 +81,27 @@ establish an A/B optimization, 2% equivalence or a 30-minute load result.
 
 ## Reproduce
 
+Use the [archived runner and inputs](https://github.com/AstroVela/ducklake/blob/3eeddc4b574d0860530eab2eb41f121cdefc453d/docs/native-vortex-source-gc-metadata.md#reproduce)
+to reproduce the November 6 experiment. For the current smoke, generate the
+input report using the same current native executable that will run the
+diagnostics.
+
 ```sh
 python -I test/vane/test_vane_vortex_source_gc_metadata_stats.py
+driver="$SKBUILD_BUILD_DIR/ducklake_vortex_source_gc_benchmark"
+python -I test/vane/test_vane_vortex_source_gc_benchmark.py \
+    --driver "$driver" --histories 8 --repetitions 2 --warmups 1 --diagnostics 1 \
+    --output-dir /tmp/source-gc-metadata-inputs
 python -I test/vane/test_vane_vortex_source_gc_metadata.py \
-    --driver /tmp/ducklake-vortex-expiry-ab-baseline-20261106 \
-    --inputs /tmp/ducklake-vortex-source-gc-full-v3-20261106/report.json \
-    --cpus 6,7,8,9,10,11 --profile formal \
-    --output-dir /tmp/source-gc-metadata-diagnostics
+    --driver "$driver" --inputs /tmp/source-gc-metadata-inputs/report.json \
+    --cpus 6,7,8,9,10,11 --profile smoke --output-dir /tmp/source-gc-metadata-smoke
 ```
 
 The output directory must be new. Preserve `measurement-contract.json`, raw
 per-call JSON/logs and `report.json`. CI runs analysis checks and functional smoke
 against its qualified native driver/input corpus and uploads the evidence.
 
-## Completed result
+## Historical result
 
 The protocol commit is `dfd71afb675d8efc17f3a02d76ad26a0c16ee2a4`.
 The single formal run completes in 193.569 seconds, including restoration and

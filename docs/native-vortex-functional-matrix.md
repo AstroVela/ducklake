@@ -25,7 +25,7 @@ reconstructed from request receipts.
 The [native SQL regression](../test/sql/data_inlining/float_exact_roundtrip.test)
 compares scalar FLOAT/DOUBLE, lists, structs and maps with independently
 typed expected values. It includes subnormal and maximum finite values, signed
-zero, nonfinite values and NULLs. Its eleven assertion blocks check committed
+zero, nonfinite values and NULLs. Its twelve assertion blocks check committed
 inline rows, flushed rows and reopened metadata. The vector mutation API retains
 its existing rejection of nonfinite vector components.
 
@@ -110,14 +110,22 @@ float32 fixture representation and reject incorrect visibility, stale typed
 versions, distances, filtering, duplicates, ordering, missing exact hits and
 ANN recall below the existing threshold.
 
+The inline SQL fixture uses the configured metadata backend in the catalog test
+matrix. Native floating literals use explicit typed parsing. Non-native STRUCT
+columns keep a parseable text representation with their floating children and
+quoted string fields. The regression verifies inlining before flush, typed
+values, nested signed zero and reattachment. The distance oracle quantizes the
+final score to Float32 and orders ties by the captured physical row address.
+
 ## Reproduce
 
 Use a non-editable installed Vane with the matching DuckLake/Vortex providers
-and a fresh output directory:
+and a fresh output directory. The installed Linux CI workflow runs the same
+deterministic matrix on one available CPU.
 
 ```sh
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_functional_oracle.py
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_functional_matrix.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_functional_oracle.py
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_functional_matrix.py \
     --cpus 6,7,8,9,10,11 --output-dir /tmp/vortex-functional-matrix
 ```
 
@@ -130,9 +138,9 @@ the incremental Release directory and package the matching providers as in the
 [development workflow](vane-native-vortex-proof.md). Keep the frozen earlier
 trial environments and evidence separate from the corrected provider closure.
 
-## Result
+## Historical qualification
 
-The corrected, isolated full run passed all **36 phases**, **432 ordinary plus
+The original [#84 qualification](https://github.com/AstroVela/ducklake/commit/a7fb59adc126c9616973e80a71773dc98cb0c594) passed all **36 phases**, **432 ordinary plus
 432 diagnostic searches**, and **56 malformed-query/mutation rejections**.
 Every dimension's minimum fixture recall is **1.0**, against the unchanged
 >=0.8 ANN gate; zero-B results remain exact. Typed client-model equality, actual
@@ -161,7 +169,7 @@ non-Ray and real-Ray processes. Formatting, Rust formatting, copyleft, workflow
 parsing and 59 relative documentation links passed; all nine executed source
 identities were verified unchanged after the run.
 
-The successful native build used the existing incremental Release directory,
+That native build used the existing incremental Release directory,
 explicit local provider source roots, the default six-extension base profile,
 fixed native pins and CI's bindgen system-header setting. The runtime was
 reinstalled non-editably and both providers rebuilt, test-signed, packaged and
@@ -182,7 +190,7 @@ full offline dependency resolution was not claimed.
 
 The native Vane module SHA-256 remains
 `8ca20bd4c8a4203f239ff6d785c45575241d3b2c8d1f8e9fc184d90de1d54876`.
-The bundle report records both exact provider wheel hashes. The matrix report
+The bundle report records both exact provider wheel hashes. The historical matrix report
 records the executed test sources and both changed runtime sources. CPU **6–11**
 and all inherited thread variables were preserved; parent affinity restored to
 CPU 0–23. Total elapsed time is recorded only for diagnostics, with no performance

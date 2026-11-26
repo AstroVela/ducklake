@@ -159,12 +159,13 @@ def failures(driver, root, checks):
             "rewrite_before_copy",
             "rewrite_written",
             "generation_created",
-            "generation_sealed",
+            "rewrite_prepared_sealed",
             "reference_written",
             "rewrite_candidate_ready",
             "rewrite_source_linked",
             "rewrite_before_commit",
             "rewrite_after_stage",
+            "rewrite_before_native_commit",
         ]
         rows = active_rows(native)
         for op in ["rewrite-fail", "rewrite-cancel"]:
@@ -177,6 +178,16 @@ def failures(driver, root, checks):
                     3,
                     expected="Injected indexed rewrite failure" if op.endswith("fail") else "Interrupted",
                 )
+                if stage == "rewrite_before_native_commit":
+                    response = json.loads((native.root / "responses" / f"{native.requests}.json").read_text())
+                    require(
+                        "commit outcome is unknown" not in response["error"].lower(),
+                        "A failure before COMMIT was reported as an ambiguous outcome",
+                    )
+                    require(
+                        "ducklake_max_retry_count" not in response["error"],
+                        "Rewrite reported a tuning hint for its fixed retry policy",
+                    )
                 require(
                     native.call("head", "knn")["revision"] == 3 and active_rows(native) == rows,
                     "Failed rewrite committed files or index independently",
@@ -202,7 +213,7 @@ def failures(driver, root, checks):
         M.qualify(native, "after-errors", recalls, 3)
         finish(native)
         checks.append(
-            "failure/cancellation at ten boundaries roll back source/index together; lost ACK after commit retains both published outputs"
+            "failure/cancellation at eleven boundaries roll back source/index together; lost ACK after commit retains both published outputs"
         )
         return {"fixture_recalls": recalls}
     finally:
@@ -236,8 +247,20 @@ def crash(driver, root, stage, checks):
         )
         output = Path(records[0]["new_path"])
         before_records = BG.status(native)
+        if stage in ("rewrite_source_linked", "rewrite_after_stage", "rewrite_after_commit"):
+            build = next(row for row in before_records if row["build_id"] == records[0]["build_id"])
+            workspace = Path(build["workspace"])
+            require(output.samefile(workspace / "rewrite.vortex"), "Linked source lost its private witness")
+            require(not list(workspace.glob("input-*.vortex")), "Staged inputs survived into the native build")
         MA.steady(native)
         require(BG.status(native) == before_records, "Restart implicitly recovered or cleaned a rewrite")
+        if committed:
+            collected = native.call("rewrite-build-gc-source-wait", LIMIT)
+            require(
+                collected["collected_builds"] == 1 and not workspace.exists() and output.exists(),
+                "Guarded build collection lost the retained source or kept its workspace",
+            )
+            checks.append("published rewrite witness collection waits for the old-file cleanup admission guard")
         native.call("maintenance-resume")
         MA.drain(native)
         require(
@@ -308,8 +331,10 @@ def collision(driver, root, checks):
             expected="destination already exists",
         )
         records = intents(native)
-        require(len(records) == 1 and records[0]["keep_file"], "Existing destination was claimed for collection")
+        require(len(records) == 1, "Expected one rewrite ownership record")
         output = Path(records[0]["new_path"])
+        build = next(row for row in BG.status(native) if row["build_id"] == records[0]["build_id"])
+        require(not output.samefile(Path(build["workspace"]) / "rewrite.vortex"), "Expected a distinct destination")
         require(native.call("head", "knn")["revision"] == 3, "Failed exclusive link published an index")
         native.call("maintenance-enable", 16, LIMIT)
         MA.drain(native)
@@ -324,6 +349,41 @@ def collision(driver, root, checks):
         return {"fixture_recalls": recalls}
     finally:
         M.stop(native)
+
+
+def cancel_lock_waits(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        rewritten, first, parts, frozen = setup(native, root)
+        before = active_rows(native)
+        for lock in ("collection", "publication", "write-admission"):
+            result = native.call("rewrite-cancel-lock", lock, SEG.generation(first), rewritten / f"{lock}.json", 3)
+            require(
+                result == {"waiting": True, "cancelled_before_release": True}, "Did not observe an interrupted wait"
+            )
+            if lock == "collection":
+                require(not intents(native), "Cancelled collection wait registered a build")
+            MA.drain(native)
+            require(
+                not intents(native) and active_rows(native) == before and native.call("head", "knn")["revision"] == 3,
+                "Cancelled rewrite changed the published inventory",
+            )
+        unchanged(native, parts, frozen)
+        finish(native)
+        checks.append("rewrite cancellation exits all three observed lock waits before the holder releases")
+        return {"locks": ["collection", "publication", "write-admission"]}
+    finally:
+        M.stop(native)
+
+
+def stage_limit(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        native.call("rewrite-stage-limit", expected="rewrite input entry budget exceeded")
+        checks.append("rewrite staging reserves the workspace and output entries within the existing collector limit")
+        return {}
+    finally:
+        native.finish()
 
 
 def deletion_quality(driver, root, checks):
@@ -423,13 +483,15 @@ def main():
         cases = [
             ("failures", failures),
             ("collision", collision),
+            ("cancel-lock-waits", cancel_lock_waits),
+            ("stage-limit", stage_limit),
             ("deletion-quality", deletion_quality),
             ("capacity", capacity),
         ]
         for stage in [
             "rewrite_allocated",
             "rewrite_written",
-            "generation_sealed",
+            "rewrite_prepared_sealed",
             "rewrite_source_linked",
             "rewrite_after_stage",
             "rewrite_after_commit",

@@ -50,14 +50,15 @@ def run(args):
         text.index("void DuckLakeMetadataManager::DeleteSnapshots("),
     )
     match = re.search(r'StringUtil::Format\(R"\((.*?)\)"', text[start:], re.S)
-    assert match is not None and "NOT EXISTS" in match.group(1)
+    assert match is not None
     old = match.group(1)
-    query = (repo / "test/vane/expiry_interval_window.sql").read_text()
+    assert "NOT EXISTS" in old and "path_is_relative%s" in old and old.count("%s") == 2
+    query = (repo / "test/vane/expiry_interval_window.sql").read_text().format(marker="%s", forced="%s")
     query = query.replace("ducklake_data_file", "{METADATA_CATALOG}.ducklake_data_file")
-    query = query.replace("ducklake_snapshot", "{METADATA_CATALOG}.ducklake_snapshot").replace("{forced}", "%s")
+    query = query.replace("ducklake_snapshot", "{METADATA_CATALOG}.ducklake_snapshot")
     report = {"baseline_source_sha256": hashlib.sha256(text.encode()).hexdigest(), "executables": {}}
     for variant in ("baseline", "unbounded", "bounded"):
-        link = list(command)
+        trial_source = text
         if variant != "baseline":
             selected = query
             if variant == "unbounded":
@@ -66,12 +67,17 @@ def run(args):
                 )
                 assert selected.count(bound) == 1
                 selected = selected.replace(bound, "")
-            generated = root / (variant + ".cpp")
             offset = start + match.start(1)
-            generated.write_text(text[:offset] + selected + text[offset + len(old) :])
-            obj = root / (variant + ".o")
-            compile_source("/ducklake_metadata_manager.cpp", generated, obj)
-            link.insert(position + 1, str(obj))
+            trial_source = text[:offset] + selected + text[offset + len(old) :]
+        generated = root / (variant + ".cpp")
+        generated.write_text(trial_source)
+        obj = root / (variant + ".o")
+        compile_source("/ducklake_metadata_manager.cpp", generated, obj)
+        link = [
+            f"-Wl,--dependency-file={root / (variant + '.d')}" if arg.startswith("-Wl,--dependency-file=") else arg
+            for arg in command
+        ]
+        link.insert(position + 1, str(obj))
         output = root / variant
         link[link.index("-o") + 1] = str(output)
         subprocess.run(link, cwd=build, check=True)

@@ -30,6 +30,12 @@ EPOCH, KEYED, WRITE, BASE, PIN = REF.EPOCH, REF.KEYED, REF.WRITE, REF.BASE, REF.
 require, query, quote = BASE.require, BASE.query, BASE.quote
 SCRIPT = Path(__file__).resolve()
 MIB = 1024 * 1024
+SOURCE_TABLES = (
+    ("ducklake_data_file", "*"),
+    ("ducklake_delete_file", "*"),
+    ("ducklake_inlined_data_tables", "*"),
+    ("ducklake_files_scheduled_for_deletion", "data_file_id,path,path_is_relative,schedule_start::VARCHAR"),
+)
 
 
 def budget(c, t_rows=100000, t_bytes=4 * MIB, f_rows=100000, f_bytes=64 * MIB):
@@ -41,7 +47,7 @@ def budget(c, t_rows=100000, t_bytes=4 * MIB, f_rows=100000, f_bytes=64 * MIB):
 
 def bootstrap(root, dimension, managed=False, inline=False):
     (root / "indexes").mkdir(mode=0o700)
-    c = BASE.connect(root)
+    c = BASE.connect(root, root / "extensions")
     c.execute("CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)")
     c.execute("CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')")
     if not inline:
@@ -74,9 +80,14 @@ def row(key, dimension=2, category=None, payload=None):
     return {"id": key, "embedding": [float(key)] + [0.0] * (dimension - 1), "category": category, "payload": payload}
 
 
+def source_catalog(c):
+    return {name: REF.rows(c, f"SELECT {cols} FROM {REF.META}.{name} ORDER BY ALL") for name, cols in SOURCE_TABLES}
+
+
 def state(c, root):
     # Fixed metadata universe; include all source/delete files, not only registered data files.
     metadata = {name: REF.rows(c, f"SELECT * FROM {REF.META}.{name} ORDER BY ALL") for name in REF.METADATA_TABLES}
+    metadata.update(source_catalog(c))
     metadata["snapshots"] = REF.rows(
         c, f"SELECT snapshot_id,schema_version FROM {REF.META}.ducklake_snapshot ORDER BY ALL"
     )
@@ -166,8 +177,8 @@ def check_seed(c, count, dimension, minimum=0):
     actual = REF.rows(
         c,
         "SELECT count(*),count(DISTINCT id),min(id),max(id),"
-        f"count(*) FILTER(WHERE array_length(embedding)!={dimension} OR list_count(embedding)!={dimension} OR embedding[1]!=id::FLOAT "
-        "OR coalesce(list_sum(list_transform(list_slice(embedding,2,-1),x->abs(x))),0)!=0 OR category IS DISTINCT FROM 'C' OR payload IS DISTINCT FROM 'seed') FROM lake.items",
+        f"count(*) FILTER(WHERE embedding IS DISTINCT FROM list_resize([id::FLOAT],{dimension},0::FLOAT) "
+        "OR category IS DISTINCT FROM 'C' OR payload IS DISTINCT FROM 'seed') FROM lake.items",
     )
     require(
         actual == [[count, count, minimum, minimum + count - 1, 0]],
@@ -202,13 +213,28 @@ def physical_case(root, dimension):
             head = BASE.head(c)
             first = head["reference"]["segments"][0]
             generation = first["reference"]["generation"]["generation"]
-            old_sources = [Path(f["uri"]) for f in first["reference"]["snapshot"]["files"]]
+            old_sources = {Path(f["uri"]) for f in first["reference"]["snapshot"]["files"]}
+            file_sql = "SELECT data_file FROM ducklake_list_files('lake','items')"
+            before_files = {Path(record["data_file"]) for record in query(c, file_sql)}
+            require(old_sources <= before_files, "The selected B sources must be current before rewrite")
             c.execute(
                 "SELECT * FROM ducklake_rewrite_vortex_index_segment_to_f('lake','main','items','knn',"
                 + quote(generation)
                 + f",{head['revision']})"
             )
             require(len(BASE.head(c)["reference"]["segments"]) == 0, "Sparse rewrite did not remove selected B input")
+            after_files = {Path(record["data_file"]) for record in query(c, file_sql)}
+            outputs = after_files - before_files
+            require(
+                before_files - after_files == old_sources and len(outputs) == 1
+                and all(path.is_file() for path in old_sources | outputs),
+                "Atomic rewrite did not replace only the selected registered inputs while retaining their old files",
+            )
+            require(
+                REF.rows(c, f"SELECT sum(record_count) FROM {REF.META}.ducklake_data_file WHERE end_snapshot IS NULL")
+                == [[limit - 1]],
+                "Replacement did not release the exact physical slot",
+            )
             ack(c, "over", extra, dimension)
             check_seed(c, limit, dimension, 1)
             check_seed(reader, limit, dimension)
@@ -231,7 +257,7 @@ def physical_case(root, dimension):
             require(all(not p.exists() for p in old_sources), "Unprotected retired source was not collected")
             search_first(c, dimension, 1)
         c.close()
-        c = BASE.connect(root)
+        c = BASE.connect(root, root / "extensions")
         require(WRITE.batch(c, "exact", last) == receipt, "Reopen lost full-capacity receipt")
         reject(c, root, lambda: WRITE.batch(c, "still-over", [row(limit + 1, dimension)]), "physical and inline rows")
         return {
@@ -303,7 +329,7 @@ def batch_case(root, managed):
                 )
             lengths.append(size)
         require(
-            BASE.raw(c) == sorted(expected, key=lambda r: r["id"]),
+            KEYED.business_rows(c) == sorted(expected, key=lambda r: r["id"]),
             "Accepted boundary requests changed typed data or duplicated retries",
         )
         return {"managed": managed, "operation_boundaries": [999, 1000, 1001], "canonical_bytes": lengths}
@@ -330,12 +356,12 @@ def inline_case(root):
         require(MODEL.row_bytes(newer) == 82, "Replacement charge changed")
         ack(c, "replace", [newer], 2, [])
         require(
-            KEYED.mutate(c, "first", [first]) == original and BASE.raw(c)[0] == newer,
+            KEYED.mutate(c, "first", [first]) == original and KEYED.business_rows(c)[0] == newer,
             "Old receipt replay resurrected a version",
         )
         ack(c, "delete", [], 2, [2])
         ack(c, "reused", [row(3)], 2, [])
-        require(BASE.raw(c) == [newer, row(3)], "Visible T slots did not follow current keyed rows")
+        require(KEYED.business_rows(c) == [newer, row(3)], "Visible T slots did not follow current keyed rows")
         retained = pending_versions(c)
         require(
             len(retained) == 4 and sum(MODEL.row_bytes(v) for v in retained) == 308,
@@ -371,10 +397,10 @@ def pending_case(root):
         reject(c, root, lambda: KEYED.mutate(c, "pending-over", [extra]), "pending inline bytes")
         for i in (0, 63):
             require(KEYED.mutate(c, f"version-{i}", [versions[i]]) == receipts[i], "Pending-full retry failed")
-        require(BASE.raw(c) == [versions[-1]], "Receipt retry changed current pending version")
+        require(KEYED.business_rows(c) == [versions[-1]], "Receipt retry changed current pending version")
         reader = c.cursor()
         reader.execute("BEGIN")
-        require(BASE.raw(reader) == [versions[-1]], "Old reader did not establish current version")
+        require(KEYED.business_rows(reader) == [versions[-1]], "Old reader did not establish current version")
         ack(c, "delete", [], 1, [0])
         reject(c, root, lambda: KEYED.mutate(c, "empty-but-full", [extra]), "pending inline bytes")
         c.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
@@ -385,14 +411,15 @@ def pending_case(root):
         )
         ack(c, "after-flush", [extra], 1, [])
         require(
-            BASE.raw(c) == [extra] and BASE.raw(reader) == [versions[-1]], "Flush lost current or old-reader versions"
+            KEYED.business_rows(c) == [extra] and KEYED.business_rows(reader) == [versions[-1]],
+            "Flush lost current or old-reader versions",
         )
         reader.execute("ROLLBACK")
         reader.close()
         reader = None
         c.close()
-        c = BASE.connect(root)
-        require(BASE.raw(c) == [extra], "Reopen changed post-flush pending admission")
+        c = BASE.connect(root, root / "extensions")
+        require(KEYED.business_rows(c) == [extra], "Reopen changed post-flush pending admission")
         return {
             "retained_versions": 64,
             "bytes_per_version": MIB,
@@ -488,18 +515,19 @@ def lease_case(root, probe):
                         result["source_bytes"] == source_bytes and result["artifact_bytes"] == artifact_bytes,
                         "Lease aggregate differs from actual authenticated files",
                     )
-                    hits = w.call(
-                        {
-                            "op": "search_mixed",
-                            "view": "current",
-                            "capture_digest": result["capture_digest"],
-                            "request": {"query": [0.0, 0.0], "k": 1, "allow": None},
-                        }
-                    )
-                    require(
-                        len(hits["hits"]) == 1 and hits["hits"][0]["row"] == row(0),
-                        "Genuine lease at its byte boundary lost typed ANN search",
-                    )
+                    for key in (32, 97, 162):
+                        [hit] = w.call(
+                            {
+                                "op": "search_mixed",
+                                "view": "current",
+                                "capture_digest": result["capture_digest"],
+                                "request": {"query": [float(key), 0.0], "k": 1, "allow": None},
+                            }
+                        )["hits"]
+                        require(
+                            hit["row"] == row(key) and hit["distance"] == 0.0,
+                            f"Genuine lease lost the exact typed hit for key {key} at its byte boundary",
+                        )
                     w.call(
                         {"op": "open_catalogued", "view": "second", "capture": str(capture), "index_name": "knn"},
                         "count budget",
@@ -534,7 +562,7 @@ def lease_case(root, probe):
         require(
             state(c, root) == before_state, "Explicit failed-build cleanup did not restore admission metadata and files"
         )
-        require(BASE.raw(c) == [row(i) for i in range(260)], "Three B plus admitted F changed typed rows")
+        require(KEYED.business_rows(c) == [row(i) for i in range(260)], "Three B plus admitted F changed typed rows")
         return {
             "segments": 3,
             "source_bytes": source_bytes,
@@ -551,6 +579,7 @@ def lease_case(root, probe):
 
 def recover_native(root, mode):
     expected = json.loads((root / "expected.json").read_text())
+    sources = json.loads((root / "sources.json").read_text())
     sealed = json.loads((root / "files.json").read_text())
     seed = [[i, [float(i), 0.0], "A", "seed-" + str(i)] for i in range(256)]
     if mode == "race":
@@ -563,37 +592,74 @@ def recover_native(root, mode):
     else:
         model = seed if mode == "before_commit" else REF.model()
     require(expected["rows"] == model, "Native expected state differs from independent business model")
-    c = BASE.connect(root)
+    c = BASE.connect(root, root / "extensions")
     try:
         require(
-            REF.snapshot(c) == expected and REF.files(root) == sealed,
+            REF.snapshot(c) == expected and source_catalog(c) == sources and REF.files(root) == sealed,
             "Reopen/recovery changed committed admission state or identities",
         )
         REF.check_query(c, model)
+        [identity] = query(
+            c,
+            "SELECT t.table_uuid::VARCHAR AS table_uuid,f.begin_snapshot AS seed_snapshot "
+            f"FROM {REF.META}.ducklake_table t JOIN {REF.META}.ducklake_data_file f USING (table_id) "
+            "WHERE t.table_name='items' AND t.end_snapshot IS NULL AND f.end_snapshot IS NULL AND f.record_count=256",
+        )
+        seed_snapshot = identity["seed_snapshot"]
+        # The flush keeps the seed's visibility snapshot and commits once before the tested write.
+        # The conflict control adds one successful commit to the unrelated table.
+        write_snapshot = seed_snapshot + 2 + int(mode == "conflict")
+        require(
+            expected["snapshots"][-1][0] == write_snapshot - int(mode == "before_commit"),
+            "Capacity boundary changed the documented snapshot sequence",
+        )
+        columns = ("id", "embedding", "category", "payload")
+        seed_input = [dict(zip(columns, values)) for values in seed]
+        requests = [("seed", seed_input, [], seed_snapshot)]
+        if mode == "race":
+            requests.append((f"slot-{extra[0][0] - 20000}", [dict(zip(columns, extra[0]))], [], write_snapshot))
+        else:
+            changed = [
+                dict(row(0), embedding=[0.125, 0.0], category="A", payload="更新"),
+                dict(row(10000), embedding=[0.25, 0.0]),
+            ]
+            requests.append(("change", changed, [1, 99999], write_snapshot))
+        receipts = {
+            request_id: {
+                "table_uuid": identity["table_uuid"],
+                "request_id": request_id,
+                "payload_hash": MODEL.digest(MODEL.canonical(upserts, 2, deletes)),
+                "row_count": len(upserts) + len(deletes),
+                "snapshot_id": snapshot_id,
+                "request_epoch": 1,
+            }
+            for request_id, upserts, deletes, snapshot_id in requests
+        }
+        receipt_sql = f"SELECT * FROM {WRITE.REQUESTS} ORDER BY request_id"
+        all_receipts = [receipts[request_id] for request_id in sorted(receipts)]
+        before_receipts = [receipts["seed"]] if mode == "before_commit" else all_receipts
+        require(query(c, receipt_sql) == before_receipts, "Recovered rows did not match their exact durable receipts")
         if mode == "before_commit":
-            KEYED.mutate(
-                c,
-                "change",
-                [
-                    dict(row(0), embedding=[0.125, 0.0], category="A", payload="更新"),
-                    dict(row(10000), embedding=[0.25, 0.0]),
-                ],
-                [1, 99999],
+            require(
+                KEYED.mutate(c, "change", changed, [1, 99999]) == receipts["change"]
+                and query(c, receipt_sql) == all_receipts,
+                "Recovered precommit request did not create one exact receipt",
             )
         if mode != "race":
             require(REF.snapshot(c)["rows"] == REF.model(), "Retry after recovery did not fill exactly the final slots")
             reject(c, root, lambda: KEYED.mutate(c, "blocked", [dict(row(30000), embedding=[0.5, 0.0])]), "inline rows")
         # Receipt retention and current data capacity are separate domains.
-        seed_input = [dict(zip(("id", "embedding", "category", "payload"), r)) for r in seed]
         current = state(c, root)
-        original = KEYED.mutate(c, "seed", seed_input)
-        require(
-            original["row_count"] == 256 and state(c, root) == current,
-            "Full-capacity seed replay changed current versions",
-        )
+        for request_id, upserts, deletes, _ in requests:
+            require(
+                KEYED.mutate(c, request_id, upserts, deletes) == receipts[request_id] and state(c, root) == current,
+                f"Full-capacity replay changed the receipt or committed state for {request_id}",
+            )
         retired = EPOCH.advance(c, 1)
         require(
-            retired["request_epoch"] == 2 and EPOCH.status(c)["retained_requests"] == 0,
+            retired["request_epoch"] == 2
+            and retired["expired_requests"] == len(receipts)
+            and EPOCH.status(c)["retained_requests"] == 0,
             "Receipt epoch did not retire independently",
         )
         reject(
@@ -607,6 +673,8 @@ def recover_native(root, mode):
             "mode": mode,
             "wal_bytes_before_recovery": json.loads((root / "sealed.json").read_text())["wal_bytes"],
             "metadata_tables": len(REF.METADATA_TABLES),
+            "source_tables": len(SOURCE_TABLES),
+            "receipts_verified": sorted(receipts),
         }
     finally:
         c.close()
