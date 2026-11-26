@@ -9,7 +9,7 @@ from pathlib import Path
 import shlex
 import subprocess
 
-BASE_SOURCE_SHA256 = "9e0f21ed12467bfa4c194dab7518f7f5994198379fe35f7483fdc5382b286c2b"
+BASE_SOURCE_SHA256 = "801dc0b5a30eafa353faaa9b5d611a74b0451598fa0da7b96cbfb001272447c1"
 EXTENSIONS = {"core_functions", "file", "httpfs", "icu", "json", "parquet", "ducklake", "vortex"}
 
 
