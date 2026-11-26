@@ -16,13 +16,13 @@ managed writes before submitting any batches:
 connection.execute("SELECT * FROM ducklake_manage_vortex_writes('lake','main','items','knn')")
 sql = (
     "SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn',?,"
-    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT)"
+    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT,?::VARCHAR)"
 )
 rows = [{'id': 1, 'embedding': [0.125, 0.0], 'category': 'A', 'payload': '最新向量'}]
-epoch = connection.execute(
-    "SELECT * FROM ducklake_vortex_request_status('lake','main','items','knn')"
-).fetchone()[1]
-request = ['request-1', rows, [2], epoch]  # Keep the same epoch on every retry.
+table_uuid, epoch = connection.execute(
+    "SELECT table_uuid, request_epoch FROM ducklake_vortex_request_status('lake','main','items','knn')"
+).fetchone()
+request = ['request-1', rows, [2], epoch, table_uuid]  # Save the full request for retries.
 receipt = connection.execute(sql, request).fetchone()
 assert connection.execute(sql, request).fetchone() == receipt
 ```

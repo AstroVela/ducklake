@@ -5,6 +5,7 @@
 #include "native_vortex_lifecycle_fixture.hpp"
 #include "native_vortex_capacity_fixture.hpp"
 #include "native_vortex_scratch_fixture.hpp"
+#include "native_vortex_uuid_fixture.hpp"
 #include "ducklake_extension.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -19,6 +20,7 @@ using namespace duckdb;
 using namespace duckdb::vortex_test;
 
 static void CheckQueuedCancellation(DuckDB &database, Connection &setup, const Value &rows) {
+	const auto table_uuid = TableUUID(setup);
 	Connection holder(database), queued(database), caller(database);
 	std::promise<void> acquired, release, waiting;
 	auto acquired_ready = acquired.get_future();
@@ -26,7 +28,8 @@ static void CheckQueuedCancellation(DuckDB &database, Connection &setup, const V
 	auto waiting_ready = waiting.get_future();
 	auto held = std::async(std::launch::async, [&] {
 		return DuckLakeVortexWriteBatch::Append(
-		    holder, *setup.context, "lake", "main", "items", "knn", "holder", rows, 1, [&](const string &stage) {
+		    holder, *setup.context, "lake", "main", "items", "knn", "holder", rows, 1, table_uuid,
+		    [&](const string &stage) {
 			    if (stage == "acquired") {
 				    acquired.set_value();
 				    Require(release_ready.wait_for(std::chrono::seconds(20)) == std::future_status::ready,
@@ -43,7 +46,7 @@ static void CheckQueuedCancellation(DuckDB &database, Connection &setup, const V
 		bool notified = false;
 		try {
 			DuckLakeVortexWriteBatch::Append(queued, *caller.context, "lake", "main", "items", "knn", "queued", rows, 1,
-			                                 [&](const string &stage) {
+			                                 table_uuid, [&](const string &stage) {
 				                                 if (stage == "lock_wait" && !notified) {
 					                                 notified = true;
 					                                 waiting.set_value();
@@ -116,11 +119,12 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 	               (file_backed ? ",DATA_INLINING_ROW_LIMIT 0)" : ",DATA_INLINING_ROW_LIMIT 1000)"));
 	if (create) {
 		fs.CreateDirectory(root + "/indexes");
+		const auto dimension = mode == "uuid-reattached-policy-capacity-reuse" ? 8 : 2;
 		SQL(setup, "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
 		           "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
 		           "SELECT * FROM ducklake_initialize_vortex_indexes('lake');"
 		           "SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn'," +
-		               Value(root + "/indexes").ToSQLString() + ",2)");
+		               Value(root + "/indexes").ToSQLString() + "," + to_string(dimension) + ")");
 		if (mode != "cancel-init") {
 			SQL(setup, "SELECT * FROM ducklake_initialize_vortex_writes('lake')");
 		}
@@ -137,6 +141,10 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 		}
 		Require(canceled && !setup.TableInfo("__ducklake_metadata_lake", "main", "ducklake_vortex_write_requests_v2"),
 		        "Canceled initialization created the request table");
+		return 0;
+	}
+	if (StringUtil::StartsWith(mode, "uuid-")) {
+		RunUUIDFixture(database, setup, root, mode);
 		return 0;
 	}
 	if (StringUtil::StartsWith(mode, "scratch-")) {
@@ -174,13 +182,15 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 	                        "'payload':'一'::VARCHAR},{'id':2::BIGINT,'embedding':[2,0]::FLOAT[],"
 	                        "'category':NULL::VARCHAR,'payload':NULL::VARCHAR}]");
 	auto rows = input->GetValue(0, 0);
+	const auto table_uuid = TableUUID(setup);
 	if (mode == "queued-cancel") {
 		CheckQueuedCancellation(database, setup, rows);
 		return 0;
 	}
 	if (mode == "cancel-commit-wait") {
 		CheckCommitWaitCancellation(database, setup, [&](Connection &writer, ClientContext &caller) {
-			DuckLakeVortexWriteBatch::Append(writer, caller, "lake", "main", "items", "knn", "waiting", rows, 1);
+			DuckLakeVortexWriteBatch::Append(writer, caller, "lake", "main", "items", "knn", "waiting", rows, 1,
+			                                 table_uuid);
 		});
 		return 0;
 	}
@@ -234,7 +244,7 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 	};
 	try {
 		auto result = DuckLakeVortexWriteBatch::Append(owner, *setup.context, "lake", "main", "items", "knn", "request",
-		                                               rows, 1, observer);
+		                                               rows, 1, table_uuid, observer);
 		if (mode == "replace-same-dimension") {
 			Require(observed && result.row_count == 2, "Same-dimension publication interrupted a valid write");
 			Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 130,
@@ -276,8 +286,8 @@ static int RunWriteFixture(const string &root, string mode, weak_ptr<DatabaseIns
 		auto count = SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>();
 		Require(count == (committed ? 2 : conflict ? 1 : 0), "Incorrect atomic batch count");
 		Connection retry(database);
-		auto result =
-		    DuckLakeVortexWriteBatch::Append(retry, *setup.context, "lake", "main", "items", "knn", "request", rows, 1);
+		auto result = DuckLakeVortexWriteBatch::Append(retry, *setup.context, "lake", "main", "items", "knn", "request",
+		                                               rows, 1, table_uuid);
 		Require(result.row_count == 2, "Retry changed WriteBatch result");
 		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == (conflict ? 3 : 2),
 		        "Retry duplicated or lost WriteBatch rows");

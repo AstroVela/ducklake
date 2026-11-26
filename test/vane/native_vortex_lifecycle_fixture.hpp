@@ -66,6 +66,22 @@ inline duckdb_yyjson::yyjson_mut_val *LifecycleRows(vortex_detail::ViewJSON &jso
 	return rows;
 }
 
+inline void AddLifecycleMetadata(vortex_detail::ViewJSON &json, duckdb_yyjson::yyjson_mut_val *metadata,
+                                 Connection &owner) {
+	for (auto name :
+	     {"ducklake_vortex_builds_v1", "ducklake_vortex_generation_refs_v1", "ducklake_vortex_generations_v1",
+	      "ducklake_vortex_indexes_v1", "ducklake_vortex_keyed_tables_v1", "ducklake_vortex_maintenance_v1",
+	      "ducklake_vortex_optimizer_rewrite_receipts_v1", "ducklake_vortex_optimizer_v2",
+	      "ducklake_vortex_request_epochs_v1", "ducklake_vortex_retired_sources_v1",
+	      "ducklake_vortex_rewrite_outputs_v1", "ducklake_vortex_rewrites_v1", "ducklake_vortex_source_deletions_v1",
+	      "ducklake_vortex_source_retention_v1", "ducklake_vortex_write_budgets_v1",
+	      "ducklake_vortex_write_requests_v2"}) {
+		json.Add(
+		    metadata, name,
+		    LifecycleRows(json, owner, "SELECT * FROM __ducklake_metadata_lake." + string(name) + " ORDER BY ALL"));
+	}
+}
+
 struct LifecycleFixture : KeyedFixture {
 	string old_generation;
 	string retained;
@@ -116,18 +132,7 @@ struct LifecycleFixture : KeyedFixture {
 		SQL(owner, "BEGIN");
 		vortex_detail::ViewJSON json;
 		auto value = json.Object(), metadata = json.Object();
-		for (auto name :
-		     {"ducklake_vortex_builds_v1", "ducklake_vortex_generation_refs_v1", "ducklake_vortex_generations_v1",
-		      "ducklake_vortex_indexes_v1", "ducklake_vortex_keyed_tables_v1", "ducklake_vortex_maintenance_v1",
-		      "ducklake_vortex_optimizer_rewrite_receipts_v1", "ducklake_vortex_optimizer_v2",
-		      "ducklake_vortex_request_epochs_v1", "ducklake_vortex_retired_sources_v1",
-		      "ducklake_vortex_rewrite_outputs_v1", "ducklake_vortex_rewrites_v1",
-		      "ducklake_vortex_source_deletions_v1", "ducklake_vortex_source_retention_v1",
-		      "ducklake_vortex_write_budgets_v1", "ducklake_vortex_write_requests_v2"}) {
-			json.Add(
-			    metadata, name,
-			    LifecycleRows(json, owner, "SELECT * FROM __ducklake_metadata_lake." + string(name) + " ORDER BY ALL"));
-		}
+		AddLifecycleMetadata(json, metadata, owner);
 		json.Add(value, "metadata", metadata);
 		json.Add(value, "snapshots",
 		         LifecycleRows(json, owner,
@@ -226,11 +231,12 @@ struct LifecycleFixture : KeyedFixture {
 
 	void Window() {
 		Connection owner(database);
-		auto result = DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, *setup.context, "lake", "main", "items", "knn", 1);
+		auto result = DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, *setup.context, "lake", "main", "items",
+		                                                            "knn", 1, table_uuid);
 		Require(result.expired_requests == 2, "Lifecycle fixture lost its existing receipts");
 		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "window",
 		                                 Value::LIST(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), {}),
-		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(-999999)}), 2);
+		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(-999999)}), 2, table_uuid);
 	}
 };
 
@@ -360,8 +366,9 @@ inline void RunLifecycleFixture(DuckDB &database, Connection &setup, const strin
 		auto rows = SQL(setup, "SELECT [{'id':12345::BIGINT,'embedding':[12345,0]::FLOAT[],"
 		                       "'category':'A'::VARCHAR,'payload':'after-checkpoint'::VARCHAR}]")
 		                ->GetValue(0, 0);
-		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "after-checkpoint", rows,
-		                                 Value::LIST(LogicalType::BIGINT, {}), 2, [&](const string &stage) {
+		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "after-checkpoint",
+		                                 rows, Value::LIST(LogicalType::BIGINT, {}), 2, f.table_uuid,
+		                                 [&](const string &stage) {
 			                                 if (mode == "lifecycle-pause-write-" + stage) {
 				                                 f.Wait("write-" + stage);
 			                                 }

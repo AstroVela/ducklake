@@ -80,7 +80,7 @@ string Read(const string &path) {
 }
 
 struct Fixture {
-	string root, old_source;
+	string root, old_source, table_uuid;
 	DuckDB database;
 	Connection writer;
 	DuckLakeVortexIndex index;
@@ -94,6 +94,7 @@ struct Fixture {
 		FileSystem::GetFileSystem(*writer.context).CreateDirectory(root + "/indexes");
 		SQL(writer, "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
 		            "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')");
+		table_uuid = TableUUID(writer);
 		if (initialize) {
 			Initialize();
 		}
@@ -114,7 +115,7 @@ struct Fixture {
 	DuckLakeVortexWriteResult WriteBatch(idx_t first, const string &request) {
 		Connection owner(database);
 		return DuckLakeVortexWriteBatch::Append(owner, *writer.context, "lake", "main", "items", "knn", request,
-		                                       Rows(first), 1);
+		                                        Rows(first), 1, table_uuid);
 	}
 	void Build(idx_t revision, const string &name) {
 		SQL(writer, "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");

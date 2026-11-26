@@ -595,6 +595,29 @@ void BuildNative(ClientContext &context, DuckLakeVortexReadView &view, const str
 	build.Check(error.get());
 }
 
+DuckLakeTableEntry &CheckRewriteIndex(DuckLakeTransaction &transaction, const DuckLakeSnapshot &snapshot,
+                                      const DuckLakeVortexRewriteState &plan, const char *stage) {
+	auto entry = transaction.GetCatalog().GetEntryById(transaction, snapshot, TableIndex(plan.table_id));
+	if (!entry) {
+		throw TransactionException("Vortex rewrite table disappeared before %s", stage);
+	}
+	if (entry->type != CatalogType::TABLE_ENTRY) {
+		throw TransactionException("Vortex rewrite table identity changed before %s", stage);
+	}
+	auto &table = entry->Cast<DuckLakeTableEntry>();
+	if (table.GetTableUUID() != plan.table_uuid || table.schema.name != plan.schema || table.name != plan.table) {
+		throw TransactionException("Vortex rewrite table identity changed before %s", stage);
+	}
+	auto current = DuckLakeVortexIndex::Lookup(transaction, table, plan.before.name);
+	auto aliases =
+	    DuckLakeVortexIndex::Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
+	                                                " WHERE table_uuid=" + Value(plan.table_uuid).ToSQLString());
+	if (current.ToJSON() != plan.before.ToJSON() || aliases->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
+		throw TransactionException("Vortex rewrite capture or index changed before %s", stage);
+	}
+	return table;
+}
+
 struct RewriteInputState {
 	string identity;
 	idx_t visible_rows = 0, source_bytes = 0;
@@ -727,7 +750,8 @@ RewriteInputState RewriteInputs(ClientContext &context, DuckLakeTransaction &tra
 }
 
 string GenerationWhere(const string &root, const string &generation) {
-	return " WHERE index_root=" + Value(root).ToSQLString() + " AND generation=" + Value(generation).ToSQLString();
+	return " WHERE index_root COLLATE C=" + Value(root).ToSQLString() +
+	       " AND generation COLLATE C=" + Value(generation).ToSQLString();
 }
 
 string LocalChild(const string &root, const string &child) {
@@ -850,6 +874,18 @@ void RegisterGeneration(DuckLakeTransaction &transaction, const DuckLakeVortexIn
 	                                            " SET state='published',keep_generation=true" + where);
 }
 
+void RetireUnreferencedGenerations(DuckLakeTransaction &transaction, const vector<std::pair<string, string>> &old) {
+	for (auto &entry : old) {
+		auto where = GenerationWhere(entry.first, entry.second);
+		auto result = DuckLakeVortexIndex::Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." +
+		                                                          string(GENERATION_REFS) + where);
+		if (!result->Fetch()->GetValue(0, 0).GetValue<idx_t>()) {
+			DuckLakeVortexIndex::Query(transaction, "UPDATE {METADATA_CATALOG}." + string(GENERATIONS) +
+			                                            " SET state='retired'" + where);
+		}
+	}
+}
+
 void UpdateGenerationRefs(DuckLakeTransaction &transaction, const string &uuid, const DuckLakeVortexIndex &index) {
 	auto owner =
 	    " WHERE table_uuid=" + Value(uuid).ToSQLString() + " AND index_name=" + Value(index.name).ToSQLString();
@@ -868,15 +904,7 @@ void UpdateGenerationRefs(DuckLakeTransaction &transaction, const string &uuid, 
 		                     Value(uuid).ToSQLString() + "," + Value(index.name).ToSQLString() + "," +
 		                     Value(segment.root).ToSQLString() + "," + Value(segment.generation).ToSQLString() + ")");
 	}
-	for (auto &entry : old) {
-		auto where = GenerationWhere(entry.first, entry.second);
-		auto result = DuckLakeVortexIndex::Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." +
-		                                                          string(GENERATION_REFS) + where);
-		if (!result->Fetch()->GetValue(0, 0).GetValue<idx_t>()) {
-			DuckLakeVortexIndex::Query(transaction, "UPDATE {METADATA_CATALOG}." + string(GENERATIONS) +
-			                                            " SET state='retired'" + where);
-		}
-	}
+	RetireUnreferencedGenerations(transaction, old);
 }
 
 #ifndef _WIN32
@@ -1244,20 +1272,7 @@ void DuckLakeVortexIndex::CheckRewriteCommit(ClientContext &context, DuckLakeTra
 	auto &caller = *plan->caller;
 	CheckInterrupted(caller);
 	const auto snapshot = transaction.RefreshVortexRewriteSnapshot();
-	auto entry = transaction.GetCatalog().GetEntryById(transaction, snapshot, TableIndex(plan->table_id));
-	if (!entry) {
-		throw TransactionException("Vortex rewrite table disappeared before commit");
-	}
-	auto &table = entry->Cast<DuckLakeTableEntry>();
-	if (table.GetTableUUID() != plan->table_uuid || table.schema.name != plan->schema || table.name != plan->table) {
-		throw TransactionException("Vortex rewrite table identity changed before commit");
-	}
-	auto current = Lookup(transaction, table, plan->before.name);
-	auto aliases = Query(transaction, "SELECT count(*) FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
-	                                      " WHERE table_uuid=" + Value(plan->table_uuid).ToSQLString());
-	if (current.ToJSON() != plan->before.ToJSON() || aliases->Fetch()->GetValue(0, 0).GetValue<idx_t>() != 1) {
-		throw TransactionException("Vortex rewrite capture or index changed before commit");
-	}
+	auto &table = CheckRewriteIndex(transaction, snapshot, *plan, "commit");
 	auto inputs = RewriteInputs(caller, transaction, table, *plan);
 	if (inputs.identity != plan->input_identity || (plan->prune && inputs.empty_files != plan->replaced)) {
 		throw TransactionException("Vortex rewrite input or schema changed before commit");
@@ -2031,6 +2046,35 @@ bool DuckLakeVortexIndex::ReferencesSource(DuckLakeTransaction &transaction, con
 	return false;
 }
 
+void DuckLakeVortexIndex::RetireTableMetadata(DuckLakeTransaction &transaction, const string &table_uuid) {
+	Initialized(transaction);
+	auto where = " WHERE table_uuid COLLATE C=" + Value(table_uuid).ToSQLString();
+	for (auto name : {BUILDS, REWRITES}) {
+		if (Query(transaction, "SELECT 1 FROM {METADATA_CATALOG}." + string(name) + where + " LIMIT 1")->Fetch()) {
+			throw InvalidInputException("Recover and collect Vortex build/rewrite ownership before table retirement");
+		}
+	}
+	auto rows = Query(transaction,
+	                  "SELECT DISTINCT r.index_root COLLATE C,r.generation COLLATE C,g.state FROM {METADATA_CATALOG}." +
+	                      string(GENERATION_REFS) + " r LEFT JOIN {METADATA_CATALOG}." + string(GENERATIONS) +
+	                      " g ON r.index_root COLLATE C=g.index_root AND r.generation COLLATE C=g.generation WHERE "
+	                      "r.table_uuid COLLATE C=" +
+	                      Value(table_uuid).ToSQLString());
+	vector<std::pair<string, string>> generations;
+	while (auto chunk = rows->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			if (chunk->GetValue(2, row).IsNull() || StringValue::Get(chunk->GetValue(2, row)) != "active") {
+				throw InvalidInputException("Vortex table retirement found invalid generation ownership");
+			}
+			generations.emplace_back(StringValue::Get(chunk->GetValue(0, row)),
+			                         StringValue::Get(chunk->GetValue(1, row)));
+		}
+	}
+	Query(transaction, "DELETE FROM {METADATA_CATALOG}." + string(GENERATION_REFS) + where);
+	Query(transaction, "DELETE FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) + where);
+	RetireUnreferencedGenerations(transaction, generations);
+}
+
 bool DuckLakeVortexIndex::HasSegments(DuckLakeTransaction &transaction, const string &table_uuid) {
 	auto result = Query(transaction, "SELECT reference FROM {METADATA_CATALOG}." + string(CATALOG_TABLE) +
 	                                     " WHERE table_uuid COLLATE C=" + Value(table_uuid).ToSQLString());
@@ -2477,9 +2521,8 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 		plan->schema_version = snapshot.schema_version;
 		plan->new_file_id = snapshot.next_file_id;
 		auto &catalog = transaction.GetCatalog();
-		auto entry = catalog.GetEntry(*source.context, CatalogType::TABLE_ENTRY, schema, table_name,
-		                              OnEntryNotFound::THROW_EXCEPTION);
-		auto &table = entry->Cast<DuckLakeTableEntry>();
+		auto &table =
+		    catalog.GetEntry<TableCatalogEntry>(*source.context, schema, table_name).Cast<DuckLakeTableEntry>();
 		plan->schema = table.schema.name;
 		plan->table = table.name;
 		plan->table_uuid = table.GetTableUUID();
@@ -2575,6 +2618,7 @@ DuckLakeVortexIndex DuckLakeVortexIndex::Rewrite(ClientContext &context, const s
 		{
 			auto publication = PublicationLock().GetExclusiveLock(interrupt);
 			auto &allocation = Begin(owner, catalog_name, &identity);
+			CheckRewriteIndex(allocation, allocation.GetSnapshot(), *plan, "allocation");
 			vector<string> paths {plan->workspace, generation_path};
 			if (!to_f) {
 				paths.push_back(reference_path);

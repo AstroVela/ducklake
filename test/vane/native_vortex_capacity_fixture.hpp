@@ -25,7 +25,7 @@ inline Value CapacityExtra(Connection &connection, int64_t id) {
 inline DuckLakeVortexWriteResult CapacityWrite(Connection &owner, ClientContext &caller, const string &id,
                                                const Value &rows) {
 	return DuckLakeVortexWriteBatch::Mutate(owner, caller, "lake", "main", "items", "knn", id, rows,
-	                                        Value::LIST(LogicalType::BIGINT, {}), 1);
+	                                        Value::LIST(LogicalType::BIGINT, {}), 1, TableUUID(owner));
 }
 
 inline string CapacitySourceCatalog(Connection &connection) {

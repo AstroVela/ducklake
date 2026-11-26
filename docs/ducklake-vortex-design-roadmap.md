@@ -85,7 +85,7 @@ T/F/B 是**同一份逻辑数据在某个 ReadView 下的物理分区**，不要
 
 1. 初始化索引、optimizer 和写入 catalog，在空表建立带维度的零 B 定义。
 2. 调用 `ducklake_manage_vortex_writes` 注册空表所有权；配置写入预算与后台策略。
-3. 调用 `ducklake_mutate_vortex_batch`，提交请求 ID、完整 upsert 行和待删除 ID。
+3. 调用 `ducklake_mutate_vortex_batch`，提交请求 ID、完整 upsert 行、待删除 ID 及创建请求时保存的表 UUID 和 epoch。
 4. 在同一原生事务内删除旧版本、插入 upsert 新行并登记回执，提交后返回 ACK。原生内联策略决定新行在提交时位于 T，还是直接落盘进入 F。仅删除的批次处理删除与回执。
 
 upsert 是整行替换。一个批次内 upsert/delete 的 ID 必须非 NULL 且互不重复。同一个 ID 同时出现在两类操作中会失败。回执包含 `table_uuid, request_id, payload_hash, row_count, snapshot_id, request_epoch`；`row_count` 是请求操作数，删除不存在的键也计入。没有实际数据变化的删除可沿用当前快照号，但回执仍持久提交。
@@ -94,7 +94,9 @@ upsert 是整行替换。一个批次内 upsert/delete 的 ID 必须非 NULL 且
 
 受管表拒绝普通 SQL INSERT/UPDATE/DELETE、append API，以及 schema、rename、drop 变更；flush、重写与回收通过已有内部授权路径执行。非受管表保留普通 SQL／append 语义。这里复用 DuckLake 原生 MVCC 和元数据 WAL，没有第二份写入 WAL 或独立的逐键版本目录。
 
-回执记录上限为**每个元数据 catalog 合计 100,000 条**，没有自动过期。快照过期与源文件 GC 各自独立。新表从 epoch 1 开始，客户端随请求保留原 epoch。显式 advance 在同一原生事务内递增一个表的 epoch 并移除它的旧回执。旧 epoch 的请求返回 `EXPIRED_REQUEST`。详见[受管写入](native-vortex-keyed-writes.md)和[请求 epoch](native-vortex-request-epochs.md)。
+回执记录上限为**每个元数据 catalog 合计 100,000 条**，没有自动过期。快照过期与源文件 GC 各自独立。新表从 epoch 1 开始，客户端随请求保留原 UUID 与 epoch。显式 advance 在同一原生事务内递增一个表的 epoch 并移除它的旧回执。旧 epoch 的请求返回 `EXPIRED_REQUEST`。详见[受管写入](native-vortex-keyed-writes.md)和[请求 epoch](native-vortex-request-epochs.md)。
+
+append、mutate 和 epoch 推进在读取回执前核验表 UUID。同名新表有自己的 UUID 和回执窗口。显式退休在一笔原生事务中提交 DROP、释放目标 UUID 的回执、策略与索引引用。待恢复的 build／rewrite、启用的策略或仍在执行的优化器任务会阻止退休。旧读者继续按其快照读取。[表 UUID 生命周期](native-vortex-table-uuid-lifecycle.md)
 
 ## 5. 一次查询如何覆盖 B/F/T
 
@@ -268,7 +270,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
-| R5 容量与产品契约 | **当前优先项，部分完成**。已验证浮点修复、请求 epoch 和回执回收、reference 与 native WAL 生命周期、容量 admission，以及私有查询目录登记与显式清理 | 继续表 UUID 生命周期。总磁盘生命周期、更大数据、质量、延迟和吞吐仍待验证 |
+| R5 容量与产品契约 | **当前优先项，部分完成**。已验证浮点修复、请求 epoch 和回执回收、reference 与 native WAL 生命周期、容量 admission，私有查询目录登记与显式清理，以及表 UUID 校验与原子逻辑退休 | 继续验证退休后的物理历史回收。总磁盘生命周期、更大数据、质量、延迟和吞吐仍待验证 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
@@ -302,7 +304,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 4. 选择一个有测量证据的热点做验证性改动，沿用现有格式和出错语义。候选达到预设收益后保留，未达门槛时记录结果并撤回改动。
 5. 30 分钟稳态验证继续暂缓。当前长测工具按三个阶段运行，通过查询前后的提交水位进行验证。恢复前先让长测使用查询实际捕获的 ReadView 快照，对齐历史稳态阶段和写入节奏，并将 canary 与 exploration 的 recall ≥0.8 都设为通过条件。保留 90 秒 drain、最终行和旧回执检查。用更长且重复的运行检查后半程积压斜率、清理速率和资源增长，确认维护能跟上持续写入。[当前长测工具](../test/vane/test_vane_vortex_sustained_load.py)
 
-稳定负载下的 R4 和 R5 性能验证继续暂缓。下一步用表 UUID 约束旧请求重放，并定义表退役时的状态清理。R6 需要独立的远程与分布式设计，R7 按收益证据决定。
+稳定负载下的 R4 和 R5 性能验证继续暂缓。下一步核对退休后的原生历史和物理文件能否在保留策略与预算内回收。R6 需要独立的远程与分布式设计，R7 按收益证据决定。
 
 ## 12. 文档与实现导航
 

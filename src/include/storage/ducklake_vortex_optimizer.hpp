@@ -4,6 +4,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include <functional>
+#include <tuple>
 
 namespace duckdb {
 class ClientContext;
@@ -11,6 +12,9 @@ class Connection;
 class DatabaseInstance;
 class ExtensionLoader;
 class DuckLakeTransaction;
+struct DuckLakeVortexTableRetirement;
+
+using DuckLakeVortexPolicyKey = std::tuple<idx_t, idx_t, string, string>;
 
 struct DuckLakeVortexWriteBudget {
 	idx_t inline_rows, inline_bytes, unindexed_rows, unindexed_bytes;
@@ -55,6 +59,9 @@ public:
 	static unique_ptr<DuckLakeVortexCollectionLock::Key>
 	AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
 	           unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard);
+	static void CheckTableRetirement(ClientContext &context, DuckLakeTransaction &transaction,
+	                                 DuckLakeVortexTableRetirement &retirement);
+	static void FinishTableRetirement(ClientContext &context, const DuckLakeVortexTableRetirement &retirement);
 };
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader);

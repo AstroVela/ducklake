@@ -13,10 +13,11 @@ struct EpochFixture {
 	DuckDB &database;
 	Connection &setup;
 	string root;
+	const string table_uuid;
 	Value seed, latest, late;
 
 	EpochFixture(DuckDB &database, Connection &setup, string root)
-	    : database(database), setup(setup), root(std::move(root)) {
+	    : database(database), setup(setup), root(std::move(root)), table_uuid(TableUUID(setup)) {
 		SQL(setup, "SELECT * FROM ducklake_initialize_vortex_optimizer('lake')");
 		Connection owner(database);
 		DuckLakeVortexWriteBatch::Manage(owner, *setup.context, "lake", "main", "items", "knn");
@@ -31,9 +32,9 @@ struct EpochFixture {
 		                  "'payload':'late'::VARCHAR}]")
 		           ->GetValue(0, 0);
 		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "seed", seed,
-		                                 Value::LIST(LogicalType::BIGINT, {}), 1);
+		                                 Value::LIST(LogicalType::BIGINT, {}), 1, table_uuid);
 		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "latest", latest,
-		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(2)}), 1);
+		                                 Value::LIST(LogicalType::BIGINT, {Value::BIGINT(2)}), 1, table_uuid);
 	}
 
 	DuckLakeVortexRequestStatus Status() {
@@ -44,13 +45,14 @@ struct EpochFixture {
 
 	DuckLakeVortexRequestAdvance Advance(Connection &owner, const std::function<void(const string &)> &observe = {}) {
 		Connection caller(database);
-		return DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, *caller.context, "lake", "main", "items", "knn", 1, observe);
+		return DuckLakeVortexWriteBatch::AdvanceRequestEpoch(owner, *caller.context, "lake", "main", "items", "knn", 1,
+		                                                     table_uuid, observe);
 	}
 
 	DuckLakeVortexWriteResult Late(Connection &owner, const std::function<void(const string &)> &observe = {}) {
 		Connection caller(database);
 		return DuckLakeVortexWriteBatch::Mutate(owner, *caller.context, "lake", "main", "items", "knn", "late", late,
-		                                        Value::LIST(LogicalType::BIGINT, {}), 1, observe);
+		                                        Value::LIST(LogicalType::BIGINT, {}), 1, table_uuid, observe);
 	}
 
 	void CurrentRows(idx_t count = 1) {
@@ -243,8 +245,8 @@ inline void RunEpochFixture(DuckDB &database, Connection &setup, const string &r
 	advanced = f.Advance(retry);
 	Require(advanced.previous_epoch == 1 && advanced.request_epoch == 2 && advanced.expired_requests == 2,
 	        "Advance recovery changed the retired receipt count");
-	auto fresh = DuckLakeVortexWriteBatch::Mutate(retry, *setup.context, "lake", "main", "items", "knn", "new-window", f.late,
-	                                              Value::LIST(LogicalType::BIGINT, {}), 2);
+	auto fresh = DuckLakeVortexWriteBatch::Mutate(retry, *setup.context, "lake", "main", "items", "knn", "new-window",
+	                                              f.late, Value::LIST(LogicalType::BIGINT, {}), 2, f.table_uuid);
 	EpochFixture::Same(advanced, f.Advance(retry));
 	Require(fresh.request_epoch == 2 && f.Status().retained_requests == 1, "Advance retry deleted a newer receipt");
 	bool expired = false;
