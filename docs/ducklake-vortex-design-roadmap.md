@@ -14,6 +14,8 @@
 
 #88 为原生查询私有副本登记所有权，增加活跃文件锁和有预算的显式崩溃回收。[查询 scratch 生命周期](native-vortex-query-scratch-lifecycle.md)
 
+开发基线 `1848e868` 已合入 #89 的请求 UUID 校验和原子表退休。#90 在原生快照过期事务中清理失去最后一个历史引用的表级配置。[#89 合入提交](https://github.com/AstroVela/ducklake/commit/1848e868c6f1dfce47d1debdb772292cced2ae2c) · [退休后的原生历史与物理回收](native-vortex-retired-history.md)
+
 当前限定：单进程独占 native DuckDB 元数据目录、本地受管 POSIX 文件、无分区／未加密的固定业务 schema、Float32 有限向量、平方 L2 距离。并发客户端与后台维护位于这一所有权范围内；多进程写者、跨主机 fencing、远程对象存储和分布式 ANN 不在当前验证范围。
 
 ```sql
@@ -193,6 +195,12 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 详见[源保留与删除协议](native-vortex-source-retention.md)、[事务完成唤醒](native-vortex-transaction-gc-wakeup.md)、[自动全链路与 SIGKILL](native-vortex-automatic-flow.md)。早期 proof 中被后续更改的锁顺序、段数或 manifest 版本，以本基线代码及后续文档为准。
 
+### 7.6 表退休后的原生历史与物理回收
+
+逻辑退休后，保留快照仍可引用旧 table ID、表级配置和原生 inline 表。catalog 的保留策略允许最后一个相关快照过期时，原生事务一并删除旧表历史与表级配置，并释放对应的 inline 表。事务回滚会同时恢复这些对象。同名重建表和其他活跃表按各自的 table ID 保留历史与配置。
+
+源文件和 generation 继续分别按删除意图、引用及对象／字节预算回收。原生 metadata checkpoint 后，后续表可以复用释放的块。验收分别记录被删除的文件及字节、原生块复用、数据库文件和 WAL 的实际大小。[回收与重开契约](native-vortex-retired-history.md)
+
 ## 8. 资源边界与运行入口
 
 以下是当前原型的硬边界，不是生产容量承诺：
@@ -230,6 +238,8 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 #87 的容量验证覆盖 1／167／168／4,096 维的物理行和向量上限、4 MiB 请求、64 MiB 保留 inline 历史、三个 B 的认证 lease，以及并发提交和崩溃恢复。通用存储和 envelope 解析单独验证。现有容量边界、事务保护和召回门槛沿用。[容量验收](native-vortex-capacity-admission.md)
 
 #88 的确定性用例覆盖普通查询、取消、旧 ReadView 跨规范 GC 和 checkpoint、查询与清理的 SIGKILL，以及显式回收的对象和字节预算。旧读者仍持有私有副本，原生重开保持需显式清理的登记。验证包括现有 16 张 Vortex 元数据表、业务行、快照和文件身份。[查询 scratch 验收](native-vortex-query-scratch-lifecycle.md)
+
+#90 的恢复用例在原生进程退出后，用签名安装包重新挂载同一数据库，逐表比较 28 张原生元数据表、16 张 Vortex 元数据表及实际 inline 表。场景涵盖普通旧读者和私有 ReadView、取消、事务回滚、进程崩溃以及重开后的显式回收。[退休历史验收](native-vortex-retired-history.md)
 
 ### 9.2 历史安装验证与 30 分钟观察
 
@@ -270,7 +280,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R2 多 B 与自动维护 | **已实现并验证**：独立新增 B、三段预算、选择性合并、自动 flush/build | 保持追加不重建未选中 B、同视图全局 top-k 和现有预算 |
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
-| R5 容量与产品契约 | **当前优先项，部分完成**。已验证浮点修复、请求 epoch 和回执回收、reference 与 native WAL 生命周期、容量 admission，私有查询目录登记与显式清理，以及表 UUID 校验与原子逻辑退休 | 继续验证退休后的物理历史回收。总磁盘生命周期、更大数据、质量、延迟和吞吐仍待验证 |
+| R5 容量与产品契约 | **部分完成**。已有浮点、请求 epoch、回执、reference／WAL、容量 admission、私有查询目录和 UUID 退休的确定性验收。退休历史用例覆盖 inline 表、表级配置、源文件、generation 及原生块复用 | 更大数据上的质量、延迟与吞吐，以及长期磁盘和 RSS 容量仍待验证 |
 | R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
@@ -304,7 +314,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 4. 选择一个有测量证据的热点做验证性改动，沿用现有格式和出错语义。候选达到预设收益后保留，未达门槛时记录结果并撤回改动。
 5. 30 分钟稳态验证继续暂缓。当前长测工具按三个阶段运行，通过查询前后的提交水位进行验证。恢复前先让长测使用查询实际捕获的 ReadView 快照，对齐历史稳态阶段和写入节奏，并将 canary 与 exploration 的 recall ≥0.8 都设为通过条件。保留 90 秒 drain、最终行和旧回执检查。用更长且重复的运行检查后半程积压斜率、清理速率和资源增长，确认维护能跟上持续写入。[当前长测工具](../test/vane/test_vane_vortex_sustained_load.py)
 
-稳定负载下的 R4 和 R5 性能验证继续暂缓。下一步核对退休后的原生历史和物理文件能否在保留策略与预算内回收。R6 需要独立的远程与分布式设计，R7 按收益证据决定。
+稳定负载下的 R4 和 R5 性能验证继续暂缓。不依赖稳定负载的下一项是 R6 的远程对象所有权与原子发布协议设计。先明确对象身份、持久发布点、跨进程 fencing 和故障恢复责任，再定义固定输入的协议验证。R7 仍按增量更新的收益证据决定。
 
 ## 12. 文档与实现导航
 
@@ -329,6 +339,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | [引用文件与 WAL 生命周期](native-vortex-reference-wal-lifecycle.md) | 调用方 JSON、generation 双引用、事务保护与 checkpoint 恢复 |
 | [容量 admission 边界](native-vortex-capacity-admission.md) | 行数、向量、写入、历史、lease 和 manifest 边界，及事务与恢复验收 |
 | [查询 scratch 所有权与回收](native-vortex-query-scratch-lifecycle.md) | 登记、活跃锁、有预算的显式回收和 SIGKILL 恢复 |
+| [表 UUID 生命周期](native-vortex-table-uuid-lifecycle.md)／[退休历史与物理回收](native-vortex-retired-history.md) | 原子退休、历史过期、inline 表与表级配置的回收、原生块复用和重开 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。

@@ -70,7 +70,7 @@ protocol used CPUs 6–11 and unchanged thread settings.
 
 The current [builder](../test/vane/build_vortex_reference_diagnostic.py) checks
 production metadata-source SHA-256
-`9e0f21ed12467bfa4c194dab7518f7f5994198379fe35f7483fdc5382b286c2b`.
+`801dc0b5a30eafa353faaa9b5d611a74b0451598fa0da7b96cbfb001272447c1`.
 It applies [one test patch](../test/vane/reference_diagnostic.patch) to a private
 copy with zero fuzz, compiles it with the configured metadata flags and links
 that complete object explicitly before the unchanged extension archives.
