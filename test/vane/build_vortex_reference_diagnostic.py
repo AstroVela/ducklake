@@ -9,7 +9,7 @@ from pathlib import Path
 import shlex
 import subprocess
 
-BASE_SOURCE_SHA256 = "97a4b1cf7d1a00c7846a974fee77647649c8b18c7ae6ae254097b9d474ffe96e"
+BASE_SOURCE_SHA256 = "801dc0b5a30eafa353faaa9b5d611a74b0451598fa0da7b96cbfb001272447c1"
 EXTENSIONS = {"core_functions", "file", "httpfs", "icu", "json", "parquet", "ducklake", "vortex"}
 
 
@@ -83,6 +83,9 @@ def run(args):
     command[position : position + 1] = [str(benchmark), str(metadata)]
     output = root / "reference-diagnostic"
     command[command.index("-o") + 1] = str(output)
+    for index, value in enumerate(command):
+        if value.startswith("-Wl,--dependency-file="):
+            command[index] = "-Wl,--dependency-file=" + str(output.with_suffix(".d"))
     inputs = {
         str((build / value).resolve()): digest((build / value).resolve())
         for value in command

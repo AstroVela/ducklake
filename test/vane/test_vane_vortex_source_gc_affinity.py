@@ -159,6 +159,7 @@ def run(args):
                         [
                             sys.executable,
                             "-I",
+                            "-B",
                             str(Path(AA.__file__).resolve()),
                             "--driver",
                             str(args.driver.resolve()),

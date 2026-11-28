@@ -1,5 +1,6 @@
 """Independent typed-row / UUID / epoch history model and raw PostgreSQL view."""
 
+from bisect import bisect_right
 from copy import deepcopy
 import hashlib
 import json
@@ -15,7 +16,29 @@ def require(value, message):
         raise AssertionError(message)
 
 
+def integer_float32_bits(value):
+    # Search the ordered positive IEEE words. Compare to the original integer
+    # and use exact distances between integral neighbors for inexact values.
+    def decode(word):
+        return struct.unpack(">f", word.to_bytes(4, "big"))[0]
+
+    magnitude = abs(value)
+    infinity = 0x7F800000
+    lower = bisect_right(range(infinity), magnitude, key=decode) - 1
+    if decode(lower) != magnitude:
+        upper = lower + 1
+        high = 2**128 if upper == infinity else int(decode(upper))
+        distance_low = magnitude - int(decode(lower))
+        distance_high = high - magnitude
+        if distance_high < distance_low or (distance_high == distance_low and upper % 2 == 0):
+            lower = upper
+    require(lower < infinity, "Reference Float32 overflow")
+    return (lower | (0x80000000 if value < 0 else 0)).to_bytes(4, "big").hex()
+
+
 def bits(value, width):
+    if width == 4 and type(value) is int:
+        return integer_float32_bits(value)
     return None if value is None else struct.pack(">f" if width == 4 else ">d", value).hex()
 
 
@@ -218,10 +241,31 @@ def observe(backend):
     return {"state": state, "tables": tables, "fields": fields, "rows": rows, "receipts": receipts}
 
 
+def observe_capacity(backend):
+    with backend.connect() as c:
+        c.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        rows = c.execute(
+            """SELECT count(*) AS versions, count(*) FILTER (WHERE end_snapshot IS NULL) AS active,
+            coalesce(sum(cardinality(embedding)) FILTER (WHERE end_snapshot IS NULL),0)*4 AS vector_bytes,
+            encode(sha256(convert_to(coalesce(string_agg(
+                encode(sha256(record_send(r)),'hex'), '' ORDER BY physical_row_id),''),'UTF8')),'hex') AS sha
+            FROM typed_rows r"""
+        ).fetchone()
+        return {
+            "rows": rows,
+            "state": c.execute("SELECT * FROM typed_catalog").fetchone(),
+            "tables": c.execute("SELECT * FROM typed_tables ORDER BY table_id").fetchall(),
+            "fields": c.execute("SELECT * FROM typed_fields ORDER BY table_uuid,ordinal").fetchall(),
+            "receipts": c.execute(
+                "SELECT * FROM typed_receipts ORDER BY table_uuid,request_epoch,request_id"
+            ).fetchall(),
+        }
+
+
 def inspect(image, model):
     require(
         image["state"]
-        == {"snapshot": model.snapshot, "next_table_id": model.next_table, "next_row_id": model.next_row, "layout": 2},
+        == {"snapshot": model.snapshot, "next_table_id": model.next_table, "next_row_id": model.next_row, "layout": 1},
         "Typed snapshot / allocation mismatch",
     )
     expected = []

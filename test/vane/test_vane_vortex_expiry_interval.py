@@ -78,7 +78,7 @@ def exercise(connection, candidate):
         predicate = "table_id IN (" + ",".join(map(str, forced)) + ") OR" if forced else ""
         expected = oracle(snapshots, files, forced)
         original = sorted(connection.execute(REFERENCE.format(forced=predicate)).fetchall())
-        actual = sorted(connection.execute(candidate.format(forced=predicate)).fetchall())
+        actual = sorted(connection.execute(candidate.format(forced=predicate, marker="")).fetchall())
         assert original == actual == expected, (checked, snapshots, forced, expected, original, actual)
         checked += 1
     return checked

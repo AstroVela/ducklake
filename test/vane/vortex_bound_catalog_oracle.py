@@ -73,6 +73,12 @@ def identity(c, table_uuid, snapshot):
     return result, rows
 
 
+def request_digest(request, typed_identity, source, index):
+    physical_identity = {k: source[k] for k in ("unit", "key", "version", "size", "sha")}
+    record = [request["id"], typed_identity, physical_identity, index["sha"], index["size"], request["expected"]]
+    return hashlib.sha256(encode(record).encode()).hexdigest()
+
+
 def observe(backend, services, storage_oracle, typed_oracle):
     raw = storage_oracle.observe(services.dsn, backend.schema, services.root_client, services.bucket)
     typed = typed_oracle.observe(backend)
@@ -111,6 +117,11 @@ def inspect(raw, typed, expected, copies, before=None):
             binding["table_id"] == tables[table_uuid]["table_id"]
             and binding["dimension"] == tables[table_uuid]["dimension"],
             "Table ID or vector dimension crossed UUID",
+        )
+    if any(reader["kind"] == "sql" and not reader["closed"] for reader in raw["readers"]):
+        require(
+            not any(unit["kind"] == "source" and unit["state"] == "deleting" for unit in units.values()),
+            "Source GC overlapped an ordinary SQL session",
         )
     for ref in raw["refs"]:
         require(units[ref["unit"]]["state"] not in ("deleting", "deleted"), "Protected unit was collected")
@@ -162,6 +173,14 @@ def inspect(raw, typed, expected, copies, before=None):
             bindings["generation:" + key]["identity"] == bindings[req["source"]]["identity"],
             "Generation/source identities mixed",
         )
+        index = next(o for o in objects.values() if o["unit"] == "generation:" + key and o["role"] == "index")
+        source = next(o for o in objects.values() if o["unit"] == req["source"])
+        require(
+            source["sealed"]
+            and source["version"] not in (None, "null")
+            and req["payload_hash"] == request_digest(req, bindings[req["source"]]["identity"], source, index),
+            "Request digest omits its sealed physical source or index input",
+        )
         if req["receipt"] is None:
             continue
         receipt = req["receipt"]
@@ -174,8 +193,6 @@ def inspect(raw, typed, expected, copies, before=None):
             and receipt["revision"] == req["expected"] + 1,
             "Receipt identity changed",
         )
-        index = next(o for o in objects.values() if o["unit"] == "generation:" + key and o["role"] == "index")
-        source = next(o for o in objects.values() if o["unit"] == req["source"])
         manifest = next(o for o in objects.values() if o["unit"] == "generation:" + key and o["role"] == "manifest")
         body = encode(
             {

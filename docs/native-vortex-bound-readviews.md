@@ -1,6 +1,6 @@
 # R6 Typed UUID、发布与 ReadView 的统一绑定
 
-本轮基于 [Draft #93](https://github.com/AstroVela/ducklake/pull/93) 的 `62b87b87e4dd56eed010feaadaeeb7f0ba83cb3b`，把 [typed metadata](native-vortex-postgres-typed-lifecycle.md) 与 [PostgreSQL／S3 backend](native-vortex-postgres-s3-backend.md) 接到一个严格的 [BoundCatalog 入口](../scripts/vortex_bound_catalog.py)。总入口为 [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)。
+本轮以 #93 合入后的开发提交 `7716a403` 为基线，通过 BoundCatalog 将 typed 元数据接入 PostgreSQL／S3 broker。[BoundCatalog 实现](../scripts/vortex_bound_catalog.py) · [类型化元数据](native-vortex-postgres-typed-lifecycle.md) · [发布 broker](native-vortex-postgres-s3-backend.md) · [总设计与 roadmap](ducklake-vortex-design-roadmap.md)
 
 **本轮验证组件身份与可见性契约。** Source／index 使用不透明 bytes fixture，未生成或查询原生 Vortex／SPFresh 文件，不能据此宣称远程 ANN、过滤或 top-k 已接通。原生 C++／Rust、SQL、provider 和远程配置限制保持不变。
 
@@ -8,7 +8,7 @@
 
 ## 一个明确的身份边界
 
-实验性 storage 和 typed metadata 同时采用全新 **v2** 布局。没有 v1 读取、迁移、自动 UUID／epoch 转换、兼容层或 fallback。#92 的单根入口保留为底层原语回归 fixture；新的 typed 发布入口不调用其未绑定的 prepare／publish／capture，也不从 `control.table_uuid`／`epoch` 推断业务目标。
+Storage 和 typed catalog 的布局号都是 **`1`**。使用当前 DDL 初始化全新 PostgreSQL schema，并以该新建 schema 进行重启和恢复验证。早期实验 schema 保留在各自的历史验证中。#92 的单根入口用于底层原语回归，typed 发布入口根据显式 typed 身份解析业务目标。
 
 新增四张关联表；`units` 增加不可空 UUID：
 
@@ -21,25 +21,27 @@
 
 `bound_units` 通过复合外键同时约束 typed table 的 UUID／table ID／schema／维度，以及 storage unit 的 ID／UUID。API 还从实际字段与 typed 历史重新计算身份，拒绝跨 UUID source、GC、错误 schema 和没有持久化绑定的接管；相同 bytes／SHA 不能替代业务身份。跨行身份使用外键，跨步骤变更使用 PostgreSQL 事务。[PG 约束](https://www.postgresql.org/docs/15/ddl-constraints.html)
 
-所有注册、封存、发布、捕获与退休都沿用 `control … FOR UPDATE` 串行化。在同一事务内检查 layout、store binding、owner 和显式 UUID；source／generation、head、引用和回执一起提交。实际破坏性 GC 原语仍在其事务内重查 owner、引用、intent 与预算；关联外键使包装层检查后 unit 不能换到另一 UUID。[PG 行锁](https://www.postgresql.org/docs/15/explicit-locking.html)
+注册、封存、发布、捕获与退休沿用 `control … FOR UPDATE` 串行化。绑定写入口与 owner 接管在开启事务前校验正整数 owner token，再在 control 行锁内比较当前 owner。状态查询和回执对账检查 storage 布局、对象存储绑定和 typed 布局。Source／generation、head、引用和回执一起提交。实际 GC 原语在其事务内保留 owner、引用、intent 与预算校验，复合外键固定 unit 的 UUID。[PG 行锁](https://www.postgresql.org/docs/15/explicit-locking.html)
 
 ## 发布、窗口与退休
 
-Source 身份记录源 snapshot 的 typed 行与物理地址；generation 继承该身份。Manifest 固定 catalog、UUID／字段／schema／snapshot、请求身份、原 expected revision、store，以及 source／index 的精确 key／version／size／SHA。Source／index bytes 仍由调用方提供，本轮没有证明这些 bytes 编码了对应 typed 行。
+Source 身份记录源 snapshot 的 typed 行与物理地址，generation 继承该身份。请求摘要同时绑定 source unit 和已封存对象的 key／version／size／SHA。Manifest 固定 catalog、UUID／字段／schema／snapshot、请求身份、原 expected revision、store，以及 source／index 的精确对象身份。Source／index bytes 仍由调用方提供，本轮没有证明这些 bytes 编码了对应 typed 行。
 
 发布 CAS 使用目标 UUID 自己的 revision：另一 UUID 先发布不会使本 UUID 的 prepared 请求过期。`control.revision`／`head` 记录整个 catalog 的发布次序和最后一次发布，不能当作任意表的当前 root。准备时固定 expected revision，显式 adopt 只改 owner claim；禁止改绑定、换 source 或自动 rebase。
 
-Typed epoch 推进后，旧 prepared 发布不能提交，必须显式取消并在原预算内回收。发布回执是物理 lineage 历史，与会被窗口推进／退休清除的业务 mutation 回执分开；`reconcile` 只按原 UUID／epoch／ID／hash 读取原结果，不把旧请求重新发布到新表。
+Typed epoch 推进后，旧 prepared 发布必须显式取消并在原预算内回收。在同一 UUID 和有效 epoch 内，`prepare` 对相同输入返回已有请求，即使 source 已过期或完成 GC。新请求仍要求有效的 native 引用。发布回执作为物理 lineage 历史保留，`reconcile` 按原 UUID／epoch／ID／摘要查找。业务 mutation 回执仍按窗口推进和退休规则清除。
 
 退休在同一 PostgreSQL 事务内结束目标 UUID 的行版本、释放 managed／epoch／业务回执、解除该 UUID 的实际 named 引用、清空 root，并把失去 named 引用的 ready generation 标为 retired。存在 allocated／deleting unit 时拒绝退休，包括取消后尚未完成 GC 的构建；没有隐藏清理。事务中途错误或 COMMIT 转发前断开时全部回滚，服务端 COMMIT 后丢 ACK 时全部提交。
 
-Native 历史引用和 reader pin 独立保留。退休不直接删除 S3 对象；活跃普通 SQL session 仍在 catalog 范围内阻止 source 历史释放。必须显式结束 session、过期 native 引用，并通过原 GC intent／STOP／精确版本删除协议回收。
+封存要求 source 仍处于 allocated，且持有以该 unit 为 holder 的 build 引用。当前 owner 可用 `abandon_source` 显式放弃未封存 source。该操作解除 build 引用，关闭后续 ticket 和 seal，保留登记身份供原 GC 协议回收。退休仍须等待该 allocated unit 完成回收。
+
+Native 历史引用和 reader pin 独立保留。活跃的普通 SQL session 在整个 catalog 范围内阻止 source 历史过期和 GC 准入。已准入的 source GC 完成前，普通 SQL capture 返回 `SOURCE_GC_ACTIVE`。回收继续使用显式 intent、STOP 和精确版本删除。
 
 ## ReadView 与同名重建
 
 一次 capture 固定查询当时的 typed snapshot 和全部 pin。Source 的构建 snapshot 可以早于查询 snapshot，因此视图同时保存两种身份，并用**物理 row ID 交集**描述 source 在查询中的可见性。更新／删除的旧物理行消失，新 inline 行有新地址；没有按业务键把旧向量混回当前版本。
 
-`materialize` 仅按持久化 UUID／snapshot／对象版本读取，校验 typed 行摘要和对象 bytes 后保存完整私有副本；之后才允许显式解除 pin。旧 UUID 退休后，原视图仍能读取原 typed 行和精确对象；同名新 UUID、规范对象 GC、writer owner 接管均不能改变已完成副本。Server 重启测试保留了独立 reader 对象；不宣称 reader 进程死亡后其内存副本可恢复。
+`materialize` 在 control 行锁内验证 typed 行摘要和完整 pin，固定精确对象版本。远程 GET 在该锁外执行，完成后重新持锁验证视图和 pin，再保存完整私有副本。若视图在 GET 期间关闭或解除 pin，当前物化失败。解除 pin 和关闭视图都在同一个 control 行锁事务内校验 typed 布局，失败时保留 reader 状态、pin 和私有副本。完整副本解除 pin 后，在表退休、同名重建、原对象 GC 和 owner 接管后仍可读取。Server 重启测试保留了独立 reader 对象；不宣称 reader 进程死亡后其内存副本可恢复。
 
 回收的 STOP body 使用 **unit 登记的 UUID**，不再使用单例 fixture 的 table seed。旧 UUID 的精确 DELETE 可跨越同名重建后完成，但只删除旧 key 的旧版本；旧 PUT 被已保留的 STOP 拒绝，不会触及新 UUID 对象。没有通过 LIST 接管未知文件或自动删除 STOP。
 
@@ -57,6 +59,10 @@ Source／artifact／向量各 **64 MiB**，manifest **1 MiB**，物理行 **100,
 | 退休与私有视图 | Named root／引用与 typed 生命周期一起释放，reader pin 阻止 GC；完整副本解除 pin 后经历规范 GC 和同名新 UUID，逐值保持 |
 | 真正晚到的对象请求 | HTTP 握手暂停旧 DELETE，期间创建并发布同名新 UUID，放行后旧版本 DELETE 为 204；取消并 GC 后才放行的旧 PUT 为 412 |
 | 故障与接管 | 实际 SIGKILL PG／MinIO，重启先核对完整状态，再 fencing 旧 owner、显式 adopt 原请求并发布；原 expected revision、输入身份和原 reader 副本保持 |
+| 写入与回执 | 无效 owner 在写入口和接管前被拒绝，接管失败时原 owner 保持有效。成功接管后发布仍要求请求已 adopt。配错存储前缀或缺少 typed 布局时拒绝查询、对账和取消 |
+| 请求重放 | 相同 typed snapshot 的不同物理 source 得到不同请求摘要。旧 source 过期和 GC 后，完全相同的 prepare 与对账均返回原结果 |
+| Source GC | 验证普通 SQL 和 source GC 的两种准入顺序，以及上传中断后的显式放弃、精确封存保护和 STOP 回收 |
+| 私有副本物化 | 固定 GET 等待点，独立表可以提交。关闭视图或解除 pin 后，在途物化不得登记副本。缺少 typed 布局时，解除 pin 和关闭视图均保留原状态 |
 
 ## 复现与证据
 
@@ -69,9 +75,17 @@ Source／artifact／向量各 **64 MiB**，manifest **1 MiB**，物理行 **100,
 
 依赖继续使用[固定 requirements](../test/vane/requirements-remote-backend.txt)，本地 PostgreSQL **15.13**，MinIO **RELEASE.2025-09-07T16-13-09Z**／SHA `7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f`。本机对象 fixture 显式指定新 `/dev/shm` 目录，结束后只移除自己创建的目录；没有自动切换存储路径。[CI](../.github/workflows/VortexRemoteBackend.yml)依次运行协议模型、backend、typed 和绑定专项，保留报告与服务日志，不运行稳定负载测试。
 
-冻结专项通过 **224 项检查，其中 21 项预期拒绝，7 组故障观测**；PG／MinIO 实际 SIGKILL 退出码均为 **-9**。主报告保留在 `/tmp/ducklake-vortex-bound-proof-v4-20261107/report.json`，SHA-256 为 **`1bb073b2fcfbab2792c11575ea44600b8c3d77e318d6661aa5fac033f002459a`**。报告记录检查名与完整状态摘要、协议帧／HTTP 握手、最终 16 表与对象版本、执行源码 SHA、实际 CPU／线程环境与恢复结果；不保存可使用的签名票据。执行前后与提交前的十个源码身份一致。
+### 当前开发基线验收
 
-新布局上的既有回归通过：
+在新建 `layout=1` schema 上，绑定专项通过 **366 项检查，其中 76 项预期拒绝**，并完成 10 组故障和并发观测。PostgreSQL 和 MinIO 的实际 SIGKILL 退出码均为 `-9`。恢复在这次运行所创建的 schema 中验证。
+
+同基线的 typed 回归通过 **175 项检查，其中 91 项预期拒绝**，完成 9 组故障观测。后端回归通过 **485 项检查，其中 35 项预期拒绝**，完成 9 项能力探测和 7 组故障观测。协议模型通过 **40 个场景和 21 个反例**，探索的 1,342 个状态及状态集合摘要与开发基线一致。各套真实服务回归均在 180 秒期限内完成。
+
+### 原叠栈验收
+
+2026-11-07 的原 PR 基于 #93 旧叠栈提交 `62b87b87`。历史专项通过 **224 项检查，其中 21 项预期拒绝，7 组故障观测**，PG 和 MinIO 实际 SIGKILL 退出码均为 **-9**。历史报告路径为 `/tmp/ducklake-vortex-bound-proof-v4-20261107/report.json`，SHA-256 为 **`1bb073b2fcfbab2792c11575ea44600b8c3d77e318d6661aa5fac033f002459a`**。报告记录检查名与完整状态摘要、协议帧和 HTTP 握手、最终 16 表与对象版本、执行源码 SHA、实际 CPU、线程环境和恢复结果。
+
+原叠栈上的关联回归通过以下检查。
 
 | 回归 | 结果 | report.json SHA-256 |
 | --- | --- | --- |
@@ -81,7 +95,7 @@ Source／artifact／向量各 **64 MiB**，manifest **1 MiB**，物理行 **100,
 
 回归报告分别保留在 `/tmp/ducklake-vortex-bound-{typed,backend,model}-regression-20261107/`。由于本机磁盘余量不足，typed／backend／最终绑定专项的服务目录也显式放在独立 `/dev/shm` fixture，完整 JSON 和服务日志另外复制保留至上述 `/tmp` 路径；原报告未改写。
 
-Vane 基础 launcher 分独立非 Ray／Ray 进程，在 CPU 6–11 通过 **1,222＋32＝1,254 项**、可选依赖缺失跳过 **11＋4＝15 项**；日志为 `/tmp/ducklake-vortex-bound-base-20261107.log`，本轮显式把测试 `TMPDIR` 放在独立内存目录，线程环境保持。专项 `checkout-audit.json` 核对所有报告、执行源码、原生树／pins 和与 #93 相同的三个已安装 native／provider 构件。原生源码及 Vane 包源未修改，无 native 重建或重装。格式、文档链接、workflow YAML／shell、copyleft 和 diff 检查通过。
+原叠栈的 Vane 基础 launcher 在 CPU 6–11 分独立非 Ray 和 Ray 进程运行，通过 **1,254 项**，因缺少可选依赖跳过 **15 项**。历史日志路径为 `/tmp/ducklake-vortex-bound-base-20261107.log`。
 
 ## 剩余边界与下一项
 
