@@ -182,7 +182,7 @@ CREATE TABLE control (
  owner bigint NOT NULL CHECK(owner>0), revision bigint NOT NULL, head text,
  bucket text NOT NULL, prefix text NOT NULL, endpoint text NOT NULL);
 CREATE TABLE units (id text PRIMARY KEY, kind text NOT NULL, charge bigint NOT NULL CHECK(charge>0),
- state text NOT NULL, snapshot text);
+ state text NOT NULL, snapshot text,table_uuid uuid NOT NULL,UNIQUE(id,table_uuid));
 CREATE TABLE objects (key text PRIMARY KEY, unit text NOT NULL REFERENCES units(id), role text NOT NULL,
  size bigint NOT NULL, sha text, version text, etag text, sealed boolean NOT NULL DEFAULT false);
 CREATE TABLE requests (id text PRIMARY KEY, payload_hash text NOT NULL, source text NOT NULL REFERENCES units(id),
@@ -197,10 +197,10 @@ CREATE TABLE gc (unit text PRIMARY KEY REFERENCES units(id), nonce uuid NOT NULL
 
 
 class Backend:
-    """One catalog, one table UUID/epoch and one named index in a private v1 schema.
+    """Storage/transaction primitives and single-root fixtures in a fresh schema.
 
     control-row locking serializes metadata mutations across broker processes.
-    Native business SQL and distributed serving are deliberately not connected.
+    BoundCatalog is the typed publication entry. Native SQL is not connected.
     """
 
     def __init__(self, dsn, schema, objects):
@@ -295,6 +295,7 @@ class Backend:
         require(raw is not None and raw["sha"] == obj["sha"] and raw["size"] == obj["size"], "IDENTITY_MISMATCH")
 
     def takeover(self, expected):
+        require(type(expected) is int and 1 <= expected <= 2**63 - 1, "BAD_OWNER")
         with self.transaction(expected) as (c, state):
             require(state["owner"] < 2**63 - 1, "OWNER_EXHAUSTED")
             c.execute("UPDATE control SET owner=owner+1 WHERE singleton")
@@ -306,7 +307,10 @@ class Backend:
         unit = "source:" + name
         with self.transaction(token) as (c, state):
             key = self.objects.prefix + f"{state['table_uuid']}/owner-{token}/source-{name}"
-            c.execute("INSERT INTO units VALUES(%s,'source',%s,'allocated',%s)", (unit, len(data), snapshot))
+            c.execute(
+                "INSERT INTO units VALUES(%s,'source',%s,'allocated',%s,%s)",
+                (unit, len(data), snapshot, state["table_uuid"]),
+            )
             c.execute(
                 "INSERT INTO objects(key,unit,role,size,sha) VALUES(%s,%s,'source',%s,%s)",
                 (key, unit, len(data), sha(data)),
@@ -314,31 +318,40 @@ class Backend:
             c.execute("INSERT INTO refs VALUES('build',%s,%s)", (unit, unit))
         return unit
 
+    @staticmethod
+    def _source_for_build(c, unit):
+        obj = c.execute(
+            "SELECT o.* FROM units u JOIN objects o ON o.unit=u.id AND o.role='source' "
+            "JOIN refs r ON r.unit=u.id AND r.holder=u.id AND r.kind='build' "
+            "WHERE u.id=%s AND u.kind='source' AND u.state='allocated'",
+            (unit,),
+        ).fetchone()
+        require(obj is not None, "SOURCE_CLOSED")
+        return obj
+
+    def _source_ticket(self, c, unit, data):
+        obj = self._source_for_build(c, unit)
+        self.identity(obj, {"sha": sha(data), "size": len(data)})
+        return self.objects.ticket(obj["key"], data=data, condition="*")
+
     def source_ticket(self, unit, data, token):
         with self.transaction(token) as (c, _):
-            row = c.execute("SELECT * FROM units WHERE id=%s", (unit,)).fetchone()
-            require(row and row["kind"] == "source" and row["state"] == "allocated", "SOURCE_CLOSED")
-            obj = self.files(c, unit)[0]
-            self.identity(obj, {"sha": sha(data), "size": len(data)})
-            return self.objects.ticket(obj["key"], data=data, condition="*")
+            return self._source_ticket(c, unit, data)
+
+    def _seal_source(self, c, unit):
+        obj = self._source_for_build(c, unit)
+        raw = self.objects.read(obj["key"])
+        self.identity(obj, raw)
+        c.execute(
+            "UPDATE objects SET sealed=true,version=%s,etag=%s WHERE key=%s",
+            (raw["version"], raw["etag"], obj["key"]),
+        )
+        c.execute("UPDATE units SET state='ready' WHERE id=%s", (unit,))
+        c.execute("UPDATE refs SET kind='native' WHERE kind='build' AND holder=%s AND unit=%s", (unit, unit))
 
     def seal_source(self, unit, token):
         with self.transaction(token) as (c, _):
-            obj = c.execute(
-                "SELECT o.* FROM units u JOIN objects o ON o.unit=u.id AND o.role='source' "
-                "JOIN refs r ON r.unit=u.id AND r.holder=u.id AND r.kind='build' "
-                "WHERE u.id=%s AND u.kind='source' AND u.state='allocated'",
-                (unit,),
-            ).fetchone()
-            require(obj is not None, "SOURCE_CLOSED")
-            raw = self.objects.read(obj["key"])
-            self.identity(obj, raw)
-            c.execute(
-                "UPDATE objects SET sealed=true,version=%s,etag=%s WHERE key=%s",
-                (raw["version"], raw["etag"], obj["key"]),
-            )
-            c.execute("UPDATE units SET state='ready' WHERE id=%s", (unit,))
-            c.execute("UPDATE refs SET kind='native' WHERE kind='build' AND holder=%s AND unit=%s", (unit, unit))
+            self._seal_source(c, unit)
 
     def prepare(self, name, source, data, token, expected, table_uuid, epoch=1, rows=128, dimension=8, segments=1):
         require(re.fullmatch(r"[a-z0-9-]{1,80}", name), "BAD_REQUEST_ID")
@@ -369,7 +382,10 @@ class Backend:
                 "INPUT_SNAPSHOT_CHANGED",
             )
             prefix = self.objects.prefix + f"{table_uuid}/owner-{token}/{name}/"
-            c.execute("INSERT INTO units VALUES(%s,'generation',%s,'allocated',NULL)", (unit, len(data)))
+            c.execute(
+                "INSERT INTO units VALUES(%s,'generation',%s,'allocated',NULL,%s)",
+                (unit, len(data), state["table_uuid"]),
+            )
             c.execute(
                 "INSERT INTO objects(key,unit,role,size,sha) VALUES(%s,%s,'index',%s,%s),(%s,%s,'manifest',0,NULL)",
                 (prefix + "index", unit, len(data), sha(data), prefix + "manifest", unit),
@@ -487,6 +503,13 @@ class Backend:
             c.execute("UPDATE requests SET state='cancelled' WHERE id=%s", (name,))
             c.execute("DELETE FROM refs WHERE kind='build' AND holder=%s", (name,))
 
+    @staticmethod
+    def _require_source_gc_idle(c):
+        require(
+            not c.execute("SELECT 1 FROM units WHERE kind='source' AND state='deleting' LIMIT 1").fetchone(),
+            "SOURCE_GC_ACTIVE",
+        )
+
     def capture(self, name, kind="vector", source=None):
         require(kind in ("vector", "sql"), "BAD_READER_KIND")
         with self.transaction() as (c, state):
@@ -499,10 +522,7 @@ class Backend:
                     c.execute("SELECT 1 FROM refs WHERE kind='native' AND unit=%s", (source,)).fetchone(),
                     "EXPIRED_NATIVE_HISTORY",
                 )
-                require(
-                    not c.execute("SELECT 1 FROM units WHERE kind='source' AND state='deleting' LIMIT 1").fetchone(),
-                    "SOURCE_GC_ACTIVE",
-                )
+                self._require_source_gc_idle(c)
                 units = [source]
             for unit in units:
                 require(
@@ -592,7 +612,9 @@ class Backend:
                 {
                     "kind": "vortex-stop-v1",
                     "catalog": str(state["catalog"]),
-                    "table": str(state["table_uuid"]),
+                    "table": str(
+                        c.execute("SELECT table_uuid FROM units WHERE id=%s", (unit,)).fetchone()["table_uuid"]
+                    ),
                     "key": key,
                     "intent": str(intent["nonce"]),
                 }
@@ -633,7 +655,9 @@ class Backend:
                     {
                         "kind": "vortex-stop-v1",
                         "catalog": str(state["catalog"]),
-                        "table": str(state["table_uuid"]),
+                        "table": str(
+                            c.execute("SELECT table_uuid FROM units WHERE id=%s", (unit,)).fetchone()["table_uuid"]
+                        ),
                         "key": obj["key"],
                         "intent": str(intent["nonce"]),
                     }
