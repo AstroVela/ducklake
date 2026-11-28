@@ -3,6 +3,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from http.client import HTTPConnection
 import argparse
 import hashlib
 import importlib.metadata
@@ -17,8 +18,11 @@ import subprocess
 import sys
 import threading
 import time
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 import uuid
 
+import boto3
 import psycopg
 
 HERE = Path(__file__).resolve().parent
@@ -31,7 +35,7 @@ RULE = {
     "schema": 1,
     "layouts": {"storage": 1, "typed": 1},
     "reader_session": "One lifetime connection, explicit terminal fence, no TTL/reconnect/adoption.",
-    "materialization": "One exact version per grant, durable copy acceptance before delivery.",
+    "materialization": "One signed HTTP GET for an exact version per grant, durable acceptance before delivery.",
     "budget": "Caller's existing <=16 work items / <=64 MiB, zero payload bytes for pin cleanup.",
     "scope": "Real PG/S3 component contracts; opaque source/index fixtures, no native remote ANN.",
     "acceptance": "All independent state/value/lock and handshake checks pass; no timing gate.",
@@ -415,7 +419,7 @@ def inflight(h, report, reader, *, kill_operation=False, pause_before_dispatch=F
     units = next(v["units"] for v in h.raw["readers"] if v["id"] == reader)
     versions = {obj["key"]: obj["version"] for obj in h.raw["objects"] if obj["unit"] in units}
     require(len(versions) > 1, "Expected a ReadView that needs more than one object grant")
-    original = backend.objects.read
+    original = backend.objects.read_exact_once
     entered, release = threading.Event(), threading.Event()
     observations = []
 
@@ -423,7 +427,7 @@ def inflight(h, report, reader, *, kill_operation=False, pause_before_dispatch=F
         entered.set()
         require(release.wait(30), "Held GET was not released")
 
-    def hold(key, version=None):
+    def hold(key, version):
         first = not observations
         if first and pause_before_dispatch:
             pause_get()
@@ -446,7 +450,7 @@ def inflight(h, report, reader, *, kill_operation=False, pause_before_dispatch=F
             pause_get()
         return result
 
-    backend.objects.read = hold
+    backend.objects.read_exact_once = hold
     cleanup, budget = R.ReaderReclaimer(h.b, h.m), B.Budget(objects=16)
     with ThreadPoolExecutor(max_workers=2) as pool:
         pending = pool.submit(bound.materialize, session, reader)
@@ -525,7 +529,7 @@ def inflight(h, report, reader, *, kill_operation=False, pause_before_dispatch=F
     ):
         h.call("fenced-" + reader + "-" + label, fn, *args, rejected="READER_FENCED")
     require(len(observations) == 1, "Fenced RPC reached S3")
-    backend.objects.read = original
+    backend.objects.read_exact_once = original
     if not pause_before_dispatch:
         h.cleanup("reclaim-" + reader, cleanup.view, session.id, 1, reader, h.token(), budget)
         h.cleanup("finish-" + reader, cleanup.finish, session.id, 1, h.token(), budget)
@@ -558,6 +562,72 @@ def accepted_materializations(h, reader):
     return next(v["accepted_materializations"] for v in h.raw["reader_session_views"] if v["reader"] == reader)
 
 
+def check_reader_get_attempts(h, report, source):
+    key, version = next((obj["key"], obj["version"]) for obj in h.raw["objects"] if obj["unit"] == source)
+    reader = "region-error-reader"
+    client = boto3.client(
+        "s3",
+        endpoint_url=h.s.endpoint,
+        region_name="eu-west-1",
+        aws_access_key_id="r6-admin",
+        aws_secret_access_key=h.s.secret,
+        config=h.s.root_client.meta.config,
+    )
+    objects = B.S3Objects(client, h.s.bucket, h.b.objects.prefix)
+    backend = B.Backend(h.s.dsn, h.b.schema, objects)
+    bound = X.BoundCatalog(backend, M.TypedMetadata(backend))
+    h.reader_processes.append(bound)
+    session = h.call("open-region-error-reader", bound.open_session, str(uuid.uuid4()), str(uuid.uuid4()))
+    h.sessions.append(session)
+    h.call("capture-region-error-reader", bound.capture, session, *h.context("neighbor"), reader, "sql", source)
+    requests = []
+    send = HTTPConnection.send
+
+    def record_send(connection, message):
+        send(connection, message)
+        method, target, _ = message.split(b"\r\n", 1)[0].decode("ascii").split(" ", 2)
+        uri = urlsplit(target)
+        query = parse_qs(uri.query)
+        requests.append(
+            {
+                "method": method,
+                "path": uri.path,
+                "versions": query.get("versionId"),
+                "query_signed": "X-Amz-Signature" in query,
+            }
+        )
+
+    def materialize():
+        # Count writes at the HTTP send boundary used by both http.client and the pinned SDK's urllib3.
+        # Keep the oracle's own HTTP requests outside this probe.
+        with patch.object(HTTPConnection, "send", record_send):
+            try:
+                return bound.materialize(session, reader)
+            finally:
+                require(len(requests) == 1, f"One reader grant sent {len(requests)} HTTP requests")
+
+    h.call("reader-get-wrong-region", materialize, rejected="HTTP_400")
+    require(
+        requests == [{"method": "GET", "path": f"/{h.s.bucket}/{key}", "versions": [version], "query_signed": True}],
+        "Region error did not stop a single signed GET for the pinned version",
+    )
+    require(accepted_materializations(h, reader) == 0 and reader not in bound.copies, "Failed GET accepted a copy")
+    h.call("close-region-error-view", bound.close_view, session, reader)
+    h.call("close-region-error-session", bound.close_session, session)
+    report["faults"].append({"operation": "reader-get-wrong-region", "status": 400, "http_requests": requests})
+
+    with H.HTTP.Fault(h.s.endpoint, "redirect") as proxy:
+        endpoint = f"http://127.0.0.1:{proxy.server.server_port}"
+        objects = B.S3Objects(S.client(endpoint, "r6-admin", h.s.secret), h.s.bucket, h.b.objects.prefix)
+        proxy.release.set()
+        h.call("reader-get-redirect", objects.read_exact_once, key, version, rejected="HTTP_307")
+        require(
+            proxy.observation == {"requests": 1, "forwarded": False, "status": 307},
+            "The reader GET followed a redirect",
+        )
+        report["faults"].append({"operation": "reader-get-redirect", **proxy.observation})
+
+
 def rejected_materialization(pending, code):
     try:
         pending.result(timeout=15)
@@ -572,11 +642,11 @@ def graceful_close_during_get(h, report):
     objects = B.S3Objects(S.client(h.s.endpoint, "r6-admin", h.s.secret), h.s.bucket, h.b.objects.prefix)
     with P.CommitProxy("127.0.0.1", h.s.pg_port, "ack_paused") as wire:
         owner, peer, session = paired_readers(h, wire, reader, objects)
-        read_object = objects.read
+        read_object = objects.read_exact_once
         entered, release_get = threading.Event(), threading.Event()
         requests = []
 
-        def read(key, version=None):
+        def read(key, version):
             with h.b.connect() as c:
                 phase = c.execute(
                     "SELECT state,fence FROM reader_sessions WHERE session_uuid=%s", (uuid.UUID(session.id),)
@@ -588,7 +658,7 @@ def graceful_close_during_get(h, report):
                 require(release_get.wait(30), "First GET result was not released")
             return result
 
-        objects.read = read
+        objects.read_exact_once = read
         with ThreadPoolExecutor(max_workers=2) as pool:
             pending = pool.submit(peer.materialize, session, reader)
             try:
@@ -1070,6 +1140,7 @@ def exercise(h, report, root):
     proxy_eof(h, report)
     worker_crash(h, source_a, report, root)
     h.create("concurrent-writer")
+    check_reader_get_attempts(h, report, source_b)
     inflight(h, report, "inflight-lifetime")
     inflight(h, report, "inflight-operation", kill_operation=True)
     inflight(h, report, "fence-after-get-authorization", kill_operation=True, pause_before_dispatch=True)
@@ -1189,9 +1260,9 @@ def main():
     try:
         os.sched_setaffinity(0, cpus)
         report["applied_affinity"] = sorted(os.sched_getaffinity(0))
-        with S.Services(
-            root / "services", args.pg_bin.resolve(), args.minio.resolve(), args.object_data_dir.resolve()
-        ) as services:
+        fixture = S.Services(root / "services", args.pg_bin.resolve(), args.minio.resolve(), args.object_data_dir.resolve())
+        fixture.env["MINIO_SITE_REGION"] = "us-east-1"
+        with fixture as services:
             report["services"] = {
                 "postgres": subprocess.check_output([str(args.pg_bin / "postgres"), "--version"], text=True).strip(),
                 "minio_sha256": B.sha(args.minio.read_bytes()),

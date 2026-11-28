@@ -26,7 +26,7 @@ Capture、materialize、解除 copy pin 和关闭视图都必须携带所属 ses
 
 Materialize 使用独立 PG 连接，并以同一 key 的两个 32 位整数获取 session 级 operation lock。该锁与用单个 bigint 标识的 lifetime lock 位于不同的 advisory 锁空间。操作连接存活时，operation lock 覆盖读取、两个 COMMIT 确认和副本登记。连接终止即释放该锁。[PG advisory 锁函数](https://www.postgresql.org/docs/15/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS)
 
-首个短事务在 control 行锁内固定 typed 行、视图和计划读取的精确对象版本。每次 GET 通过单独的短事务授权，在同一行锁内核对 session、实际 lifetime lock、视图和完整 pin。授权事务正常结束后，只发送一次该对象版本的 GET，网络读取期间释放全局行锁。每个读取返回后再次核对实际 lifetime lock，并验证版本、数据摘要和大小。
+首个短事务在 control 行锁内固定 typed 行、视图和计划读取的精确对象版本。每次 GET 通过单独的短事务授权，在同一行锁内核对 session、实际 lifetime lock、视图和完整 pin。授权事务正常结束后，broker 用 SigV4 为该对象的 version ID 签名，通过单次 HTTP 请求读取。区域错误和 HTTP 重定向直接终止当前物化。网络读取在全局行锁外完成，沿用 S3 客户端的连接与读取超时和原对象字节预算。每个读取返回后再次核对实际 lifetime lock，并验证版本、数据摘要和大小。
 
 物化完成读取后在 control 行锁内重新校验视图并 COMMIT。收到这次确认后，验收事务在同一行锁内再次核对持久 fence、实际 lifetime lock、视图和 pin，并原子递增该视图的验收序号。只有收到验收 COMMIT 确认的调用才登记、交付私有副本，副本携带本次的 `acceptance` 序号。验收确认丢失时，序号可能已推进，持久 pin 保留，本次副本不交付。验收只记录序号，副本数据仍保存在私有内存。
 
@@ -58,6 +58,7 @@ Fencing 不提前撤销普通 SQL 保护：尚未被显式关闭的 `kind=sql` v
 | --- | --- |
 | 活跃、暂停与崩溃 reader | 独立 reader broker 进程实际 SIGSTOP／SIGCONT，锁仍在时回收拒绝；实际 SIGKILL 后 pin／SQL 保护仍持久，只有显式 fence／逐 view 回收才解除 |
 | GET 授权与断连 | 在真实 GET 已完成且结果尚未返回时终止 lifetime backend，确认回收等待 advisory lock，另一张表仍可提交。同时终止操作 backend 后，回收可先推进 fence。另在授权已完成、GET 尚未发送时终止两条连接，等回收完成后再放行，验证只发送原精确版本的一次 GET，无法发出下一次或交付副本 |
+| 区域错误与重定向 | 对真实 MinIO 使用错误签名区域，从 HTTP 发送层确认仅发送一次带精确 version ID 的 GET，返回 400 后验收序号仍为零且 pin 保留。隔离副本恢复原 SDK GET 时，该断言捕获两次发送。另由本地 HTTP fixture 返回 307，确认服务端只收到一个请求 |
 | 正常关闭与 COMMIT 确认 | 暂停真实 GET，验证正常关闭等待目标 session 且另一张表可提交。关闭已提交且确认仍暂停时，旧 session 无法获得 GET 授权。在首次物化 COMMIT 确认暂停时通过第二个 BoundCatalog 先关闭视图或解除 pin，确认恢复后验收序号保持原值 |
 | 已验收副本晚于 fence 返回 | 在验收 COMMIT 已确认且副本尚未登记时终止操作 backend，另一 BoundCatalog 关闭视图和 session。放行后按原验收序号交付同一视图、同一 payload 的副本。终态后重新物化拒绝，序号保持不变 |
 | 所有权与约束 | 跨 session 的读取／unpin／close／回收、重复 UUID、非法 fence、旧 writer、复合外键及 CHECK 拒绝。Begin、view 和 finish 拒绝无效 writer owner，且保持持久状态和预算。Writer 轮换后活跃 reader 仍可 materialize |
@@ -86,13 +87,13 @@ Open／capture 的未知提交可能留下未交付给调用方的持久 session
 
 | 验证 | 结果 |
 | --- | --- |
-| Reader session | 345 项检查，含 55 项预期拒绝。26 组故障观测、5 个不安全变体反例 |
+| Reader session | 351 项检查，含 57 项预期拒绝。28 组故障观测、5 个不安全变体反例 |
 | 绑定 | 373 项检查，含 76 项预期拒绝。10 组故障与并发观测 |
 | Typed | 175 项检查，含 91 项预期拒绝。9 组故障观测 |
 | 后端 | 485 项检查，含 35 项预期拒绝。9 项能力探测、7 组故障观测 |
 | 协议模型 | 40 个场景、21 个反例，1,342 个状态的集合摘要与开发基线一致 |
 
-三组 GET 用例均观察到回收等待目标 session 的 advisory lock，且另一张表在等待期间提交。各组只完成一次精确版本 GET，均未登记副本。其中一组在回收完成、fence 已为 2 时才发出此前已授权的 GET。跨实例关闭视图和解除 pin 都能让尚未验收的物化失败。已获确认的第二份副本在另一个实例关闭会话、fence 推进后按验收序号 2 返回。最终验收 COMMIT 转发前断开和提交后丢确认的两组故障均保留全部 pin，本次副本均未登记。共享预算的 16 个工作项上限和 payload 字节计数通过验证。
+三组在途 GET 用例均观察到回收等待目标 session 的 advisory lock，且另一张表在等待期间提交。各组只完成一次精确版本 GET，均未登记副本。其中一组在回收完成、fence 已为 2 时才发出此前已授权的 GET。真实 MinIO 的区域错误和 HTTP 307 各观察到一个实际请求。跨实例关闭视图和解除 pin 都能让尚未验收的物化失败。已获确认的第二份副本在另一个实例关闭会话、fence 推进后按验收序号 2 返回。最终验收 COMMIT 转发前断开和提交后丢确认的两组故障均保留全部 pin，本次副本均未登记。共享预算的 16 个工作项上限和 payload 字节计数通过验证。
 
 ### 原叠栈验收
 

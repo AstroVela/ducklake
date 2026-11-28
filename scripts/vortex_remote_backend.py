@@ -65,25 +65,33 @@ class Ticket:
     headers: tuple = field(repr=False)
 
 
-def dispatch(ticket, body=None):
-    """One HTTP attempt. A disconnected response never triggers an implicit retry."""
+@contextmanager
+def _send_once(ticket, body=None, *, connect_timeout=30, read_timeout=30):
     parsed = urlsplit(ticket.url)
     require(parsed.scheme == "https" or (parsed.scheme == "http" and parsed.hostname == "127.0.0.1"), "HTTPS_REQUIRED")
     if parsed.scheme == "https":
         connection = http.client.HTTPSConnection(
-            parsed.hostname, parsed.port, timeout=30, context=ssl.create_default_context()
+            parsed.hostname, parsed.port, timeout=connect_timeout, context=ssl.create_default_context()
         )
     else:
-        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=30)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=connect_timeout)
     try:
+        connection.connect()
+        connection.sock.settimeout(read_timeout)
         connection.request(ticket.method, parsed.path + "?" + parsed.query, body=body, headers=dict(ticket.headers))
-        response = connection.getresponse()
+        with closing(connection.getresponse()) as response:
+            yield response
+    finally:
+        connection.close()
+
+
+def dispatch(ticket, body=None):
+    """One HTTP attempt. A disconnected response never triggers an implicit retry."""
+    with _send_once(ticket, body) as response:
         data, headers = response.read(MIB + 1), dict(response.getheaders())
         require(len(data) <= MIB, "HTTP_METADATA_BUDGET")
         require(response.status in (200, 204), f"HTTP_{response.status}")
         return {k.lower(): v for k, v in headers.items()}
-    finally:
-        connection.close()
 
 
 class S3Objects:
@@ -127,12 +135,36 @@ class S3Objects:
             require(version and version != "null", "EXACT_VERSION_REQUIRED")
             params["VersionId"] = version
             operation, method = "delete_object", "DELETE"
+        return self._signed_ticket(operation, method, params, headers)
+
+    def _signed_ticket(self, operation, method, params, headers):
+        key, version = params["Key"], params.get("VersionId")
         url = self.client.generate_presigned_url(operation, Params=params, ExpiresIn=300)
         query = parse_qs(urlsplit(url).query)
         signed = set(query.get("X-Amz-SignedHeaders", [""])[0].split(";"))
         require({"host", *[k.lower() for k in headers]} <= signed, "REQUIRED_HEADERS_NOT_SIGNED")
-        require(version is None or query.get("versionId") == [version], "DELETE_VERSION_NOT_BOUND")
+        require(version is None or query.get("versionId") == [version], f"{method}_VERSION_NOT_BOUND")
         return Ticket(method, key, url, tuple(sorted(headers.items())))
+
+    def read_exact_once(self, key, version):
+        self.key(key)
+        require(version and version != "null", "EXACT_VERSION_REQUIRED")
+        params = {"Bucket": self.bucket, "Key": key, "VersionId": version}
+        ticket = self._signed_ticket("get_object", "GET", params, {})
+        config = self.client.meta.config
+        # The SDK signs this request. Dispatch it directly so region redirects cannot resend it.
+        with _send_once(ticket, connect_timeout=config.connect_timeout, read_timeout=config.read_timeout) as response:
+            if response.status == 404:
+                return None
+            require(response.status == 200, f"HTTP_{response.status}")
+            version_id = response.getheader("x-amz-version-id")
+            require(version_id not in (None, "null"), "VERSIONING_REQUIRED")
+            size, etag = response.length, response.getheader("ETag")
+            require(size is not None and etag is not None, "INCOMPLETE_OBJECT")
+            require(size <= LIMITS["source"], "OBJECT_BUDGET")
+            data = response.read(LIMITS["source"] + 1)
+            require(len(data) == size, "INCOMPLETE_OBJECT")
+            return {"version": version_id, "etag": etag, "data": data, "sha": sha(data), "size": size}
 
     def read(self, key, version=None):
         self.key(key)

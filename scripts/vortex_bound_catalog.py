@@ -520,7 +520,7 @@ class BoundCatalog:
                 # Authorize just this version while the fence and its pins are serialized.
                 with self.backend._transaction(c, rollback=True):
                     require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
-                raw = self.backend.objects.read(obj["key"], obj["version"])
+                raw = self.backend.objects.read_exact_once(obj["key"], obj["version"])
                 session.require_lock(c)
                 self.backend.identity(obj, raw)
                 require(raw["version"] == obj["version"], "IDENTITY_MISMATCH")

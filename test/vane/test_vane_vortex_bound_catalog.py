@@ -2,6 +2,7 @@
 """Deterministic real-service binding, retirement, ReadView and GC contracts."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
 import argparse
 import importlib.util
@@ -514,20 +515,23 @@ def check_readview_materialization(h, source):
         identity = h.capture("neighbor", name, "sql", source)
         if action == "unpin":
             h.call("complete-first-copy", h.x.materialize, h.session, name)
-        client = S.client(h.s.endpoint, "r6-admin", h.s.secret)
-        objects = B.S3Objects(client, h.s.bucket, h.b.objects.prefix)
         reader = X.BoundCatalog(h.b, h.m)
         h.reader_processes.append(reader)
         entered, release = Event(), Event()
         requested_versions = []
 
-        def pause_get(request, **_):
-            requested_versions.append(parse_qs(urlsplit(request.url).query).get("versionId"))
-            entered.set()
-            require(release.wait(10), "GET was not released")
+        send = B._send_once
 
-        client.meta.events.register("before-send.s3.GetObject", pause_get)
-        with patch.object(h.b.objects, "read", objects.read), ThreadPoolExecutor(max_workers=1) as pool:
+        @contextmanager
+        def pause_get(ticket, *args, **kwargs):
+            if ticket.method == "GET":
+                requested_versions.append(parse_qs(urlsplit(ticket.url).query).get("versionId"))
+                entered.set()
+                require(release.wait(10), "GET was not released")
+            with send(ticket, *args, **kwargs) as response:
+                yield response
+
+        with patch.object(B, "_send_once", pause_get), ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(reader.materialize, h.session, name)
             try:
                 require(entered.wait(10) and not pending.done(), "Exact-version GET did not reach its handshake")
