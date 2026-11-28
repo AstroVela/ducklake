@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import Event
 import time
+from urllib.parse import parse_qs, urlsplit
 import uuid
 
 import psycopg
@@ -164,9 +166,8 @@ class Checks:
         table = self.tables[name]
         return name, table["table_uuid"], table["schema_hash"]
 
-    def source(self, name, source_id="shared"):
+    def source(self, name, source_id="shared", data=b"same-opaque-source-bytes"):
         context = self.context(name)
-        data = b"same-opaque-source-bytes"
         unit = self.call(
             "register-source-" + name,
             self.x.register_source,
@@ -242,6 +243,292 @@ class Checks:
         return result
 
 
+def check_writer_tokens(h, source, source_data):
+    context = h.context("items")
+    table_uuid = context[1]
+    request = (*context, 1, "same")
+    key = next(obj["key"] for obj in h.raw["objects"] if obj["unit"] == source)
+    budget = B.Budget()
+    for name, method, args in (
+        ("register", h.x.register_source, (*context, h.model.snapshot, "missing-owner", source_data)),
+        ("source-ticket", h.x.source_ticket, (*context, source, source_data)),
+        ("seal-source", h.x.seal_source, (*context, source)),
+        ("abandon-source", h.x.abandon_source, (*context, source)),
+        ("prepare", h.x.prepare, (*context, 1, "missing-owner", source, b"index", 0)),
+        ("adopt", h.x.adopt, request),
+        ("payload-ticket", h.x.payload_ticket, (*request, "index", b"index")),
+        ("seal", h.x.seal, (*request, "index")),
+        ("manifest", h.x.manifest, request),
+        ("publish", h.x.publish, request),
+        ("cancel", h.x.cancel, (table_uuid, 1, "same")),
+        ("expire-native", h.x.expire_native, (table_uuid, source)),
+    ):
+        h.call("missing-owner-" + name, method, *args, None, rejected="BAD_OWNER")
+    for name, method, args in (
+        ("plan-gc", h.x.plan_gc, (table_uuid, source)),
+        ("stop", h.x.stop, (table_uuid, source, key)),
+        ("delete-payload", h.x.delete_payload, (table_uuid, source, key)),
+        ("finish-gc", h.x.finish_gc, (table_uuid, source)),
+    ):
+        h.call("missing-owner-" + name, method, *args, None, budget, rejected="BAD_OWNER")
+    for label, token in (("bool", True), ("float", 1.0), ("string", "1"), ("zero", 0), ("overflow", 2**63)):
+        h.call("publish-owner-" + label, h.x.publish, *request, token, rejected="BAD_OWNER")
+    require(not budget.admitted, "Missing owner changed the GC budget")
+
+
+def check_request_guards(h, table_uuid, receipt):
+    wrong_objects = B.S3Objects(h.s.root_client, h.s.bucket, "wrong-prefix/")
+    wrong_backend = B.Backend(h.s.dsn, h.b.schema, wrong_objects)
+    wrong = X.BoundCatalog(wrong_backend, M.TypedMetadata(wrong_backend))
+    original = (table_uuid, 1, "original")
+    pending = (table_uuid, 1, "replacement", h.token())
+    for name, method, args in (
+        ("status", wrong.status, original),
+        ("reconcile", wrong.reconcile, (*original, receipt["payload_hash"])),
+        ("cancel", wrong.cancel, pending),
+    ):
+        h.call(name + "-wrong-store", method, *args, rejected="STORE_BINDING_MISMATCH")
+
+    # The rest of the fresh schema still contains real requests and receipts.
+    with h.b.connect() as c:
+        state = c.execute("DELETE FROM typed_catalog WHERE singleton RETURNING *").fetchone()
+        require(state["layout"] == 1, "Missing-layout fixture did not start in layout 1")
+        try:
+            before = O.observe(h.b, h.s, BASE, T)
+            for name, method, args in (
+                ("status", h.x.status, original),
+                ("reconcile", h.x.reconcile, (*original, receipt["payload_hash"])),
+                ("cancel", h.x.cancel, pending),
+            ):
+                try:
+                    method(*args)
+                except M.MetadataError as error:
+                    require(str(error) == "UNSUPPORTED_TYPED_LAYOUT", f"Unexpected {name} error: {error}")
+                else:
+                    raise AssertionError(name + " accepted a missing typed layout")
+                require(O.observe(h.b, h.s, BASE, T) == before, "Layout rejection changed the durable state")
+                h.report["checks"].append({"name": name + "-missing-layout", "rejected": "UNSUPPORTED_TYPED_LAYOUT"})
+        finally:
+            c.execute(
+                "INSERT INTO typed_catalog VALUES(%(singleton)s,%(layout)s,%(snapshot)s,%(next_table_id)s,%(next_row_id)s)",
+                state,
+            )
+    h.check()
+
+
+def check_source_replay(h, neighbor_source):
+    name = "request-replay"
+    table_uuid = h.create(name)["table_uuid"]
+    context = h.context(name)
+    source, _, _ = h.source(name, "original", b"original opaque source")
+    alternate, _, _ = h.source(name, "alternate", b"replacement opaque source")
+    h.ready(name, "original", source)
+    receipt = h.publish(name, "original")
+    key = h.x.request_key(table_uuid, 1, "original")
+    request = next(req for req in h.raw["requests"] if req["id"] == key)
+    bindings = {unit["unit"]: unit["identity"] for unit in h.raw["bound_units"]}
+    sources = {obj["unit"]: obj for obj in h.raw["objects"] if obj["role"] == "source"}
+    index = next(obj for obj in h.raw["objects"] if obj["unit"] == "generation:" + key and obj["role"] == "index")
+    require(
+        bindings[source] == bindings[alternate] and sources[source]["sha"] != sources[alternate]["sha"],
+        "Physical-input replay fixture changed the logical source snapshot",
+    )
+    other_digest = O.request_digest(request, bindings[alternate], sources[alternate], index)
+    h.call(
+        "reconcile-wrong-physical-source",
+        h.x.reconcile,
+        table_uuid,
+        1,
+        "original",
+        other_digest,
+        rejected="PAYLOAD_MISMATCH",
+    )
+    data = b"same-opaque-index-bytes"
+    token = h.token()
+    h.call(
+        "prepare-invalid-expected-revision",
+        h.x.prepare,
+        *context,
+        1,
+        "original",
+        source,
+        data,
+        0.0,
+        token,
+        rejected="BAD_REVISION",
+    )
+    h.call(
+        "prepare-wrong-physical-source",
+        h.x.prepare,
+        *context,
+        1,
+        "original",
+        alternate,
+        data,
+        0,
+        token,
+        rejected="PAYLOAD_MISMATCH",
+    )
+    h.ready(name, "replacement", alternate)
+    check_request_guards(h, table_uuid, receipt)
+    h.publish(name, "replacement")
+    h.call("expire-original-source-after-replacement", h.x.expire_native, table_uuid, source, token)
+    h.call(
+        "expired-source-denies-new-prepare",
+        h.x.prepare,
+        *context,
+        1,
+        "new-request",
+        source,
+        data,
+        2,
+        token,
+        rejected="INPUT_SNAPSHOT_CHANGED",
+    )
+    h.call("expired-source-denies-reseal", h.x.seal_source, *context, source, token, rejected="SOURCE_CLOSED")
+    args = (*context, 1, "original", source, data, 0, token)
+    require(
+        h.call("exact-prepare-replay-after-expiry", h.x.prepare, *args) == request,
+        "Expired source changed the original prepare result",
+    )
+
+    # Exercise both admission orders with an unrelated, still-current SQL source.
+    budget = B.Budget()
+    h.capture("neighbor", "sql-first", "sql", neighbor_source)
+    h.call(
+        "sql-first-defers-source-GC", h.x.plan_gc, table_uuid, source, token, budget, rejected="ORDINARY_TRANSACTION"
+    )
+    require(not budget.admitted, "A deferred GC charged the budget")
+    h.call("end-sql-first", h.x.close_view, "sql-first")
+    h.call("admit-source-GC-first", h.x.plan_gc, table_uuid, source, token, budget)
+    h.call(
+        "source-GC-first-defers-SQL",
+        h.x.capture,
+        *h.context("neighbor"),
+        "gc-first-sql",
+        "sql",
+        neighbor_source,
+        rejected="SOURCE_GC_ACTIVE",
+    )
+    h.call("deleting-source-denies-reseal", h.x.seal_source, *context, source, token, rejected="SOURCE_CLOSED")
+    h.collect(table_uuid, source, budget, start=False)
+    require(h.call("exact-prepare-replay-after-GC", h.x.prepare, *args) == request, "GC changed the prepare result")
+    require(
+        h.call("exact-reconcile-after-GC", h.x.reconcile, table_uuid, 1, "original", receipt["payload_hash"])
+        == receipt,
+        "GC changed the original receipt",
+    )
+    h.capture("neighbor", "sql-after-GC", "sql", neighbor_source)
+    h.call("close-sql-after-GC", h.x.close_view, "sql-after-GC")
+
+
+def check_abandoned_sources(h, neighbor_source):
+    name = "unfinished"
+    table_uuid = h.create(name)["table_uuid"]
+    context = h.context(name)
+    data = b"opaque bytes unavailable to the replacement owner"
+    old_owner = h.token()
+    late, missing = (
+        h.call("register-unfinished-" + label, h.x.register_source, *context, h.model.snapshot, label, data, old_owner)
+        for label in ("late-upload", "missing-upload")
+    )
+    ticket = h.call("ticket-before-owner-exits", h.x.source_ticket, *context, late, data, old_owner)
+    owner = h.call("take-over-after-source-registration", h.b.takeover, old_owner)
+    h.call("old-owner-cannot-abandon-source", h.x.abandon_source, *context, late, old_owner, rejected="FENCED")
+    neighbor = h.context("neighbor")
+    h.call(
+        "foreign-UUID-cannot-abandon-source",
+        h.x.abandon_source,
+        *neighbor,
+        late,
+        owner,
+        rejected="UNIT_BINDING_MISMATCH",
+    )
+    h.call(
+        "ready-source-cannot-be-abandoned",
+        h.x.abandon_source,
+        *neighbor,
+        neighbor_source,
+        owner,
+        rejected="SOURCE_CLOSED",
+    )
+
+    h.call("abandon-unfinished-source", h.x.abandon_source, *context, late, owner)
+    h.call("repeat-source-abandonment", h.x.abandon_source, *context, late, owner)
+    h.call("closed-source-denies-new-ticket", h.x.source_ticket, *context, late, data, owner, rejected="SOURCE_CLOSED")
+    h.call("old-ticket-arrives-before-GC", B.dispatch, ticket, data)
+    h.call(
+        "uploaded-source-without-build-ref-denies-seal",
+        h.x.seal_source,
+        *context,
+        late,
+        owner,
+        rejected="SOURCE_CLOSED",
+    )
+    h.collect(table_uuid, late)
+    h.call("late-abandoned-PUT-after-STOP", B.dispatch, ticket, data, rejected="HTTP_412")
+
+    h.call("abandon-never-uploaded-source", h.x.abandon_source, *context, missing, owner)
+    h.call(
+        "abandoned-source-blocks-retirement-until-GC", h.m.retire, name, table_uuid, owner, rejected="BUILD_IN_PROGRESS"
+    )
+    require(
+        h.collect(table_uuid, missing) == {"objects": 1, "bytes": len(data)},
+        "Reclaiming the missing upload changed the original GC charge",
+    )
+    h.call(
+        "retire-after-explicit-source-GC", h.m.retire, name, table_uuid, owner, model=lambda: h.model.retire(table_uuid)
+    )
+
+
+def check_readview_materialization(h, source):
+    source_version = next(obj["version"] for obj in h.raw["objects"] if obj["unit"] == source)
+    for action, error in (("keep", None), ("close", "VIEW_CLOSED"), ("unpin", "VIEW_NOT_PINNED")):
+        name = "get-" + action
+        identity = h.capture("neighbor", name, "sql", source)
+        if action == "unpin":
+            h.call("complete-first-copy", h.x.materialize, name)
+        client = S.client(h.s.endpoint, "r6-admin", h.s.secret)
+        objects = B.S3Objects(client, h.s.bucket, h.b.objects.prefix)
+        backend = B.Backend(h.s.dsn, h.b.schema, objects)
+        reader = X.BoundCatalog(backend, M.TypedMetadata(backend))
+        h.reader_processes.append(reader)
+        entered, release = Event(), Event()
+        requested_versions = []
+
+        def pause_get(request, **_):
+            requested_versions.append(parse_qs(urlsplit(request.url).query).get("versionId"))
+            entered.set()
+            require(release.wait(10), "GET was not released")
+
+        client.meta.events.register("before-send.s3.GetObject", pause_get)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(reader.materialize, name)
+            try:
+                require(entered.wait(10) and not pending.done(), "Exact-version GET did not reach its handshake")
+                with h.b.connect() as c:
+                    c.execute("SELECT 1 FROM control WHERE singleton FOR UPDATE NOWAIT").fetchone()
+                if action == "keep":
+                    h.mutate("items", "write-during-reader-GET", [row(2, "other table updated")])
+                elif action == "close":
+                    h.call("close-during-GET", h.x.close_view, name)
+                else:
+                    h.call("unpin-during-GET", h.x.release_copy_pin, name)
+            finally:
+                release.set()
+            copy = h.call("materialize-with-" + action, pending.result, timeout=15, rejected=error)
+        require(requested_versions == [[source_version]], "Materialization did not read exactly the registered version")
+        if error is None:
+            require(copy["identity"] == identity and reader.copies[name] == copy, "Writer changed the private copy")
+        else:
+            require(name not in reader.copies, "Invalidated ReadView retained an in-flight copy")
+        if action == "keep":
+            h.call("close-after-GET", reader.close_view, name)
+        elif action == "unpin":
+            h.call("close-after-unpin-GET", h.x.close_view, name)
+        h.report["faults"].append({"operation": "bound-materialize-" + action, "exact_gets": len(requested_versions)})
+
+
 def exercise(h, report):
     a, b = h.create("items", (3, 11, 24, 37, 48, 59, 70, 81)), h.create("neighbor")
     au, bu = a["table_uuid"], b["table_uuid"]
@@ -278,6 +565,7 @@ def exercise(h, report):
         )
     # Identical request/source labels and byte payloads remain independent across UUIDs.
     h.ready("items", "same", source_a)
+    check_writer_tokens(h, source_a, source_data)
     h.call(
         "unbound-adoption-rejected",
         h.x.adopt,
@@ -495,6 +783,15 @@ def exercise(h, report):
     h.reader_processes.append(bound)
     h.call("owner-transfer-after-restart", writer.takeover, old_token)
     h.call("old-owner-fenced", bound.adopt, *h.context("items"), 1, "restart", old_token, rejected="FENCED")
+    h.call(
+        "new-owner-must-adopt-before-publish",
+        bound.publish,
+        *h.context("items"),
+        1,
+        "restart",
+        h.token(),
+        rejected="REQUEST_CLOSED",
+    )
     h.call("explicit-adopt-original-binding", bound.adopt, *h.context("items"), 1, "restart", h.token())
     h.publish("items", "restart")
     require(h.copies()["old-view"] == old_copy, "Owner transfer revoked independent reader copy")
@@ -530,6 +827,9 @@ def exercise(h, report):
     h.call("neighbor-old-view-still-readable", h.x.materialize, "neighbor-vector")
     h.call("close-old-independent-copy", h.reader_processes[0].close_view, "old-view")
     h.call("close-new-independent-copy", h.reader_processes[0].close_view, "new-view")
+    check_source_replay(h, source_b)
+    check_abandoned_sources(h, source_b)
+    check_readview_materialization(h, source_b)
 
 
 def main():

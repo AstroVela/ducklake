@@ -317,31 +317,40 @@ class Backend:
             c.execute("INSERT INTO refs VALUES('build',%s,%s)", (unit, unit))
         return unit
 
+    @staticmethod
+    def _source_for_build(c, unit):
+        obj = c.execute(
+            "SELECT o.* FROM units u JOIN objects o ON o.unit=u.id AND o.role='source' "
+            "JOIN refs r ON r.unit=u.id AND r.holder=u.id AND r.kind='build' "
+            "WHERE u.id=%s AND u.kind='source' AND u.state='allocated'",
+            (unit,),
+        ).fetchone()
+        require(obj is not None, "SOURCE_CLOSED")
+        return obj
+
+    def _source_ticket(self, c, unit, data):
+        obj = self._source_for_build(c, unit)
+        self.identity(obj, {"sha": sha(data), "size": len(data)})
+        return self.objects.ticket(obj["key"], data=data, condition="*")
+
     def source_ticket(self, unit, data, token):
         with self.transaction(token) as (c, _):
-            row = c.execute("SELECT * FROM units WHERE id=%s", (unit,)).fetchone()
-            require(row and row["kind"] == "source" and row["state"] == "allocated", "SOURCE_CLOSED")
-            obj = self.files(c, unit)[0]
-            self.identity(obj, {"sha": sha(data), "size": len(data)})
-            return self.objects.ticket(obj["key"], data=data, condition="*")
+            return self._source_ticket(c, unit, data)
+
+    def _seal_source(self, c, unit):
+        obj = self._source_for_build(c, unit)
+        raw = self.objects.read(obj["key"])
+        self.identity(obj, raw)
+        c.execute(
+            "UPDATE objects SET sealed=true,version=%s,etag=%s WHERE key=%s",
+            (raw["version"], raw["etag"], obj["key"]),
+        )
+        c.execute("UPDATE units SET state='ready' WHERE id=%s", (unit,))
+        c.execute("UPDATE refs SET kind='native' WHERE kind='build' AND holder=%s AND unit=%s", (unit, unit))
 
     def seal_source(self, unit, token):
         with self.transaction(token) as (c, _):
-            obj = c.execute(
-                "SELECT o.* FROM units u JOIN objects o ON o.unit=u.id AND o.role='source' "
-                "JOIN refs r ON r.unit=u.id AND r.holder=u.id AND r.kind='build' "
-                "WHERE u.id=%s AND u.kind='source' AND u.state='allocated'",
-                (unit,),
-            ).fetchone()
-            require(obj is not None, "SOURCE_CLOSED")
-            raw = self.objects.read(obj["key"])
-            self.identity(obj, raw)
-            c.execute(
-                "UPDATE objects SET sealed=true,version=%s,etag=%s WHERE key=%s",
-                (raw["version"], raw["etag"], obj["key"]),
-            )
-            c.execute("UPDATE units SET state='ready' WHERE id=%s", (unit,))
-            c.execute("UPDATE refs SET kind='native' WHERE kind='build' AND holder=%s AND unit=%s", (unit, unit))
+            self._seal_source(c, unit)
 
     def prepare(self, name, source, data, token, expected, table_uuid, epoch=1, rows=128, dimension=8, segments=1):
         require(re.fullmatch(r"[a-z0-9-]{1,80}", name), "BAD_REQUEST_ID")
@@ -493,6 +502,13 @@ class Backend:
             c.execute("UPDATE requests SET state='cancelled' WHERE id=%s", (name,))
             c.execute("DELETE FROM refs WHERE kind='build' AND holder=%s", (name,))
 
+    @staticmethod
+    def _require_source_gc_idle(c):
+        require(
+            not c.execute("SELECT 1 FROM units WHERE kind='source' AND state='deleting' LIMIT 1").fetchone(),
+            "SOURCE_GC_ACTIVE",
+        )
+
     def capture(self, name, kind="vector", source=None):
         require(kind in ("vector", "sql"), "BAD_READER_KIND")
         with self.transaction() as (c, state):
@@ -505,10 +521,7 @@ class Backend:
                     c.execute("SELECT 1 FROM refs WHERE kind='native' AND unit=%s", (source,)).fetchone(),
                     "EXPIRED_NATIVE_HISTORY",
                 )
-                require(
-                    not c.execute("SELECT 1 FROM units WHERE kind='source' AND state='deleting' LIMIT 1").fetchone(),
-                    "SOURCE_GC_ACTIVE",
-                )
+                self._require_source_gc_idle(c)
                 units = [source]
             for unit in units:
                 require(
