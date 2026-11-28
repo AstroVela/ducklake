@@ -1,6 +1,6 @@
 # DuckLake＋Vortex 总设计与 roadmap
 
-本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，以 **2026-11-25 的开发基线**为准。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
+本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，基于 #90 合入后的开发提交 `083384bb`。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
 
 本文是随代码维护的仓库总纲。初稿阅读副本见 [ChatGPT Page](https://chatgpt.com/space/page_0c2fa263e4dc81919bfaea100e8008cd)。
 
@@ -16,7 +16,9 @@
 
 开发基线 `1848e868` 已合入 #89 的请求 UUID 校验和原子表退休。#90 在原生快照过期事务中清理失去最后一个历史引用的表级配置。[#89 合入提交](https://github.com/AstroVela/ducklake/commit/1848e868c6f1dfce47d1debdb772292cced2ae2c) · [退休后的原生历史与物理回收](native-vortex-retired-history.md)
 
-当前限定：单进程独占 native DuckDB 元数据目录、本地受管 POSIX 文件、无分区／未加密的固定业务 schema、Float32 有限向量、平方 L2 距离。并发客户端与后台维护位于这一所有权范围内；多进程写者、跨主机 fencing、远程对象存储和分布式 ANN 不在当前验证范围。
+#91 为远程对象登记、原子发布、跨 owner 引用保护及回收定义协议，并用可执行模型验证有界交错。[R6 远程发布协议与独立模型](native-vortex-remote-publication.md)
+
+当前生产验证范围为单进程独占 native DuckDB 元数据目录、本地受管 POSIX 文件、无分区／未加密的固定业务 schema、Float32 有限向量和平方 L2 距离。并发客户端与后台维护位于这一所有权范围内。
 
 ```sql
 CREATE TABLE lake.items (
@@ -241,6 +243,8 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 #90 的恢复用例在原生进程退出后，用签名安装包重新挂载同一数据库，逐表比较 28 张原生元数据表、16 张 Vortex 元数据表及实际 inline 表。场景涵盖普通旧读者和私有 ReadView、取消、事务回滚、进程崩溃以及重开后的显式回收。[退休历史验收](native-vortex-retired-history.md)
 
+#91 的协议模型覆盖 40 个固定场景、21 个负对照和两组有界状态探索。固定场景包括源删除在途时的普通事务保护、逻辑中断和 owner 接管。独立 oracle 核对每次提交的回执与源回收后的物理版本。真实服务故障恢复待 PostgreSQL／S3 适配器验收。[R6 模型验收](native-vortex-remote-publication.md#有界验证结果)
+
 ### 9.2 历史安装验证与 30 分钟观察
 
 旧堆栈提交 `2a937706` 在撤回查询合并后完成当时的安装态验证，包括 38 个 native source 用例、13 个 maintenance 用例、261 个 SQL assertion block、11 个快照／计时 oracle 测试、5 个文件计量测试和 4 个 A/B 分析测试。同一次资格验证的 Vane base launcher 分进程通过 1,222 个非 Ray 和 32 个 Ray 测试，另有 15 个可选依赖跳过。[历史安装验证](https://github.com/AstroVela/ducklake/blob/2a9377062cddc0c222d8dd99e4d5efee3a298c76/docs/native-vortex-maintenance-probe-ab.md#final-installed-qualification-after-withdrawal)
@@ -281,7 +285,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
 | R5 容量与产品契约 | **部分完成**。已有浮点、请求 epoch、回执、reference／WAL、容量 admission、私有查询目录和 UUID 退休的确定性验收。退休历史用例覆盖 inline 表、表级配置、源文件、generation 及原生块复用 | 更大数据上的质量、延迟与吞吐，以及长期磁盘和 RSS 容量仍待验证 |
-| R6 云端与分布式 | **未完成**：远程对象所有权、远程持久日志／发布协议、fencing、缓存、Vane 分布式 ReadView | 单独设计远程原子性与故障模型；固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k 的端到端验证 |
+| R6 云端与分布式 | **协议设计和有界模型已验证**。模型覆盖 owner fencing、同事务 head／引用／回执、ReadView pin 及迟到上传屏障。[远程发布协议](native-vortex-remote-publication.md) | 验收 PostgreSQL／S3 适配器能力、reader session 与 pin 回收，再验证固定视图 fan-out、读位置等待、owner 故障转移和分布式 top-k |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
 原 RFC 的静态索引、实时可见、B/F/T、compaction／GC 目标在 R0–R3 有对应实现；其 Iceberg 专属物化、云端 fencing 和分布式 serving 并未因 DuckLake 本地链路通过而完成。保留原 RFC 作为历史来源，本文件作为 DuckLake 路线的总纲。
@@ -314,7 +318,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 4. 选择一个有测量证据的热点做验证性改动，沿用现有格式和出错语义。候选达到预设收益后保留，未达门槛时记录结果并撤回改动。
 5. 30 分钟稳态验证继续暂缓。当前长测工具按三个阶段运行，通过查询前后的提交水位进行验证。恢复前先让长测使用查询实际捕获的 ReadView 快照，对齐历史稳态阶段和写入节奏，并将 canary 与 exploration 的 recall ≥0.8 都设为通过条件。保留 90 秒 drain、最终行和旧回执检查。用更长且重复的运行检查后半程积压斜率、清理速率和资源增长，确认维护能跟上持续写入。[当前长测工具](../test/vane/test_vane_vortex_sustained_load.py)
 
-稳定负载下的 R4 和 R5 性能验证继续暂缓。不依赖稳定负载的下一项是 R6 的远程对象所有权与原子发布协议设计。先明确对象身份、持久发布点、跨进程 fencing 和故障恢复责任，再定义固定输入的协议验证。R7 仍按增量更新的收益证据决定。
+R4 和 R5 的性能验证继续暂缓。R6 下一步用单一 PostgreSQL／S3 适配器重放固定故障序列，验证版本化条件写、精确版本读取和删除，以及数据库同事务发布和接管。STOP 与协议元数据的累积仍待给出容量边界。R7 仍按增量更新的收益证据决定。[远程适配器验收](native-vortex-remote-publication.md#下一阶段)
 
 ## 12. 文档与实现导航
 
@@ -340,6 +344,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | [容量 admission 边界](native-vortex-capacity-admission.md) | 行数、向量、写入、历史、lease 和 manifest 边界，及事务与恢复验收 |
 | [查询 scratch 所有权与回收](native-vortex-query-scratch-lifecycle.md) | 登记、活跃锁、有预算的显式回收和 SIGKILL 恢复 |
 | [表 UUID 生命周期](native-vortex-table-uuid-lifecycle.md)／[退休历史与物理回收](native-vortex-retired-history.md) | 原子退休、历史过期、inline 表与表级配置的回收、原生块复用和重开 |
+| [R6 远程对象所有权与原子发布](native-vortex-remote-publication.md) | 后端能力、owner fencing、同事务发布、读者 pin、迟到上传屏障和有界模型 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。
