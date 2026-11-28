@@ -564,6 +564,34 @@ def accepted_materializations(h, reader):
 
 def check_reader_get_attempts(h, report, source):
     key, version = next((obj["key"], obj["version"]) for obj in h.raw["objects"] if obj["unit"] == source)
+    expected = [{"method": "GET", "path": f"/{h.s.bucket}/{key}", "versions": [version], "query_signed": True}]
+
+    def assert_one_request(requests, operation, *args):
+        send = HTTPConnection.send
+
+        def record_send(connection, message):
+            send(connection, message)
+            method, target, _ = message.split(b"\r\n", 1)[0].decode("ascii").split(" ", 2)
+            uri = urlsplit(target)
+            query = parse_qs(uri.query)
+            requests.append(
+                {
+                    "method": method,
+                    "path": uri.path,
+                    "versions": query.get("versionId"),
+                    "query_signed": "X-Amz-Signature" in query,
+                }
+            )
+
+        # Count writes from both http.client and the pinned SDK's urllib3.
+        # The oracle's own HTTP requests run after this probe.
+        with patch.object(HTTPConnection, "send", record_send):
+            try:
+                return operation(*args)
+            finally:
+                methods = ", ".join(request["method"] for request in requests)
+                require(len(requests) == 1, f"One reader grant sent {len(requests)} HTTP requests ({methods})")
+
     reader = "region-error-reader"
     client = boto3.client(
         "s3",
@@ -580,52 +608,44 @@ def check_reader_get_attempts(h, report, source):
     session = h.call("open-region-error-reader", bound.open_session, str(uuid.uuid4()), str(uuid.uuid4()))
     h.sessions.append(session)
     h.call("capture-region-error-reader", bound.capture, session, *h.context("neighbor"), reader, "sql", source)
-    requests = []
-    send = HTTPConnection.send
-
-    def record_send(connection, message):
-        send(connection, message)
-        method, target, _ = message.split(b"\r\n", 1)[0].decode("ascii").split(" ", 2)
-        uri = urlsplit(target)
-        query = parse_qs(uri.query)
-        requests.append(
-            {
-                "method": method,
-                "path": uri.path,
-                "versions": query.get("versionId"),
-                "query_signed": "X-Amz-Signature" in query,
-            }
-        )
-
-    def materialize():
-        # Count writes at the HTTP send boundary used by both http.client and the pinned SDK's urllib3.
-        # Keep the oracle's own HTTP requests outside this probe.
-        with patch.object(HTTPConnection, "send", record_send):
-            try:
-                return bound.materialize(session, reader)
-            finally:
-                require(len(requests) == 1, f"One reader grant sent {len(requests)} HTTP requests")
-
-    h.call("reader-get-wrong-region", materialize, rejected="HTTP_400")
-    require(
-        requests == [{"method": "GET", "path": f"/{h.s.bucket}/{key}", "versions": [version], "query_signed": True}],
-        "Region error did not stop a single signed GET for the pinned version",
+    region_requests = []
+    h.call(
+        "reader-get-wrong-region",
+        assert_one_request,
+        region_requests,
+        bound.materialize,
+        session,
+        reader,
+        rejected="HTTP_400",
     )
+    require(region_requests == expected, "Region error did not stop a single signed GET for the pinned version")
     require(accepted_materializations(h, reader) == 0 and reader not in bound.copies, "Failed GET accepted a copy")
     h.call("close-region-error-view", bound.close_view, session, reader)
     h.call("close-region-error-session", bound.close_session, session)
-    report["faults"].append({"operation": "reader-get-wrong-region", "status": 400, "http_requests": requests})
+    report["faults"].append({"operation": "reader-get-wrong-region", "status": 400, "http_requests": region_requests})
 
     with H.HTTP.Fault(h.s.endpoint, "redirect") as proxy:
         endpoint = f"http://127.0.0.1:{proxy.server.server_port}"
         objects = B.S3Objects(S.client(endpoint, "r6-admin", h.s.secret), h.s.bucket, h.b.objects.prefix)
+        redirect_requests = []
         proxy.release.set()
-        h.call("reader-get-redirect", objects.read_exact_once, key, version, rejected="HTTP_307")
+        h.call(
+            "reader-get-redirect",
+            assert_one_request,
+            redirect_requests,
+            objects.read_exact_once,
+            key,
+            version,
+            rejected="HTTP_307",
+        )
+        require(redirect_requests == expected, "Redirect did not stop a single signed GET for the pinned version")
         require(
             proxy.observation == {"requests": 1, "forwarded": False, "status": 307},
             "The reader GET followed a redirect",
         )
-        report["faults"].append({"operation": "reader-get-redirect", **proxy.observation})
+        report["faults"].append(
+            {"operation": "reader-get-redirect", "http_requests": redirect_requests, **proxy.observation}
+        )
 
 
 def rejected_materialization(pending, code):

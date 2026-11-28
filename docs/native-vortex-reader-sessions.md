@@ -58,7 +58,7 @@ Fencing 不提前撤销普通 SQL 保护：尚未被显式关闭的 `kind=sql` v
 | --- | --- |
 | 活跃、暂停与崩溃 reader | 独立 reader broker 进程实际 SIGSTOP／SIGCONT，锁仍在时回收拒绝；实际 SIGKILL 后 pin／SQL 保护仍持久，只有显式 fence／逐 view 回收才解除 |
 | GET 授权与断连 | 在真实 GET 已完成且结果尚未返回时终止 lifetime backend，确认回收等待 advisory lock，另一张表仍可提交。同时终止操作 backend 后，回收可先推进 fence。另在授权已完成、GET 尚未发送时终止两条连接，等回收完成后再放行，验证只发送原精确版本的一次 GET，无法发出下一次或交付副本 |
-| 区域错误与重定向 | 对真实 MinIO 使用错误签名区域，从 HTTP 发送层确认仅发送一次带精确 version ID 的 GET，返回 400 后验收序号仍为零且 pin 保留。隔离副本恢复原 SDK GET 时，该断言捕获两次发送。另由本地 HTTP fixture 返回 307，确认服务端只收到一个请求 |
+| 区域错误与重定向 | 对真实 MinIO 使用错误签名区域，从客户端 HTTP 发送层确认只发送一次带精确 version ID 的签名 GET。返回 400 后验收序号仍为零且 pin 保留。隔离副本恢复原 SDK GET 时，该断言捕获两次发送。本地 HTTP fixture 返回 307 时复用同一计数。隔离副本在 307 后额外发出 HEAD 时，断言记录 GET 和 HEAD，并因两次发送而失败 |
 | 正常关闭与 COMMIT 确认 | 暂停真实 GET，验证正常关闭等待目标 session 且另一张表可提交。关闭已提交且确认仍暂停时，旧 session 无法获得 GET 授权。在首次物化 COMMIT 确认暂停时通过第二个 BoundCatalog 先关闭视图或解除 pin，确认恢复后验收序号保持原值 |
 | 已验收副本晚于 fence 返回 | 在验收 COMMIT 已确认且副本尚未登记时终止操作 backend，另一 BoundCatalog 关闭视图和 session。放行后按原验收序号交付同一视图、同一 payload 的副本。终态后重新物化拒绝，序号保持不变 |
 | 所有权与约束 | 跨 session 的读取／unpin／close／回收、重复 UUID、非法 fence、旧 writer、复合外键及 CHECK 拒绝。Begin、view 和 finish 拒绝无效 writer owner，且保持持久状态和预算。Writer 轮换后活跃 reader 仍可 materialize |
