@@ -1,15 +1,18 @@
 # Transaction-scoped source-reference diagnostics
 
-**Qualified replacement result on 2026-11-06: all 128 diagnostics, eight warmups
-and eight oracle cases pass; the large-input path loop averages 30.637 ms.**
-The [repeated metadata diagnostic](native-vortex-source-gc-metadata.md) found
-36.763 ms outside SQL in an 84.165-ms large-input collector mean. That envelope
-does not identify a C++ cause. This study measures the existing
-`HasFileReference` body, its result Fetch and its path-processing loop in a
-private diagnostic executable. No production reference algorithm, guards,
-transaction lifetime, COMMIT order, policy, budget or installed provider changes.
+The historical #82 run at [`7643fc79`](https://github.com/AstroVela/ducklake/commit/7643fc79939891bdc2b296105f208ee633716868)
+completed 128 diagnostics, eight warmups and eight oracle cases in its qualified
+replacement run on 2026-11-06. The large-input path loop averaged 30.637 ms.
+The [historical #81 diagnostic](native-vortex-source-gc-metadata.md) had observed
+36.763 ms outside SQL in an 84.165-ms large-input collector mean. #82 measured
+`HasFileReference`, result Fetch and the path loop in a private executable.
 
-## Protocol frozen before formal sampling
+The current source patch measures the integrated implementation, including its
+existing local path identity checks. The build and smoke below use this
+production source and keep its guards, transactions, COMMIT order, policy
+and budget. The historical timings belong to the archived revision.
+
+## Historical protocol frozen before formal sampling
 
 Qualification amendment, also committed before replacement sampling: require
 the default six base extensions and only the two explicitly linked native
@@ -58,15 +61,16 @@ The ordinary-transaction deferral and full native GC checks still run on every
 collector invocation. Keep the two-object/64-MiB budget and keep-two/min-age-zero
 policy. Every call restores fresh single-link images at original canonical paths.
 
-The functional smoke uses two history-8 file inputs, two rounds, sixteen measured
-diagnostics, eight warmups and two four-case oracles. It has no timing claim.
-CI uses one explicit available CPU; formal uses 6–11 with unchanged threads.
+The current functional smoke uses inline and materialized history-8 inputs for
+file collection, two rounds, sixteen measured diagnostics, eight warmups and two
+four-case oracles. CI uses one explicit available CPU. The historical formal
+protocol used CPUs 6–11 and unchanged thread settings.
 
 ## Private build and provenance
 
-The [builder](../test/vane/build_vortex_reference_diagnostic.py) requires exact
+The current [builder](../test/vane/build_vortex_reference_diagnostic.py) checks
 production metadata-source SHA-256
-`97a4b1cf7d1a00c7846a974fee77647649c8b18c7ae6ae254097b9d474ffe96e`.
+`801dc0b5a30eafa353faaa9b5d611a74b0451598fa0da7b96cbfb001272447c1`.
 It applies [one test patch](../test/vane/reference_diagnostic.patch) to a private
 copy with zero fuzz, compiles it with the configured metadata flags and links
 that complete object explicitly before the unchanged extension archives.
@@ -80,9 +84,9 @@ original producer, sealed report/images, private build and input archive hashes.
 It writes a **separate consumer declaration**, retaining original producer/report
 hashes and canonical paths, to identify the instrumented executable consuming
 those images. The sealed input report is never rewritten. An artifact copy of
-the declaration is retained in the result directory. The unchanged #81 metadata
-sampler restores and validates each call, then this study validates and analyzes
-all added reference scopes. Native guards reject incomplete captures per call.
+the declaration is retained in the result directory. The integrated [metadata sampler](../test/vane/test_vane_vortex_source_gc_metadata.py)
+restores and validates each call. The diagnostics then check and analyze all
+added reference scopes. Native guards reject incomplete captures per call.
 
 This build has instrumentation and an explicit metadata object, unlike #81.
 No timing subtraction across those binaries or a claim of performance improvement
@@ -99,11 +103,13 @@ data-file plus delete-file inventory. Each unreferenced call has nonempty chunks
 and one terminal empty Fetch. Preserve exact query and checkpoint checks from #81.
 
 Fetch is timed per result chunk, including the terminal empty call. The **path
-loop** has one timer per nonempty chunk and includes Value/string extraction,
-`CanonicalizePath`, comparison and diagnostic overhead. No per-row clock is
-inserted. This does not separately measure pure canonicalization, CPU, I/O or
-scheduler wait. The call scope retains result/chunk destruction; bookkeeping
-outside the scope remains in the collector residual.
+loop** has one timer per nonempty chunk. In the integrated build it includes
+value/string extraction, `MatchesSourcePath` directory-entry resolution and
+filesystem access checks, comparison, and diagnostic overhead. The target
+`SourcePathIdentity` is computed once before the loop and stays in the call
+remainder. The historical build used lexical `CanonicalizePath` and comparison.
+Neither measurement isolates CPU, I/O or scheduler wait. The call scope also
+includes result/chunk destruction.
 
 Keep disjoint outer SQL categories unchanged and split their `outside_sql` into
 reference Fetch, reference path loop, reference remainder and outside-reference
@@ -119,25 +125,40 @@ variance explained; constant total variance remains undefined. Earlier primary
 and A/A decisions stay unchanged. R4 remains open, without a new 30-minute or
 sustained-write stability claim.
 
-## Reproduce
+## Reproduce the integrated smoke
+
+Use the explicit provider source directories and base extension profile in the
+[CI workflow](../.github/workflows/VaneNativeVortex.yml). Set `runtime_build` to
+that configured and built runtime directory. Use new directories for the
+sealed inputs, private build and report.
 
 ```sh
+driver="$runtime_build/ducklake_vortex_source_gc_benchmark"
+cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local \
+    python -I test/vane/test_vane_vortex_source_gc_benchmark.py \
+    --driver "$driver" --histories 8 --repetitions 2 --warmups 1 --diagnostics 1 \
+    --output-dir /tmp/source-reference-inputs
 python -I test/vane/build_vortex_reference_diagnostic.py \
-    --build-dir /tmp/vane-native-vortex-runtime-20261030/build/python-release \
-    --output-dir /tmp/source-reference-build
+    --build-dir "$runtime_build" --output-dir /tmp/source-reference-build
 python -I test/vane/test_vane_vortex_source_gc_reference_stats.py
-python -I test/vane/test_vane_vortex_source_gc_reference.py \
-    --producer-driver /tmp/ducklake-vortex-expiry-ab-baseline-20261106 \
+env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local \
+    python -I test/vane/test_vane_vortex_source_gc_reference.py \
+    --producer-driver "$driver" \
     --build-report /tmp/source-reference-build/build.json \
-    --inputs /tmp/ducklake-vortex-source-gc-full-v3-20261106/report.json \
-    --cpus 6,7,8,9,10,11 --profile formal \
-    --output-dir /tmp/source-reference-formal
+    --inputs /tmp/source-reference-inputs/report.json \
+    --cpus "$cpu" --profile smoke --output-dir /tmp/source-reference-smoke
 ```
 
-Build and output directories must be new. Preserve the build manifest, consumer
-declaration, raw native JSON/logs, shared sampling report and final analysis.
+Preserve the build manifest, consumer declaration, raw native JSON/logs,
+shared sampling report and final analysis. The integrated smoke checks the
+current path and transaction semantics. Its timings are outside the formal
+result, and current long-duration R4 validation remains open.
 
-## Qualified replacement result
+## Historical qualified replacement result on 2026-11-06
+
+The [archived reproduction instructions](https://github.com/AstroVela/ducklake/blob/7643fc79939891bdc2b296105f208ee633716868/docs/native-vortex-reference-diagnostics.md#reproduce)
+use the original producer, expected source hash and input corpus.
 
 The initial protocol commit is `ad4555a1b7afc35332127dfd4d359af95f6e6753`;
 the qualification amendment is `3d7359a56d3761ea10f38894a5f6047e0c5c5c3a`.
@@ -211,34 +232,25 @@ SHA-256: `626d5c7df96736b62d437f968abffac8591d23f6ebdf73fa8a1afa6e6808d6a3`.
 The separate corrected smoke passes sixteen diagnostics, eight warmups and
 eight oracle cases; it is functional evidence only.
 
-Local qualification passes 43 analysis checks, including the two new build
+The historical qualification passed 43 analysis checks, including the two new build
 profile/source-root rejection checks, and thirty installed package-profile
 checks with one optional skip. The full base launcher on the corrected,
-non-editable runtime passes **1,254 tests with fifteen optional skips**, using
+non-editable runtime passed **1,254 tests with fifteen optional skips**, using
 separate non-Ray/Ray processes. Formatting, workflow YAML, 55 relative links,
 copyleft and measured source/driver/corpus/archive identities pass. The original
 three archived wheels and five previous samplers remain unchanged. Only the
 new default-profile collection is qualified; the earlier failed base check and
 excluded timing report remain available as separate evidence.
 
-## Next bounded candidate
+## Applicability of the historical candidate
 
-Validate a **sound filename-mismatch prefilter** before the existing full
-canonical-path equality check. A final ordinary path component that differs
-from the target filename can exclude a match; potentially matching names and
-special endings such as `.`, `..` and trailing separators still need complete
-path checking. This targets measured loop work without caching references or
-discarding metadata history. No such candidate is adopted in this PR.
+The historical path-loop result motivated a filename-mismatch prefilter for the
+old lexical canonicalization/equality check. The integrated implementation
+resolves existing local references and compares their directory-entry identity.
+A differently named leaf symlink can therefore reference the same target.
+A prefilter on unresolved filenames could also bypass filesystem access checks
+or resolution errors. Any new candidate must preserve these outcomes as well as
+historical references and the guarded transaction protocol.
 
-First prove equivalence against the existing canonicalization/equality behavior
-with an independent path oracle, including relative/absolute paths, aliases,
-dot components, trailing separators, repeated filenames in different directories
-and historical references. Then predeclare a matched explicit-object A/B on the
-same restored corpus, with the existing quality and control requirements. Keep
-all per-transaction ownership/index/native-reference/intent checks and budgets;
-no cross-transaction reference cache, compatibility layer or error fallback.
-
-R4 remains open. This result is a diagnostic target, not a runtime speedup,
-reclassification of earlier A/A precision or a new 30-minute sustained-load
-qualification. Continuous-write backlog/resource stability and the existing
-actual-snapshot, recall and drain checks remain to be completed.
+R4 still requires current actual-ReadView recall checks, a 90-second drain,
+and sustained-write backlog and resource validation.

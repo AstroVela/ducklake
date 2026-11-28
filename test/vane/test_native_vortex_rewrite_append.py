@@ -80,7 +80,7 @@ def exercise(proof, native, root, checks, workers):
     stages = [
         "rewrite_allocated",
         "rewrite_written",
-        "generation_sealed",
+        "rewrite_prepared_sealed",
         "rewrite_candidate_ready",
         "rewrite_source_linked",
     ]
@@ -302,6 +302,50 @@ def final_commit(driver, root, stage, checks):
         M.stop(native)
 
 
+def admission_commit(driver, root, immediate, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        rewritten, first, parts, frozen = RW.setup(native, root, maintenance=False)
+        mode = "true" if immediate else "false"
+        native.sql(f"SET GLOBAL immediate_transaction_mode={mode}")
+        sql = SEG.sql(
+            native,
+            root,
+            "INSERT INTO lake.items VALUES(200001,[133.03125,4,2,0,1,8,7,16],'A','before-admission')",
+        )
+        result = native.call(
+            "rewrite-admission-race", "rewrite_source_linked", SEG.generation(first), rewritten / "commit.json", 3, sql
+        )
+        require(
+            "published" in result and result["native_builds"] == result["bindings"] == 1,
+            f"Rewrite failed to include the admitted commit in immediate mode {mode}: {result}",
+        )
+        output(native, result["published"])
+        RW.unchanged(native, parts, frozen)
+        recalls = []
+        M.qualify(native, "after-admission", recalls, 3)
+        appended = [CAT.MIXED.READ.business(row) for row in native.rows("after-admission") if row["id"] == 200001]
+        require(
+            appended
+            == [
+                {
+                    "id": 200001,
+                    "embedding": [133.03125, 4, 2, 0, 1, 8, 7, 16],
+                    "category": "A",
+                    "payload": "before-admission",
+                }
+            ],
+            "Rewrite changed or lost the admitted row",
+        )
+        native.call("maintenance-enable", 16, RW.LIMIT)
+        MA.drain(native)
+        RW.finish(native)
+        checks.append(f"rewrite sees the commit queued ahead of write admission with immediate_transaction_mode={mode}")
+        return {"fixture_recalls": recalls, "immediate_transaction_mode": immediate}
+    finally:
+        M.stop(native)
+
+
 def interrupted_binding(driver, root, op, stage, checks):
     native = CAT.Native(driver, root / "native")
     try:
@@ -400,6 +444,23 @@ def crash(driver, root, stage, checks):
         require(len(records) == 1 and records[0]["keep_file"] == committed, "Crash lost atomic source ownership")
         target = Path(records[0]["new_path"])
         status = RW.BG.status(native)
+        build = RW.BG.candidate(native)
+        if stage in ("rewrite_candidate_ready", "rewrite_bind_sealed", "rewrite_after_commit"):
+            workspace = Path(build["workspace"])
+            generation = Path(build["index_root"]) / build["generation"]
+            require((workspace / "prepared/manifest.json").is_file(), "Crash lost the prepared generation")
+            require(
+                (generation / "manifest.json").is_file() == (stage != "rewrite_candidate_ready"),
+                "Registered generation was sealed at the wrong stage",
+            )
+            require(
+                build["state"] == ("published" if committed else "building") and build["keep_generation"] == committed,
+                "Registry status advanced before atomic publication",
+            )
+            if committed:
+                checks.append(
+                    "prepared and final seals persist only their artifacts until the registry commits publication"
+                )
         MA.steady(native)
         require(RW.BG.status(native) == status, "Restart implicitly retried or collected a stopped rewrite")
         native.call("maintenance-resume")
@@ -457,6 +518,12 @@ def main():
         )
         for stage in ["rewrite_bind_created", "rewrite_bound", "rewrite_after_stage"]:
             cases.append(("commit-" + stage, lambda d, r, c, s=stage: final_commit(d, r, s, c)))
+        cases.extend(
+            [
+                ("admission-deferred", lambda d, r, c: admission_commit(d, r, False, c)),
+                ("admission-immediate", lambda d, r, c: admission_commit(d, r, True, c)),
+            ]
+        )
         for op in ["rewrite-fail", "rewrite-cancel"]:
             for stage in [
                 "rewrite_bind_started",

@@ -71,7 +71,7 @@ pub fn run(input: &Path, output: &Path) -> VortexResult<()> {
             };
             check("payload_ready")?;
             drop(tree);
-            owned.close()?;
+            owned.close(&check)?;
             Ok(json!({"root":root}))
         } else if spec.operation == "collect" {
             serde_json::to_value(scratch::collect(

@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 
 def load(name, filename):
@@ -107,10 +108,15 @@ class Probe:
 
     def call(self, operation="collect", error=None, **kwargs):
         process, output = self.start(operation, **kwargs)
-        require(
-            process.wait(timeout=120) == 0,
-            "Probe process failed: " + str(output.with_suffix(".log")),
-        )
+        try:
+            require(
+                process.wait(timeout=120) == 0,
+                "Probe process failed: " + str(output.with_suffix(".log")),
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=20)
         value = json.loads(output.read_text())
         if error is not None:
             require(
@@ -216,6 +222,8 @@ def generic(probe, root, report):
     process, _ = p.owner(stop="scratch_allocated", crash=False)
     try:
         p.seal_rejection("busy")
+        p.call("owner", fail="scratch_wait_root_lock", error="scratch_wait_root_lock")
+        require(len(MODEL.registrations(p.root)) == 1, "Interrupted namespace admission registered another owner")
         kill(process, report, "allocation-intent")
     finally:
         if process.poll() is None:
@@ -227,6 +235,29 @@ def generic(probe, root, report):
         "Allocation intent not reclaimed",
     )
     MODEL.assert_released(p.parent)
+
+    p = case("interrupt-close-while-namespace-locked")
+    closing, closing_output = p.start("owner", sizes=[17], stop="payload_ready", fail="scratch_wait_root_lock")
+    blocker = None
+    try:
+        wait_at(closing, closing_output.with_suffix(".checkpoint.json"), "payload_ready", report["applied_affinity"])
+        [closing_id] = MODEL.registrations(p.root)
+        blocker, blocker_output = p.owner(sizes=(), stop="scratch_allocated", crash=False)
+        closing_output.with_suffix(".release").touch()
+        require(closing.wait(timeout=120) == 0, "Interrupted close did not return its result")
+        outcome = json.loads(closing_output.read_text())
+        require(not outcome["ok"] and "scratch_wait_root_lock" in outcome["error"], "Close did not observe interruption")
+        require(closing_id in MODEL.registrations(p.root), "Interrupted close lost its durable registration")
+        blocker_output.with_suffix(".release").touch()
+        require(blocker.wait(timeout=120) == 0 and json.loads(blocker_output.read_text())["ok"], "Lock holder failed to close")
+        require(set(MODEL.registrations(p.root)) == {closing_id}, "Wrong owner survived interrupted close")
+        reclaimed = p.drain()
+        require(sum(result["removed_views"] for result in reclaimed) == 1, "Interrupted close did not drain")
+    finally:
+        for process in (closing, blocker):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=20)
 
     p = case("object-byte-boundary")
     p.owner()
@@ -278,6 +309,7 @@ def generic(probe, root, report):
         "work-identity",
         "lock-identity",
         "payload-identity",
+        "registry-identity-with-staging",
     ):
         p = case(kind)
         p.owner()
@@ -301,6 +333,7 @@ def generic(probe, root, report):
                 "work-identity": work,
                 "lock-identity": work / "owner.lock",
                 "payload-identity": work / "payload",
+                "registry-identity-with-staging": p.root / "registry",
             }[kind]
             original = p.path / "saved-original"
             injected.rename(original)
@@ -309,6 +342,10 @@ def generic(probe, root, report):
             else:
                 injected.mkdir(mode=0o700)
             marker = "identity"
+        if kind == "registry-identity-with-staging":
+            staging = p.root / ".record.tmp"
+            staging.write_text("reserved staging fixture")
+            staging.chmod(0o600)
         p.seal_rejection(marker)
         require(witness.read_text() == "foreign bytes", "Changed a foreign target")
         if injected.is_dir():
@@ -318,6 +355,8 @@ def generic(probe, root, report):
         if original:
             original.rename(injected)
         p.drain()
+        if kind == "registry-identity-with-staging":
+            require(not staging.exists(), "Verified root did not release its own staging slot")
 
     for kind in ("post-plan-addition", "unintended-missing", "planned-file-identity"):
         p = case(kind)
@@ -340,6 +379,39 @@ def generic(probe, root, report):
                 target.unlink()
             saved.rename(target)
         p.drain()
+
+    p = case("registry-beyond-one-mib-of-names")
+    p.call("owner")
+    header = p.root / "root.json"
+    marker = json.loads(header.read_text())
+    count = MIB // 37 + 17  # both bounded rounds exceed one MiB of canonical names
+    registry = p.root / "registry"
+    names = [str(uuid.UUID(int=value)) for value in range(1, count + 1)]
+    record = dict(version=1, root=marker["directory"], state="allocating", work=None, payload=None, lock=None, plan=[])
+    for name in names:
+        fd = os.open(registry / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(dict(record, owner=name), stream)
+    marker["cursor"] = names[-2]
+    header.write_text(json.dumps(marker))
+    result = p.call(max_objects=2, max_bytes=1)
+    require(
+        result["registered_views"] == count and result["examined_views"] == 2 and result["removed_views"] == 2
+        and result["remaining_views"] == count - 2 and result["collected_bytes"] == 0,
+        "Large registry prevented a bounded collector round",
+    )
+    require(not (registry / names[-1]).exists() and not (registry / names[0]).exists(), "Wrapped cursor skipped its window")
+    second = p.call(max_objects=16, max_bytes=1)
+    require(
+        second["registered_views"] == count - 2
+        and second["examined_views"] == second["removed_views"] == second["collected_objects"] == 16
+        and second["remaining_views"] == count - 18 and second["collected_bytes"] == 0,
+        "Second large-registry round did not continue from its cursor",
+    )
+    require(all(not (registry / name).exists() for name in names[1:17]), "Second round skipped eligible owners")
+    for name in names[17:-1]:
+        (registry / name).unlink()
+    MODEL.assert_released(p.parent)
 
     p = case("namespace-bindings")
     p.owner()
@@ -463,12 +535,23 @@ def recover(root, changed=False):
     scratch = Path((root / "scratch-root").read_text())
     MODEL.assert_root(scratch, root / "data")
     before = MODEL.fingerprint(scratch / "work")
+    before_owner_state = MODEL.fingerprint(scratch)
     registered = len(MODEL.registrations(scratch))
-    c = BASE.connect(root)
+    lock = scratch.with_name(scratch.name + ".lock")
+    if root.name == "query-kill-before_fetch":
+        with BASE.connect(root, root / "extensions") as denied:
+            denied.execute("SET enable_external_access=false")
+            WRITE.rejected(lambda: sql_collect(denied, scratch), "cannot access directory")
+        with BASE.connect(root, root / "extensions") as directory_only:
+            directory_only.execute("SET allowed_directories=[" + quote(scratch) + "]")
+            directory_only.execute("SET enable_external_access=false")
+            WRITE.rejected(lambda: sql_collect(directory_only, scratch), f'Cannot access file "{lock}"')
+        require(MODEL.fingerprint(scratch) == before_owner_state, "Denied collection changed the dead owner")
+    c = BASE.connect(root, root / "extensions")
     try:
         require(
             REF.snapshot(c) == expected,
-            "Reopen changed one of 13 metadata tables, snapshots or typed rows",
+            "Reopen changed Vortex metadata, snapshots or typed rows",
         )
         require(
             MODEL.fingerprint(scratch / "work") == before,
@@ -488,6 +571,23 @@ def recover(root, changed=False):
         for objects, bytes_ in ((0, 1), (17, 1), (1, 0), (1, 64 * MIB + 1)):
             WRITE.rejected(lambda: sql_collect(c, scratch, objects, bytes_), "budget")
         WRITE.rejected(lambda: sql_collect(c, root / "private"), "does not belong")
+        if root.name == "query-kill-before_fetch":
+            for spelling, marker in (
+                (str(scratch) + "/", "budgets or root"),
+                (str(scratch) + "/.", "canonical diagnostic root"),
+                (str(scratch).replace("/.", "//.", 1), "canonical diagnostic root"),
+            ):
+                WRITE.rejected(lambda: sql_collect(c, spelling), marker)
+        c.execute("ATTACH ':memory:' AS not_ducklake")
+        try:
+            WRITE.rejected(
+                lambda: c.execute(
+                    "SELECT * FROM ducklake_collect_vortex_query_scratch('not_ducklake'," + quote(scratch) + ",2,1)"
+                ),
+                "requires an attached DuckLake catalog",
+            )
+        finally:
+            c.execute("DETACH not_ducklake")
         WRITE.rejected(
             lambda: c.execute("SELECT * FROM ducklake_collect_vortex_query_scratch('lake',NULL,2,67108864)"),
             "cannot be NULL",
@@ -518,6 +618,11 @@ def recover(root, changed=False):
             REF.snapshot(c) == expected and protected_files(root) == sealed,
             "Scratch GC changed canonical state",
         )
+        if root.name == "query-kill-before_fetch":
+            c.execute("SET allowed_directories=[" + quote(scratch) + "]")
+            c.execute("SET allowed_paths=[" + quote(lock) + "]")
+            c.execute("SET enable_external_access=false")
+            require(sql_collect(c, scratch)["remaining_views"] == 0, "Explicit root and lock grants were not accepted")
         result = {
             "status": "passed",
             "registered_before": registered,
@@ -559,6 +664,49 @@ def recovery_process(case, changed, report):
     # Provider extraction caches are reproducible; preserve all databases, payloads and proof records.
     if (case / "extensions").is_dir():
         shutil.rmtree(case / "extensions")
+
+
+def uri_query_and_collection(root, report):
+    private = root / "private"
+    private.mkdir(mode=0o700)
+    (root / "indexes").mkdir(mode=0o700)
+    uri = "file:" + str(root / "data")
+    previous = os.environ.get("TMPDIR")
+    os.environ["TMPDIR"] = str(private)
+    try:
+        with BASE.connect(root, root / "extensions", create=True, data_path=uri) as connection:
+            BASE.insert(connection, 0, 65)
+            connection.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
+            revision = BASE.head(connection)["revision"]
+            connection.execute(
+                "SELECT * FROM ducklake_append_vortex_index_segment('lake','main','items','knn',"
+                + quote(root / "indexes" / "seed.json") + f",8,{revision})"
+            )
+            require(len(BASE.head(connection)["reference"]["segments"]) == 1, "URI fixture must query a built segment")
+        with BASE.connect(root, root / "extensions", data_path=uri) as connection:
+            [row] = query(
+                connection,
+                "SELECT * FROM ducklake_vortex_search_diagnostics('lake','main','items','knn',"
+                "[128,0,0,0,1,8,7,16]::FLOAT[],1)",
+            )
+            require(
+                row["hits"] == [
+                    {"id": 0, "embedding": [128, 0, 0, 0, 1, 8, 7, 16], "category": "B", "payload": None, "distance": 0}
+                ],
+                "URI query lost its exact typed hit",
+            )
+            scratch = Path(json.loads(row["diagnostics"])["scratch_root"])
+            MODEL.assert_root(scratch, root / "data")
+            result = sql_collect(connection, scratch)
+            require(result["root"] == str(scratch) and result["remaining_views"] == 0, "URI collector used another root")
+            MODEL.assert_released(private)
+    finally:
+        if previous is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous
+    report["native_cases"].append("uri")
+    print("installed URI query and collection passed", flush=True)
 
 
 def native(driver, root, report):
@@ -606,10 +754,19 @@ def native(driver, root, report):
                 process.kill()
                 process.wait(timeout=20)
 
-    for mode in ("normal", "query-cancel", "allocation-cancel", "query-fail", "held"):
+    uri_root = root / "native-uri"
+    uri_root.mkdir(mode=0o700)
+    uri_query_and_collection(uri_root, report)
+
+    for mode in ("normal", "query-cancel", "allocation-cancel", "wait-cancel", "query-fail", "held"):
         case = new_case("native-" + mode)
         process = start(case, "scratch-" + mode)
-        require(process.wait(timeout=120) == 0, "Native scratch case failed: " + str(case))
+        try:
+            require(process.wait(timeout=120) == 0, "Native scratch case failed: " + str(case))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=20)
         require(
             (case / "checkpoint").read_text() == "scratch-complete",
             "Native case incomplete",

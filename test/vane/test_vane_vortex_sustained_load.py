@@ -27,27 +27,45 @@ assert SPEC is not None and SPEC.loader is not None
 AUTO = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(AUTO)
 BASE, KEYED = AUTO.BASE, AUTO.KEYED
+MIXED = BASE.SEARCH.CAT.MIXED
 query, require, quote = AUTO.query, AUTO.require, AUTO.quote
 REQUESTS = AUTO.WRITE.REQUESTS
 PHASES = [("paced", 1.0), ("burst", 0.0), ("recovery", 1.0)]
+SEARCH_COLUMNS = [
+    ("id", "BIGINT"),
+    ("embedding", "FLOAT[]"),
+    ("category", "VARCHAR"),
+    ("payload", "VARCHAR"),
+    ("distance", "FLOAT"),
+]
 PR_SET_PTRACER = 0x59616D61
-SPEC = importlib.util.spec_from_file_location("load_metrics", Path(__file__).with_name("vortex_load_metrics.py"))
-assert SPEC is not None and SPEC.loader is not None
-METRICS = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(METRICS)
+EXIT_AFTER_EOF_SECONDS = 30
 
 
-def phases(args):
-    return [("steady", args.write_interval)] if args.profile == "steady" else PHASES
-
-
-def enable_stall_capture():
+def enable_stall_capture(launcher_pid):
     import ctypes
     import faulthandler
 
     libc = ctypes.CDLL(None, use_errno=True)
-    require(libc.prctl(PR_SET_PTRACER, os.getppid(), 0, 0, 0) == 0, f"PR_SET_PTRACER failed: {ctypes.get_errno()}")
+    require(os.getppid() == launcher_pid, "Stall diagnostics launcher changed")
+    require(libc.prctl(PR_SET_PTRACER, launcher_pid, 0, 0, 0) == 0, f"PR_SET_PTRACER failed: {ctypes.get_errno()}")
+    if os.getppid() != launcher_pid:
+        libc.prctl(PR_SET_PTRACER, 0, 0, 0, 0)
+        raise AssertionError("Stall diagnostics launcher changed")
+    # Python restores the previous disposition before native teardown finishes.
+    signal.signal(signal.SIGUSR2, signal.SIG_IGN)
     faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
+
+
+def start_worker(command, **options):
+    # An explicitly ignored SIGCHLD makes Linux reap the child automatically.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    return subprocess.Popen(command, **options)
+
+
+def worker_exited(child):
+    # Leave the PID reserved while the debugger and watchdog can still use it.
+    return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
 
 
 def capture_stall(child, case, progress, reason):
@@ -56,44 +74,53 @@ def capture_stall(child, case, progress, reason):
         pid=child.pid,
         progress=progress,
         build_workspaces=sorted(path.name for path in (case / "indexes").glob(".build-*")),
+        python_dump_requested=False,
     )
-    try:
-        with (case / "native-stacks.log").open("w") as log:
-            result = subprocess.run(
-                [
-                    "gdb",
-                    "-q",
-                    "-n",
-                    "-batch",
-                    "-ex",
-                    "set debuginfod enabled off",
-                    "-ex",
-                    "set pagination off",
-                    "-ex",
-                    "thread apply all bt 32",
-                    "-ex",
-                    "detach",
-                    "-p",
-                    str(child.pid),
-                ],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                timeout=20,
-            )
-        diagnostic["gdb_exit_status"] = result.returncode
-        if child.poll() is None:
-            child.send_signal(signal.SIGUSR2)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        diagnostic["error"] = str(error)
+    if not progress["diagnostics_ready"]:
+        diagnostic["skipped"] = "worker_diagnostics_not_ready"
+    elif worker_exited(child):
+        diagnostic["skipped"] = "worker_exited"
+    else:
+        try:
+            with (case / "native-stacks.log").open("w") as log:
+                result = subprocess.run(
+                    [
+                        "gdb",
+                        "-q",
+                        "-n",
+                        "-batch",
+                        "-ex",
+                        "set debuginfod enabled off",
+                        "-ex",
+                        "set pagination off",
+                        "-ex",
+                        "thread apply all bt 32",
+                        "-ex",
+                        "detach",
+                        "-p",
+                        str(child.pid),
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=20,
+                )
+            diagnostic["gdb_exit_status"] = result.returncode
+        except (OSError, subprocess.TimeoutExpired) as error:
+            diagnostic["gdb_error"] = str(error)
+        if not worker_exited(child):
+            try:
+                os.kill(child.pid, signal.SIGUSR2)
+                diagnostic["python_dump_requested"] = True
+            except OSError as error:
+                diagnostic["python_error"] = str(error)
     (case / "stall.json").write_text(json.dumps(diagnostic, indent=2) + "\n")
 
 
 def row(key, epoch, dimension, fixture):
     result = AUTO.row(key, epoch)
     if fixture == "cost":
-        result["embedding"] = [float(key) + (epoch % 3) / 64] + [
-            float((key * (i + 3)) % (i + 11)) for i in range(1, dimension)
-        ]
+        first = MIXED.BASE.float32_vector([float(key) + (epoch % 3) / 64])[0]
+        result["embedding"] = [first] + [float((key * (i + 3)) % (i + 11)) for i in range(1, dimension)]
     else:
         result["embedding"].extend(((key * (i + 1)) % 17) / 16 for i in range(8, dimension))
     return result
@@ -125,8 +152,16 @@ def watermark(connection):
     )[0]["n"]
 
 
-def maintenance_profile(connection):
-    return query(connection, "SELECT * FROM ducklake_vortex_maintenance_profile('lake')")
+def healthy(connection):
+    optimizer, maintenance = AUTO.healthy(connection)
+    require(not optimizer["error"], f"Optimizer reported an error: {optimizer}")
+    require(not maintenance["error"], f"Maintenance reported an error: {maintenance}")
+    return optimizer, maintenance
+
+
+def await_drain_status(ready, deadline):
+    remaining = deadline - time.monotonic()
+    return remaining > 0 and ready.wait(remaining) and time.monotonic() < deadline
 
 
 def counters():
@@ -145,7 +180,7 @@ def counters():
 
 
 def bootstrap(root, count, dimension, fixture):
-    connection = BASE.connect(root)
+    connection = BASE.connect(root, root / "extensions")
     (root / "indexes").mkdir()
     for sql in [
         "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)",
@@ -188,17 +223,25 @@ def bootstrap(root, count, dimension, fixture):
     return connection
 
 
-def worker(args):
-    if args.capture_stalls:
-        enable_stall_capture()
-    if args.profile == "steady":
-        private = args.worker_case / "private"
-        private.mkdir(mode=0o700)
-        os.environ["TMPDIR"] = str(private)
-    import vane
+def verify_write_budget(connection, count, dimension, fixture):
+    before = AUTO.current_stamp(connection)
+    try:
+        KEYED.mutate(connection, "budget-preflight", [row(count + i, 0, dimension, fixture) for i in range(257)])
+    except Exception as error:
+        require("RESOURCE_EXHAUSTED: Vortex write inline rows budget exceeded" in str(error), str(error))
+    else:
+        raise AssertionError("A 257-row mutation crossed the configured 256-row T budget")
+    AUTO.WRITE.check_no_request(connection, "budget-preflight")
+    require(
+        AUTO.WRITE.count(connection) == count and AUTO.current_stamp(connection) == before,
+        "Rejected preflight mutation changed the committed state",
+    )
 
+
+def worker(args):
     root, count, dimension, fixture = args.worker_case, args.rows[0], args.dimensions[0], args.fixtures[0]
     lock, stopped = threading.Lock(), threading.Event()
+    drain_ready = threading.Event()
     pipe = os.fdopen(args.events_fd, "w", encoding="utf-8", buffering=1)
     emitted = 0
     phase = "setup"
@@ -215,15 +258,13 @@ def worker(args):
         with lock:
             return dict(counters(), event_pipe_bytes=emitted, time_ns=time.monotonic_ns())
 
+    if args.capture_stalls:
+        enable_stall_capture(args.diagnostics_parent_pid)
+        emit("diagnostics_ready")
+    import vane
+
     connection = bootstrap(root, count, dimension, fixture)
-    try:
-        KEYED.mutate(connection, "budget-preflight", [row(count + i, 0, dimension, fixture) for i in range(257)])
-    except Exception as error:
-        require("RESOURCE_EXHAUSTED: Vortex write inline rows budget exceeded" in str(error), str(error))
-    else:
-        raise AssertionError("A 257-row mutation crossed the configured 256-row T budget")
-    AUTO.WRITE.check_no_request(connection, "budget-preflight")
-    require(AUTO.WRITE.count(connection) == count, "Rejected preflight mutation changed the live row count")
+    verify_write_budget(connection, count, dimension, fixture)
     emit(
         "ready",
         version=vane.__version__,
@@ -231,7 +272,6 @@ def worker(args):
         count=count,
         dimension=dimension,
         fixture=fixture,
-        seed_snapshot=query(connection, "SELECT max(snapshot_id) AS n FROM " + REQUESTS)[0]["n"],
         admission_rejection_check="257-row request rejected atomically by the 256-row T budget",
         providers={
             dist.metadata["Name"]: dist.version
@@ -241,43 +281,10 @@ def worker(args):
     )
     keys, epoch = list(range(count)), 1
     pending_started = None
-    errors = []
+    errors, acknowledged = [], []
+    last_drain_sample = None
     cursors = [connection.cursor() for _ in range(args.readers + 1)]
     baseline = usage()
-    inventory = METRICS.FileInventory(root) if args.profile == "steady" else None
-
-    def cost_sample(cursor, sample_phase):
-        started = time.monotonic()
-        catalog = query(
-            cursor,
-            "SELECT (SELECT count(*) FROM "
-            + REQUESTS
-            + ") AS request_receipts, (SELECT coalesce(sum(octet_length(encode(table_uuid))"
-            "+octet_length(encode(request_id))+octet_length(encode(payload_hash))+16),0) FROM "
-            + REQUESTS
-            + ") AS receipt_logical_payload_bytes, (SELECT count(*) FROM "
-            "__ducklake_metadata_lake.ducklake_snapshot) AS native_snapshots,"
-            "(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_generations_v1 "
-            "WHERE state='active') AS active_generations",
-        )[0]
-        require(catalog["active_generations"] <= 3, "Sampled active B segments exceeded the existing budget")
-        files = inventory.sample()
-        emit(
-            "cost_sample",
-            phase=sample_phase,
-            usage=usage(),
-            catalog=catalog,
-            inventory=files,
-            sample_seconds=time.monotonic() - started,
-        )
-
-    emit(
-        "measurement_start",
-        usage=baseline,
-        maintenance_profile=maintenance_profile(connection),
-    )
-    if inventory is not None:
-        cost_sample(connection, "setup")
 
     def guarded(call):
         try:
@@ -285,11 +292,13 @@ def worker(args):
         except Exception as error:
             errors.append(str(error))
             stopped.set()
+            drain_ready.set()
             raise
 
     def reader(index):
         cursor = cursors[index]
         serial = index
+        checked_schema = False
         while not stopped.is_set():
             serial += args.readers
             canary = index == 0
@@ -307,48 +316,42 @@ def worker(args):
             before_time = time.monotonic_ns()
             before = watermark(cursor)
             started = time.monotonic_ns()
-            result = query(
-                cursor,
-                BASE.SEARCH.search_sql(vector, category=category, diagnostics=True),
-            )
+            hits = query(cursor, BASE.SEARCH.search_sql(vector, category=category))
             finished = time.monotonic_ns()
+            if not checked_schema:
+                require(
+                    [(col[0], str(col[1])) for col in cursor.description] == SEARCH_COLUMNS, "Search schema changed"
+                )
+                checked_schema = True
             after = watermark(cursor)
-            require(len(result) == 1, "Diagnostic search did not return exactly one capture")
-            capture = json.loads(result[0]["diagnostics"])["native_capture"]
             emit(
                 "query",
                 phase=query_phase,
                 canary=canary,
                 before=before,
                 after=after,
-                snapshot_id=capture["snapshot_id"],
                 before_time_ns=before_time,
                 elapsed_ms=(finished - started) / 1e6,
                 finished_ns=finished,
                 vector=vector,
                 category=category,
-                rows=result[0]["hits"],
+                rows=hits,
             )
             stopped.wait(args.recovery_query_pause if phase in ["recovery", "drain"] else args.query_pause)
 
     def monitor():
+        nonlocal last_drain_sample
         cursor = cursors[-1]
-        next_cost = time.monotonic() + 5
         while not stopped.is_set():
-            optimizer, maintenance = AUTO.healthy(cursor)
+            sample_phase = phase
+            optimizer, maintenance = healthy(cursor)
             source = query(cursor, "SELECT * FROM ducklake_vortex_source_retention_status('lake')")[0]
-            emit(
-                "sample",
-                phase=phase,
-                usage=usage(),
-                optimizer=optimizer,
-                maintenance=maintenance,
-                source=source,
-                maintenance_profile=maintenance_profile(cursor),
-            )
-            if inventory is not None and time.monotonic() >= next_cost:
-                cost_sample(cursor, phase)
-                next_cost = time.monotonic() + 5
+            sample = dict(phase=sample_phase, usage=usage(), optimizer=optimizer, maintenance=maintenance, source=source)
+            emit("sample", **sample)
+            if sample_phase == "drain":
+                last_drain_sample = sample
+                if AUTO.ready_for_settle(optimizer, maintenance, source):
+                    drain_ready.set()
             stopped.wait(0.25)
 
     def producer(name, interval, deadline):
@@ -398,6 +401,7 @@ def worker(args):
                         elapsed_ms=(finished - started) / 1e6,
                         input_bytes=canonical_bytes(rows, deletes, dimension),
                     )
+                    acknowledged.append(receipt)
                     for slot, key in changes:
                         keys[slot] = key
                     epoch += 1
@@ -406,78 +410,43 @@ def worker(args):
         finally:
             cursor.close()
 
-    failure = None
     with ThreadPoolExecutor(max_workers=args.readers + 2) as pool:
         tasks = [pool.submit(guarded, lambda index=i: reader(index)) for i in range(args.readers)]
         tasks.append(pool.submit(guarded, monitor))
         try:
-            for name, interval in phases(args):
+            for name, interval in PHASES:
                 phase = name
-                begin_profile = maintenance_profile(connection)
                 begin = usage()
                 task = pool.submit(guarded, lambda: producer(name, interval, time.monotonic() + args.seconds))
                 task.result(timeout=args.seconds + 90)
-                emit(
-                    "phase",
-                    phase=name,
-                    begin=begin,
-                    end=usage(),
-                    interval_seconds=interval,
-                    begin_profile=begin_profile,
-                    end_profile=maintenance_profile(connection),
-                )
+                emit("phase", phase=name, begin=begin, end=usage(), interval_seconds=interval)
                 require(not errors, str(errors))
-            phase = "drain"
             begin = usage()
-            _, source, footprint = AUTO.settle(connection, root, 2, min(100000, 3 * count + 2048))
-            emit("drained", begin=begin, end=usage(), source=source, footprint=footprint)
-        except Exception as error:
-            emit("worker_error", phase=phase, error=str(error))
-            failure = error
+            deadline_ns = begin["time_ns"] + AUTO.SETTLE_TIMEOUT_SECONDS * 1_000_000_000
+            deadline = deadline_ns / 1e9
+            phase = "drain"
+            emit("drain_started", begin=begin, deadline_ns=deadline_ns)
+            try:
+                ready = await_drain_status(drain_ready, deadline)
+                require(not errors, str(errors))
+                require(ready, "Automatic pipeline did not settle: status monitor did not observe readiness by deadline")
+                emit("drain_verifying", time_ns=time.monotonic_ns())
+                _, source, footprint = AUTO.settle(connection, root, 2, min(100000, 3 * count + 2048), deadline=deadline)
+                verified_at_ns = time.monotonic_ns()
+                require(verified_at_ns < deadline_ns, "Automatic pipeline did not settle: verification crossed deadline")
+            except Exception as error:
+                emit("drain_failed", time_ns=time.monotonic_ns(), sample=last_drain_sample, error=str(error))
+                raise
+            emit("drained", begin=begin, end=usage(), verified_at_ns=verified_at_ns, source=source, footprint=footprint)
         finally:
             stopped.set()
             for task in tasks:
-                try:
-                    task.result(timeout=90)
-                except Exception as error:
-                    if failure is None:
-                        failure = error
+                task.result(timeout=90)
             for cursor in cursors:
                 cursor.close()
-            emit(
-                "measured",
-                begin=baseline,
-                end=usage(),
-                maintenance_profile=maintenance_profile(connection),
-            )
+    emit("measured", begin=baseline, end=usage())
     try:
-        if failure is not None:
-            raise failure
-        if inventory is not None:
-            cost_sample(connection, "post_measurement")
-        require(not errors, str(errors))
-        emit("final_rows", rows=BASE.raw(connection))
-        recorded = query(
-            connection,
-            "SELECT request_id,snapshot_id FROM "
-            + REQUESTS
-            + " WHERE starts_with(request_id,'steady-') ORDER BY snapshot_id",
-        )
-        require(len(recorded) == epoch - 1, "Rejected attempts left receipts or successful writes lost receipts")
-        for entry in recorded[:1] + recorded[-1:]:
-            # Retry checks run outside the measured workload.
-            number = int(entry["request_id"].split("-")[-1])
-            old_keys = list(range(count))
-            for n in range(1, number + 1):
-                rows, deletes, changes = plan(old_keys, n, dimension, fixture)
-                for slot, key in changes:
-                    old_keys[slot] = key
-            require(
-                KEYED.mutate(connection, entry["request_id"], rows, deletes)["snapshot_id"] == entry["snapshot_id"],
-                "Retry changed its receipt",
-            )
-        emit("retry_rows", rows=BASE.raw(connection))
-    finally:
+        healthy(connection)
         connection.execute("SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')")
         connection.execute("SELECT * FROM ducklake_cancel_vortex_maintenance('lake')")
         deadline = time.monotonic() + 30
@@ -487,7 +456,39 @@ def worker(args):
         ):
             require(time.monotonic() < deadline, "Workers did not stop at load teardown")
             time.sleep(0.01)
-        emit("profile_final", maintenance_profile=maintenance_profile(connection))
+        require(not errors, str(errors))
+        final_rows = KEYED.business_rows(connection)
+        emit("final_rows", rows=final_rows)
+        recorded = query(
+            connection,
+            "SELECT table_uuid,request_id,payload_hash,row_count,snapshot_id,request_epoch FROM "
+            + REQUESTS
+            + " WHERE starts_with(request_id,'steady-') ORDER BY snapshot_id",
+        )
+        require(recorded == acknowledged, "Durable mutation receipts diverged from successful acknowledgements")
+        if pending_started is not None:
+            request = f"steady-{epoch}"
+            AUTO.WRITE.check_no_request(connection, request)
+            emit("unadmitted", request_id=request, started_ns=pending_started)
+        stamp = AUTO.current_stamp(connection)
+        for entry in recorded[:1] + recorded[-1:]:
+            # Retry checks run outside the measured workload.
+            number = int(entry["request_id"].split("-")[-1])
+            old_keys = list(range(count))
+            for n in range(1, number + 1):
+                rows, deletes, changes = plan(old_keys, n, dimension, fixture)
+                for slot, key in changes:
+                    old_keys[slot] = key
+            require(
+                KEYED.mutate(connection, entry["request_id"], rows, deletes, epoch=entry["request_epoch"]) == entry,
+                "Retry changed its receipt",
+            )
+            require(
+                AUTO.current_stamp(connection) == stamp and KEYED.business_rows(connection) == final_rows,
+                "Retry changed the snapshot, index or current rows",
+            )
+        emit("retry_rows", rows=KEYED.business_rows(connection))
+    finally:
         connection.close()
         pipe.close()
 
@@ -513,44 +514,76 @@ def valid_hits(sample, model):
     rows = sample["rows"]
     if len(rows) > 10 or len({entry["id"] for entry in rows}) != len(rows):
         return None
-    previous = -1
-    point = sample["vector"]
-    for entry in rows:
-        expected = model.get(entry["id"])
-        if expected is None or any(entry[key] != expected[key] for key in ["embedding", "category", "payload"]):
-            return None
-        if sample["category"] is not None and entry["category"] != sample["category"]:
-            return None
-        exact = sum((a - b) ** 2 for a, b in zip(entry["embedding"], point))
-        if entry["distance"] < previous or not math.isclose(entry["distance"], exact, rel_tol=1e-5, abs_tol=1e-4):
-            return None
-        previous = entry["distance"]
     eligible = [
         entry for entry in model.values() if sample["category"] is None or entry["category"] == sample["category"]
     ]
     if not eligible:
         return 1.0 if not rows else None
-    vectors = np.asarray([entry["embedding"] for entry in eligible], dtype=np.float64)
-    distances = np.sum((vectors - np.asarray(point)) ** 2, axis=1)
-    ranked = sorted(zip(distances.tolist(), [entry["id"] for entry in eligible]))[:10]
-    wanted = {key for _, key in ranked}
-    recall = len(wanted & {entry["id"] for entry in rows}) / len(wanted)
-    return recall
+    point = np.asarray(sample["vector"], dtype=np.float32)
+    vectors = np.asarray([entry["embedding"] for entry in eligible], dtype=np.float32)
+    require(vectors.shape == (len(eligible), len(point)), "Oracle vector dimension mismatch")
+    # Normalize the inputs to Float32, accumulate in Float64, and round once.
+    distances = np.zeros(len(eligible), dtype=np.float64)
+    for coordinate in range(len(point)):
+        difference = vectors[:, coordinate].astype(np.float64) - float(point[coordinate])
+        distances += difference * difference
+    rounded = distances.astype(np.float32).tolist()
+    scores = {entry["id"]: score for entry, score in zip(eligible, rounded)}
+    previous = 0.0
+    for entry in rows:
+        key = entry["id"]
+        if type(key) is not int or key not in scores:
+            return None
+        expected = model[key]
+        if any(entry[field] != expected[field] for field in ("embedding", "category", "payload")):
+            return None
+        distance = entry["distance"]
+        if not math.isfinite(distance) or distance < previous:
+            return None
+        if not math.isclose(distance, scores[key], rel_tol=1e-5, abs_tol=1e-4):
+            return None
+        previous = distance
+
+    # Public search omits physical addresses. At the cutoff, assume that omitted
+    # equal-score rows precede returned rows. The frozen proof checks exact tie order.
+    k = min(10, len(scores))
+    cutoff = sorted(rounded)[k - 1]
+    nearer = sum(score < cutoff for score in scores.values())
+    found_nearer = sum(scores[entry["id"]] < cutoff for entry in rows)
+    found_tied = sum(scores[entry["id"]] == cutoff for entry in rows)
+    tied = sum(score == cutoff for score in scores.values())
+    return (found_nearer + max(0, k - nearer - (tied - found_tied))) / k
 
 
-def validate_queries(events, count, dimension, fixture):
+def check_oracle():
+    point = [0.0, 0.0, 0.0]
+    model = {key: dict(id=key, embedding=[float(key), 0.0, 0.0], category="B", payload=None) for key in range(8)}
+    tied_vectors = ([4096.0, 0.5, 0.5], [4096.0, 0.0, 0.0], [4096.0, 1.0, 0.0], [4096.0, 0.0, 1.0])
+    for key, vector in enumerate(tied_vectors, 8):
+        model[key] = dict(id=key, embedding=vector, category="B", payload=None)
+    rows = [dict(model[key], distance=MIXED.float32_squared_l2(point, model[key]["embedding"])) for key in range(10)]
+    sample = dict(rows=rows, vector=point, category="B")
+    require(valid_hits(sample, model) == 0.8, "Oracle treated a Float32 cutoff tie as a known physical order")
+    for bad in (
+        dict(rows[9], id=float(rows[9]["id"])),
+        dict(rows[9], embedding=[4096.0]),
+        dict(rows[9], distance=float("inf")),
+        dict(rows[9], category="A"),
+    ):
+        require(valid_hits(dict(sample, rows=rows[:-1] + [bad]), model) is None, "Oracle accepted an invalid hit")
+    require(valid_hits(dict(sample, rows=rows[::-1]), model) is None, "Oracle accepted unordered distances")
+    require(
+        valid_hits(dict(sample, rows=[dict(rows[0], distance=-0.00005)]), model) is None,
+        "Oracle accepted a negative squared distance",
+    )
+    require(row(262144, 8065, 8, "cost")["embedding"][0] == 262144.0, "Cost model lost native Float32 rounding")
+
+
+def validate(events, count, dimension, fixture):
     acks = sorted([event for event in events if event["kind"] == "ack"], key=lambda entry: entry["epoch"])
     require([entry["epoch"] for entry in acks] == list(range(1, len(acks) + 1)), "Mutation sequence has a gap")
     snapshots = [0] + [entry["receipt"]["snapshot_id"] for entry in acks]
     require(snapshots == sorted(set(snapshots)), "Commit order changed the single producer's order")
-    finished_times = [entry["finished_ns"] for entry in acks]
-    require(finished_times == sorted(finished_times), "Single-producer acknowledgement times changed order")
-    ready = [event for event in events if event["kind"] == "ready"]
-    require(
-        len(ready) == 1 and type(ready[0]["seed_snapshot"]) is int,
-        "Missing committed seed snapshot",
-    )
-    seed_snapshot = ready[0]["seed_snapshot"]
     keys, model, changes = list(range(count)), {key: row(key, 0, dimension, fixture) for key in range(count)}, []
     for entry in acks:
         upserts, deletes, replaced = plan(keys, entry["epoch"], dimension, fixture)
@@ -564,116 +597,62 @@ def validate_queries(events, count, dimension, fixture):
             del state[key]
         state.update((entry["id"], entry) for entry in upserts)
 
-    samples = [event for event in events if event["kind"] == "query"]
-    require(
-        all(type(sample.get("snapshot_id")) is int and sample["snapshot_id"] >= seed_snapshot for sample in samples),
-        "Query has no actual ReadView snapshot after the committed seed",
-    )
-    samples.sort(key=lambda entry: entry["snapshot_id"])
+    samples = sorted([event for event in events if event["kind"] == "query"], key=lambda entry: entry["before"])
     recalls, canary_recalls, exploration_recalls, overlapping, position = [], [], [], 0, 0
     for sample in samples:
         require(
             sample["before"] in snapshots and sample["after"] in snapshots and sample["before"] <= sample["after"],
             "Query watermark has no committed model",
         )
-        acknowledged = snapshots[bisect.bisect_right(finished_times, sample["before_time_ns"])]
+        acknowledged = max(
+            (entry["receipt"]["snapshot_id"] for entry in acks if entry["finished_ns"] <= sample["before_time_ns"]),
+            default=0,
+        )
         require(sample["before"] >= acknowledged, "Query missed a previously acknowledged commit")
         lower, upper = bisect.bisect_left(snapshots, sample["before"]), bisect.bisect_left(snapshots, sample["after"])
-        selected = bisect.bisect_right(snapshots, sample["snapshot_id"]) - 1
-        require(
-            lower <= selected <= upper,
-            "Actual ReadView snapshot is outside its committed read window",
-        )
-        while position < selected:
+        while position < lower:
             apply(model, changes[position])
             position += 1
-        recall = valid_hits(sample, model)
-        require(
-            recall is not None,
-            "Query does not match its actual ReadView snapshot's committed model",
-        )
+        candidate = dict(model)
+        compatible_recalls = []
+        for index in range(lower, upper + 1):
+            if index > lower:
+                apply(candidate, changes[index - 1])
+            recall = valid_hits(sample, candidate)
+            if recall is not None:
+                compatible_recalls.append(recall)
+        require(compatible_recalls, "Query matches no single committed state inside its read window")
+        lower_bound = min(compatible_recalls)
         if sample["canary"]:
-            canary_recalls.append(recall)
+            canary_recalls.append(lower_bound)
         else:
-            exploration_recalls.append(recall)
-        recalls.append(recall)
+            exploration_recalls.append(lower_bound)
+        recalls.append(lower_bound)
         overlapping += upper > lower
     for change in changes[position:]:
         apply(model, change)
     expected = [model[key] for key in sorted(model)]
-    require(len(expected) == count and len(samples) >= 12, "Insufficient concurrent workload coverage")
-    return (
-        dict(
-            queries=len(samples),
-            oracle="actual_read_view_snapshot",
-            distinct_read_view_snapshots=len({sample["snapshot_id"] for sample in samples}),
-            queries_overlapping_commits=overlapping,
-            minimum_recall=min(recalls),
-            canary_minimum_recall=min(canary_recalls),
-            canary_gate_passed=min(canary_recalls) >= 0.8,
-            exploration_minimum_recall=min(exploration_recalls),
-            exploration_recall=percentiles(exploration_recalls),
-            exploration_meets_0_8_target=min(exploration_recalls) >= 0.8,
-            committed_batches=len(acks),
-        ),
-        expected,
-    )
-
-
-def profile_delta(begin, end):
-    require(begin and end, "Missing maintenance timing samples")
-    require(
-        len({entry["profile_id"] for entry in begin + end}) == 1,
-        "Maintenance profile reset inside the measured window",
-    )
-    first = {entry["stage"]: entry for entry in begin}
-    require(len(first) == len(begin) == len(end), "Duplicate maintenance timing stage")
-    result = {}
-    for entry in end:
-        require(
-            entry["stage"] in first and entry["stage"] not in result,
-            "Maintenance timing stage changed",
-        )
-        old = first[entry["stage"]]
-        require(
-            all(type(entry[key]) is int and entry[key] >= old[key] >= 0 for key in ["calls", "total_ns", "max_ns"])
-            and entry["max_ns"] <= entry["total_ns"],
-            "Maintenance timing counters are invalid or decreased",
-        )
-        calls, ns = entry["calls"] - old["calls"], entry["total_ns"] - old["total_ns"]
-        result[entry["stage"]] = dict(
-            calls=calls,
-            total_ms=ns / 1e6,
-            average_ms=ns / calls / 1e6 if calls else None,
-            lifetime_max_ms=entry["max_ns"] / 1e6,
-        )
-    return result
-
-
-def profile_metrics(events):
-    start = next(entry for entry in events if entry["kind"] == "measurement_start")["maintenance_profile"]
-    end = next(entry for entry in events if entry["kind"] == "measured")["maintenance_profile"]
-    stopped = next(entry for entry in events if entry["kind"] == "profile_final")["maintenance_profile"]
-    return dict(
-        profile_id=start[0]["profile_id"],
-        semantics="steady-clock wall time; completed scopes, including waits and exceptions; parent stages overlap children",
-        through_measurement=profile_delta(start, end),
-        through_worker_stop=profile_delta(start, stopped),
-    )
-
-
-def validate(events, count, dimension, fixture):
-    result, expected = validate_queries(events, count, dimension, fixture)
     for kind in ["final_rows", "retry_rows"]:
         actual = [entry for entry in events if entry["kind"] == kind]
         require(len(actual) == 1 and actual[0]["rows"] == expected, "Drain or old retry changed current logical rows")
-    return result
+    require(len(expected) == count and len(samples) >= 12, "Insufficient concurrent workload coverage")
+    return dict(
+        queries=len(samples),
+        queries_overlapping_commits=overlapping,
+        minimum_recall_lower_bound=min(recalls),
+        canary_minimum_recall_lower_bound=min(canary_recalls),
+        canary_gate_passed=min(canary_recalls) >= 0.8,
+        exploration_minimum_recall_lower_bound=min(exploration_recalls),
+        exploration_recall=percentiles(exploration_recalls),
+        exploration_meets_0_8_target=min(exploration_recalls) >= 0.8,
+        committed_batches=len(acks),
+    )
 
 
-def phase_metrics(events):
+def summarize(events):
     result = {}
-    for phase in (entry for entry in events if entry["kind"] == "phase"):
-        name = phase["phase"]
+    for name, _ in PHASES:
+        phase = next(entry for entry in events if entry["kind"] == "phase" and entry["phase"] == name)
         acks = [entry for entry in events if entry["kind"] == "ack" and entry["phase"] == name]
         queries = [entry for entry in events if entry["kind"] == "query" and entry["phase"] == name]
         rejections = [entry for entry in events if entry["kind"] == "rejected" and entry["phase"] == name]
@@ -697,56 +676,7 @@ def phase_metrics(events):
             canonical_mutation_bytes=logical,
             process_write_bytes_per_mutation_byte=usage["write_bytes"] / logical,
             acknowledged_batches_per_second=len(acks) / usage["seconds"],
-            maintenance_profile=profile_delta(phase["begin_profile"], phase["end_profile"]),
         )
-    return result
-
-
-def latency_windows(events):
-    windows = []
-    for phase in (entry for entry in events if entry["kind"] == "phase" and entry["phase"] == "steady"):
-        start, end = phase["begin"]["time_ns"], phase["end"]["time_ns"]
-        buckets = {}
-        for entry in events:
-            if entry.get("phase") != "steady" or entry["kind"] not in ["ack", "query", "rejected"]:
-                continue
-            stamp = entry["before_time_ns"] if entry["kind"] == "query" else entry["started_ns"]
-            bucket = max(0, (stamp - start) // 60_000_000_000)
-            buckets.setdefault(bucket, []).append(entry)
-        for minute, entries in sorted(buckets.items()):
-            seconds = (min(end, start + (minute + 1) * 60_000_000_000) - (start + minute * 60_000_000_000)) / 1e9
-            require(seconds > 0, "Measurement window is outside the completed steady phase")
-            acks = [entry for entry in entries if entry["kind"] == "ack"]
-            queries = [entry for entry in entries if entry["kind"] == "query"]
-            windows.append(
-                dict(
-                    minute=minute,
-                    seconds=seconds,
-                    committed_batches=len(acks),
-                    committed_operations=160 * len(acks),
-                    acknowledged_batches_per_second=len(acks) / seconds,
-                    ack_attempt_ms=percentiles([entry["elapsed_ms"] for entry in acks]) if acks else None,
-                    ack_with_explicit_retries_ms=(
-                        percentiles([entry["end_to_end_ms"] for entry in acks]) if acks else None
-                    ),
-                    queries=len(queries),
-                    query_ms=percentiles([entry["elapsed_ms"] for entry in queries]) if queries else None,
-                    query_classes={
-                        label: (
-                            percentiles([entry["elapsed_ms"] for entry in queries if entry["canary"] == canary])
-                            if any(entry["canary"] == canary for entry in queries)
-                            else None
-                        )
-                        for label, canary in [("canary", True), ("exploration", False)]
-                    },
-                    rejected_attempts=sum(entry["kind"] == "rejected" for entry in entries),
-                )
-            )
-    return windows
-
-
-def summarize(events):
-    result = phase_metrics(events)
     drain = next(entry for entry in events if entry["kind"] == "drained")
     samples = [entry for entry in events if entry["kind"] == "sample"]
     require(
@@ -762,9 +692,10 @@ def summarize(events):
     )
     return dict(
         phases=result,
-        maintenance_profile=profile_metrics(events),
-        steady_latency_windows=latency_windows(events),
-        burst_reached_write_budget=(result["burst"]["backpressure_rejections"] > 0 if "burst" in result else None),
+        burst_reached_write_budget=result["burst"]["backpressure_rejections"] > 0,
+        terminal_unadmitted_request=next(
+            (entry["request_id"] for entry in events if entry["kind"] == "unadmitted"), None
+        ),
         drain=delta(drain["begin"], drain["end"]),
         footprint=drain["footprint"],
         sampled_peak_rss_kib=max(entry["usage"]["VmRSS"] for entry in samples),
@@ -781,7 +712,124 @@ def summarize(events):
     )
 
 
-def run_worker(args, case, events, count, dimension, fixture):
+def stall_reason(progress, now, deadline):
+    if progress["ready"]:
+        if now - progress["time"] >= 30:
+            return "no_events_30_seconds"
+        if now - progress["query_time"] >= 30:
+            return "queries_stalled_30_seconds"
+    exit_deadline = progress.get("exit_deadline")
+    if exit_deadline is not None and exit_deadline < deadline and exit_deadline - now <= 25:
+        return "event_pipe_exit_deadline"
+    if deadline - now <= 25:
+        return "watchdog_deadline"
+    return None
+
+
+def collect_worker_events(child, case, pipe, budget, capture_stalls):
+    events, malformed = [], None
+    exit_timed_out = False
+    expired, stopped = threading.Event(), threading.Event()
+    progress_lock = threading.Lock()
+    now = time.monotonic()
+    deadline = now + budget
+    progress = dict(time=now, query_time=now, ready=False, diagnostics_ready=False)
+
+    def kill_worker():
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def expire():
+        if not worker_exited(child):
+            expired.set()
+            kill_worker()
+
+    def diagnose():
+        while not stopped.wait(0.25):
+            if worker_exited(child):
+                return
+            with progress_lock:
+                current = dict(progress)
+            reason = stall_reason(current, time.monotonic(), deadline)
+            if reason is not None:
+                capture_stall(child, case, current, reason)
+                return
+
+    watchdog = diagnostics = None
+    try:
+        watchdog = threading.Timer(max(0, deadline - time.monotonic()), expire)
+        watchdog.start()
+        if capture_stalls:
+            diagnostics = threading.Thread(target=diagnose)
+            diagnostics.start()
+        with (case / "events.jsonl").open("wb") as trace:
+            for line in pipe:
+                trace.write(line)
+                try:
+                    event = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    malformed = malformed or str(error)
+                    continue
+                if not isinstance(event, dict) or not isinstance(event.get("kind"), str):
+                    malformed = malformed or "event kind is missing"
+                    continue
+                events.append(event)
+                if capture_stalls:
+                    with progress_lock:
+                        now = time.monotonic()
+                        kind = event["kind"]
+                        progress.update(time=now, kind=kind, phase=event.get("phase"))
+                        if kind == "diagnostics_ready":
+                            progress["diagnostics_ready"] = True
+                        elif kind == "ready":
+                            progress.update(ready=True, query_time=now)
+                        elif kind == "query":
+                            progress["query_time"] = now
+                            progress["last_query"] = {
+                                key: event.get(key) for key in ["vector", "category", "before", "after", "canary"]
+                            }
+                        elif kind == "sample":
+                            progress["sample"] = event
+                        elif kind == "measured":
+                            progress["ready"] = False
+        exit_deadline = time.monotonic() + EXIT_AFTER_EOF_SECONDS
+        if capture_stalls:
+            with progress_lock:
+                progress["exit_deadline"] = exit_deadline
+        while not worker_exited(child):
+            if time.monotonic() >= exit_deadline:
+                exit_timed_out = True
+                break
+            time.sleep(0.01)
+    finally:
+        stopped.set()
+        if watchdog is not None:
+            watchdog.cancel()
+            if watchdog.ident is not None:
+                watchdog.join()
+        if not worker_exited(child):
+            kill_worker()
+        if diagnostics and diagnostics.ident is not None:
+            diagnostics.join()
+        child.wait(timeout=10)
+
+    if child.returncode != 0 or exit_timed_out:
+        watchdog_expired = expired.is_set() and child.returncode == -signal.SIGKILL
+        error = f"Load worker failed (exit {child.returncode}, watchdog_expired={watchdog_expired}). "
+        if exit_timed_out:
+            error += f"Worker kept running after closing its event pipe for {EXIT_AFTER_EOF_SECONDS} seconds. "
+        if malformed:
+            error += f"Malformed event in events.jsonl. {malformed}. "
+        raise AssertionError(error + (case / "worker.log").read_text(errors="replace")[-6000:])
+    require(malformed is None, f"Malformed event in events.jsonl. {malformed}")
+    return events
+
+
+def run_case(args, root, count, dimension, fixture):
+    case = root / f"{fixture}-rows-{count}-dim-{dimension}"
+    case.mkdir(mode=0o700)
     read_fd, write_fd = os.pipe()
     command = [
         sys.executable,
@@ -799,10 +847,6 @@ def run_worker(args, case, events, count, dimension, fixture):
         fixture,
         "--seconds",
         str(args.seconds),
-        "--profile",
-        args.profile,
-        "--write-interval",
-        str(args.write_interval),
         "--readers",
         str(args.readers),
         "--query-pause",
@@ -811,146 +855,28 @@ def run_worker(args, case, events, count, dimension, fixture):
         str(args.recovery_query_pause),
     ]
     if args.capture_stalls:
-        command.append("--capture-stalls")
-    with (case / "worker.log").open("w") as log:
-        child = subprocess.Popen(command, pass_fds=(write_fd,), stdout=log, stderr=subprocess.STDOUT)
-        os.close(write_fd)
-        expired, diagnostics_stopped = threading.Event(), threading.Event()
-        progress_lock = threading.Lock()
-        progress = dict(time=time.monotonic(), query_time=time.monotonic(), ready=False)
-        watchdog_seconds = len(phases(args)) * args.seconds + 300
-        deadline = time.monotonic() + watchdog_seconds
-
-        def expire():
-            expired.set()
-            child.kill()
-
-        def diagnose():
-            while not diagnostics_stopped.wait(0.25):
-                if child.poll() is not None:
-                    return
-                with progress_lock:
-                    current = dict(progress)
-                now = time.monotonic()
-                stalled = current["ready"] and now - current["time"] >= 30
-                queries_stalled = current["ready"] and now - current["query_time"] >= 30
-                if stalled or queries_stalled or deadline - now <= 25:
-                    reason = (
-                        "queries_stalled_30_seconds"
-                        if queries_stalled
-                        else "no_events_30_seconds" if stalled else "watchdog_deadline"
-                    )
-                    capture_stall(child, case, current, reason)
-                    return
-
-        watchdog = threading.Timer(watchdog_seconds, expire)
-        watchdog.start()
-        diagnostics = threading.Thread(target=diagnose) if args.capture_stalls else None
-        if diagnostics:
-            diagnostics.start()
-        try:
-            with os.fdopen(read_fd, encoding="utf-8") as pipe, (case / "events.jsonl").open("w") as trace:
-                for line in pipe:
-                    trace.write(line)
-                    event = json.loads(line)
-                    events.append(event)
-                    with progress_lock:
-                        progress.update(time=time.monotonic(), kind=event["kind"], phase=event.get("phase"))
-                        if event["kind"] == "ready":
-                            progress.update(ready=True, query_time=time.monotonic())
-                        elif event["kind"] == "query":
-                            progress["query_time"] = time.monotonic()
-                            progress["last_query"] = {
-                                key: event[key]
-                                for key in [
-                                    "vector",
-                                    "category",
-                                    "before",
-                                    "after",
-                                    "snapshot_id",
-                                    "canary",
-                                ]
-                            }
-                        elif event["kind"] == "sample":
-                            progress["sample"] = event
-                        elif event["kind"] == "measured":
-                            progress["ready"] = False
-            child.wait(timeout=30)
-            require(
-                child.returncode == 0,
-                f"Load worker failed (exit {child.returncode}, watchdog_expired={expired.is_set()}): "
-                + (case / "worker.log").read_text()[-6000:],
-            )
-        finally:
-            watchdog.cancel()
-            diagnostics_stopped.set()
-            if diagnostics:
-                diagnostics.join(timeout=25)
-            if child.poll() is None:
-                child.kill()
-                child.wait(timeout=10)
-
-
-def partial_measurement(events, count, dimension, fixture):
+        command.extend(["--capture-stalls", "--diagnostics-parent-pid", str(os.getpid())])
+    with (
+        os.fdopen(read_fd, "rb") as pipe,
+        os.fdopen(write_fd, "wb") as event_writer,
+        (case / "worker.log").open("w") as log,
+    ):
+        child = start_worker(command, pass_fds=(event_writer.fileno(),), stdout=log, stderr=subprocess.STDOUT)
+        event_writer.close()
+        events = collect_worker_events(child, case, pipe, 3 * args.seconds + 300, args.capture_stalls)
     result = dict(
-        evidence="partial; worker, final logical state and drain acceptance did not all complete",
-        queries_observed=sum(event["kind"] == "query" for event in events),
-        acknowledgements_observed=sum(event["kind"] == "ack" for event in events),
+        status="completed",
+        fixture=fixture,
+        rows=count,
+        dimension=dimension,
+        runtime=next(entry for entry in events if entry["kind"] == "ready"),
+        **validate(events, count, dimension, fixture),
+        **summarize(events),
     )
-    samples = [event for event in events if event["kind"] == "sample"]
-    if samples:
-        result["last_sample"] = samples[-1]
-    starts = [event for event in events if event["kind"] == "measurement_start"]
-    measured = [event for event in events if event["kind"] == "measured"]
-    if starts and (measured or samples):
-        end = measured[-1]["end"] if measured else samples[-1]["usage"]
-        result["usage_through_last_observation"] = delta(starts[0]["usage"], end)
-    try:
-        result["completed_phases"] = phase_metrics(events)
-        result["steady_latency_windows"] = latency_windows(events)
-    except Exception as error:
-        result["phase_measurement_error"] = str(error)
-    try:
-        result["observed_query_validation"], _ = validate_queries(events, count, dimension, fixture)
-    except Exception as error:
-        result["query_validation_error"] = str(error)
-    result["cost_attribution"] = METRICS.summarize(events)
-    try:
-        result["maintenance_profile"] = profile_metrics(events)
-    except Exception as error:
-        result["maintenance_profile_error"] = str(error)
-    return result
-
-
-def run_case(args, root, count, dimension, fixture):
-    case = root / f"{fixture}-rows-{count}-dim-{dimension}"
-    case.mkdir(mode=0o700)
-    events = []
-    try:
-        run_worker(args, case, events, count, dimension, fixture)
-        result = dict(
-            status="completed",
-            fixture=fixture,
-            rows=count,
-            dimension=dimension,
-            runtime=next(entry for entry in events if entry["kind"] == "ready"),
-            **validate(events, count, dimension, fixture),
-            **summarize(events),
-        )
-        result["cost_attribution"] = METRICS.summarize(events)
-        result["correctness"] = "passed"
-        if not result["canary_gate_passed"] or not result["exploration_meets_0_8_target"]:
-            result.update(status="failed", error="Canary or exploration fell below its existing 0.8 recall target")
-    except Exception as error:
-        result = dict(
-            status="failed",
-            fixture=fixture,
-            rows=count,
-            dimension=dimension,
-            error=str(error),
-            partial_measurement=partial_measurement(events, count, dimension, fixture),
-        )
-    result["stall_capture_performed"] = (case / "stall.json").exists()
+    result["stall_capture_attempted"] = (case / "stall.json").exists()
+    result["correctness"] = "passed"
+    if not result["canary_gate_passed"]:
+        result.update(status="failed", error="Qualified canary fell below its unchanged 0.8 recall gate")
     (case / "report.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
@@ -961,12 +887,11 @@ def main():
     destination.add_argument("--output-dir", type=Path)
     destination.add_argument("--worker-case", type=Path)
     parser.add_argument("--events-fd", type=int)
+    parser.add_argument("--diagnostics-parent-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--fixtures", choices=["cost", "automatic"], nargs="+", default=["automatic"])
     parser.add_argument("--rows", type=int, nargs="+", default=[4096])
     parser.add_argument("--dimensions", type=int, nargs="+", default=[8])
     parser.add_argument("--seconds", type=float, default=12)
-    parser.add_argument("--profile", choices=["phased", "steady"], default="phased")
-    parser.add_argument("--write-interval", type=float, default=1.0)
     parser.add_argument("--readers", type=int, default=2)
     parser.add_argument("--query-pause", type=float, default=0.02)
     parser.add_argument("--recovery-query-pause", type=float, default=0.5)
@@ -974,7 +899,7 @@ def main():
         "--capture-stalls", action="store_true", help="Capture native/Python stacks before watchdog termination"
     )
     args = parser.parse_args()
-    require(os.environ.get("VANE_RUNNER") == "local-fast", "Set VANE_RUNNER=local-fast explicitly")
+    require(os.environ.get("VANE_RUNNER") == "local", "Set VANE_RUNNER=local explicitly")
     require(not args.capture_stalls or shutil.which("gdb"), "--capture-stalls requires gdb")
     require(
         all(512 <= n <= 32768 for n in args.rows) and all(8 <= n <= 128 for n in args.dimensions),
@@ -985,15 +910,16 @@ def main():
         "Invalid workload configuration",
     )
     require(0.25 <= args.recovery_query_pause <= 5, "Invalid planned recovery query interval")
-    require(0.1 <= args.write_interval <= 60, "Invalid steady write interval")
-    require(args.profile == "steady" or args.write_interval == 1, "--write-interval requires --profile steady")
     if args.worker_case:
         require(
             args.events_fd is not None and len(args.rows) == len(args.dimensions) == len(args.fixtures) == 1,
             "Worker requires one case and its event pipe",
         )
+        if args.capture_stalls:
+            require(args.diagnostics_parent_pid is not None and args.diagnostics_parent_pid > 0, "Missing launcher PID")
         worker(args)
         return
+    check_oracle()
     root = args.output_dir.resolve()
     root.mkdir(mode=0o700, parents=True)
     report = dict(
@@ -1004,9 +930,6 @@ def main():
         cpu_count=os.cpu_count(),
         reader_threads=args.readers,
         seconds_per_phase=args.seconds,
-        profile=args.profile,
-        nominal_workload_seconds=len(phases(args)) * args.seconds,
-        write_interval_seconds=args.write_interval if args.profile == "steady" else None,
         query_pause_seconds=args.query_pause,
         recovery_query_pause_seconds=args.recovery_query_pause,
         stall_capture_enabled=args.capture_stalls,
@@ -1021,21 +944,22 @@ def main():
                         result = run_case(args, root, count, dimension, fixture)
                     except Exception as error:
                         failed = True
+                        case = root / f"{fixture}-rows-{count}-dim-{dimension}"
                         result = dict(
-                            status="failed", fixture=fixture, rows=count, dimension=dimension, error=str(error)
+                            status="failed",
+                            fixture=fixture,
+                            rows=count,
+                            dimension=dimension,
+                            error=str(error),
+                            stall_capture_attempted=(case / "stall.json").exists(),
                         )
-                        (root / f"{fixture}-rows-{count}-dim-{dimension}" / "report.json").write_text(
-                            json.dumps(result, indent=2) + "\n"
-                        )
+                        (case / "report.json").write_text(json.dumps(result, indent=2) + "\n")
                         print(f"Load case failed: {count} rows / {dimension}D; see worker.log", flush=True)
                     else:
-                        if result["status"] == "failed":
-                            print(f"Load case failed: {count} rows / {dimension}D; see report.json", flush=True)
-                        else:
-                            print(
-                                f"Sustained load measured: {count} rows / {dimension}D; {result['queries']} queries",
-                                flush=True,
-                            )
+                        print(
+                            f"Sustained load measured: {count} rows / {dimension}D; {result['queries']} queries",
+                            flush=True,
+                        )
                     failed = failed or result["status"] == "failed"
                     report["cases"].append(result)
         report["status"] = "completed_with_failures" if failed else "completed"

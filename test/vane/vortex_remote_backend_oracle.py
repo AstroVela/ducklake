@@ -58,6 +58,11 @@ def inspect(image, before=None):
     requests = {r["id"]: r for r in image["requests"]}
     versions = {(r["key"], r["version"]): r for r in image["versions"]}
     intents = {r["unit"]: r for r in image["gc"]}
+    ordinary_open = any(r["kind"] == "sql" and not r["closed"] for r in image["readers"])
+    require(
+        not ordinary_open or not any(u["kind"] == "source" and u["state"] == "deleting" for u in units.values()),
+        "SQL_SOURCE_GC_OVERLAP",
+    )
     committed = [r for r in requests.values() if r["receipt"] is not None]
     require(state["revision"] == len(committed), "HEAD_RECEIPT_ATOMICITY")
     require(sorted(r["receipt"]["revision"] for r in committed) == list(range(1, len(committed) + 1)), "REVISION_CHAIN")

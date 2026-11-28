@@ -68,18 +68,15 @@ idx_t DuckLakeDeleteData::Filter(row_t start_row_index, idx_t count, SelectionVe
 	idx_t result_count = 0;
 	bool check_snapshots = snapshot_filter.IsValid() && !snapshot_ids.empty();
 	for (idx_t i = 0; i < count; i++) {
-		if (delete_idx < deleted_rows.size() && start_row_index + i == deleted_rows[delete_idx]) {
-			bool is_deleted = true;
-			if (check_snapshots) {
-				// only consider deletions where snapshot_id <= snapshot_filter
-				is_deleted = snapshot_ids[delete_idx] <= snapshot_filter.GetIndex();
-			}
+		bool is_deleted = false;
+		// External and inlined delete records can refer to the same position.
+		while (delete_idx < deleted_rows.size() && start_row_index + i == deleted_rows[delete_idx]) {
+			is_deleted = is_deleted || !check_snapshots || snapshot_ids[delete_idx] <= snapshot_filter.GetIndex();
 			delete_idx++;
-			if (is_deleted) {
-				continue;
-			}
 		}
-		result_sel.set_index(result_count++, i);
+		if (!is_deleted) {
+			result_sel.set_index(result_count++, i);
+		}
 	}
 	return result_count;
 }
@@ -88,8 +85,8 @@ bool DuckLakeDeleteData::HasEmbeddedSnapshots() const {
 	return !snapshot_ids.empty();
 }
 
-optional_idx DuckLakeDeleteData::GetSnapshotForRow(idx_t row_id) const {
-	auto it = scan_snapshot_map.find(row_id);
+optional_idx DuckLakeDeleteData::GetSnapshotForPosition(idx_t position) const {
+	auto it = scan_snapshot_map.find(position);
 	if (it != scan_snapshot_map.end()) {
 		return it->second;
 	}
@@ -110,15 +107,26 @@ idx_t DuckLakeDeleteFilter::Filter(row_t start_row_index, idx_t count, Selection
 }
 
 DeleteFileScanResult DuckLakeDeleteFilter::ScanDeletionVectorFile(ClientContext &context,
-                                                                  const DuckLakeFileData &delete_file) {
+                                                                  const DuckLakeFileData &delete_file,
+                                                                  optional_idx source_rows) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto file_handle = fs.OpenFile(delete_file.path, FileOpenFlags::FILE_FLAGS_READ);
 	auto file_size = file_handle->GetFileSize();
-
+	if (source_rows.IsValid() && (file_size < 0 || idx_t(file_size) != delete_file.file_size_bytes)) {
+		throw InvalidInputException("Compaction delete file size changed");
+	}
 	auto buffer = make_unsafe_uniq_array<data_t>(file_size);
 	file_handle->Read(buffer.get(), file_size);
 
 	auto dv_data = DuckLakeDeletionVectorData::FromBlob(buffer.get(), file_size);
+	if (source_rows.IsValid()) {
+		for (auto &entry : dv_data->bitmaps) {
+			auto &bitmap = entry.second;
+			if (!bitmap.isEmpty() && ((idx_t(entry.first) << 32) | bitmap.maximum()) >= source_rows.GetIndex()) {
+				throw InvalidInputException("Compaction delete position exceeds source rows");
+			}
+		}
+	}
 
 	DeleteFileScanResult result;
 	result.has_embedded_snapshots = false;
@@ -133,10 +141,18 @@ DeleteFileScanResult DuckLakeDeleteFilter::ScanDeletionVectorFile(ClientContext 
 
 DeleteFileScanResult DuckLakeDeleteFilter::ScanDeleteFile(ClientContext &context, const DuckLakeFileData &delete_file,
                                                           optional_idx snapshot_filter_min,
-                                                          optional_idx snapshot_filter_max) {
+                                                          optional_idx snapshot_filter_max, optional_idx source_rows) {
 	// Check if this is a puffin deletion vector file
 	if (delete_file.format == DeleteFileFormat::PUFFIN) {
-		return ScanDeletionVectorFile(context, delete_file);
+		return ScanDeletionVectorFile(context, delete_file, source_rows);
+	}
+	if (source_rows.IsValid()) {
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto handle = fs.OpenFile(delete_file.path, FileOpenFlags::FILE_FLAGS_READ);
+		auto size = handle->GetFileSize();
+		if (size < 0 || idx_t(size) != delete_file.file_size_bytes) {
+			throw InvalidInputException("Compaction delete file size changed");
+		}
 	}
 
 	// Set up custom MultiFileReader to avoid HEAD requests
@@ -220,6 +236,9 @@ DeleteFileScanResult DuckLakeDeleteFilter::ScanDeleteFile(ClientContext &context
 				    row_id, last_delete);
 			}
 
+			if (source_rows.IsValid() && idx_t(row_id) >= source_rows.GetIndex()) {
+				throw InvalidInputException("Compaction delete position exceeds source rows");
+			}
 			result.deleted_rows.push_back(row_id);
 			last_delete = row_id;
 
@@ -285,79 +304,47 @@ void DuckLakeDeleteFilter::Initialize(const DuckLakeInlinedDataDeletes &inlined_
 	delete_data->snapshot_ids = std::move(merged_snapshot_ids);
 }
 
-unordered_map<idx_t, idx_t> DuckLakeDeleteFilter::ScanDataFileRowIds(ClientContext &context,
-                                                                     const DuckLakeFileData &data_file,
-                                                                     const unordered_set<idx_t> &file_positions) {
-	unordered_map<idx_t, idx_t> result;
-	if (file_positions.empty()) {
-		return result;
-	}
-
-	ParquetFileScanner scanner(context, data_file);
-
-	// Find the _ducklake_internal_row_id column
-	auto row_id_col_idx = scanner.FindColumn("_ducklake_internal_row_id");
-	if (!row_id_col_idx.IsValid()) {
-		// If we don't have a _ducklake_internal_row_id, we can exit
-		return result;
-	}
-
-	DataChunk scan_chunk;
-	scan_chunk.Initialize(context, scanner.GetTypes());
-
-	idx_t current_file_position = 0;
-	while (scanner.Scan(scan_chunk)) {
-		idx_t count = scan_chunk.size();
-
-		// Access the row_id column at its correct position
-		UnifiedVectorFormat row_id_data;
-		scan_chunk.data[row_id_col_idx.GetIndex()].ToUnifiedFormat(count, row_id_data);
-		auto row_ids = UnifiedVectorFormat::GetData<int64_t>(row_id_data);
-
-		for (idx_t i = 0; i < count; i++) {
-			if (file_positions.count(current_file_position) > 0) {
-				auto row_id_idx = row_id_data.sel->get_index(i);
-				if (row_id_data.validity.RowIsValid(row_id_idx)) {
-					result[current_file_position] = NumericCast<idx_t>(row_ids[row_id_idx]);
-				}
-			}
-			current_file_position++;
+void DuckLakeDeleteFilter::InitializeVortexDeletionScan(ClientContext &context,
+                                                        const DuckLakeDeleteScanEntry &delete_scan) {
+	auto first_deletion = delete_scan.inlined_file_deletions;
+	auto record = [&](idx_t position, idx_t snapshot) {
+		auto entry = first_deletion.emplace(position, snapshot);
+		entry.first->second = MinValue(entry.first->second, snapshot);
+	};
+	for (auto &mask : delete_scan.vortex_masks) {
+		auto deletes =
+		    ScanDeleteFile(context, mask.file, optional_idx(), delete_scan.end_snapshot, delete_scan.row_count);
+		for (idx_t i = 0; i < deletes.deleted_rows.size(); i++) {
+			auto snapshot = deletes.has_embedded_snapshots ? deletes.snapshot_ids[i] : mask.begin_snapshot;
+			record(deletes.deleted_rows[i], snapshot);
 		}
 	}
-	return result;
-}
-
-void DuckLakeDeleteFilter::PopulateSnapshotMapFromPositions(
-    ClientContext &context, const DuckLakeFileData &data_file,
-    const unordered_map<idx_t, idx_t> &position_to_snapshot) const {
-	if (position_to_snapshot.empty()) {
-		return;
-	}
-	unordered_set<idx_t> positions;
-	for (auto &entry : position_to_snapshot) {
-		positions.insert(entry.first);
-	}
-	// Try to get row_ids from the data file
-	auto file_pos_to_row_id = ScanDataFileRowIds(context, data_file, positions);
-	if (!file_pos_to_row_id.empty()) {
-		// File has embedded row_ids, use row_id as key
-		delete_data->uses_row_id = true;
-		for (auto &entry : position_to_snapshot) {
-			auto it = file_pos_to_row_id.find(entry.first);
-			if (it != file_pos_to_row_id.end()) {
-				delete_data->scan_snapshot_map[it->second] = entry.second;
-			}
-		}
-	} else {
-		// No embedded row_ids, use file position as key
-		delete_data->uses_row_id = false;
-		for (auto &entry : position_to_snapshot) {
-			delete_data->scan_snapshot_map[entry.first] = entry.second;
+	if (delete_scan.vortex_drop_snapshot.IsValid()) {
+		for (idx_t position = 0; position < delete_scan.row_count; position++) {
+			record(position, delete_scan.vortex_drop_snapshot.GetIndex());
 		}
 	}
+	// Find each position's earliest delete before applying the requested snapshot range.
+	auto start_snapshot = delete_scan.start_snapshot.GetIndex();
+	auto end_snapshot = delete_scan.end_snapshot.GetIndex();
+	for (idx_t position = 0; position < delete_scan.row_count; position++) {
+		auto entry = first_deletion.find(position);
+		if (entry != first_deletion.end() && entry->second >= start_snapshot && entry->second <= end_snapshot) {
+			continue;
+		}
+		delete_data->deleted_rows.push_back(position);
+		if (entry != first_deletion.end()) {
+			first_deletion.erase(entry);
+		}
+	}
+	delete_data->scan_snapshot_map = std::move(first_deletion);
 }
 
 void DuckLakeDeleteFilter::Initialize(ClientContext &context, const DuckLakeDeleteScanEntry &delete_scan) {
+	if (delete_scan.file.data_format == DataFileFormat::VORTEX) {
+		InitializeVortexDeletionScan(context, delete_scan);
+		return;
+	}
 	// Scanning deletes - we need to scan the opposite (i.e. only the rows that were deleted)
 	// rows_to_scan[i] = true means row i was deleted and should be returned
 	auto rows_to_scan = make_unsafe_uniq_array<bool>(delete_scan.row_count);
@@ -406,10 +393,7 @@ void DuckLakeDeleteFilter::Initialize(ClientContext &context, const DuckLakeDele
 		}
 	}
 
-	// Scan data file to get row_id mappings for all positions
-	if (!all_position_to_snapshot.empty()) {
-		PopulateSnapshotMapFromPositions(context, delete_scan.file, all_position_to_snapshot);
-	}
+	delete_data->scan_snapshot_map = std::move(all_position_to_snapshot);
 
 	if (!delete_scan.previous_delete_file.path.empty() && !has_embedded_snapshots) {
 		// if we have a previous delete file - scan that set of deletes

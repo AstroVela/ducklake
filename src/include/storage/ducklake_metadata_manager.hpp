@@ -218,15 +218,15 @@ public:
 	                      DuckLakeSnapshot snapshot, DuckLakeFileSizeOptions options, bool include_undeleted = false);
 	virtual idx_t GetBeginSnapshotForTable(TableIndex table_id);
 	virtual idx_t GetBeginSnapshotForSchemaVersion(TableIndex table_id, idx_t schema_version);
-	virtual idx_t GetNetDataFileRowCount(TableIndex table_id, DuckLakeSnapshot snapshot);
+	virtual optional_idx GetExactDataFileRowCount(TableIndex table_id, DuckLakeSnapshot snapshot);
 	virtual idx_t GetNetInlinedRowCount(const string &inlined_table_name, DuckLakeSnapshot snapshot);
 	//! SQL builders for stats-refresh metadata lookups; caller substitutes placeholders + executes.
-	static string GetNetDataFileRowCountSql(TableIndex table_id, const string &inlined_deletion_table);
+	static string GetExactDataFileRowCountSql(TableIndex table_id, const string &inlined_deletion_table);
 	static string GetNetInlinedRowCountSql(const string &inlined_table_name);
 	static string GetTableColumnSchemaSql(TableIndex table_id);
 	static string GetInlinedTableNamesSql(TableIndex table_id);
 	virtual vector<DuckLakeFileForCleanup> GetOldFilesForCleanup(const string &filter);
-	bool HasFileReference(const string &path, const string &separator);
+	bool HasFileReference(const string &path, const string &separator, bool include_scheduled);
 	virtual vector<DuckLakeFileForCleanup> GetOrphanFilesForCleanup(const string &filter, const string &separator);
 	virtual vector<DuckLakeFileForCleanup> GetFilesForCleanup(const string &filter, CleanupType type,
 	                                                          const string &separator);
@@ -299,6 +299,15 @@ public:
 	static string LatestInlinedTableQuery(idx_t table_id);
 	static string DropDataFiles(const set<DataFileIndex> &dropped_files);
 	static string DropDeleteFiles(const set<DataFileIndex> &dropped_files);
+	static const char *VortexRetiredSourceTable() {
+		return "ducklake_vortex_retired_sources_v1";
+	}
+	static const char *VortexRewriteOutputTable() {
+		return "ducklake_vortex_rewrite_outputs_v1";
+	}
+	bool HasVortexFileMarkerTable(const char *marker_table);
+	//! SQL predicate for a physical rewrite marker on a file row aliased as data.
+	string VortexFileMarkerPredicate(const char *marker_table);
 	//! Caller supplies one resolved path per overwritten file, in the same order.
 	static string DeleteOverwrittenDeleteFiles(const vector<DuckLakeOverwrittenDeleteFile> &overwritten_files,
 	                                           const vector<DuckLakePath> &resolved_paths);
