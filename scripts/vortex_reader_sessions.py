@@ -1,11 +1,17 @@
 """Explicit PostgreSQL reader ownership; no TTL, reconnect or orphan adoption."""
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+import struct
 
 from psycopg.types.json import Jsonb
 
 from vortex_remote_backend import require, sha
 from vortex_postgres_metadata import canonical_uuid, integer
+
+
+def _operation_key(lifetime_key):
+    # PostgreSQL's two-integer advisory key space is separate from bigint lifetime keys.
+    return struct.unpack("!ii", lifetime_key.to_bytes(8, "big", signed=True))
 
 
 class ReaderSession:
@@ -65,29 +71,36 @@ class ReaderSession:
             "READER_DISCONNECTED",
         )
 
+    def require_active(self, c):
+        self.metadata.catalog(c)
+        row = c.execute("SELECT * FROM reader_sessions WHERE session_uuid=%s", (canonical_uuid(self.id),)).fetchone()
+        require(
+            row
+            and row["state"] == "active"
+            and row["fence"] == self.fence
+            and str(row["owner_uuid"]) == self.owner
+            and row["lock_key"] == self.key
+            and row["backend_pid"] == self.pid
+            and row["backend_start"] == self.started,
+            "READER_FENCED",
+        )
+        self.require_lock(c)
+
     @contextmanager
     def operation(self, backend, metadata):
         require(self.backend is backend and self.metadata is metadata, "READER_CATALOG_MISMATCH")
         with backend.transaction() as (c, state):
-            metadata.catalog(c)
-            row = c.execute(
-                "SELECT * FROM reader_sessions WHERE session_uuid=%s", (canonical_uuid(self.id),)
-            ).fetchone()
-            require(
-                row
-                and row["state"] == "active"
-                and row["fence"] == self.fence
-                and str(row["owner_uuid"]) == self.owner
-                and row["lock_key"] == self.key
-                and row["backend_pid"] == self.pid
-                and row["backend_start"] == self.started,
-                "READER_FENCED",
-            )
-            self.require_lock(c)
+            self.require_active(c)
             yield c, state
-            # A lost lifetime connection during a remote GET must not publish a copy.
-            # No reconnect is attempted if either PostgreSQL connection has died.
             self.require_lock(c)
+
+    @contextmanager
+    def serialized_operation(self, backend, metadata):
+        require(self.backend is backend and self.metadata is metadata, "READER_CATALOG_MISMATCH")
+        with closing(backend.connect()) as c:
+            # Keep the session operation ordered through local completion and disconnect.
+            c.execute("SELECT pg_advisory_lock(%s::integer,%s::integer)", _operation_key(self.key))
+            yield c
 
     def view(self, c, reader):
         require(
@@ -133,9 +146,17 @@ class ReaderReclaimer:
         return row
 
     def begin(self, session_uuid, original, token, budget):
-        with self.backend.transaction(token) as (c, _):
+        token = integer(token, 1, 2**63 - 1, "BAD_OWNER")
+        with closing(self.backend.connect()) as c, self.backend._transaction(c):
+            self.backend._control(c, token, lock=False)
+            self.metadata.catalog(c)
+            key = self.target(c, session_uuid, original)["lock_key"]
+            # Wait for this reader without holding the catalog-wide control row.
+            c.execute("SELECT pg_advisory_xact_lock(%s::integer,%s::integer)", _operation_key(key))
+            self.backend._control(c, token)
             self.metadata.catalog(c)
             row = self.target(c, session_uuid, original)
+            require(row["lock_key"] == key, "READER_SESSION_CHANGED")
             if row["intent"] is not None:
                 return row["intent"]
             require(row["state"] == "active" and row["fence"] == original, "READER_SESSION_CLOSED")
@@ -157,7 +178,7 @@ class ReaderReclaimer:
         return intent
 
     def view(self, session_uuid, original, reader, token, budget):
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
             self.metadata.catalog(c)
             row = self.target(c, session_uuid, original)
             require(row["intent"] is not None and row["fence"] == original + 1, "NO_READER_RECLAIM_INTENT")
@@ -199,7 +220,7 @@ class ReaderReclaimer:
         return receipt
 
     def finish(self, session_uuid, original, token, budget):
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
             self.metadata.catalog(c)
             row = self.target(c, session_uuid, original)
             require(row["intent"] is not None and row["fence"] == original + 1, "NO_READER_RECLAIM_INTENT")

@@ -240,6 +240,51 @@ def scenarios(report):
 
     recorded(report, "native-retention-independent-of-named-generation-and-global-SQL-gate", native_independent)
 
+    def source_gc_transaction_gate(h):
+        h.publish("a", 1, 1, "source-b")
+        h.command("expire_native", "source-a", 1)
+        h.command("gc_round", "g", 1, 1, 1024)
+        h.command("capture", "already-open", "sql", "source-b")
+        h.command("plan_gc", "source-a", 1, "g", rejection="ORDINARY_TRANSACTION")
+        h.command("close", "already-open")
+
+        h.command("plan_gc", "source-a", 1, "g")
+        h.command("capture", "after-admission", "sql", "source-b", rejection="SOURCE_GC_ACTIVE")
+        stop = h.command("stop", "source-a", "source-a", 1, "g")
+        h.command("deliver", stop, False)
+        h.command("stop", "source-a", "source-a", 1, "g")
+        version = h.model.m["gc"]["source-a"]["targets"]["source-a"]
+        require(version is not None, "Source GC lost its exact target")
+        h.command("finish_gc", "source-a", 1, "g", rejection="PAYLOAD_REMAINS")
+        delete = h.command("delete_payload", "source-a", "source-a", 1, "g")
+        h.command("duplicate", delete, "late-source-delete")
+        h.command("capture", "after-delete-issued", "sql", "source-b", rejection="SOURCE_GC_ACTIVE")
+
+        h.command("crash", 1)
+        image = h.model.fingerprint()
+        h.model = P.Protocol.restore(json.loads(image))
+        require(h.model.fingerprint() == image, "Restore implicitly resumed source GC")
+        h.command("capture", "after-restore", "sql", "source-b", rejection="SOURCE_GC_ACTIVE")
+        h.command("takeover", 1)
+        h.command("capture", "after-takeover", "sql", "source-b", rejection="SOURCE_GC_ACTIVE")
+        h.command("finish_gc", "source-a", 1, "g", rejection="FENCED")
+        h.command("gc_round", "resume", 2, 1, 1024)
+        h.command("plan_gc", "source-a", 2, "resume")
+        h.command("deliver", delete, False)
+        h.command("capture", "before-finish", "sql", "source-b", rejection="SOURCE_GC_ACTIVE")
+        receipt = h.command("finish_gc", "source-a", 2, "resume")
+        require(receipt == {"objects": 1, "bytes": 1024}, "Source recovery changed its charge")
+        require(h.model.version("source-a", version) is None, "Completed source target still exists")
+
+        h.command("capture", "after-finish", "sql", "source-b")
+        raw = P.compact(h.model.store)
+        h.command("deliver", "late-source-delete", False)
+        require(P.compact(h.model.store) == raw, "Replayed source DELETE changed objects after completion")
+        h.command("close", "after-finish")
+        require(h.command("finish_gc", "source-a", 2, "resume") == receipt, "Source GC replay changed its receipt")
+
+    recorded(report, "source-gc-excludes-ordinary-transactions-through-recovery", source_gc_transaction_gate)
+
     def late_put(h):
         h.command("prepare", "a", 1, 1, "source-b")
         h.command("upload", "a", "index", 1)
@@ -488,7 +533,7 @@ def mutation_cases(report):
     def stage_commands(name="a", token=1):
         return [("begin", name, token)] + [("stage", name, p, token) for p in ("head", "refs", "receipt")]
 
-    def replay(mutant, commands):
+    def replay(mutant, commands, expected_violation=None):
         model = P.Protocol(mutant)
         trace = []
         violation = None
@@ -514,6 +559,8 @@ def mutation_cases(report):
                 violation = str(error)
                 break
         require(violation is not None, "Unsafe variant escaped the independent oracle: " + mutant)
+        if expected_violation is not None:
+            require(violation == expected_violation, f"{mutant} failed at the wrong invariant: {violation}")
         report["counterexamples"].append({"mutant": mutant, "violation": violation, "trace": trace})
 
     ready, staged = ready_commands(), stage_commands()
@@ -553,6 +600,24 @@ def mutation_cases(report):
         ready + staged + [("commit", "a", 1), ("capture", "sql", "sql", "source-b"), ("expire_native", "source-a", 1)],
     )
     replay(
+        "allow_sql_during_source_gc",
+        ready
+        + staged
+        + [
+            ("commit", "a", 1),
+            ("expire_native", "source-a", 1),
+            ("gc_round", "g", 1),
+            ("plan_gc", "source-a", 1, "g"),
+            ("capture", "sql", "sql", "source-b"),
+        ],
+        "SQL_SOURCE_GC_OVERLAP",
+    )
+    replay(
+        "omit_receipt_on_lost_ack",
+        ready + [("takeover", 1), ("adopt", "a", 2)] + stage_commands(token=2) + [("commit", "a", 2, False)],
+        "ATOMIC_PUBLICATION_RECEIPT",
+    )
+    replay(
         "reconcile_returns_head",
         ready + staged + [("commit", "a", 1), ("reconcile", "seed", P.digest("seed:source-a"))],
     )
@@ -564,6 +629,7 @@ def mutation_cases(report):
         "sweep_foreign_keys",
         "unconditional_put",
         "stop_is_delete_marker",
+        "omit_gc_payload_target",
     ):
         h = Harness(mutant)
         try:
@@ -587,6 +653,11 @@ def mutation_cases(report):
                 h.collect("generation:a", 1, "g")
                 h.command("deliver", "late-copy", False)
         except O.Violation as error:
+            if mutant == "omit_gc_payload_target":
+                require(
+                    str(error) == "LATE_UPLOAD_RESURRECTION" and h.trace[-1]["command"][0] == "finish_gc",
+                    "Omitted target did not leave a payload at GC completion",
+                )
             report["counterexamples"].append({"mutant": mutant, "violation": str(error), "trace": h.trace})
         else:
             raise AssertionError("Unsafe variant escaped the independent oracle: " + mutant)

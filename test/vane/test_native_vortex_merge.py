@@ -81,6 +81,22 @@ def exercise(proof, native, root, checks, workers):
     )
     core, rows = qualify(native, "three-B", recalls, 3)
     require(core["diagnostics"]["routes"]["scan_files"] and core["diagnostics"]["routes"]["inline_rows"], "Missing F/T")
+    phase_checks = []
+    for phase in ["ann_us", "rerank_us"]:
+        observed = native.call("timed-core-search", phase, 3)
+        timed = json.loads(observed["query_json"])
+        measured = timed["diagnostics"]["cost"]["phases_us"][phase]
+        require(
+            observed["ann_calls"] == 3 and observed["observed_delay_us"] > 0,
+            "Timing fixture did not visit three ANN segments",
+        )
+        require(measured >= observed["observed_delay_us"], f"{phase} omitted work from a ready segment")
+        require(timed["rows"] == core["rows"], "Three-segment timing changed query results")
+        recalls.append(SEARCH.qualify(timed, rows, VECTOR))
+        phase_checks.append(
+            {"phase": phase, "observed_delay_us": observed["observed_delay_us"], "reported_us": measured}
+        )
+    checks.append("three-segment ANN/rerank timing accumulates observed delays without stable-load speed assertions")
     native.call("append", "knn", merged / "fourth.json", 3, expected="segment count budget exceeded")
     native.call("merge", merged / "missing.json", 3, "missing", chosen[0], expected="no longer ready")
     native.call("merge", merged / "duplicate.json", 3, chosen[0], chosen[0], expected="two distinct ready generations")
@@ -178,6 +194,7 @@ def exercise(proof, native, root, checks, workers):
         "fixture_recalls": recalls,
         "final_revision": 7,
         "selected_rows": 256,
+        "phase_checks": phase_checks,
         "unchanged_generation": generation(first),
     }
 
@@ -288,6 +305,75 @@ def background(driver, root, checks):
             "durable smallest-pair tasks precede append at the three-slot limit; four cycles preserve B1, F/T visibility and write quotas through cancellation"
         )
         return {"fixture_recalls": recalls, "final_revision": 11, "run_count": final["run_count"]}
+    finally:
+        stop(native)
+
+
+def completion_cancel(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, _, first, frozen, _ = setup(native, root)
+        native.call("optimizer-init")
+        native.call("optimizer-enable", artifacts, 100000, 4194304, 128, 67108864, "optimizer_merged", "pause")
+        SEG.add_f(native, 7000)
+        native.call("optimizer-wait")
+        finished = OPT.status(native)
+        require(
+            finished["state"] == "published"
+            and finished["task_kind"] == "merge"
+            and finished["published_revision"] == 4
+            and not finished["running"],
+            "Merge completion callback preceded terminal state persistence",
+        )
+        published = native.call("head", "knn")
+        require(
+            native.call("owners")["database_references"] == 3,
+            "Completed merge callback is not holding its worker database pin",
+        )
+        native.call("optimizer-cancel")
+        cancelled = OPT.status(native)
+        require(
+            cancelled["state"] == "cancelled" and not cancelled["enabled"] and not cancelled["error"],
+            "Cancellation did not persist its terminal state",
+        )
+        native.call("optimizer-release")
+        deadline = time.monotonic() + 5
+        while True:
+            owner = native.call("owners")
+            if owner["database_references"] == 2 and len(owner["connections"]) == 1:
+                break
+            require(time.monotonic() < deadline, f"Completed merge retained its worker pin: {owner}")
+            time.sleep(0.01)
+        after = OPT.status(native)
+        require(
+            after["state"] == "cancelled"
+            and not after["enabled"]
+            and not after["error"]
+            and not after["running"]
+            and after["run_count"] == finished["run_count"],
+            "Completed merge callback overwrote the caller's cancelled state",
+        )
+        require(native.call("head", "knn") == published, "Completed cancellation changed the committed merge")
+        SEG.unchanged(native, first, frozen)
+        native.call("reopen")
+        durable = OPT.status(native)
+        require(
+            durable["state"] == "cancelled" and not durable["enabled"] and not durable["error"],
+            "Reopen lost completed merge cancellation",
+        )
+        require(native.call("head", "knn") == published, "Reopen replaced the committed merge")
+        recalls = []
+        qualify(native, "completed-cancel", recalls, 2)
+        native.finish()
+        checks.append(
+            "completed merge cancellation survives callback return, worker-pin release and reopen without rewriting the committed head"
+        )
+        return {
+            "state_after_worker_release": after["state"],
+            "revision": published["revision"],
+            "worker_database_references": [3, 2],
+            "fixture_recalls": recalls,
+        }
     finally:
         stop(native)
 
@@ -455,6 +541,7 @@ def main():
             ("background", background),
             ("failure", failure),
             ("global-rows", global_rows),
+            ("completion-cancel", completion_cancel),
         ]:
             directory = root / name
             directory.mkdir()

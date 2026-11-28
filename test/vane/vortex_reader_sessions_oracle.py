@@ -31,7 +31,7 @@ def observe(backend, services, bound_oracle, storage_oracle, typed_oracle):
     return json.loads(encode(raw)), typed, expected, json.loads(encode(locks))
 
 
-def inspect(raw, copies, locks, before=None, previous_copies=None):
+def inspect(raw, copies, before=None):
     sessions = {s["session_uuid"]: s for s in raw["reader_sessions"]}
     links = {v["reader"]: v for v in raw["reader_session_views"]}
     reclaims = {r["reader"]: r for r in raw["reader_reclaims"]}
@@ -73,6 +73,8 @@ def inspect(raw, copies, locks, before=None, previous_copies=None):
             )
     for reader, link in links.items():
         require(link["session_uuid"] in sessions and link["session_fence"] == 1, "Wrong session-view lineage")
+        accepted = link["accepted_materializations"]
+        require(type(accepted) is int and accepted >= 0, "Invalid durable copy acceptance count")
         pins = sorted(r["unit"] for r in raw["refs"] if r["kind"] == "reader" and r["holder"] == reader)
         session = sessions[link["session_uuid"]]
         if reader in reclaims:
@@ -104,22 +106,12 @@ def inspect(raw, copies, locks, before=None, previous_copies=None):
                 copy["session_uuid"] == link["session_uuid"] and copy["session_fence"] == 1,
                 "Private copy crossed session",
             )
-            if previous_copies is not None and reader not in previous_copies:
-                bits = session["lock_key"] & (2**64 - 1)
-                require(
-                    session["state"] == "active"
-                    and any(
-                        l["pid"] == session["backend_pid"]
-                        and l["backend_start"] == session["backend_start"]
-                        and l["high"] == bits >> 32
-                        and l["low"] == bits & (2**32 - 1)
-                        for l in locks
-                    ),
-                    "A disconnected/fenced session published a new copy",
-                )
+            receipt = copy.get("acceptance")
+            require(type(receipt) is int and 0 < receipt <= accepted, "A private copy has no durable acceptance")
     if before is not None:
         old_sessions = {s["session_uuid"]: s for s in before["reader_sessions"]}
         old_links = {v["reader"]: v for v in before["reader_session_views"]}
+        old_readers = {r["id"]: r for r in before["readers"]}
         for sid, old in old_sessions.items():
             current = sessions[sid]
             require(
@@ -139,7 +131,20 @@ def inspect(raw, copies, locks, before=None, previous_copies=None):
                 require(old["intent"] == current["intent"], "Original reclaim intent changed")
             if old["receipt"] is not None:
                 require(old["receipt"] == current["receipt"], "Original session receipt changed")
-        require(all(links[k] == v for k, v in old_links.items()), "View was transferred to another session")
+        for reader, old in old_links.items():
+            link = links.get(reader)
+            require(
+                link is not None and all(link[k] == old[k] for k in ("session_uuid", "session_fence")),
+                "View was transferred to another session",
+            )
+            require(
+                link["accepted_materializations"] >= old["accepted_materializations"], "Copy acceptance regressed"
+            )
+            if link["accepted_materializations"] > old["accepted_materializations"]:
+                require(
+                    old_sessions[old["session_uuid"]]["state"] == "active" and not old_readers[reader]["closed"],
+                    "A fenced session or closed view accepted a new copy",
+                )
         for reader in set(links) - set(old_links):
             sid = links[reader]["session_uuid"]
             require(

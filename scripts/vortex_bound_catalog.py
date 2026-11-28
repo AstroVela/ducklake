@@ -9,6 +9,7 @@ from decimal import Decimal
 import hashlib
 import re
 import struct
+from threading import Lock
 
 from psycopg.types.json import Jsonb
 
@@ -21,6 +22,7 @@ class BoundCatalog:
     def __init__(self, backend, metadata):
         require(metadata.backend is backend, "METADATA_CATALOG_MISMATCH")
         self.backend, self.metadata, self.copies = backend, metadata, {}
+        self._copies_lock = Lock()
 
     @staticmethod
     def label(value):
@@ -134,7 +136,7 @@ class BoundCatalog:
         self.label(source_id)
         require(0 < len(data) <= LIMITS["source"], "SOURCE_BUDGET")
         unit = f"source:{table_uuid}:{source_id}"
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
             table = self.target(c, name, table_uuid, schema_hash)
             identity, _ = self.snapshot(c, table, snapshot)
             require(len(identity["row_ids"]) * identity["dimension"] * 4 <= LIMITS["vector"], "ROW_VECTOR_BUDGET")
@@ -152,51 +154,53 @@ class BoundCatalog:
         return unit
 
     def source_ticket(self, name, table_uuid, schema_hash, unit, data, token):
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
             self.target(c, name, table_uuid, schema_hash)
-            binding = self.unit(c, unit, table_uuid)
-            require(binding["kind"] == "source" and binding["state"] == "allocated", "SOURCE_CLOSED")
-            obj = self.backend.files(c, unit)[0]
-            self.backend.identity(obj, {"sha": sha(data), "size": len(data)})
-            return self.backend.objects.ticket(obj["key"], data=data, condition="*")
+            self.unit(c, unit, table_uuid)
+            return self.backend._source_ticket(c, unit, data)
 
     def seal_source(self, name, table_uuid, schema_hash, unit, token):
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
+            self.target(c, name, table_uuid, schema_hash)
+            self.unit(c, unit, table_uuid)
+            self.backend._seal_source(c, unit)
+
+    def abandon_source(self, name, table_uuid, schema_hash, unit, token):
+        with self.metadata._write_transaction(token) as (c, _):
             self.target(c, name, table_uuid, schema_hash)
             binding = self.unit(c, unit, table_uuid)
             require(binding["kind"] == "source" and binding["state"] == "allocated", "SOURCE_CLOSED")
-            obj = self.backend.files(c, unit)[0]
-            raw = self.backend.objects.read(obj["key"])
-            self.backend.identity(obj, raw)
-            c.execute(
-                "UPDATE objects SET sealed=true,version=%s,etag=%s WHERE key=%s",
-                (raw["version"], raw["etag"], obj["key"]),
-            )
-            c.execute("UPDATE units SET state='ready' WHERE id=%s", (unit,))
-            c.execute("DELETE FROM refs WHERE kind='build' AND holder=%s", (unit,))
-            c.execute("INSERT INTO refs VALUES('native',%s,%s)", (unit, unit))
+            # Retirement still waits for explicit, budgeted GC of the allocated unit.
+            c.execute("DELETE FROM refs WHERE kind='build' AND holder=%s AND unit=%s", (unit, unit))
 
     def prepare(self, name, table_uuid, schema_hash, epoch, request_id, source, data, expected, token):
         key = self.request_key(table_uuid, epoch, request_id)
         require(0 < len(data) <= LIMITS["artifact"], "ARTIFACT_BUDGET")
-        with self.backend.transaction(token) as (c, _):
+        integer(expected, 0, 2**63 - 1, "BAD_REVISION")
+        with self.metadata._write_transaction(token) as (c, _):
             table = self.target(c, name, table_uuid, schema_hash, epoch)
+            old = c.execute("SELECT * FROM requests WHERE id=%s", (key,)).fetchone()
+            if old is not None:
+                require(old["source"] == source and old["expected"] == expected, "PAYLOAD_MISMATCH")
             binding = self.unit(c, source, table_uuid)
+            require(binding["kind"] == "source", "INPUT_SNAPSHOT_CHANGED")
+            source_file = c.execute(
+                "SELECT key,version,size,sha FROM objects WHERE unit=%s AND role='source' AND sealed", (source,)
+            ).fetchone()
+            require(source_file and source_file["version"] not in (None, "null"), "INPUT_SNAPSHOT_CHANGED")
+            index_sha = sha(data)
+            digest_input = [key, binding["identity"], {"unit": source, **source_file}, index_sha, len(data), expected]
+            payload_hash = sha(canonical(digest_input).encode())
+            # GC preserves the sealed object's metadata, which still identifies an exact replay.
+            if old is not None:
+                require(old["payload_hash"] == payload_hash, "PAYLOAD_MISMATCH")
+                return old
             require(
-                binding["kind"] == "source"
-                and binding["state"] == "ready"
+                binding["state"] == "ready"
                 and c.execute("SELECT 1 FROM refs WHERE kind='native' AND unit=%s", (source,)).fetchone(),
                 "INPUT_SNAPSHOT_CHANGED",
             )
             require(65 <= len(binding["identity"]["row_ids"]) <= LIMITS["rows"], "ROW_VECTOR_BUDGET")
-            payload_hash = sha(canonical([key, binding["identity"], sha(data), len(data), expected]).encode())
-            old = c.execute("SELECT * FROM requests WHERE id=%s", (key,)).fetchone()
-            if old is not None:
-                require(
-                    old["payload_hash"] == payload_hash and old["source"] == source and old["expected"] == expected,
-                    "PAYLOAD_MISMATCH",
-                )
-                return old
             head = c.execute("SELECT * FROM bound_heads WHERE table_uuid=%s", (table["table_uuid"],)).fetchone()
             require(head["revision"] == expected, "REVISION_CONFLICT")
             unit = "generation:" + key
@@ -207,7 +211,7 @@ class BoundCatalog:
             )
             c.execute(
                 "INSERT INTO objects(key,unit,role,size,sha) VALUES(%s,%s,'index',%s,%s),(%s,%s,'manifest',0,NULL)",
-                (prefix + "index", unit, len(data), sha(data), prefix + "manifest", unit),
+                (prefix + "index", unit, len(data), index_sha, prefix + "manifest", unit),
             )
             self.insert_binding(c, unit, binding["identity"])
             c.execute(
@@ -223,7 +227,8 @@ class BoundCatalog:
 
     def status(self, table_uuid, epoch, request_id):
         key = self.request_key(table_uuid, epoch, request_id)
-        with self.backend.connect() as c:
+        with self.backend.transaction() as (c, _):
+            self.metadata.catalog(c)
             require(
                 c.execute("SELECT 1 FROM bound_requests WHERE request=%s", (key,)).fetchone(), "UNKNOWN_BOUND_REQUEST"
             )
@@ -245,7 +250,7 @@ class BoundCatalog:
         return req
 
     def adopt(self, name, table_uuid, schema_hash, epoch, request_id, token):
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
             self.target(c, name, table_uuid, schema_hash, epoch)
             key = self.request_key(table_uuid, epoch, request_id)
             require(
@@ -263,7 +268,7 @@ class BoundCatalog:
 
     def payload_ticket(self, name, table_uuid, schema_hash, epoch, request_id, role, data, token):
         require(role in ("index", "manifest"), "BAD_ROLE")
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
             req = self.request(c, name, table_uuid, schema_hash, epoch, request_id, token)
             obj = next(o for o in self.backend.files(c, "generation:" + req["id"]) if o["role"] == role)
             require(obj["sha"] is not None and not obj["sealed"], "NOT_UPLOADABLE")
@@ -272,7 +277,7 @@ class BoundCatalog:
 
     def seal(self, name, table_uuid, schema_hash, epoch, request_id, role, token):
         require(role in ("index", "manifest"), "BAD_ROLE")
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
             req = self.request(c, name, table_uuid, schema_hash, epoch, request_id, token)
             obj = next(o for o in self.backend.files(c, "generation:" + req["id"]) if o["role"] == role)
             require(obj["sha"] is not None, "NOT_UPLOADABLE")
@@ -285,7 +290,7 @@ class BoundCatalog:
             )
 
     def manifest(self, name, table_uuid, schema_hash, epoch, request_id, token):
-        with self.backend.transaction(token) as (c, state):
+        with self.metadata._write_transaction(token) as (c, state):
             req = self.request(c, name, table_uuid, schema_hash, epoch, request_id, token)
             binding = self.unit(c, req["source"], table_uuid)["identity"]
             source = self.backend.files(c, req["source"])[0]
@@ -315,7 +320,7 @@ class BoundCatalog:
         return body.encode()
 
     def publish(self, name, table_uuid, schema_hash, epoch, request_id, token):
-        with self.backend.transaction(token) as (c, state):
+        with self.metadata._write_transaction(token) as (c, state):
             table = self.target(c, name, table_uuid, schema_hash, epoch)
             key = self.request_key(table_uuid, epoch, request_id)
             old = self.backend.request(c, key)
@@ -372,7 +377,8 @@ class BoundCatalog:
 
     def cancel(self, table_uuid, epoch, request_id, token):
         key = self.request_key(table_uuid, epoch, request_id)
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
+            self.metadata.catalog(c)
             require(
                 c.execute(
                     "SELECT 1 FROM bound_requests WHERE request=%s AND table_uuid=%s", (key, canonical_uuid(table_uuid))
@@ -388,30 +394,34 @@ class BoundCatalog:
         return ReaderSession.open(self.backend, self.metadata, session_uuid, owner_uuid)
 
     def close_session(self, session):
-        try:
-            with session.operation(self.backend, self.metadata) as (c, _):
-                require(
-                    not c.execute(
-                        "SELECT 1 FROM reader_session_views b JOIN readers r ON r.id=b.reader WHERE b.session_uuid=%s AND NOT r.closed",
-                        (canonical_uuid(session.id),),
-                    ).fetchone(),
-                    "READER_VIEWS_REMAIN",
-                )
-                receipt = {
-                    "session_uuid": session.id,
-                    "owner_uuid": session.owner,
-                    "original_fence": session.fence,
-                    "fence": session.fence + 1,
-                    "closed": True,
-                }
-                c.execute(
-                    "UPDATE reader_sessions SET fence=fence+1,state='closed',receipt=%s WHERE session_uuid=%s",
-                    (Jsonb(receipt), canonical_uuid(session.id)),
-                )
-        except CommitUnknown:
+        with session.serialized_operation(self.backend, self.metadata) as c:
+            try:
+                with self.backend._transaction(c):
+                    self.backend._control(c)
+                    session.require_active(c)
+                    require(
+                        not c.execute(
+                            "SELECT 1 FROM reader_session_views b JOIN readers r ON r.id=b.reader WHERE b.session_uuid=%s AND NOT r.closed",
+                            (canonical_uuid(session.id),),
+                        ).fetchone(),
+                        "READER_VIEWS_REMAIN",
+                    )
+                    receipt = {
+                        "session_uuid": session.id,
+                        "owner_uuid": session.owner,
+                        "original_fence": session.fence,
+                        "fence": session.fence + 1,
+                        "closed": True,
+                    }
+                    c.execute(
+                        "UPDATE reader_sessions SET fence=fence+1,state='closed',receipt=%s WHERE session_uuid=%s",
+                        (Jsonb(receipt), canonical_uuid(session.id)),
+                    )
+                    session.require_lock(c)
+            except CommitUnknown:
+                session.disconnect()
+                raise
             session.disconnect()
-            raise
-        session.disconnect()
         return receipt
 
     def capture(self, session, name, table_uuid, schema_hash, reader_id, kind="vector", source=None):
@@ -432,6 +442,7 @@ class BoundCatalog:
                     "EXPIRED_NATIVE_HISTORY",
                 )
                 source_identity = self.unit(c, source, table_uuid)["identity"]
+                self.backend._require_source_gc_idle(c)
                 units = [source]
             for unit in units:
                 bound = self.unit(c, unit, table_uuid)
@@ -453,24 +464,51 @@ class BoundCatalog:
                 (reader_id, table["table_uuid"], query["snapshot_id"], Jsonb(identity)),
             )
             c.execute(
-                "INSERT INTO reader_session_views VALUES(%s,%s,%s)",
+                "INSERT INTO reader_session_views(reader,session_uuid,session_fence) VALUES(%s,%s,%s)",
                 (reader_id, canonical_uuid(session.id), session.fence),
             )
         return identity
 
-    def materialize(self, session, reader_id):
-        with session.operation(self.backend, self.metadata) as (c, _):
-            session.view(c, reader_id)
-            view = c.execute(
-                "SELECT r.*,b.identity,b.table_uuid,b.snapshot_id FROM readers r JOIN bound_readers b ON b.reader=r.id WHERE r.id=%s AND NOT r.closed",
-                (reader_id,),
+    def _materialization_view(self, c, session, reader_id):
+        self.backend._control(c)
+        session.require_active(c)
+        session.view(c, reader_id)
+        view = c.execute(
+            "SELECT r.*,b.identity,b.table_uuid,b.snapshot_id FROM readers r JOIN bound_readers b ON b.reader=r.id WHERE r.id=%s AND NOT r.closed",
+            (reader_id,),
+        ).fetchone()
+        require(view is not None, "VIEW_CLOSED")
+        refs = c.execute("SELECT unit FROM refs WHERE kind='reader' AND holder=%s", (reader_id,)).fetchall()
+        require({r["unit"] for r in refs} == set(view["units"]), "VIEW_NOT_PINNED")
+        return view
+
+    def _accept_materialization(self, c, session, reader_id, view):
+        with self.backend._transaction(c):
+            require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
+            accepted = c.execute(
+                """UPDATE reader_session_views SET accepted_materializations=accepted_materializations+1
+                WHERE reader=%s AND session_uuid=%s AND session_fence=%s RETURNING accepted_materializations""",
+                (reader_id, canonical_uuid(session.id), session.fence),
             ).fetchone()
-            require(view is not None, "VIEW_CLOSED")
-            refs = c.execute("SELECT unit FROM refs WHERE kind='reader' AND holder=%s", (reader_id,)).fetchall()
-            require({r["unit"] for r in refs} == set(view["units"]), "VIEW_NOT_PINNED")
-            table = c.execute("SELECT * FROM typed_tables WHERE table_uuid=%s", (view["table_uuid"],)).fetchone()
-            query, rows = self.snapshot(c, table, view["snapshot_id"])
-            require(query == view["identity"]["query"], "READVIEW_BINDING_CHANGED")
+            require(accepted is not None, "READER_VIEW_OWNER_MISMATCH")
+        return accepted["accepted_materializations"]
+
+    def materialize(self, session, reader_id):
+        with session.serialized_operation(self.backend, self.metadata) as c:
+            # This snapshot is read-only. Roll back its row lock before any S3 request.
+            with self.backend._transaction(c, rollback=True):
+                view = self._materialization_view(c, session, reader_id)
+                table = c.execute("SELECT * FROM typed_tables WHERE table_uuid=%s", (view["table_uuid"],)).fetchone()
+                query, rows = self.snapshot(c, table, view["snapshot_id"])
+                require(query == view["identity"]["query"], "READVIEW_BINDING_CHANGED")
+                files = []
+                for unit in view["units"]:
+                    self.unit(c, unit, str(view["table_uuid"]))
+                    files.extend(self.backend.files(c, unit))
+                require(
+                    all(obj["sealed"] and obj["version"] not in (None, "null") for obj in files), "UNSEALED_READVIEW"
+                )
+
             result = {
                 "session_uuid": session.id,
                 "session_fence": session.fence,
@@ -478,19 +516,26 @@ class BoundCatalog:
                 "rows": rows,
                 "objects": {},
             }
-            for unit in view["units"]:
-                self.unit(c, unit, str(view["table_uuid"]))
-                for obj in self.backend.files(c, unit):
-                    session.require_lock(c)
-                    raw = self.backend.objects.read(obj["key"], obj["version"])
-                    session.require_lock(c)
-                    self.backend.identity(obj, raw)
-                    result["objects"][obj["key"]] = raw["data"]
-        self.copies[reader_id] = result
+            for obj in files:
+                # Authorize just this version while the fence and its pins are serialized.
+                with self.backend._transaction(c, rollback=True):
+                    require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
+                raw = self.backend.objects.read_exact_once(obj["key"], obj["version"])
+                session.require_lock(c)
+                self.backend.identity(obj, raw)
+                require(raw["version"] == obj["version"], "IDENTITY_MISMATCH")
+                result["objects"][obj["key"]] = raw["data"]
+
+            with self._copies_lock:
+                with self.backend._transaction(c):
+                    require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
+                # A peer may have removed pins while the COMMIT acknowledgement was in transit.
+                result["acceptance"] = self._accept_materialization(c, session, reader_id, view)
+                self.copies[reader_id] = result
         return result
 
     def release_copy_pin(self, session, reader_id):
-        with session.operation(self.backend, self.metadata) as (c, _):
+        with self._copies_lock, session.operation(self.backend, self.metadata) as (c, _):
             session.view(c, reader_id)
             require(
                 reader_id in self.copies
@@ -508,18 +553,15 @@ class BoundCatalog:
             c.execute("DELETE FROM refs WHERE kind='reader' AND holder=%s", (reader_id,))
 
     def close_view(self, session, reader_id):
-        with session.operation(self.backend, self.metadata) as (c, _):
-            session.view(c, reader_id)
-            require(
-                c.execute("SELECT 1 FROM bound_readers WHERE reader=%s", (reader_id,)).fetchone(),
-                "UNKNOWN_BOUND_READER",
-            )
-            c.execute("UPDATE readers SET closed=true WHERE id=%s", (reader_id,))
-            c.execute("DELETE FROM refs WHERE kind='reader' AND holder=%s", (reader_id,))
-        self.copies.pop(reader_id, None)
+        with self._copies_lock:
+            with session.operation(self.backend, self.metadata) as (c, _):
+                session.view(c, reader_id)
+                c.execute("UPDATE readers SET closed=true WHERE id=%s", (reader_id,))
+                c.execute("DELETE FROM refs WHERE kind='reader' AND holder=%s", (reader_id,))
+            self.copies.pop(reader_id, None)
 
     def validate_gc(self, table_uuid, unit, token):
-        with self.backend.transaction(token) as (c, _):
+        with self.metadata._write_transaction(token) as (c, _):
             self.unit(c, unit, table_uuid)
 
     def expire_native(self, table_uuid, source, token):

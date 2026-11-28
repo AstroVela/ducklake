@@ -63,8 +63,25 @@ def text(value):
         raise MetadataError("BAD_UTF8") from None
 
 
+def round_integer_to_float32(value):
+    precision = value.bit_length()
+    require(precision <= 128, "FLOAT_RANGE")
+    shift = precision - 24
+    if shift <= 0:
+        return value
+    significand, remainder = divmod(abs(value), 1 << shift)
+    halfway = 1 << (shift - 1)
+    if remainder > halfway or (remainder == halfway and significand % 2):
+        significand += 1
+    rounded = significand << shift
+    return -rounded if value < 0 else rounded
+
+
 def floating(value, width):
     require(type(value) in (int, float), "BAD_FLOAT")
+    if width == 4 and type(value) is int:
+        # Round at binary32 precision before converting to an exact Python float.
+        value = round_integer_to_float32(value)
     try:
         value = float(value)
         require(math.isfinite(value), "NONFINITE_FLOAT")
@@ -114,9 +131,9 @@ def encoded_row(row):
 
 
 DDL = f"""
-CREATE TABLE typed_catalog(singleton boolean PRIMARY KEY CHECK(singleton),layout integer NOT NULL CHECK(layout=3),
+CREATE TABLE typed_catalog(singleton boolean PRIMARY KEY CHECK(singleton),layout integer NOT NULL CHECK(layout=1),
  snapshot bigint NOT NULL CHECK(snapshot>=0),next_table_id bigint NOT NULL,next_row_id bigint NOT NULL);
-INSERT INTO typed_catalog VALUES(true,3,0,1,1);
+INSERT INTO typed_catalog VALUES(true,1,0,1,1);
 CREATE TABLE typed_tables(table_uuid uuid PRIMARY KEY,table_id bigint NOT NULL UNIQUE,name bytea NOT NULL,
  dimension integer NOT NULL CHECK(dimension BETWEEN 1 AND 4096),schema_hash bytea NOT NULL CHECK(octet_length(schema_hash)=32),
  begin_snapshot bigint NOT NULL,end_snapshot bigint,request_epoch numeric(20,0),last_previous numeric(20,0),
@@ -170,6 +187,7 @@ CREATE TABLE reader_sessions(session_uuid uuid PRIMARY KEY,owner_uuid uuid NOT N
        (state='reclaimed' AND fence=2 AND intent IS NOT NULL AND receipt IS NOT NULL)));
 CREATE TABLE reader_session_views(reader text PRIMARY KEY REFERENCES bound_readers(reader),
  session_uuid uuid NOT NULL REFERENCES reader_sessions(session_uuid),session_fence bigint NOT NULL CHECK(session_fence=1),
+ accepted_materializations bigint NOT NULL DEFAULT 0 CHECK(accepted_materializations>=0),
  UNIQUE(reader,session_uuid,session_fence));
 CREATE TABLE reader_reclaims(reader text PRIMARY KEY,
  session_uuid uuid NOT NULL REFERENCES reader_sessions(session_uuid),original_fence bigint NOT NULL CHECK(original_fence=1),
@@ -181,14 +199,17 @@ class TypedMetadata:
     def __init__(self, backend):
         self.backend = backend
 
+    def _write_transaction(self, token):
+        return self.backend.transaction(integer(token, 1, 2**63 - 1, "BAD_OWNER"))
+
     def initialize(self, token):
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             c.execute(DDL)
 
     @staticmethod
     def catalog(c):
         state = c.execute("SELECT * FROM typed_catalog WHERE singleton").fetchone()
-        require(state and state["layout"] == 3, "UNSUPPORTED_TYPED_LAYOUT")
+        require(state and state["layout"] == 1, "UNSUPPORTED_TYPED_LAYOUT")
         return state
 
     @staticmethod
@@ -222,7 +243,7 @@ class TypedMetadata:
             for i, (n, f) in enumerate(zip(field_ids, FIELDS))
         ) + struct.pack("!I", dimension)
         schema_hash = hashlib.sha256(descriptor).digest()
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             state = self.catalog(c)
             require(
                 not c.execute("SELECT 1 FROM typed_tables WHERE table_uuid=%s", (parsed,)).fetchone(),
@@ -256,6 +277,7 @@ class TypedMetadata:
 
     def status(self, name, table_uuid):
         with self.backend.transaction() as (c, _):
+            self.catalog(c)
             table = self.target(c, name, table_uuid)
             count = c.execute(
                 "SELECT count(*) AS n FROM typed_receipts WHERE table_uuid=%s", (table["table_uuid"],)
@@ -274,7 +296,7 @@ class TypedMetadata:
         require(1 <= len(request_key) <= 128 and b"\0" not in request_key, "BAD_REQUEST_ID")
         require(type(rows) in (list, tuple) and type(deletes) in (list, tuple), "BAD_BATCH")
         require(1 <= len(rows) + len(deletes) <= LIMITS["operations"], "OPERATION_BUDGET")
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             state = self.catalog(c)
             table = self.target(c, name, table_uuid)
             current = int(table["request_epoch"])
@@ -360,7 +382,7 @@ class TypedMetadata:
 
     def advance(self, name, table_uuid, expected, token):
         integer(expected, 1, MAX_EPOCH, "BAD_EPOCH")
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             self.catalog(c)
             table = self.target(c, name, table_uuid)
             current = int(table["request_epoch"])
@@ -394,19 +416,17 @@ class TypedMetadata:
 
     def retire(self, name, table_uuid, token):
         parsed = canonical_uuid(table_uuid)
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             state = self.catalog(c)
-            live = c.execute(
-                "SELECT * FROM typed_tables WHERE name=%s AND end_snapshot IS NULL", (text(name),)
+            latest = c.execute(
+                "SELECT table_uuid,end_snapshot FROM typed_tables WHERE name=%s ORDER BY table_id DESC LIMIT 1",
+                (text(name),),
             ).fetchone()
-            if live is None:
-                old = c.execute(
-                    "SELECT * FROM typed_tables WHERE table_uuid=%s AND name=%s AND end_snapshot IS NOT NULL",
-                    (parsed, text(name)),
-                ).fetchone()
-                require(old is not None, "UNKNOWN_RETIREMENT_UUID")
-                return {"table_uuid": table_uuid, "retired": True, "snapshot_id": old["end_snapshot"]}
-            require(live["table_uuid"] == parsed, "STALE_TABLE")
+            require(latest is not None, "UNKNOWN_RETIREMENT_UUID")
+            if latest["end_snapshot"] is not None:
+                require(latest["table_uuid"] == parsed, "UNKNOWN_RETIREMENT_UUID")
+                return {"table_uuid": table_uuid, "retired": True, "snapshot_id": latest["end_snapshot"]}
+            require(latest["table_uuid"] == parsed, "STALE_TABLE")
             require(
                 not c.execute(
                     "SELECT 1 FROM bound_units b JOIN units u ON u.id=b.unit WHERE b.table_uuid=%s AND u.state IN ('allocated','deleting')",
@@ -434,6 +454,7 @@ class TypedMetadata:
 
     def read(self, name, table_uuid):
         with self.backend.transaction() as (c, _):
+            self.catalog(c)
             table = self.target(c, name, table_uuid)
             return self._rows(c, table["table_uuid"], None)
 

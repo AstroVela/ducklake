@@ -1,6 +1,6 @@
 # R7 受控 LIRE split／merge／reassign 的确定性验证
 
-本轮基于 [Draft #96](https://github.com/AstroVela/ducklake/pull/96) 的 `c8cf424834f650080cd1f8ee232b4c3c5445a747`，继续验证本地原生 SPFresh。总入口为 [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)，上一轮[同步原生增删](native-vortex-spfresh-updates.md)的历史结果保留。
+本地移植的开发基线是 #96 合入提交 `1be4191d`。原始 LIRE 实验提交 `01ad28e8` 基于旧版 #96（`c8cf4248`），下文的历史测量对应这两个旧提交。[总设计与 roadmap](ducklake-vortex-design-roadmap.md) · [#96 同步原生增删](native-vortex-spfresh-updates.md)
 
 本轮运行实际 `Split`、`MergePostings`、`Reassign` 和 RocksDB，检查重平衡后的持久文件、重开与旧 ReadView。生产 SQL／optimizer 继续使用静态 provider；动态元数据发布、后台并发与 R6 不在本轮范围内。
 
@@ -14,7 +14,7 @@
 
 ## 原生任务与预算
 
-[测试 SDK patch](../test/vane/spfresh_update/native-lire.patch) 在固定 Vortex `static-only.patch` 和上一轮 `native-update.patch` 后应用，不进入生产 provider wheel。SPFresh 固定 `5893eb61ee3b18610b6b00f1939be7dae1af8904`，Vortex 固定 `122b63e0408a187a9d0ecdd129f1cbe12b6b46b2`，链接实际 RocksDB 8.9.1。
+测试构建依次应用 Vortex 的 `static-only.patch`、#96 的 `native-update.patch` 和受控 LIRE 补丁，并链接 RocksDB 8.9.1。开发基线固定 SPFresh `5893eb61ee3b18610b6b00f1939be7dae1af8904` 和 Vortex `42beeb3a72769869a3d3d16887a011ee7f922362`。历史实验使用 Vortex `122b63e0408a187a9d0ecdd129f1cbe12b6b46b2`。[测试 SDK 补丁](../test/vane/spfresh_update/native-lire.patch)
 
 新实验模式显式使用 `InPlace=false／Update=false`，由[单线程控制队列](../test/vane/spfresh_update/lire_control.h)调用实际 upstream job 的 `exec`。没有启动原生后台线程池；这证明串行受控重平衡契约，不证明共享可变句柄上的并发查询或 upstream 后台调度正确性。上一轮同步增删模式保留作独立回归，不是失败后的替代路径。
 
@@ -47,7 +47,7 @@ posting 写入预算在实际 RocksDB Put／Merge／Delete 前计费，**不包�
 
 [原生组件反例](../test/vane/vortex_spfresh_lire_merge_case.py) 使用固定的 256＋1,600 行输入，显式标为 synthetic component VID，独立于真实 DuckLake RowRef 的端到端验证。它在同一份关闭后的 checkpoint 上分别运行修复版与撤回上述两处修正的[控制构建](../test/vane/spfresh_update/native-merge-control.patch)，逐文件 SHA 确认输入相同。构建报告要求两份 SDK 只在目标 header 不同；控制构建仅用于验收，没有运行时兼容模式。
 
-## 确定性结果
+## 原始提交 `01ad28e8` 的历史验证结果
 
 正式 LIRE 专项通过 **252 次实际 ANN 查询比较、388 次显式 drain、10 项拒绝检查与 3 个真实 SIGKILL 边界**，fixture 最低 recall **1.0**。其中 108 次查询位于追加数据的两个簇与分区边界，分别检查 k=1／3／10；其余查询延续上一轮固定输入。源 snapshot、历史 SQL、Vortex IEEE 行与业务 NULL／NUL 值均独立核对。
 

@@ -55,6 +55,14 @@ def write(path, value):
     sync(path.parent)
 
 
+def read_manifest(path):
+    with path.open("rb") as stream:
+        require(os.fstat(stream.fileno()).st_size <= MIB, "MANIFEST_BUDGET")
+        packet = stream.read(MIB + 1)
+    require(len(packet) <= MIB, "MANIFEST_BUDGET")
+    return packet
+
+
 def address(row):
     return encoded(row["row_ref"])
 
@@ -84,7 +92,9 @@ def validate_capture(capture):
 
 
 def inventory(root):
-    result, total = {}, 0
+    require(not root.is_symlink(), "SYMLINK_INPUT")
+    require(root.is_dir(), "NATIVE_DIRECTORY_REQUIRED")
+    sizes, total = {}, 0
     for path in sorted(root.rglob("*")):
         require(not path.is_symlink(), "SYMLINK_INPUT")
         if path.is_dir():
@@ -93,17 +103,29 @@ def inventory(root):
         size = path.stat().st_size
         require(size <= LIMIT - total, "ARTIFACT_BUDGET")
         total += size
-        result[str(path.relative_to(root))] = {"size": size, "sha256": sha(path.read_bytes())}
+        sizes[str(path.relative_to(root))] = size
+    result = {}
+    for name, size in sizes.items():
+        with (root / name).open("rb") as stream:
+            require(os.fstat(stream.fileno()).st_size == size, "GENERATION_CHANGED")
+            data = stream.read(size + 1)
+        require(len(data) == size, "GENERATION_CHANGED")
+        result[name] = {"size": size, "sha256": sha(data)}
     return result
 
 
-def seal(root, capture, mapping):
+def visibility(mapping, live):
+    return "".join("1" if address(row) in live else "0" for row in mapping)
+
+
+def seal(executable, root, capture, mapping, log, *, lire=False):
     validate_capture(capture)
     require(len(mapping) <= ROWS and len({address(r) for r in mapping}) == len(mapping), "VID_MAP")
     live = {address(r): r for r in capture["rows"]}
     require(set(live) <= {address(r) for r in mapping}, "VID_MAP")
     require(all(row == live[address(row)] for row in mapping if address(row) in live), "VID_MAP")
-    body = {"format_version": 1, "capture": capture, "mapping": mapping, "files": inventory(root / "native")}
+    files, _ = validate_checkpoint(executable, root, visibility(mapping, live), log, lire=lire)
+    body = {"format_version": 1, "capture": capture, "mapping": mapping, "files": files}
     # Persist every declared native file before the single publication pointer.
     for name in body["files"]:
         with (root / "native" / name).open("rb") as stream:
@@ -116,13 +138,14 @@ def seal(root, capture, mapping):
     return body
 
 
-def verify(root):
+def verify(root, *, expected_sha=None):
     require(not root.is_symlink() and root.is_dir(), "GENERATION_REQUIRED")
     require({p.name for p in root.iterdir()} == {"native", "seal.json"}, "GENERATION_INVENTORY")
     require(not (root / "native").is_symlink() and (root / "native").is_dir(), "SYMLINK_INPUT")
     require(not (root / "seal.json").is_symlink(), "SYMLINK_INPUT")
-    packet = (root / "seal.json").read_bytes()
-    require(len(packet) <= MIB, "MANIFEST_BUDGET")
+    require((root / "seal.json").is_file(), "NONREGULAR_INPUT")
+    packet = read_manifest(root / "seal.json")
+    require(expected_sha is None or sha(packet) == expected_sha, "HEAD_CHANGED")
     body = json.loads(packet)
     require(
         set(body) == {"format_version", "capture", "mapping", "files"} and body["format_version"] == 1,
@@ -167,6 +190,7 @@ class Worker:
     def receive(self):
         event = self.events.get(timeout=90)
         require(event is not None, "NATIVE_OPERATION_FAILED")
+        require("error" not in event, event.get("error"))
         return event
 
     def call(self, operation, *values):
@@ -189,6 +213,26 @@ class Worker:
         self.log.close()
 
 
+def validate_checkpoint(
+    executable, root, expected_visibility, log, *, expected_files=None, retain_reader=False, lire=False
+):
+    native = root / "native"
+    files = inventory(native)
+    if expected_files is not None:
+        require(files == expected_files, "GENERATION_CHANGED")
+    worker = Worker(executable, "open-lire" if lire else "open", native, log)
+    try:
+        require(worker.ready["live"] == expected_visibility.count("1"), "NATIVE_ROW_COUNT")
+        require(worker.ready["visibility"] == expected_visibility, "NATIVE_VID_VISIBILITY")
+        if not retain_reader:
+            worker.close()
+        require(inventory(native) == files, "NATIVE_REOPEN_CHANGED")
+    except BaseException:
+        worker.stop()
+        raise
+    return files, worker if retain_reader else None
+
+
 def seed(executable, root, capture, log):
     validate_capture(capture)
     require(len(capture["rows"]) >= 65, "BUILD_MINIMUM")
@@ -202,7 +246,7 @@ def seed(executable, root, capture, log):
     finally:
         worker.stop()
     path.unlink()
-    return seal(root, capture, rows)
+    return seal(executable, root, capture, rows, log)
 
 
 def clone(source, target):
@@ -247,7 +291,7 @@ def advance(executable, source, target, capture, log, observe=lambda _: None):
         worker.close()
     finally:
         worker.stop()
-    body = seal(target, capture, mapping + added)
+    body = seal(executable, target, capture, mapping + added, log)
     observe("after_seal")
     return body
 
@@ -263,7 +307,7 @@ class Catalog:
 
     def head(self):
         require((self.root / "head.json").is_file(), "NO_PUBLISHED_INDEX")
-        head = json.loads((self.root / "head.json").read_bytes())
+        head = json.loads(read_manifest(self.root / "head.json"))
         require(
             set(head) == {"format_version", "revision", "generation", "seal_sha256", "table_uuid", "snapshot_id"}
             and head["format_version"] == 1,
@@ -271,8 +315,7 @@ class Catalog:
         )
         require(re.fullmatch(r"[a-z0-9-]+", head["generation"]) is not None, "HEAD_FORMAT")
         root = self.root / head["generation"]
-        require(sha((root / "seal.json").read_bytes()) == head["seal_sha256"], "HEAD_CHANGED")
-        body = verify(root)
+        body = verify(root, expected_sha=head["seal_sha256"])
         require(
             all(body["capture"]["file_capture"][key] == head[key] for key in ("table_uuid", "snapshot_id")),
             "HEAD_CHANGED",
@@ -281,11 +324,11 @@ class Catalog:
 
     def publish(self, name, expected_revision, observe=lambda _: None):
         require(re.fullmatch(r"[a-z0-9-]+", name) is not None, "GENERATION_NAME")
-        body = verify(self.root / name)
         with (self.root / "lock").open("rb") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             old = self.head() if (self.root / "head.json").exists() else None
             require((0 if old is None else old["revision"]) == expected_revision, "PUBLICATION_CONFLICT")
+            body = verify(self.root / name)
             capture = body["capture"]["file_capture"]
             require(old is None or old["table_uuid"] == capture["table_uuid"], "TABLE_UUID_CHANGED")
             require(old is None or old["snapshot_id"] < capture["snapshot_id"], "STALE_SNAPSHOT")
@@ -293,7 +336,7 @@ class Catalog:
                 "format_version": 1,
                 "revision": expected_revision + 1,
                 "generation": name,
-                "seal_sha256": sha((self.root / name / "seal.json").read_bytes()),
+                "seal_sha256": sha(encoded(body)),
                 "table_uuid": capture["table_uuid"],
                 "snapshot_id": capture["snapshot_id"],
             }
@@ -302,7 +345,7 @@ class Catalog:
             observe("after_publish")
             return head
 
-    def read(self, executable, private, capture, log):
+    def read(self, executable, private, capture, log, *, lire=False):
         with (self.root / "lock").open("rb") as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
             head = self.head()
@@ -312,7 +355,7 @@ class Catalog:
             )
             body = clone(self.root / head["generation"], private)
             require(body["capture"] == capture, "READVIEW_CHANGED")
-            return ReadView(executable, private, body, log)
+            return ReadView(executable, private, body, log, lire=lire)
 
     def collect(self, name, objects, bytes_):
         require(1 <= objects <= 16 and 1 <= bytes_ <= LIMIT, "GC_BUDGET")
@@ -331,14 +374,18 @@ class Catalog:
 
 
 class ReadView:
-    def __init__(self, executable, private, body, log):
+    def __init__(self, executable, private, body, log, *, lire=False):
         self.root, self.body = private, body
-        self.worker = Worker(executable, "open", private / "native", log)
-        try:
-            require(self.worker.ready["live"] == len(body["capture"]["rows"]), "NATIVE_ROW_COUNT")
-        except BaseException:
-            self.worker.stop()
-            raise
+        live = {address(row) for row in body["capture"]["rows"]}
+        _, self.worker = validate_checkpoint(
+            executable,
+            private,
+            visibility(body["mapping"], live),
+            log,
+            expected_files=body["files"],
+            retain_reader=True,
+            lire=lire,
+        )
 
     def query(self, vector, k):
         require(type(k) is int and 1 <= k <= 64, "QUERY_K")

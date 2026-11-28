@@ -10,7 +10,8 @@ import shutil
 import struct
 
 
-def exercise(args, report, files, oracle, trace):
+def exercise(args, report, lire, oracle, trace):
+    files = lire.F
     root = args.output_dir / "merge-prefix-case"
     root.mkdir(mode=0o700)
     vectors = [[float(i), *([0.0] * 6), -0.0] for i in range(256)]
@@ -23,7 +24,7 @@ def exercise(args, report, files, oracle, trace):
     def drain(worker, phase):
         state = worker.call("state")
         for _ in range(2000):
-            if state["queued"] == 0:
+            if not state["queued"] and not state["pending_add"]:
                 return state
             state = worker.call("drain", 16, files.LIMIT)
             trace(report, phase, state)
@@ -34,23 +35,17 @@ def exercise(args, report, files, oracle, trace):
     worker = files.Worker(args.probe, "seed-lire", native, root / "source.log", input_path)
     try:
         for offset in (256, 1056):
-            expected = list(range(offset, offset + 800))
-            files.require(
-                worker.call("add", 800, *[v for row in vectors[offset : offset + 800] for v in row])
-                == {"ids": expected},
-                "COMPONENT_VID_CHANGED",
-            )
+            lire.append(worker, rows[offset : offset + 800], offset)
         split = drain(worker, "component-split")
         files.require(split["splits"] > 0 and split["version_changes"] > 0, "COMPONENT_NO_SPLIT")
+        files.require(split["vids"] == len(rows), "COMPONENT_VID_CHANGED")
         files.require(worker.call("checkpoint") == {"saved": True}, "COMPONENT_CHECKPOINT_FAILED")
         worker.close()
     finally:
         worker.stop()
     image = oracle.observe(args.probe, native, body)
-    head = min(
-        (int(h) for h in image["current_postings"] if int(h) >= 64),
-        key=lambda h: len(image["current_postings"][str(h)]),
-    )
+    # This head preserves the merge counterexample within the deletion budget.
+    head = 59
     removed = image["current_postings"][str(head)][5:]
     files.require(0 < len(removed) <= 1000, "COMPONENT_MUTATION_BUDGET")
     body["capture"]["rows"] = [r for i, r in enumerate(rows) if i not in set(removed)]

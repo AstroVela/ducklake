@@ -13,28 +13,14 @@ F = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(F)
 
 
-class View(F.ReadView):
-    def __init__(self, executable, private, body, log):
-        self.root, self.body = private, body
-        self.worker = F.Worker(executable, "open-lire", private / "native", log)
-        try:
-            F.require(self.worker.ready["live"] == len(body["capture"]["rows"]), "NATIVE_ROW_COUNT")
-        except BaseException:
-            self.worker.stop()
-            raise
-
-
-def read(catalog, executable, private, capture, log):
-    with (catalog.root / "lock").open("rb") as lock:
-        fcntl.flock(lock, fcntl.LOCK_SH)
-        head = catalog.head()
-        F.require(
-            all(head[k] == capture["file_capture"][k] for k in ("table_uuid", "snapshot_id")),
-            "INDEX_WATERMARK_MISMATCH",
-        )
-        body = F.clone(catalog.root / head["generation"], private)
-        F.require(body["capture"] == capture, "READVIEW_CHANGED")
-        return View(executable, private, body, log)
+def append(worker, rows, first_vid):
+    reply = worker.call("add", len(rows), *[v for row in rows for v in row["row"]["embedding"]])
+    remaining = reply.get("pending_add", 0)
+    F.require(type(remaining) is int and 0 <= remaining <= len(rows), "ADD_IDENTITY")
+    expected = {"ids": list(range(first_vid, first_vid + len(rows) - remaining))}
+    if remaining:
+        expected["pending_add"] = remaining
+    F.require(reply == expected, "ADD_IDENTITY")
 
 
 def seed(executable, root, capture, log):
@@ -51,13 +37,14 @@ def seed(executable, root, capture, log):
     finally:
         worker.stop()
     path.unlink()
-    return F.seal(root, capture, rows), state
+    return F.seal(executable, root, capture, rows, log, lire=True), state
 
 
 class Candidate:
     def __init__(self, executable, source, target, capture, log):
         self.worker = None
         self.target, self.capture = target, capture
+        self.executable, self.log = executable, log
         F.validate_capture(capture)
         with (source.parent / "lock").open("rb") as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
@@ -81,10 +68,7 @@ class Candidate:
             for vid in removed:
                 F.require(self.worker.call("delete", vid) == {"deleted": True}, "DELETE_IDENTITY")
             if added:
-                actual = self.worker.call("add", len(added), *[v for r in added for v in r["row"]["embedding"]])
-                F.require(
-                    actual == {"ids": list(range(len(self.mapping), len(self.mapping) + len(added)))}, "ADD_IDENTITY"
-                )
+                append(self.worker, added, len(self.mapping))
             self.mapping = self.mapping + added
         except BaseException:
             self.stop()
@@ -101,11 +85,12 @@ class Candidate:
 
     def seal(self):
         state = self.state()
-        F.require(state["queued"] == 0, "LIRE_CHECKPOINT_BUSY")
+        F.require(not state["queued"] and not state["pending_add"], "LIRE_CHECKPOINT_BUSY")
+        F.require(state["vids"] == len(self.mapping), "ADD_IDENTITY")
         F.require(self.worker.call("checkpoint") == {"saved": True}, "CHECKPOINT_FAILED")
         self.worker.close()
         self.worker = None
-        return F.seal(self.target, self.capture, self.mapping), state
+        return F.seal(self.executable, self.target, self.capture, self.mapping, self.log, lire=True), state
 
     def stop(self):
         if self.worker is not None:

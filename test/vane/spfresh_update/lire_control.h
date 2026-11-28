@@ -54,7 +54,8 @@ inline void point(const std::string &stage) {
 	if (!std::getline(std::cin, response) || response != "continue")
 		throw std::runtime_error("LIRE_PAUSE_CLOSED");
 }
-inline void drain(uint32_t work, uint64_t payload) {
+template <class ResumeAppend>
+inline void drain(uint32_t work, uint64_t payload, ResumeAppend resume_append) {
 	if (!enabled || failed || work < 1 || work > 16 || payload < 1 || payload > 64ULL * 1024 * 1024)
 		throw std::runtime_error("LIRE_BUDGET");
 	max_steps = work;
@@ -64,7 +65,11 @@ inline void drain(uint32_t work, uint64_t payload) {
 	metering = true;
 	try {
 		Helper::ThreadPool::Abort abort(false);
-		while (!jobs.empty() && jobs.front().bound <= max_steps - steps) {
+		while (steps < max_steps) {
+			if (jobs.empty())
+				resume_append();
+			if (jobs.empty() || jobs.front().bound > max_steps - steps)
+				break;
 			auto work_item = std::move(jobs.front());
 			jobs.pop_front();
 			work_item.job->exec(&abort);

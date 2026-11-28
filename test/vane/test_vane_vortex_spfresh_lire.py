@@ -31,6 +31,7 @@ O = load("lire_physical_oracle", "vortex_spfresh_lire_oracle.py")
 MERGE = load("lire_merge_case", "vortex_spfresh_lire_merge_case.py")
 F, K, BASE = L.F, H.K, H.BASE
 require, query, quote = BASE.require, BASE.query, BASE.quote
+POSTING_RECORD_LIMIT = 12 * 4096 // (4 + 1 + 8 * 4)
 RULE = {
     "schema": 1,
     "scope": "Local controlled native Split/MergePostings/Reassign; production SQL/provider unchanged, R6 deferred.",
@@ -51,13 +52,14 @@ RULE = {
 
 def trace(report, name, state):
     require(0 <= state["steps"] <= 16 and 0 <= state["posting_bytes"] <= F.LIMIT, "LIRE exceeded original budgets")
+    require(all(0 <= head["size"] <= POSTING_RECORD_LIMIT for head in state["heads"]), "Posting exceeded 12 pages")
     report["drains"].append(dict(phase=name, **{k: v for k, v in state.items() if k != "heads"}))
 
 
 def finish(report, name, candidate):
     state = candidate.state()
     for _ in range(2000):
-        if state["queued"] == 0:
+        if not state["queued"] and not state["pending_add"]:
             return candidate.seal()
         state = candidate.drain(16, F.LIMIT)
         trace(report, name, state)
@@ -142,6 +144,26 @@ def oracle_guards(args, report, native, body, image):
         require(F.inventory(target) == before, "Oracle changed inspected files")
 
 
+def reopen_posting_count_guard(args, report, source, body):
+    target = args.output_dir / "posting-count-mismatch"
+    F.clone(source, target)
+    path = target / "native/posting-sizes.bin"
+    sizes = bytearray(path.read_bytes())
+    slots, columns = struct.unpack_from("<ii", sizes)
+    require(slots > 64 and columns == 1 and len(sizes) == 8 + 4 * slots, "Wrong split checkpoint shape")
+    struct.pack_into("<i", sizes, 0, slots - 1)
+    path.write_bytes(sizes[:-4])
+    log = args.output_dir / "posting-count-mismatch.log"
+    live = {F.address(row) for row in body["capture"]["rows"]}
+    H.rejected(
+        report,
+        "posting-count-differs-from-head-slots",
+        lambda: F.validate_checkpoint(args.probe, target, F.visibility(body["mapping"], live), log, lire=True),
+        "NATIVE_OPERATION_FAILED",
+    )
+    require("SPFresh posting size count does not match the head count" in log.read_text(), "Wrong posting-count guard")
+
+
 def fault_child(config):
     root = Path(config["root"])
     candidate = L.Candidate(
@@ -168,7 +190,7 @@ def fault_child(config):
                 print(json.dumps({"event": stage, "affinity": sorted(os.sched_getaffinity(0))}), flush=True)
                 require(sys.stdin.readline().strip() == "continue", "Fault controller closed")
                 return
-            require(value["queued"] > 0, "Expected native stage never occurred")
+            require(value["queued"] or value["pending_add"], "Expected native stage never occurred")
         raise AssertionError("Native pause was not reached")
     finally:
         candidate.stop()
@@ -214,7 +236,9 @@ def fault(report, args, catalog, source, capture, stage, merge=None, budget=None
                 with selectors.DefaultSelector() as selector:
                     selector.register(process.stdout, selectors.EVENT_READ)
                     require(selector.select(90), "Native fault handshake deadline")
-                event = json.loads(process.stdout.readline())
+                line = process.stdout.readline()
+                require(line, f"Native fault process returned no event. See {log.name}")
+                event = json.loads(line)
                 require(
                     event == {"event": stage, "affinity": sorted(os.sched_getaffinity(0))}, "Wrong native fault event"
                 )
@@ -234,7 +258,7 @@ def exercise(args, report):
     lake = root / "lake"
     lake.mkdir(mode=0o700)
     (lake / "indexes").mkdir(mode=0o700)
-    c = BASE.connect(lake, create=True)
+    c = BASE.connect(lake, lake / "extensions", create=True)
     views = []
     try:
         c.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
@@ -257,7 +281,7 @@ def exercise(args, report):
         first, state = L.seed(args.probe, catalog.root / "g1", initial, root / "seed.log")
         physical(report, "seed", args, catalog.root / "g1", first)
         catalog.publish("g1", 0)
-        old = L.read(catalog, args.probe, root / "view-initial", initial, root / "view-initial.log")
+        old = catalog.read(args.probe, root / "view-initial", initial, root / "view-initial.log", lire=True)
         views.append(old)
         heads = sorted(state["heads"], key=lambda h: h["vector"][0])
         head = min(heads[1:-1], key=lambda h: (h["size"], h["id"]))
@@ -290,8 +314,8 @@ def exercise(args, report):
                 physical(report, "first-burst", args, catalog.root / "g2", second)
                 catalog.publish("g2", 1)
         before_split, target = captures[1], captures[2]
-        checkpoint_view = L.read(
-            catalog, args.probe, root / "view-before-split", before_split, root / "view-before-split.log"
+        checkpoint_view = catalog.read(
+            args.probe, root / "view-before-split", before_split, root / "view-before-split.log", lire=True
         )
         views.append(checkpoint_view)
         for stage in ("after_split", "after_reassign_version", "checkpoint_busy", "byte_budget"):
@@ -301,14 +325,38 @@ def exercise(args, report):
             fault(report, args, catalog, "g2", target, "budget-" + str(i), budget=budget)
         candidate = L.Candidate(args.probe, catalog.root / "g2", catalog.root / "g3", target, root / "split.log")
         try:
+            saturated = candidate.state()
+            largest_posting = max(head["size"] for head in saturated["heads"])
+            require(
+                largest_posting == POSTING_RECORD_LIMIT
+                and saturated["splits"] == 0
+                and saturated["queued"] == 1
+                and saturated["pending_add"] > 0
+                and saturated["vids"] + saturated["pending_add"] == len(target["rows"]),
+                "Full posting did not defer unallocated rows before split",
+            )
+            report["split_admission"] = {
+                "max_posting_records": largest_posting,
+                "allocated_vids": saturated["vids"],
+                "pending_rows": saturated["pending_add"],
+            }
             first_step = candidate.drain(1, F.LIMIT)
             trace(report, "one-work-item", first_step)
-            require(first_step["steps"] == 1 and first_step["queued"] > 0, "Split did not leave real reassign work")
+            require(
+                first_step["steps"] == 1
+                and first_step["splits"] == 1
+                and first_step["queued"] > 0
+                and first_step["pending_add"] == saturated["pending_add"]
+                and first_step["vids"] == saturated["vids"],
+                "Split did not leave pending reassign and append work",
+            )
             deferred = candidate.drain(1, F.LIMIT)
             trace(report, "nested-reservation-deferred", deferred)
             require(
                 deferred["steps"] == 0
                 and deferred["queued"] == first_step["queued"]
+                and deferred["pending_add"] == first_step["pending_add"]
+                and deferred["vids"] == first_step["vids"]
                 and deferred["posting_bytes"] == 0,
                 "Small work budget executed a nested job",
             )
@@ -324,8 +372,9 @@ def exercise(args, report):
             split_image["head_slots"] > 64 and split_image["retired_heads"] > 0 and split_image["version_changes"] > 0,
             "Persisted split/version state did not change",
         )
+        reopen_posting_count_guard(args, report, catalog.root / "g3", third)
         catalog.publish("g3", 2)
-        new = L.read(catalog, args.probe, root / "view-split", target, root / "view-split.log")
+        new = catalog.read(args.probe, root / "view-split", target, root / "view-split.log", lire=True)
         views.append(new)
         qualify(report, "split-reopened", new, target)
         report["gc"] = [catalog.collect("g1", 16, F.LIMIT), catalog.collect("g2", 16, F.LIMIT)]
@@ -381,7 +430,7 @@ def exercise(args, report):
         require(merged_image["active_heads"] < split_image["active_heads"], "Merge did not retire a head")
         oracle_guards(args, report, catalog.root / merged_name / "native", fourth, merged_image)
         catalog.publish(merged_name, next_generation - 1)
-        final = L.read(catalog, args.probe, root / "view-merged", merged_capture, root / "view-merged.log")
+        final = catalog.read(args.probe, root / "view-merged", merged_capture, root / "view-merged.log", lire=True)
         views.append(final)
         qualify(report, "merge-reopened", final, merged_capture)
         report["gc"].append(catalog.collect("g3", 16, F.LIMIT))
@@ -467,7 +516,7 @@ def main():
         os.sched_setaffinity(0, cpus)
         report["applied_affinity"] = sorted(os.sched_getaffinity(0))
         exercise(args, report)
-        MERGE.exercise(args, report, F, O, trace)
+        MERGE.exercise(args, report, L, O, trace)
         require(hashes == {str(p): H.digest(p) for p in sources}, "Executed source changed")
         require(threads == {k: os.environ.get(k) for k in threads}, "Thread settings changed")
         report['status'] = 'passed'
