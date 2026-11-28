@@ -1,0 +1,56 @@
+name: R6 PostgreSQL S3 backend contracts
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r6-backend-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deterministic-backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - uses: ikalnytskyi/action-setup-postgres@10ab8a56cc77b4823c2bfa57b1d4dd5605ef0481 # v7
+        with:
+          postgres-version: '15'
+          port: '5432'
+      - name: Install isolated clients and the pinned object fixture
+        run: |
+          python -m pip install -r test/vane/requirements-remote-backend.txt
+          curl --fail --location --silent --show-error --connect-timeout 10 --max-time 180 \
+            https://github.com/minio/minio/releases/download/RELEASE.2025-09-07T16-13-09Z/minio.linux-amd64.RELEASE.2025-09-07T16-13-09Z \
+            --output "$RUNNER_TEMP/r6-minio"
+          printf '%s  %s\n' 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f "$RUNNER_TEMP/r6-minio" | sha256sum --check --strict
+          chmod 700 "$RUNNER_TEMP/r6-minio"
+      - name: Run the model and real backend contracts
+        run: |
+          set -euo pipefail
+          cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          python -I test/vane/test_vane_vortex_remote_protocol.py --cpus "$cpu" \
+            --output-dir "$RUNNER_TEMP/r6-model-proof"
+          python -I test/vane/test_vane_vortex_remote_backend.py --cpus "$cpu" \
+            --pg-bin "$(pg_config --bindir)" --minio "$RUNNER_TEMP/r6-minio" \
+            --object-data-dir "$RUNNER_TEMP/r6-object-data" --output-dir "$RUNNER_TEMP/r6-backend-proof"
+      - name: Retain fixed contract evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: r6-backend-proof
+          path: |
+            ${{ runner.temp }}/r6-model-proof/*.json
+            ${{ runner.temp }}/r6-backend-proof/*.json
+            ${{ runner.temp }}/r6-backend-proof/services/*.log

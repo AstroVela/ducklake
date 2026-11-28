@@ -4,6 +4,8 @@
 
 本地验证固定 CPU **6–11**，继承现有线程环境；既有原生测试的 DuckDB `threads=2` 设置保持。本模型不创建 DuckDB 或 ANN 线程。保留事务保护与预算，继续暂缓 R4 A/A、性能 A/B、长期稳态及依赖稳定负载的 R5 资格测试；耗时只记录为观察值。
 
+后续的 [PostgreSQL／S3 最小 backend](native-vortex-postgres-s3-backend.md)已把协议接到真实 PostgreSQL 与 MinIO API。它明确采用 broker 签发条件 SigV4 票据作为唯一 worker 授权方式，补充实际服务的原子发布、未知响应与 GC 验证；本文件继续保留 #91 的模型基线及历史结果。Vane 原生远程 SQL 与 ANN 仍未接入。
+
 ## 现有能力与待替换的本地假设
 
 | 当前实现证据 | 远程协议需要的能力 |
@@ -149,6 +151,6 @@ CI 在 native 构建前单独运行相同的标准库模型并留存 rule／repo
 
 ## 下一阶段
 
-R6 仍未完成。下一份应实现上述**单一真实后端的最小 adapter 与能力 conformance**：先在隔离服务中验证版本化条件创建、STOP 替换与保护、精确 GET／DELETE、未知响应核对，再验证 PostgreSQL 同事务 CAS／引用／回执及提交故障切换。沿用本轮固定故障序列，不能以模型通过代替真实服务证据。
+单一后端原型已用隔离 PostgreSQL 和 MinIO 验证版本化条件创建、STOP 替换与保护、精确 GET／DELETE、未知响应核对，以及 PostgreSQL 同事务 CAS、引用和回执。原生接入、真实 AWS 部署和服务故障域验收仍属后续工作。[组件验收](native-vortex-postgres-s3-backend.md#当前组件验收)
 
 移除 native DuckDB 限制前，还须补齐远程 metadata 的 Float32、NULL、LIST、NUL／BLOB、UUID／epoch 生命周期、普通事务保护与 typed ReadView 验收；建立 reader session fencing、持久 pin 回收和认证私有缓存契约。之后才接固定 ReadView 的 Vane fan-out、读位置等待、分布式 top-k 与 owner 故障恢复。既有 vortex-index／SPFresh 静态 B 继续复用；R7 原生在线更新不由本次协议模型顺带宣称接入。
