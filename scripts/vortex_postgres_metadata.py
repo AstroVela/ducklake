@@ -63,8 +63,25 @@ def text(value):
         raise MetadataError("BAD_UTF8") from None
 
 
+def round_integer_to_float32(value):
+    precision = value.bit_length()
+    require(precision <= 128, "FLOAT_RANGE")
+    shift = precision - 24
+    if shift <= 0:
+        return value
+    significand, remainder = divmod(abs(value), 1 << shift)
+    halfway = 1 << (shift - 1)
+    if remainder > halfway or (remainder == halfway and significand % 2):
+        significand += 1
+    rounded = significand << shift
+    return -rounded if value < 0 else rounded
+
+
 def floating(value, width):
     require(type(value) in (int, float), "BAD_FLOAT")
+    if width == 4 and type(value) is int:
+        # Round at binary32 precision before converting to an exact Python float.
+        value = round_integer_to_float32(value)
     try:
         value = float(value)
         require(math.isfinite(value), "NONFINITE_FLOAT")
@@ -156,8 +173,11 @@ class TypedMetadata:
     def __init__(self, backend):
         self.backend = backend
 
+    def _write_transaction(self, token):
+        return self.backend.transaction(integer(token, 1, 2**63 - 1, "BAD_OWNER"))
+
     def initialize(self, token):
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             c.execute(DDL)
 
     @staticmethod
@@ -197,7 +217,7 @@ class TypedMetadata:
             for i, (n, f) in enumerate(zip(field_ids, FIELDS))
         ) + struct.pack("!I", dimension)
         schema_hash = hashlib.sha256(descriptor).digest()
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             state = self.catalog(c)
             require(
                 not c.execute("SELECT 1 FROM typed_tables WHERE table_uuid=%s", (parsed,)).fetchone(),
@@ -248,7 +268,7 @@ class TypedMetadata:
         require(1 <= len(request_key) <= 128 and b"\0" not in request_key, "BAD_REQUEST_ID")
         require(type(rows) in (list, tuple) and type(deletes) in (list, tuple), "BAD_BATCH")
         require(1 <= len(rows) + len(deletes) <= LIMITS["operations"], "OPERATION_BUDGET")
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             state = self.catalog(c)
             table = self.target(c, name, table_uuid)
             current = int(table["request_epoch"])
@@ -334,7 +354,7 @@ class TypedMetadata:
 
     def advance(self, name, table_uuid, expected, token):
         integer(expected, 1, MAX_EPOCH, "BAD_EPOCH")
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             self.catalog(c)
             table = self.target(c, name, table_uuid)
             current = int(table["request_epoch"])
@@ -368,19 +388,17 @@ class TypedMetadata:
 
     def retire(self, name, table_uuid, token):
         parsed = canonical_uuid(table_uuid)
-        with self.backend.transaction(token) as (c, _):
+        with self._write_transaction(token) as (c, _):
             state = self.catalog(c)
-            live = c.execute(
-                "SELECT * FROM typed_tables WHERE name=%s AND end_snapshot IS NULL", (text(name),)
+            latest = c.execute(
+                "SELECT table_uuid,end_snapshot FROM typed_tables WHERE name=%s ORDER BY table_id DESC LIMIT 1",
+                (text(name),),
             ).fetchone()
-            if live is None:
-                old = c.execute(
-                    "SELECT * FROM typed_tables WHERE table_uuid=%s AND name=%s AND end_snapshot IS NOT NULL",
-                    (parsed, text(name)),
-                ).fetchone()
-                require(old is not None, "UNKNOWN_RETIREMENT_UUID")
-                return {"table_uuid": table_uuid, "retired": True, "snapshot_id": old["end_snapshot"]}
-            require(live["table_uuid"] == parsed, "STALE_TABLE")
+            require(latest is not None, "UNKNOWN_RETIREMENT_UUID")
+            if latest["end_snapshot"] is not None:
+                require(latest["table_uuid"] == parsed, "UNKNOWN_RETIREMENT_UUID")
+                return {"table_uuid": table_uuid, "retired": True, "snapshot_id": latest["end_snapshot"]}
+            require(latest["table_uuid"] == parsed, "STALE_TABLE")
             snapshot = state["snapshot"] + 1
             c.execute("DELETE FROM typed_receipts WHERE table_uuid=%s", (parsed,))
             c.execute(
