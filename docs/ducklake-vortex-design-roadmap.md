@@ -285,7 +285,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 ### 9.4 R7 原生增删的本地组件证据
 
-R7 本地实验使用实际 RocksDB 和 SPFresh AddIndexSPFresh／DeleteIndex。在 `c0fa417` 和当前 Vortex 固定点上复验通过 156 次 ANN 查询比较、30 项拒绝检查和 6 个真实 SIGKILL 边界，fixture 最低 recall 1.0。同步写入执行 posting 页数上限，封存前只读重开并核对行数。业务已提交而 ANN 落后时崩溃，重开保留 T 数据，完整回执重放不推进业务 snapshot。显式推进后才更新动态实验水位，私有旧视图在 canonical checkpoint GC 后继续查询。[R7 本地原生增删／checkpoint／旧 ReadView](native-vortex-spfresh-updates.md)
+R7 本地实验使用实际 RocksDB 和 SPFresh AddIndexSPFresh／DeleteIndex。在 `c0fa417` 和当前 Vortex 固定点上复验通过 156 次 ANN 查询比较、46 项拒绝检查和 6 个真实 SIGKILL 边界，fixture 最低 recall 1.0。同步写入执行 posting 页数上限。封存前先检查 64 MiB 文件预算，只读重开后核对 posting sizes 和每个 VID 的可见性，最后复核文件清单。业务已提交而 ANN 落后时崩溃，重开保留 T 数据，完整回执重放不推进业务 snapshot。显式推进后才更新动态实验水位，私有旧视图在 canonical checkpoint GC 后继续查询。[R7 本地原生增删／checkpoint／旧 ReadView](native-vortex-spfresh-updates.md)
 
 该证据限于同步 posting 增删、关闭 checkpoint 与明确的私有版本副本。实验发布指针位于本地，生产 SQL／optimizer 使用 `spfresh.static`。LIRE split／merge／reassign 和复制 checkpoint 的性能收益仍待验证。R6 远程 codec 接线继续暂缓。
 

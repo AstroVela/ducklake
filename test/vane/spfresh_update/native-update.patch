@@ -1,3 +1,77 @@
+diff --git a/AnnService/inc/Core/Common/Dataset.h b/AnnService/inc/Core/Common/Dataset.h
+index 0f02ef0..2321014 100644
+--- a/AnnService/inc/Core/Common/Dataset.h
++++ b/AnnService/inc/Core/Common/Dataset.h
+@@ -372,6 +372,23 @@ namespace SPTAG
+                 return Save(ptr);
+             }
+ 
++            // Version labels and posting sizes are standalone, single-column records.
++            ErrorCode LoadScalarRecord(std::shared_ptr<Helper::DiskIO> input, SizeType blockSize, SizeType capacity)
++            {
++                SizeType fileRows;
++                DimensionType fileCols;
++                IOBINARY(input, ReadBinary, sizeof(fileRows), reinterpret_cast<char*>(&fileRows));
++                IOBINARY(input, ReadBinary, sizeof(fileCols), reinterpret_cast<char*>(&fileCols));
++                if (fileRows <= 0 || fileRows > capacity || fileCols != 1) return ErrorCode::FailedParseValue;
++
++                Initialize(fileRows, 1, blockSize, capacity);
++                incRows = 0;
++                const auto bytes = static_cast<std::uint64_t>(fileRows) * sizeof(T);
++                IOBINARY(input, ReadBinary, bytes, data);
++                char extra;
++                return input->ReadBinary(1, &extra) == 0 ? ErrorCode::Success : ErrorCode::FailedParseValue;
++            }
++
+             ErrorCode Load(std::shared_ptr<Helper::DiskIO> pInput, SizeType blockSize, SizeType capacity)
+             {
+                 IOBINARY(pInput, ReadBinary, sizeof(SizeType), (char*)&(rows));
+diff --git a/AnnService/inc/Core/Common/PostingSizeRecord.h b/AnnService/inc/Core/Common/PostingSizeRecord.h
+index e1935ea..1196b92 100644
+--- a/AnnService/inc/Core/Common/PostingSizeRecord.h
++++ b/AnnService/inc/Core/Common/PostingSizeRecord.h
+@@ -73,7 +73,7 @@ namespace SPTAG
+ 
+             inline ErrorCode Load(std::shared_ptr<Helper::DiskIO> input, SizeType blockSize, SizeType capacity)
+             {
+-                return m_data.Load(input, blockSize, capacity);
++                return m_data.LoadScalarRecord(input, blockSize, capacity);
+             }
+ 
+             inline ErrorCode Load(const std::string& filename, SizeType blockSize, SizeType capacity)
+diff --git a/AnnService/inc/Core/Common/VersionLabel.h b/AnnService/inc/Core/Common/VersionLabel.h
+index 2dff02e..a32bacc 100644
+--- a/AnnService/inc/Core/Common/VersionLabel.h
++++ b/AnnService/inc/Core/Common/VersionLabel.h
+@@ -63,7 +63,7 @@ namespace SPTAG
+                 }
+             }
+ 
+-            inline SizeType GetVectorNum()
++            inline SizeType GetVectorNum() const
+             {
+                 return m_data.R();
+             }
+@@ -87,8 +87,18 @@ namespace SPTAG
+             {
+                 SizeType deleted;
+                 IOBINARY(input, ReadBinary, sizeof(SizeType), (char*)&deleted);
++                if (deleted < 0 || deleted > capacity) return ErrorCode::FailedParseValue;
++                auto status = m_data.LoadScalarRecord(input, blockSize, capacity);
++                if (status != ErrorCode::Success) return status;
++                SizeType marked = 0;
++                for (SizeType vid = 0; vid < m_data.R(); ++vid) {
++                    const auto label = *m_data[vid];
++                    if (label == 0xfe) ++marked;
++                    else if (label != 0xff && label > 0x7f) return ErrorCode::FailedParseValue;
++                }
++                if (marked != deleted) return ErrorCode::FailedParseValue;
+                 m_deleted = deleted;
+-                return m_data.Load(input, blockSize, capacity);
++                return ErrorCode::Success;
+             }
+ 
+             inline ErrorCode Load(const std::string& filename, SizeType blockSize, SizeType capacity)
 diff --git a/AnnService/inc/Core/DefinitionList.h b/AnnService/inc/Core/DefinitionList.h
 index 812cc3c..f1f0457 100644
 --- a/AnnService/inc/Core/DefinitionList.h
@@ -11,7 +85,7 @@ index 812cc3c..f1f0457 100644
  // 0x1000 ~ 0x1FFF  Index Build Status
  
 diff --git a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
-index ca0eb26..1d53da8 100644
+index ca0eb26..52b9057 100644
 --- a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
 +++ b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
 @@ -13,7 +13,9 @@
@@ -68,7 +142,49 @@ index ca0eb26..1d53da8 100644
                  // SizeType VID = *(int*)(&appendPosting[0]);
                  // LOG(Helper::LogLevel::LL_Error, "Split Triggered by inserting VID: %d, reAssign: %d\n", VID, reassignThreshold);
                  // GetDBStats();
-@@ -1116,6 +1128,8 @@ namespace SPTAG::SPANN {
+@@ -1094,8 +1106,39 @@ namespace SPTAG::SPANN {
+             LOG(Helper::LogLevel::LL_Info, "DataBlockSize: %d, Capacity: %d\n", m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
+ 
+             if (!m_opt->m_useSPDK) {
+-                m_versionMap->Load(m_opt->m_deleteIDFile, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
+-                m_postingSizes.Load(m_opt->m_ssdInfoFile, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
++                const auto versionStatus = m_versionMap->Load(m_opt->m_deleteIDFile, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
++                if (versionStatus != ErrorCode::Success) {
++                    LOG(Helper::LogLevel::LL_Error, "Failed to load SPFresh version labels: %d\n", static_cast<int>(versionStatus));
++                    return false;
++                }
++                const auto postingStatus = m_postingSizes.Load(m_opt->m_ssdInfoFile, m_opt->m_datasetRowsInBlock, m_opt->m_datasetCapacity);
++                if (postingStatus != ErrorCode::Success) {
++                    LOG(Helper::LogLevel::LL_Error, "Failed to load SPFresh posting sizes: %d\n", static_cast<int>(postingStatus));
++                    return false;
++                }
++                if (!m_opt->m_update) {
++                    if (m_postingSizes.GetPostingNum() != m_opt->m_headVectorCount) {
++                        LOG(Helper::LogLevel::LL_Error, "SPFresh posting size count does not match the head count\n");
++                        return false;
++                    }
++                    for (SizeType head = 0; head < m_postingSizes.GetPostingNum(); ++head) {
++                        const auto size = m_postingSizes.GetSize(head);
++                        if (size < 0 || size > m_postingSizeLimit) {
++                            LOG(Helper::LogLevel::LL_Error, "SPFresh posting size is out of bounds for head %d\n", head);
++                            return false;
++                        }
++#ifdef SPTAG_ROCKSDB_ONLY
++                        if (RocksDBIO::ReadOnly) {
++                            std::string posting;
++                            if (db->Get(head, &posting) != ErrorCode::Success ||
++                                posting.size() != static_cast<size_t>(size) * m_vectorInfoSize) {
++                                LOG(Helper::LogLevel::LL_Error, "SPFresh posting length differs for head %d\n", head);
++                                return false;
++                            }
++                        }
++#endif
++                    }
++                }
+                 LOG(Helper::LogLevel::LL_Info, "Current vector num: %d.\n", m_versionMap->GetVectorNum());
+                 LOG(Helper::LogLevel::LL_Info, "Current posting num: %d.\n", m_postingSizes.GetPostingNum());
+             }
+@@ -1116,6 +1159,8 @@ namespace SPTAG::SPANN {
              std::shared_ptr<VectorIndex> p_index,
              SearchStats* p_stats, std::set<int>* truth, std::map<int, std::set<int>>* found) override
          {
@@ -77,7 +193,7 @@ index ca0eb26..1d53da8 100644
              auto exStart = std::chrono::high_resolution_clock::now();
  
              // const auto postingListCount = static_cast<uint32_t>(p_exWorkSpace->m_postingIDs.size());
-@@ -1140,7 +1154,9 @@ namespace SPTAG::SPANN {
+@@ -1140,7 +1185,9 @@ namespace SPTAG::SPANN {
              std::chrono::microseconds remainLimit = m_hardLatencyLimit - std::chrono::microseconds((int)p_stats->m_totalLatency);
  
              auto readStart = std::chrono::high_resolution_clock::now();
@@ -88,7 +204,7 @@ index ca0eb26..1d53da8 100644
              auto readEnd = std::chrono::high_resolution_clock::now();
  
              for (uint32_t pi = 0; pi < postingLists.size(); ++pi) {
-@@ -1507,7 +1523,8 @@ namespace SPTAG::SPANN {
+@@ -1507,7 +1554,8 @@ namespace SPTAG::SPANN {
                  for (int i = 0; i < replicaCount; i++)
                  {
                      // AppendAsync(selections[i].node, 1, appendPosting_ptr);
@@ -98,7 +214,7 @@ index ca0eb26..1d53da8 100644
                  }
              }
              return ErrorCode::Success;
-@@ -1549,6 +1566,11 @@ namespace SPTAG::SPANN {
+@@ -1549,6 +1597,11 @@ namespace SPTAG::SPANN {
          }
  
          bool AllFinished() { return m_splitThreadPool->allClear() && m_reassignThreadPool->allClear(); }
@@ -111,7 +227,7 @@ index ca0eb26..1d53da8 100644
          void GetDBStats() override { 
              db->GetStat();
 diff --git a/AnnService/inc/Core/SPANN/ExtraRocksDBController.h b/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
-index 5ebe241..b1205ed 100644
+index 5ebe241..a75f96e 100644
 --- a/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
 +++ b/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
 @@ -8,6 +8,7 @@
@@ -206,6 +322,15 @@ index 5ebe241..b1205ed 100644
          void ShutDown() override {
              db->Close();
              //DestroyDB(dbPath, dbOptions);
+@@ -162,7 +174,7 @@ namespace SPTAG::SPANN
+                 return ErrorCode::Success;
+             }
+             else {
+-                LOG(Helper::LogLevel::LL_Error, "\e[0;31mError in Get\e[0m: %s, key: %d\n", s.getState(), *((SizeType*)(key.data())));
++                LOG(Helper::LogLevel::LL_Error, "Error in Get: %s\n", s.ToString().c_str());
+                 return ErrorCode::Fail;
+             }
+         }
 @@ -186,12 +198,12 @@ namespace SPTAG::SPANN
              db->MultiGet(rocksdb::ReadOptions(), db->DefaultColumnFamily(),
                  num_keys, slice_keys, slice_values, statuses);
@@ -235,6 +360,19 @@ index 03f36db..4b46189 100644
              virtual void ForceCompaction() { return; }
  
              virtual bool CheckValidPosting(SizeType postingID) = 0;
+diff --git a/AnnService/inc/Core/SPANN/Index.h b/AnnService/inc/Core/SPANN/Index.h
+index 0ad3455..e26d235 100644
+--- a/AnnService/inc/Core/SPANN/Index.h
++++ b/AnnService/inc/Core/SPANN/Index.h
+@@ -73,6 +73,8 @@ namespace SPTAG
+             inline Options* GetOptions() { return &m_options; }
+ 
+             inline SizeType GetNumSamples() const { return m_versionMap.Count(); }
++            inline SizeType GetNumVids() const { return m_versionMap.GetVectorNum(); }
++            inline bool IsDeleted(SizeType vid) const { return m_versionMap.Deleted(vid); }
+             inline DimensionType GetFeatureDim() const { return m_pQuantizer ? m_pQuantizer->ReconstructDim() : m_index->GetFeatureDim(); }
+             inline SizeType GetValueSize() const { return m_options.m_dim * sizeof(T); }
+ 
 diff --git a/AnnService/inc/Helper/KeyValueIO.h b/AnnService/inc/Helper/KeyValueIO.h
 index 5379a89..85436eb 100644
 --- a/AnnService/inc/Helper/KeyValueIO.h
@@ -282,7 +420,7 @@ index ee338eb..e087d56 100644
      }
  }
 diff --git a/AnnService/src/Core/SPANN/SPANNIndex.cpp b/AnnService/src/Core/SPANN/SPANNIndex.cpp
-index cb22593..4c9d074 100644
+index cb22593..ff0b3ba 100644
 --- a/AnnService/src/Core/SPANN/SPANNIndex.cpp
 +++ b/AnnService/src/Core/SPANN/SPANNIndex.cpp
 @@ -106,7 +106,7 @@ namespace SPTAG
@@ -303,7 +441,20 @@ index cb22593..4c9d074 100644
                          m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
                      }
                      else {
-@@ -320,8 +320,7 @@ namespace SPTAG
+@@ -247,8 +247,10 @@ namespace SPTAG
+                 };
+             for (int j = 0; j < m_options.m_iSSDNumberOfThreads; j++) { threads.emplace_back(func); }
+             for (auto& thread : threads) { thread.join(); }
+-            } else {
+-                m_versionMap.Load(m_options.m_deleteIDFile, m_index->m_iDataBlockSize, m_index->m_iDataCapacity);
++            } else if (!m_options.m_useKV || m_pQuantizer) {
++                // The RocksDB searcher already loaded the version labels.
++                const auto status = m_versionMap.Load(m_options.m_deleteIDFile, m_index->m_iDataBlockSize, m_index->m_iDataCapacity);
++                if (status != ErrorCode::Success) return status;
+             }
+ 
+             if ((m_options.m_useSPDK || m_options.m_useKV) && m_options.m_preReassign) {
+@@ -320,8 +322,7 @@ namespace SPTAG
              if ((ret = m_index->SaveIndexData(p_indexStreams)) != ErrorCode::Success) return ret;
  
              if (m_options.m_excludehead) IOBINARY(p_indexStreams[m_index->GetIndexFiles()->size()], WriteBinary, sizeof(std::uint64_t) * m_index->GetNumSamples(), (char*)(m_vectorTranslateMap.get()));
@@ -313,7 +464,7 @@ index cb22593..4c9d074 100644
          }
  
  #pragma region K-NN search
-@@ -369,11 +368,9 @@ namespace SPTAG
+@@ -369,11 +370,9 @@ namespace SPTAG
                  m_workspace->m_postingIDs.clear();
  
                  float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
@@ -327,7 +478,7 @@ index cb22593..4c9d074 100644
                  for (int i = 0; i < p_queryResults->GetResultNum(); ++i)
                  {
                      auto res = p_queryResults->GetResult(i);
-@@ -898,7 +895,7 @@ namespace SPTAG
+@@ -898,7 +897,7 @@ namespace SPTAG
  #ifndef SPTAG_STATIC_ONLY
                  if (m_options.m_useKV)
                  {

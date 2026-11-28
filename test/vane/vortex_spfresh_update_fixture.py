@@ -92,7 +92,9 @@ def validate_capture(capture):
 
 
 def inventory(root):
-    result, total = {}, 0
+    require(not root.is_symlink(), "SYMLINK_INPUT")
+    require(root.is_dir(), "NATIVE_DIRECTORY_REQUIRED")
+    sizes, total = {}, 0
     for path in sorted(root.rglob("*")):
         require(not path.is_symlink(), "SYMLINK_INPUT")
         if path.is_dir():
@@ -101,8 +103,19 @@ def inventory(root):
         size = path.stat().st_size
         require(size <= LIMIT - total, "ARTIFACT_BUDGET")
         total += size
-        result[str(path.relative_to(root))] = {"size": size, "sha256": sha(path.read_bytes())}
+        sizes[str(path.relative_to(root))] = size
+    result = {}
+    for name, size in sizes.items():
+        with (root / name).open("rb") as stream:
+            require(os.fstat(stream.fileno()).st_size == size, "GENERATION_CHANGED")
+            data = stream.read(size + 1)
+        require(len(data) == size, "GENERATION_CHANGED")
+        result[name] = {"size": size, "sha256": sha(data)}
     return result
+
+
+def visibility(mapping, live):
+    return "".join("1" if address(row) in live else "0" for row in mapping)
 
 
 def seal(executable, root, capture, mapping, log):
@@ -111,13 +124,8 @@ def seal(executable, root, capture, mapping, log):
     live = {address(r): r for r in capture["rows"]}
     require(set(live) <= {address(r) for r in mapping}, "VID_MAP")
     require(all(row == live[address(row)] for row in mapping if address(row) in live), "VID_MAP")
-    # A write acknowledgement is insufficient if the closed checkpoint cannot reopen.
-    worker = open_checkpoint(executable, root, len(live), log)
-    try:
-        worker.close()
-    finally:
-        worker.stop()
-    body = {"format_version": 1, "capture": capture, "mapping": mapping, "files": inventory(root / "native")}
+    files, _ = validate_checkpoint(executable, root, visibility(mapping, live), log)
+    body = {"format_version": 1, "capture": capture, "mapping": mapping, "files": files}
     # Persist every declared native file before the single publication pointer.
     for name in body["files"]:
         with (root / "native" / name).open("rb") as stream:
@@ -205,14 +213,22 @@ class Worker:
         self.log.close()
 
 
-def open_checkpoint(executable, root, live_rows, log):
-    worker = Worker(executable, "open", root / "native", log)
+def validate_checkpoint(executable, root, expected_visibility, log, *, expected_files=None, retain_reader=False):
+    native = root / "native"
+    files = inventory(native)
+    if expected_files is not None:
+        require(files == expected_files, "GENERATION_CHANGED")
+    worker = Worker(executable, "open", native, log)
     try:
-        require(worker.ready["live"] == live_rows, "NATIVE_ROW_COUNT")
+        require(worker.ready["live"] == expected_visibility.count("1"), "NATIVE_ROW_COUNT")
+        require(worker.ready["visibility"] == expected_visibility, "NATIVE_VID_VISIBILITY")
+        if not retain_reader:
+            worker.close()
+        require(inventory(native) == files, "NATIVE_REOPEN_CHANGED")
     except BaseException:
         worker.stop()
         raise
-    return worker
+    return files, worker if retain_reader else None
 
 
 def seed(executable, root, capture, log):
@@ -358,7 +374,10 @@ class Catalog:
 class ReadView:
     def __init__(self, executable, private, body, log):
         self.root, self.body = private, body
-        self.worker = open_checkpoint(executable, private, len(body["capture"]["rows"]), log)
+        live = {address(row) for row in body["capture"]["rows"]}
+        _, self.worker = validate_checkpoint(
+            executable, private, visibility(body["mapping"], live), log, expected_files=body["files"], retain_reader=True
+        )
 
     def query(self, vector, k):
         require(type(k) is int and 1 <= k <= 64, "QUERY_K")

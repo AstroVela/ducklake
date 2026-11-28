@@ -3,6 +3,7 @@
 #include "inc/Core/SPANN/ExtraRocksDBController.h"
 #include "inc/Helper/SimpleIniReader.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +18,8 @@ namespace fs = std::filesystem;
 constexpr int DIM = 8;
 constexpr int HEADS = 64;
 constexpr int ROWS = 100000;
+constexpr int BLOCK_ROWS = 1024;
+constexpr int POSTING_PAGES = 12;
 
 static void require(bool yes, const char *message) {
 	if (!yes)
@@ -41,19 +44,27 @@ static std::shared_ptr<SPTAG::SPANN::Index<float>> open(const fs::path &root) {
 	SPTAG::Helper::IniReader config;
 	check(config.LoadIniFile((root / "indexloader.ini").string()), "LoadIni");
 	check(index->LoadConfig(config), "LoadConfig");
-	require(index->GetOptions()->m_useKV && !index->GetOptions()->m_useSPDK && index->GetOptions()->m_inPlace &&
-	            !index->GetOptions()->m_update,
+	const auto &options = *index->GetOptions();
+	require(options.m_useKV && !options.m_useSPDK && options.m_inPlace && !options.m_update && !options.m_preReassign &&
+	            !options.m_excludehead &&
+	            options.m_dim == DIM && options.m_headVectorCount == HEADS && options.m_datasetCapacity == ROWS &&
+	            options.m_datasetRowsInBlock == BLOCK_ROWS && options.m_postingPageLimit == POSTING_PAGES &&
+	            options.m_searchPostingPageLimit == POSTING_PAGES,
 	        "Unsupported dynamic probe profile");
 	paths(*index, root);
 	std::vector<std::shared_ptr<SPTAG::Helper::DiskIO>> handles;
 	auto files = index->GetIndexFiles();
 	for (auto &name : *files) {
+		const fs::path relative(name);
+		require(!relative.is_absolute() && std::find(relative.begin(), relative.end(), "..") == relative.end(),
+		        "Head file outside checkpoint");
 		auto handle = SPTAG::f_createIO();
 		require(handle && handle->Initialize((root / name).c_str(), std::ios::binary | std::ios::in),
 		        "Index file missing");
 		handles.push_back(std::move(handle));
 	}
 	check(index->LoadIndexData(handles), "LoadData");
+	require(index->GetMemoryIndex()->GetNumSamples() == HEADS, "Unexpected native head count");
 	index->SetReady(true);
 	return index;
 }
@@ -74,7 +85,7 @@ static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, co
 	set(*index, "Base", "IndexAlgoType", "BKT");
 	set(*index, "Base", "ValueType", "Float");
 	set(*index, "Base", "DistCalcMethod", "L2");
-	set(*index, "Base", "DataBlockSize", "1024");
+	set(*index, "Base", "DataBlockSize", std::to_string(BLOCK_ROWS));
 	set(*index, "Base", "DataCapacity", std::to_string(ROWS));
 	paths(*index, root);
 	set(*index, "SelectHead", "isExecute", "true");
@@ -89,7 +100,7 @@ static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, co
 	set(*index, "BuildHead", "TPTLeafSize", "32");
 	set(*index, "BuildHead", "NeighborhoodSize", "16");
 	set(*index, "BuildHead", "RefineIterations", "2");
-	set(*index, "BuildHead", "DataBlockSize", "1024");
+	set(*index, "BuildHead", "DataBlockSize", std::to_string(BLOCK_ROWS));
 	set(*index, "BuildHead", "DataCapacity", std::to_string(ROWS));
 	set(*index, "BuildSSDIndex", "isExecute", "true");
 	set(*index, "BuildSSDIndex", "BuildSsdIndex", "true");
@@ -100,8 +111,8 @@ static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, co
 	set(*index, "BuildSSDIndex", "InPlace", "true");
 	set(*index, "BuildSSDIndex", "Update", "false");
 	set(*index, "BuildSSDIndex", "ExcludeHead", "false");
-	set(*index, "BuildSSDIndex", "PostingPageLimit", "12");
-	set(*index, "BuildSSDIndex", "SearchPostingPageLimit", "12");
+	set(*index, "BuildSSDIndex", "PostingPageLimit", std::to_string(POSTING_PAGES));
+	set(*index, "BuildSSDIndex", "SearchPostingPageLimit", std::to_string(POSTING_PAGES));
 	set(*index, "BuildSSDIndex", "ReplicaCount", "4");
 	set(*index, "BuildSSDIndex", "InternalResultNum", "32");
 	set(*index, "BuildSSDIndex", "SearchInternalResultNum", "64");
@@ -133,7 +144,19 @@ int main(int argc, char **argv) {
 			SPTAG::SPANN::RocksDBIO::ReadOnly = mode == "open";
 			index = open(root);
 		}
-		std::cout << "R7 {\"ready\":true,\"live\":" << index->GetNumSamples() << "}" << std::endl;
+		const auto total = index->GetNumVids();
+		const auto live = index->GetNumSamples();
+		require(total >= 0 && total <= ROWS && live >= 0 && live <= total, "Native VID budget");
+		std::ostringstream ready;
+		ready << "R7 {\"ready\":true,\"live\":" << live;
+		if (mode == "open") {
+			std::string visibility(total, '0');
+			for (SPTAG::SizeType vid = 0; vid < total; ++vid)
+				if (!index->IsDeleted(vid))
+					visibility[vid] = '1';
+			ready << ",\"visibility\":\"" << visibility << "\"";
+		}
+		std::cout << ready.str() << "}" << std::endl;
 		std::string line;
 		while (std::getline(std::cin, line)) {
 			require(line.size() <= 4 * 1024 * 1024, "Command budget");
@@ -146,7 +169,7 @@ int main(int argc, char **argv) {
 				require(!SPTAG::SPANN::RocksDBIO::ReadOnly, "Read-only view");
 				int count;
 				require(bool(in >> count) && count > 0 && count <= 1000 &&
-				            index->GetNumSamples() + index->GetNumDeleted() + count <= ROWS,
+				            index->GetNumVids() + count <= ROWS,
 				        "Add budget");
 				std::vector<float> vectors(count * DIM);
 				for (auto &v : vectors)
@@ -165,7 +188,7 @@ int main(int argc, char **argv) {
 			} else if (op == "delete") {
 				require(!SPTAG::SPANN::RocksDBIO::ReadOnly, "Read-only view");
 				int id;
-				require(bool(in >> id) && id >= 0 && id < index->GetNumSamples() + index->GetNumDeleted(),
+				require(bool(in >> id) && id >= 0 && id < index->GetNumVids(),
 				        "Invalid VID");
 				auto result = index->DeleteIndex(id);
 				require(result == ErrorCode::Success || result == ErrorCode::VectorNotFound, "Delete failed");
