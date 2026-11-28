@@ -20,6 +20,9 @@ statement ok
 CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
 
 statement ok
+SET VARIABLE request_table_uuid = (SELECT t.table_uuid::VARCHAR FROM __ducklake_metadata_lake.ducklake_table t JOIN __ducklake_metadata_lake.ducklake_schema s USING(schema_id) WHERE t.table_name='items' AND s.schema_name='main' AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL)
+
+statement ok
 CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
 
 statement ok
@@ -29,7 +32,7 @@ statement ok
 SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__',2)
 
 statement error
-SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'}],1::UBIGINT)
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'}],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 WriteBatch catalog is not initialized
 
@@ -37,7 +40,7 @@ statement ok
 SELECT * FROM ducklake_initialize_vortex_writes('lake')
 
 query TI
-SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],1::UBIGINT)
+SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 r1	2
 
@@ -47,7 +50,7 @@ SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2 
 1
 
 query TI
-SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],1::UBIGINT)
+SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 r1	2
 
@@ -63,12 +66,12 @@ SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0,0]:
 2	NULL
 
 statement error
-SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[5,0],'category':'A','payload':'一'}],1::UBIGINT)
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[5,0],'category':'A','payload':'一'}],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 request_id payload mismatch
 
 statement error
-SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','bad',[{'id':3,'embedding':[1,0],'category':'A','payload':'valid'},{'id':4,'embedding':[1,2,3],'category':'A','payload':'invalid'}],1::UBIGINT)
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','bad',[{'id':3,'embedding':[1,0],'category':'A','payload':'valid'},{'id':4,'embedding':[1,2,3],'category':'A','payload':'invalid'}],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 dimension
 
@@ -78,12 +81,12 @@ SELECT (SELECT count(*) FROM lake.items),(SELECT count(*) FROM __ducklake_metada
 2	1
 
 statement error
-SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','empty',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],1::UBIGINT)
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','empty',[]::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 1 to 1000
 
 statement error
-SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'}],1::UBIGINT)
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'}],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 request ID
 
@@ -91,7 +94,7 @@ statement ok
 BEGIN
 
 statement error
-SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','outer',[{'id':3,'embedding':[1,0],'category':'A','payload':'一'}],1::UBIGINT)
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','outer',[{'id':3,'embedding':[1,0],'category':'A','payload':'一'}],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 autocommit
 
@@ -110,7 +113,7 @@ statement ok
 CALL ducklake_flush_inlined_data('lake',table_name=>'items')
 
 query TI
-SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],1::UBIGINT)
+SELECT request_id,row_count FROM ducklake_write_vortex_batch('lake','main','items','knn','r1',[{'id':1,'embedding':[1,0],'category':'A','payload':'一'},{'id':2,'embedding':[2,0],'category':NULL,'payload':NULL}],1::UBIGINT,getvariable('request_table_uuid'))
 ----
 r1	2
 
@@ -124,6 +127,22 @@ query I
 SELECT current_setting('ducklake_max_retry_count')
 ----
 10
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_write_batch.ducklake' AS lake (READ_ONLY)
+
+statement error
+SELECT * FROM ducklake_initialize_vortex_writes('lake')
+----
+writable DuckLake attachment
+
+statement error
+SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn','read-only',[{'id':3,'embedding':[1,0],'category':'A','payload':'一'}],1::UBIGINT,getvariable('request_table_uuid'))
+----
+writable DuckLake attachment
 
 statement ok
 DETACH lake

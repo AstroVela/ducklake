@@ -1,6 +1,6 @@
 # Native Vortex 已退休表的原生历史与物理回收契约
 
-本轮承接 [表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md)，验证本地 native DuckDB 元数据下，逻辑退休之后的原生历史、inline 表、源文件、generation 与 WAL。总入口为 [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)。生产变更是在原生过期事务中清理已无历史引用的 table ID 配置；接口、元数据布局、依赖、事务保护和预算沿用 #89 的 `e4cd030bb8fbe657179c045d75a2a5f65e1fe3b1`。
+在 #89 合入开发分支的 `1848e868` 基线上，#90 验证逻辑退休之后的原生历史、inline 表、源文件、generation 与 WAL。生产变更在原生过期事务中清理已无历史引用的 table ID 配置，沿用现有接口、元数据布局、依赖、事务保护和预算。[表 UUID 状态生命周期](native-vortex-table-uuid-lifecycle.md) · [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)
 
 验证保持 CPU **6–11**、DuckDB **threads=2**、原 SPFresh／线程环境、事务保护和预算。输入、事务屏障及故障阶段固定；耗时只观察，R4 A/A、性能 A/B 与长期稳态继续暂缓。
 
@@ -52,14 +52,14 @@ CHECKPOINT __ducklake_metadata_lake;
 
 块可以复用，但数据库文件仍可能增长；collector 删除的源／索引字节、原生空闲块和文件尺寸是三个独立度量。三轮固定输入不构成长时间磁盘或 RSS 上界，也不证明生产吞吐和延迟。
 
-退休幂等回放依赖原生历史认证。表名尚未重用且历史仍在时，同 UUID 退休返回原结果；历史过期后，无法认证的 UUID 明确失败。同名新表存在时，旧 UUID 继续返回 `STALE_TABLE`。本轮不增加独立 tombstone、兼容层、孤儿接管或 fallback。
+退休重放使用原生历史验证表名最后所属的 UUID。该版本的结束快照至当前快照必须连续保留。同名新表仍在时，旧 UUID 返回 `STALE_TABLE`。表已删除且历史不足以证明最后归属时，重放返回错误。[表 UUID 的重放条件](native-vortex-table-uuid-lifecycle.md)
 
 ## 确定性验收与恢复
 
 [安装态 coordinator](../test/vane/test_vane_vortex_retired_history.py) 驱动 [native fixture](../test/vane/native_vortex_history_fixture.hpp)，并在每个 native 场景结束或 SIGKILL 后，启动全新的已安装 Vane 进程核对和显式恢复。
 
 ```bash
-env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local-fast python -I \
+env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local python -I \
   test/vane/test_vane_vortex_retired_history.py \
   --driver /path/to/ducklake_vortex_write_driver \
   --cpus 6,7,8,9,10,11 --output-dir /fresh/retired-history-proof
@@ -67,7 +67,7 @@ env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local-fast python -I \
 
 逐项核对范围包括：
 
-- 全部 **28 张原生元数据表、13 张 Vortex 元数据表**，实际注册的 inline 数据表及已存在的 inline 文件删除表。
+- 原生记录和安装态重开逐表核对 **28 张原生元数据表、16 张 Vortex 元数据表** 的表名及内容，并比较实际注册的 inline 数据表和已存在的 inline 文件删除表。
 - 原生表 UUID／table ID、快照、独立 typed row 模型，以及所有 data／indexes 文件的 SHA-256 和尺寸。
 - T-only 与 B＋F＋T 退休／同名重建；普通旧读者、保留快照的时间旅行查询、另一个退休表与相邻真实 B 的隔离。
 - disabled／age／keep 策略、事务内显式过期的 rollback、小字节预算、源与 generation 的对象／字节计账、未知文件及 caller reference 保持。
@@ -81,7 +81,9 @@ env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local-fast python -I \
 
 本轮继续限定单进程本地 POSIX 所有权与已知 catalog；不把进程 SIGKILL 验收扩展为掉电、远程持久性或多进程 fencing 保证。
 
-## 本轮验证结果与构件身份
+## 原分支的历史验证结果与构件身份
+
+以下数字、摘要和路径来自 2026-11-06 的原分支验证。该版本基于 #89 原提交 `e4cd030b`，其恢复检查涵盖 13 张 Vortex 元数据表。[原验证提交](https://github.com/AstroVela/ducklake/commit/48293724a8d3b0652a689a7c85e01e7892369ca8)
 
 专项验收通过 **4 组独立公开契约、33 个 native／全新安装态恢复场景，含 15 次实际 SIGKILL**。取消与注入错误分别覆盖七个阶段；原生 UPDATE 冲突必须匹配实际冲突错误，事务内 inline DROP 后的故障必须恢复全部原生记录和表级配置。
 

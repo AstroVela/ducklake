@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import time
 
 SPEC = importlib.util.spec_from_file_location(
@@ -199,7 +200,9 @@ def exercise(proof, native, root, checks, workers):
     MA.drain(native)
     native.sql(
         "SELECT * FROM ducklake_expire_snapshots('lake',older_than=>now());"
-        "SELECT * FROM ducklake_cleanup_old_files('lake',cleanup_all=>true)"
+        "SELECT * FROM ducklake_cleanup_old_files('lake',cleanup_all=>true);"
+        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('expired retirement metadata remains') END "
+        "FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1"
     )
     require(
         all(not Path(f["uri"]).exists() for f in M.files([first, *parts])),
@@ -293,7 +296,7 @@ def interruption(driver, root, kind, checks):
         M.stop(native)
 
 
-def crash(driver, root, stage, checks):
+def crash(driver, root, stage, checks, *, append_after_restart=False):
     native = CAT.Native(driver, root / "native")
     try:
         single(native, root)
@@ -315,27 +318,52 @@ def crash(driver, root, stage, checks):
             RW.active_rows(native) == (0 if committed else 4096),
             "Crash committed only half of source retirement",
         )
+        native.sql(
+            f"SELECT CASE WHEN count(*)={2 if committed else 0} THEN true "
+            "ELSE error('crash split retirement audit metadata') END "
+            "FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1"
+        )
         if committed:
             require(
                 head["reference"]["publication"] == durable["run_id"],
                 "Restart lost retirement publication identity",
             )
         OPT.steady(native, OPT.status(native))
-        native.call("optimizer-resume")
-        row = OPT.wait(
-            native,
-            lambda s: s["compaction_reason"] == "no_segments" and not s["running"],
-            "post-crash retirement",
-        )
+        if append_after_restart:
+            SEG.add_f(native, 5000)
+            native.call("append", "knn", root / "artifacts" / "later-B.json", 2)
+            require(native.call("head", "knn")["revision"] == 3, "Later append did not advance the published revision")
+            native.sql(
+                "SELECT CASE WHEN state='published' THEN true "
+                "ELSE error('resume lost the committed retirement receipt') END "
+                "FROM ducklake_resume_vortex_optimizer('lake','main','items','knn')"
+            )
+            row = OPT.steady(native, OPT.status(native))
+            require(
+                row["published_revision"] == 2 and row["run_id"] == durable["run_id"],
+                "A later publication changed the recovered retirement identity",
+            )
+        else:
+            native.call("optimizer-resume")
+            row = OPT.wait(
+                native,
+                lambda s: s["compaction_reason"] == "no_segments" and not s["running"],
+                "post-crash retirement",
+            )
         require(
             row["run_count"] == (1 if committed else 2),
             "Crash recovery replayed a committed task or auto retried",
         )
         native.call("maintenance-resume")
         recalls = []
-        qualify(native, "restarted-empty", recalls, 0)
+        qualify(native, "restarted", recalls, int(append_after_restart))
         BG.finish(native)
-        checks.append(f"SIGKILL at {stage} recovers a complete old/new plan; only explicit resume schedules fresh work")
+        if append_after_restart:
+            checks.append("a later append after restart preserves the committed retirement receipt")
+        else:
+            checks.append(
+                f"SIGKILL at {stage} recovers a complete old/new plan; only explicit resume schedules fresh work"
+            )
         return {"fixture_recalls": recalls}
     finally:
         M.stop(native)
@@ -396,6 +424,454 @@ def delete_publication_race(driver, root, checks):
         M.stop(native)
 
 
+def source_binding(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        generation = SEG.generation(first)
+        native.call("retire-reattach", generation)
+
+        moved = root / "relocated-data"
+        shutil.copytree(native.root / "data", moved)
+        catalog = f"ducklake:{native.root / 'metadata.ducklake'}"
+        native.sql(
+            "DETACH lake; "
+            f"ATTACH {BASE.quote(catalog)} AS lake (DATA_PATH {BASE.quote(moved)}, OVERRIDE_DATA_PATH TRUE);"
+            "SELECT CASE WHEN count(*)=4096 THEN true ELSE error('relocation changed the table contents') END "
+            "FROM lake.items"
+        )
+        before = native.call("head", "knn")
+        native.call("retire", generation, 1, expected="source file identity changed")
+        require(native.call("head", "knn") == before, "Input identity rejection changed the index revision")
+        require(RW.active_rows(native) == 4096, "Input identity rejection dropped active sources")
+        native.finish()
+        checks.extend(
+            [
+                "retirement rejects a stale caller attachment",
+                "retirement checks the active file ID against its resolved path after managed data relocation",
+            ]
+        )
+        return {"active_rows": 4096}
+    finally:
+        M.stop(native)
+
+
+def unrelated_inline_delete(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        single(native, root)
+        SEG.add_f(native, 5000)
+        native.sql(
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('fixture already has inline file deletes') END "
+            "FROM information_schema.tables WHERE table_catalog='__ducklake_metadata_lake' "
+            "AND table_name='ducklake_inlined_delete_1'"
+        )
+        BG.pause(native, "retire_candidate_ready")
+        native.sql("DELETE FROM lake.items WHERE id=5000")
+        native.sql(
+            "SELECT CASE WHEN count(*)=1 THEN true ELSE error('expected one inline delete') END "
+            "FROM __ducklake_metadata_lake.ducklake_inlined_delete_1"
+        )
+        native.call("optimizer-release")
+        row = BG.published(native, 2)
+        require(row["run_count"] == 1 and RW.active_rows(native) == 128, "Unrelated inline delete affected retirement")
+        native.sql(
+            "SELECT CASE WHEN count(*)=127 AND min(id)=5001 THEN true "
+            "ELSE error('retirement changed the unindexed file visibility') END FROM lake.items"
+        )
+        BG.finish(native)
+        checks.append("an unrelated first inline deletion does not invalidate the selected retirement inputs")
+        return {"unindexed_physical_rows": 128, "unindexed_visible_rows": 127}
+    finally:
+        M.stop(native)
+
+
+def retirement_audit(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        native.sql(
+            "SET VARIABLE audit_start=(SELECT max(snapshot_id)+1 FROM lake.snapshots());"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',2048,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id%2=0;"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id=1;"
+            "DELETE FROM lake.items WHERE id%2=1;"
+            "SET VARIABLE audit_end=(SELECT max(snapshot_id) FROM lake.snapshots())"
+        )
+        native.sql(
+            "SELECT CASE WHEN "
+            "(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1)=2049 AND "
+            "(SELECT sum(delete_count) FROM __ducklake_metadata_lake.ducklake_delete_file "
+            "WHERE end_snapshot IS NULL)=2047 "
+            "THEN true ELSE error('expected an inline-only file and a mixed-mask file') END"
+        )
+        native.sql(
+            "CREATE TEMP TABLE audit_before AS SELECT snapshot_id,id FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('audit_start'),getvariable('audit_end'));"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "THEN true ELSE error('fixture lost logical delete events') END FROM audit_before"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.sql(
+            "SET VARIABLE retire_version=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('retirement emitted a delete') END FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('retire_version'),getvariable('retire_version'));"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('retirement emitted a change') END FROM "
+            "ducklake_table_changes('lake','main','items',getvariable('retire_version'),getvariable('retire_version'));"
+            "CREATE TEMP TABLE audit_after AS SELECT snapshot_id,id FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('audit_start'),getvariable('retire_version'));"
+            "SELECT CASE WHEN (SELECT count(*) FROM audit_after)=4096 AND NOT EXISTS("
+            "SELECT * FROM audit_before EXCEPT ALL SELECT * FROM audit_after) "
+            "THEN true ELSE error('retirement changed the logical delete history') END"
+        )
+        SEG.add_f(native, 5000)
+        native.sql(
+            "DELETE FROM lake.items WHERE id=5000;"
+            "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
+            "SELECT CASE WHEN count(*)=2049 THEN true ELSE error('flush moved retired masks') END "
+            "FROM __ducklake_metadata_lake.ducklake_inlined_delete_1;"
+            "SELECT CASE WHEN delete_file_count=1 THEN true ELSE error('flush included retired sources') END "
+            "FROM ducklake_table_info('lake') WHERE table_name='items';"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "THEN true ELSE error('flush changed historical deletion events') END FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('audit_start'),getvariable('retire_version'));"
+            "DELETE FROM lake.items WHERE id=5001;"
+            "SELECT * FROM ducklake_expire_snapshots('lake',older_than=>now());"
+            "SELECT CASE WHEN count(*)=1 AND count(*) FILTER (WHERE d.end_snapshot IS NULL)=1 "
+            "THEN true ELSE error('retirement expiry left old masks or erased an active mask') END "
+            "FROM __ducklake_metadata_lake.ducklake_inlined_delete_1 i "
+            "LEFT JOIN __ducklake_metadata_lake.ducklake_data_file d ON d.data_file_id=i.file_id;"
+            "SELECT CASE WHEN count(*)=126 AND min(id)=5002 THEN true "
+            "ELSE error('expiry changed current visibility') END FROM lake.items"
+        )
+        native.finish()
+        checks.append("inline-only and mixed delete masks retain their audit snapshots through physical retirement")
+        checks.append("flush retains retired masks and expiry removes them without changing active masks")
+        return {"logical_deletes": 4096, "new_retirement_events": 0}
+    finally:
+        M.stop(native)
+
+
+def versioned_delete_mask(driver, root, checks, *, vectors=False):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        if vectors:
+            native.sql("CALL ducklake_set_option('lake','write_deletion_vectors',true,table_name=>'items')")
+        native.sql(
+            "CREATE TABLE lake.other(i INTEGER);"
+            "DELETE FROM lake.items WHERE id<128;"
+            "SET VARIABLE partial_version=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id=128;"
+            "SET VARIABLE inline_version=(SELECT max(snapshot_id) FROM lake.snapshots())"
+        )
+        unrelated, finish_delete = root / "unrelated.sql", root / "finish-delete.sql"
+        unrelated.write_text("INSERT INTO lake.other VALUES(1)")
+        finish_delete.write_text("DELETE FROM lake.items")
+        native.call("concurrent-deletes", unrelated, finish_delete)
+        native.sql(
+            "SET VARIABLE final_version=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SET VARIABLE unrelated_version=getvariable('final_version')-1;"
+            "SELECT CASE WHEN "
+            "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('partial_version')))=3968 AND "
+            "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('unrelated_version')))=3967 AND "
+            "(SELECT count(*) FROM lake.items)=0 "
+            "THEN true ELSE error('final delete changed historical visibility') END;"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "AND count(*) FILTER (WHERE id<128 AND snapshot_id=getvariable('partial_version'))=128 "
+            "AND count(*) FILTER (WHERE id=128 AND snapshot_id=getvariable('inline_version'))=1 "
+            "AND count(*) FILTER (WHERE id>=129 AND snapshot_id=getvariable('final_version'))=3967 "
+            "THEN true ELSE error('full mask assigned deletes to incorrect snapshots') END FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('partial_version'),getvariable('final_version'));"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('unrelated commit acquired deletes') END FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('unrelated_version'),"
+            "getvariable('unrelated_version'))"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.sql(
+            "SELECT CASE WHEN file_count=0 AND delete_file_count=0 THEN true "
+            "ELSE error('retired source masks still count toward current table size') END "
+            "FROM ducklake_table_info('lake') WHERE table_name='items';"
+            "SELECT CASE WHEN count(*)=3968 THEN true ELSE error('retirement discarded prior mask history') END "
+            "FROM lake.items AT (VERSION=>getvariable('partial_version'))"
+        )
+        native.sql(
+            "SET VARIABLE superseded_versions=(SELECT list(snapshot_id) FROM lake.snapshots() "
+            "WHERE snapshot_id>=getvariable('partial_version') AND snapshot_id<getvariable('final_version'));"
+            "SELECT * FROM ducklake_expire_snapshots('lake',"
+            "versions=>getvariable('superseded_versions'));"
+            "SELECT CASE WHEN count(*)=3967 AND min(id)=129 "
+            "THEN true ELSE error('expiry changed the retained DELETE event') END FROM "
+            "ducklake_table_deletions('lake','main','items',getvariable('final_version'),getvariable('final_version'))"
+        )
+        native.finish()
+        mask = "Puffin" if vectors else "Parquet"
+        checks.append(f"a completed {mask} mask with a disjoint inline deletion preserves exact DELETE history")
+        return {"prior_deletions": 129, "final_deletions": 3967, "delete_format": mask}
+    finally:
+        M.stop(native)
+
+
+def append_after_retirement(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        single(native, root)
+        BG.pause(native, "retire_candidate_ready")
+        native.sql("BEGIN; INSERT INTO lake.items VALUES(5000,[0,0,0,0,0,0,0,0],'A','queued')")
+        native.call("optimizer-release")
+        BG.published(native, 2)
+        native.sql(
+            "COMMIT;"
+            "SELECT CASE WHEN count(*)=1 AND min(id)=5000 THEN true ELSE error('staged append was lost') END "
+            "FROM lake.items;"
+            "SELECT CASE WHEN changes_made LIKE 'rewrite_delete:%' THEN true "
+            "ELSE error('retirement journaled a logical delete') END "
+            "FROM __ducklake_metadata_lake.ducklake_snapshot_changes WHERE snapshot_id="
+            "(SELECT max(snapshot_id)-1 FROM lake.snapshots())"
+        )
+        BG.finish(native)
+        checks.append("an append staged before retirement commits afterward without a logical-delete conflict")
+        return {"appended_rows": 1, "revision": 2}
+    finally:
+        M.stop(native)
+
+
+def completed_mask_flush(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        native.sql(
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items');"
+            "SET VARIABLE first_delete=(SELECT max(snapshot_id)+1 FROM lake.snapshots())"
+        )
+        bulk, inline = root / "bulk-delete.sql", root / "inline-delete.sql"
+        bulk.write_text("DELETE FROM lake.items WHERE id<128")
+        inline.write_text("DELETE FROM lake.items WHERE id=0")
+        native.call("concurrent-deletes", bulk, inline)
+        native.sql(
+            "SET VARIABLE partial_version=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "BEGIN; DELETE FROM lake.items;"
+            "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('flush exposed a staged deletion') END FROM lake.items;"
+            "COMMIT;"
+            "SET VARIABLE final_delete=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "CREATE TEMP TABLE complete_masks AS SELECT delete_file_id,begin_snapshot "
+            "FROM __ducklake_metadata_lake.ducklake_delete_file WHERE end_snapshot IS NULL;"
+            "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
+            "SELECT CASE WHEN count(*)=2 AND NOT EXISTS (SELECT * FROM complete_masks EXCEPT ALL "
+            "SELECT delete_file_id,begin_snapshot FROM __ducklake_metadata_lake.ducklake_delete_file "
+            "WHERE end_snapshot IS NULL) THEN true ELSE error('flush rewrote a completed mask version') END "
+            "FROM complete_masks;"
+            "SELECT CASE WHEN count(*)=3968 THEN true ELSE error('flush changed prior visibility') END "
+            "FROM lake.items AT (VERSION=>getvariable('partial_version'))"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.sql(
+            "SET VARIABLE retirement=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SELECT CASE WHEN count(*)=0 THEN true ELSE error('retirement replayed an overlapping DELETE') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('retirement'),getvariable('retirement'));"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "AND count(*) FILTER (WHERE id<128 AND snapshot_id=getvariable('first_delete'))=128 "
+            "AND count(*) FILTER (WHERE id>=128 AND snapshot_id=getvariable('final_delete'))=3968 "
+            "THEN true ELSE error('overlapping masks changed the first DELETE snapshot') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('first_delete'),getvariable('retirement'))"
+        )
+        native.finish()
+        checks.append("flush preserves staged and committed complete masks before retirement")
+        checks.append("an overlapping inline mask preserves the first delete and emits no event at retirement")
+        return {"prior_visible_rows": 3968}
+    finally:
+        M.stop(native)
+
+
+def flush_before_complete_mask(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        native.sql(
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items');"
+            "SET VARIABLE delete_start=(SELECT max(snapshot_id)+1 FROM lake.snapshots());"
+            "DELETE FROM lake.items WHERE id<128 AND id%2=0;"
+            "DELETE FROM lake.items WHERE id IN (128,129);"
+            "SET VARIABLE before_flush=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "BEGIN;"
+            "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
+            "DELETE FROM lake.items;"
+            "COMMIT;"
+            "SET VARIABLE final_delete=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SELECT CASE WHEN "
+            "(SELECT count(*) FROM lake.items AT (VERSION=>getvariable('before_flush')))=4030 "
+            "AND (SELECT count(*) FROM lake.items)=0 "
+            "THEN true ELSE error('superseded flush changed historical visibility') END;"
+            "SELECT CASE WHEN count(*)=4030 AND count(DISTINCT id)=4030 "
+            "AND count(*) FILTER (WHERE id IN (128,129))=0 "
+            "THEN true ELSE error('final delete repeated earlier inline deletions') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('final_delete'),getvariable('final_delete'));"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "THEN true ELSE error('superseded flush changed logical delete history') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('delete_start'),getvariable('final_delete'))"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.finish()
+        checks.append("a completing DELETE preserves inline history when it supersedes a flush in the same transaction")
+        return {"prior_visible_rows": 4030, "logical_deletes": 4096}
+    finally:
+        M.stop(native)
+
+
+def concurrent_mask_flush(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        SEG.setup(native, root)
+        native.sql(
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id<128;"
+            "DELETE FROM lake.items WHERE id IN (128,2048)"
+        )
+        flush = root / "flush.sql"
+        flush.write_text("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
+        native.call("concurrent-deletes", flush, flush, expected="deleted from it")
+        native.sql("DELETE FROM lake.items WHERE id=129")
+        stale_delete = root / "delete.sql"
+        stale_delete.write_text("DELETE FROM lake.items WHERE id>=256 AND id<384")
+        native.call("concurrent-deletes", flush, stale_delete, expected="deleted from it")
+        native.sql(
+            "SELECT CASE WHEN count(*)=2 AND count(DISTINCT data_file_id)=2 THEN true "
+            "ELSE error('flush left multiple active masks for a source') END "
+            "FROM __ducklake_metadata_lake.ducklake_delete_file WHERE end_snapshot IS NULL;"
+            "SELECT CASE WHEN count(*)=3965 AND count(DISTINCT id)=3965 "
+            "AND count(*) FILTER (WHERE id<130 OR id=2048)=0 "
+            "AND count(*) FILTER (WHERE id>=256 AND id<384)=128 "
+            "THEN true ELSE error('overlapping mask publications changed visibility') END FROM lake.items"
+        )
+        native.finish()
+        checks.append("backdated flush masks conflict with concurrent flush and DELETE on the same source")
+        return {"active_masks": 2, "visible_rows": 3965}
+    finally:
+        M.stop(native)
+
+
+def concurrent_complete_mask(driver, root, checks, *, vectors=False):
+    native = CAT.Native(driver, root / "native")
+    try:
+        SEG.setup(native, root)
+        if vectors:
+            native.sql("CALL ducklake_set_option('lake','write_deletion_vectors',true,table_name=>'items')")
+        native.sql(
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id<128;"
+            "SET VARIABLE first_delete=(SELECT max(snapshot_id) FROM lake.snapshots())"
+        )
+        inline, complete = root / "inline.sql", root / "complete.sql"
+        inline.write_text("DELETE FROM lake.items WHERE id=128")
+        complete.write_text("DELETE FROM lake.items")
+        native.call("concurrent-deletes", inline, complete)
+        native.sql(
+            "SET VARIABLE final_delete=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SET VARIABLE inline_delete=getvariable('final_delete')-1;"
+            "SELECT CASE WHEN (SELECT count(*) FROM lake.items AT (VERSION=>getvariable('inline_delete')))=3967 "
+            "AND (SELECT count(*) FROM lake.items)=0 THEN true "
+            "ELSE error('concurrent inline delete changed visibility') END;"
+            "SELECT CASE WHEN count(*)=3967 AND min(id)=129 AND min(snapshot_id)=getvariable('final_delete') "
+            "THEN true ELSE error('completion replayed the concurrent inline DELETE') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('final_delete'),getvariable('final_delete'));"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "AND count(*) FILTER (WHERE id=128 AND snapshot_id=getvariable('inline_delete'))=1 "
+            "THEN true ELSE error('concurrent deletion history has duplicate rows') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('first_delete'),getvariable('final_delete'))"
+        )
+        for version, count in (("first_delete", 128), ("inline_delete", 1), ("final_delete", 3967)):
+            native.sql(
+                f"SELECT CASE WHEN count(*)={count} THEN true ELSE error('snapshot filter changed the event set') END "
+                "FROM ducklake_table_deletions('lake','main','items',getvariable('first_delete'),getvariable('final_delete')) "
+                f"WHERE snapshot_id=getvariable('{version}')"
+            )
+        native.sql(
+            "SELECT CASE WHEN count(*)=3967 AND min(id)=129 THEN true ELSE error('change filter lost DELETE events') END "
+            "FROM ducklake_table_changes('lake','main','items',getvariable('first_delete'),getvariable('final_delete')) "
+            "WHERE snapshot_id=getvariable('final_delete') AND change_type='delete'"
+        )
+        for projection in ("snapshot_id", "snapshot_id,rowid"):
+            native.sql(
+                "SELECT CASE WHEN count(*)=1 AND min(snapshot_id)=getvariable('inline_delete') "
+                "THEN true ELSE error('business filter changed the projected deletion snapshot') END FROM "
+                f"(SELECT {projection} FROM ducklake_table_deletions("
+                "'lake','main','items',getvariable('first_delete'),getvariable('final_delete')) WHERE id=128)"
+            )
+        native.finish()
+        mask = "Puffin" if vectors else "Parquet"
+        checks.append(f"concurrent inline and completing {mask} deletes preserve the first event per row")
+        checks.append(f"snapshot predicates filter finalized {mask} deletion events and table changes")
+        return {"logical_deletes": 4096, "final_deletes": 3967, "delete_format": mask}
+    finally:
+        M.stop(native)
+
+
+def flushed_source_delete_snapshot(driver, root, checks):
+    native = CAT.Native(driver, root / "native")
+    try:
+        artifacts, _, _, _ = SEG.setup(native, root)
+        native.sql("CALL ducklake_set_option('lake','data_inlining_row_limit',100,table_name=>'items')")
+        for start in (5000, 5064):
+            native.sql(
+                f"INSERT INTO lake.items SELECT {start}+i,[128+i/16.0,4,2,0,1,8,7,16],"
+                "'B','flushed' FROM range(64)t(i)"
+            )
+        native.sql("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
+        native.call("append", "knn", artifacts / "B2.json", 1)
+        native.sql(
+            "CALL ducklake_set_option('lake','data_inlining_row_limit',0,table_name=>'items');"
+            "DELETE FROM lake.items WHERE id>=5000;"
+            "SET VARIABLE final_delete=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SELECT CASE WHEN count(*)=128 AND min(id)=5000 AND max(id)=5127 "
+            "AND min(snapshot_id)=getvariable('final_delete') AND max(snapshot_id)=getvariable('final_delete') "
+            "THEN true ELSE error('audit used the flushed source insertion snapshots') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('final_delete'),getvariable('final_delete'))"
+        )
+        native.finish()
+        checks.append("full DELETE of a flushed Vortex source uses its delete commit for all audit rows")
+        return {"logical_deletes": 128}
+    finally:
+        M.stop(native)
+
+
+def flush_late_inline_mask(driver, root, checks, *, vectors=False):
+    native = CAT.Native(driver, root / "native")
+    try:
+        _, _, first, _ = SEG.setup(native, root)
+        if vectors:
+            native.sql("CALL ducklake_set_option('lake','write_deletion_vectors',true,table_name=>'items')")
+        native.sql("CALL ducklake_set_option('lake','data_inlining_row_limit',8,table_name=>'items')")
+        complete, inline = root / "complete.sql", root / "inline.sql"
+        complete.write_text("DELETE FROM lake.items")
+        inline.write_text("DELETE FROM lake.items WHERE id=0")
+        native.call("concurrent-deletes", complete, inline)
+        native.sql(
+            "SET VARIABLE late_inline=(SELECT max(snapshot_id) FROM lake.snapshots());"
+            "SET VARIABLE full_delete=getvariable('late_inline')-1;"
+            "SELECT CASE WHEN (SELECT count(*) FROM lake.items AT (VERSION=>getvariable('full_delete')))=0 "
+            "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1)=1 "
+            "THEN true ELSE error('expected an older complete mask and a later inline deletion') END;"
+            "CALL ducklake_flush_inlined_data('lake',table_name=>'items');"
+            "SELECT CASE WHEN (SELECT count(*) FROM lake.items AT (VERSION=>getvariable('full_delete')))=0 "
+            "AND (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1)=0 "
+            "THEN true ELSE error('inline flush changed historical visibility') END;"
+            "SELECT CASE WHEN count(*)=4096 AND count(DISTINCT id)=4096 "
+            "AND min(snapshot_id)=getvariable('full_delete') AND max(snapshot_id)=getvariable('full_delete') "
+            "THEN true ELSE error('inline flush changed the first DELETE snapshot') END "
+            "FROM ducklake_table_deletions('lake','main','items',getvariable('full_delete'),getvariable('late_inline'))"
+        )
+        native.call("retire", SEG.generation(first), 1)
+        native.finish()
+        mask = "Puffin" if vectors else "Parquet"
+        checks.append(f"flush preserves the earlier {mask} deletion when a stale inline deletion commits later")
+        return {"logical_deletes": 4096, "historical_live_rows": 0, "delete_format": mask}
+    finally:
+        M.stop(native)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["duckdb", "driver", "probe", "output-dir"]:
@@ -422,7 +898,25 @@ def main():
     try:
         report["main"] = exercise(proof, native, directory, report["checks"], workers)
         report["cases"] = []
-        cases = [("capacity", capacity), ("delete-publication-race", delete_publication_race)]
+        cases = [
+            ("capacity", capacity),
+            ("delete-publication-race", delete_publication_race),
+            ("source-binding", source_binding),
+            ("unrelated-inline-delete", unrelated_inline_delete),
+            ("retirement-audit", retirement_audit),
+            ("versioned-parquet-mask", versioned_delete_mask),
+            ("versioned-puffin-mask", lambda d, r, c: versioned_delete_mask(d, r, c, vectors=True)),
+            ("completed-mask-flush", completed_mask_flush),
+            ("flush-before-completion", flush_before_complete_mask),
+            ("concurrent-mask-flush", concurrent_mask_flush),
+            ("concurrent-parquet-completion", concurrent_complete_mask),
+            ("concurrent-puffin-completion", lambda d, r, c: concurrent_complete_mask(d, r, c, vectors=True)),
+            ("flushed-source-delete-snapshot", flushed_source_delete_snapshot),
+            ("late-inline-parquet-flush", flush_late_inline_mask),
+            ("late-inline-puffin-flush", lambda d, r, c: flush_late_inline_mask(d, r, c, vectors=True)),
+            ("append-after-retirement", append_after_retirement),
+            ("later-append", lambda d, r, c: crash(d, r, "retire_after_commit", c, append_after_restart=True)),
+        ]
         cases += [
             (kind, lambda d, r, c, k=kind: interruption(d, r, k, c)) for kind in ["failure", "cancel", "ack", "race"]
         ]

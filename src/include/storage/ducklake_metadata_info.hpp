@@ -383,6 +383,8 @@ struct DuckLakeFileListEntry {
 	optional_idx snapshot_filter_max;
 	//! Lower bound filter, we only include rows where _ducklake_internal_snapshot_id >= snapshot_filter_min
 	optional_idx snapshot_filter_min;
+	//! Physical rewrite snapshots excluded from an insertion scan.
+	vector<idx_t> snapshot_filter_excluded;
 	MappingIndex mapping_id;
 	DuckLakeDataType data_type = DuckLakeDataType::DATA_FILE;
 	//! The data file id
@@ -391,6 +393,11 @@ struct DuckLakeFileListEntry {
 	set<idx_t> inlined_file_deletions;
 	//! Column min/max values for dynamic filter pushdown
 	unordered_map<idx_t, pair<string, string>> column_min_max;
+};
+
+struct DuckLakeDeleteMaskVersion {
+	DuckLakeFileData file;
+	idx_t begin_snapshot;
 };
 
 struct DuckLakeDeleteScanEntry {
@@ -409,6 +416,9 @@ struct DuckLakeDeleteScanEntry {
 	DataFileIndex file_id;
 	//! Inlined file deletions {row_id -> snapshot_id}
 	unordered_map<idx_t, idx_t> inlined_file_deletions;
+	//! Vortex change scans collect the full delete history of each physical source.
+	vector<DuckLakeDeleteMaskVersion> vortex_masks;
+	optional_idx vortex_drop_snapshot;
 };
 
 struct DuckLakeFileListExtendedEntry {
@@ -462,6 +472,7 @@ struct DuckLakeCompactionFileEntry {
 	set<idx_t> inlined_file_deletions;
 	//! Whether this file has any inlined deletions (cheap flag; set for all compaction types).
 	bool has_inlined_deletions = false;
+	bool has_physical_rewrite_rows = false;
 };
 
 struct DuckLakeRewriteFileEntry {
@@ -490,6 +501,7 @@ struct DuckLakeCompactedFileInfo {
 	TableIndex table_index;
 	optional_idx delete_file_start_snapshot;
 	optional_idx delete_file_end_snapshot;
+	bool has_physical_rewrite_rows = false;
 };
 
 struct DuckLakeMergeAdjacentOptions {

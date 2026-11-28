@@ -25,9 +25,9 @@ RULE = {
     "sampling": META.RULE["sampling"],
     "warmups_per_case": META.RULE["warmups_per_case"],
     "order": META.RULE["order"],
-    "oracle": "Once per selected case before sampling: live reference, lexical alias, absent reference, query-error propagation; roll back metadata edits and verify original logical state.",
+    "oracle": "Once per selected case before sampling: live reference, dot-component path alias, absent reference, missing-data-table catalog error; roll back metadata edits and verify original logical state.",
     "producer": "Original sealed images and producing executable stay unchanged. A separate declaration identifies the private instrumented consumer and retains producer provenance.",
-    "path_loop": "One timer per nonempty chunk: Value/string extraction, CanonicalizePath and comparison together, including diagnostic overhead. No per-row clock and no separate pure canonicalization estimate.",
+    "path_loop": "One timer per nonempty chunk: Value/string extraction, MatchesSourcePath directory-entry resolution and filesystem access checks, comparison, and diagnostic overhead. No per-row clock or separate estimate of lexical normalization or filesystem access.",
     "partition": "Match each of four reference call scopes to exactly one contained known-source SQL query on the same metadata connection. Replace outside-SQL with reference Fetch, path loop, reference remainder and remaining outside-reference time.",
     "interpretation": "Instrumented diagnostics only; no optimization or primary/A/A verdict. Do not subtract times across builds or attribute the old outside-SQL total from this trace alone.",
 }
@@ -119,7 +119,7 @@ def run(args):
             "ducklake",
             "vortex",
         }
-        assert build["production_source_sha256"] == "97a4b1cf7d1a00c7846a974fee77647649c8b18c7ae6ae254097b9d474ffe96e"
+        assert build["production_source_sha256"] == "801dc0b5a30eafa353faaa9b5d611a74b0451598fa0da7b96cbfb001272447c1"
         source = json.loads(inputs.read_text())
         assert source["status"] == "completed" and source["decision"] == "baseline_only"
         assert digest(args.producer_driver.resolve()) == source["driver_sha256"]
@@ -137,6 +137,7 @@ def run(args):
         assert all(digest(Path(p)) == h for p, h in tracked.items())
         selected = META.AA.select_cases("smoke" if args.profile == "smoke" else "focus", source["cases"])
         selected = [c for c in selected if c["task"] == "files"]
+        assert len(selected) == 2
         cpus, original = args.cpus, sorted(os.sched_getaffinity(0))
         topology, threads = PIN.topology(cpus), PIN.thread_environment()
         PIN.validate_cpus(cpus, original, topology, args.profile == "formal")
@@ -145,6 +146,7 @@ def run(args):
             identities=tracked,
             original_input_report=str(inputs),
             original_input_report_sha256=digest(inputs),
+            ducklake_extension_version=source["ducklake_extension_version"],
             producer_driver_sha256=source["driver_sha256"],
             consumer_driver_sha256=build["driver_sha256"],
             original_affinity=original,
@@ -153,7 +155,7 @@ def run(args):
         )
         private = root / "private"
         private.mkdir(mode=0o700)
-        env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local-fast")
+        env = dict(os.environ, TMPDIR=str(private), VANE_RUNNER="local")
         env.pop("VORTEX_SPFRESH_NATIVE", None)
         with PIN.pinned_affinity(cpus):
             for case in selected:
@@ -166,6 +168,7 @@ def run(args):
                 shutil.rmtree(work)
                 shutil.copytree(image, work, copy_function=shutil.copy2)
                 before = BASE.manifest(work)
+                assert BASE.fingerprint(before) == case["input_image_sha256"]
                 name = f"oracle-{case['history']}-{case['history_storage']}"
                 with (root / (name + ".log")).open("w") as log:
                     result = subprocess.run(
@@ -190,7 +193,11 @@ def run(args):
                 assert len(calls) == 4 and [c["found"] for c in calls] == [True, True, False, False]
                 assert [c["completed"] for c in calls] == [True, True, True, False]
                 after = BASE.manifest(work)
-                assert all(after.get(p) == v for p, v in before.items() if p.startswith(("data/", "indexes/")))
+                before_files, after_files = (
+                    {p: v for p, v in manifest.items() if p.startswith(("data/", "indexes/"))}
+                    for manifest in (before, after)
+                )
+                assert after_files == before_files
                 assert BASE.fingerprint(BASE.manifest(image)) == case["input_image_sha256"]
                 BASE.save(root / (name + ".json"), oracle)
                 report["oracles"].append(

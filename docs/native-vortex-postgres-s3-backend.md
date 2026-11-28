@@ -1,6 +1,6 @@
 # R6 PostgreSQL／S3 最小后端与确定性契约验证
 
-本轮基于 [Draft #91](https://github.com/AstroVela/ducklake/pull/91) 的 `95f82fc574a8e9741f8022d92801fea1e12e26f8`，把[远程协议模型](native-vortex-remote-publication.md)接到真实 PostgreSQL 事务与 S3 API。入口为 [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)。
+本轮以 #91 合入后的 `9032cbf6` 为开发基线，在真实 PostgreSQL 事务与 S3 API 上验证远程发布协议。[#91 合入提交](https://github.com/AstroVela/ducklake/commit/9032cbf6c42c7590198bf3f7753eb8a0f3d5f3d1) · [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)
 
 交付的是可独立调用的[实验性 backend](../scripts/vortex_remote_backend.py)及真实服务 conformance，**尚未接入 Vane SQL、原生维护调度或 ANN 查询**。生产 C++／Rust、native DuckDB 限制、SQL 接口与 provider 保持 #91；现有原生普通事务保护不变。测试使用独立私有 schema 和受登记约束的 S3 namespace，上传受控 opaque 字节与真实 manifest；不把它们当作真实 Vortex／SPFresh 编码资格。
 
@@ -39,11 +39,13 @@ Endpoint、bucket 和 prefix 随 catalog 持久登记，并进入 manifest 身�
 
 ## 对象、读者与 GC
 
-Source 先登记并持 build 引用，再条件上传、完整读回校验、封存精确版本并转为 native 引用。Generation 上传／封存 index 后，manifest 绑定 store、UUID／epoch／request、原 expected revision、输入 snapshot 与 source／index 的精确版本。发布只使用完整封存的候选；取消解除 build 引用，不直接删除对象。
+Source 登记后持有自身的 build 引用。封存只接受仍处于 allocated 且持有这条引用的 source。条件上传的对象经完整读回校验后，同一事务记录精确版本，将 source 转为 ready，并将该 build 引用转为 native。历史过期或进入回收后，重放封存返回 `SOURCE_CLOSED`。Generation 上传／封存 index 后，manifest 绑定 store、UUID／epoch／request、原 expected revision、输入 snapshot 与 source／index 的精确版本。发布只使用完整封存的候选；取消解除 build 引用，不直接删除对象。
 
 S3 payload 与 manifest 通过实际版本 GET 读回，重新校验尺寸和 SHA；ETag 只用作条件令牌。普通请求必须为 HTTPS，本地 fixture 只允许 loopback HTTP。未启用 versioning、存在启用中的 lifecycle、SDK 自动重试或非 SigV4 配置均不能进入对应操作；没有功能降级。
 
-捕获视图在同一个 control 行锁事务中固定 root／revision 并登记全部 pin。Owner 接管不删除 reader。`materialize` 按精确版本取得完整私有 bytes 并校验后，才允许显式解除 pin；旧规范对象被删除后，副本保持。没有 TTL 自动释放。当前 adapter 的普通 SQL 保护使用显式 reader session 登记：活跃 `kind=sql` session 全局阻止 native 历史释放和 source GC。**它尚未自动接管任意 PostgreSQL 或 Vane SQL 事务**；原生 transaction-start gate 保持原实现，原生入口继续拒绝远程配置。
+捕获视图在同一个 control 行锁事务中固定 root／revision 并登记全部 pin。活跃 pin 跨 owner 切换保留。`materialize` 按精确版本取得完整私有 bytes 并校验后，才允许显式解除 pin。规范对象被回收后，已物化的私有副本仍可读取。
+
+Broker 通过显式 `kind=sql` session 登记普通事务。它与源回收准入共用 PostgreSQL control 行锁。普通事务先登记时，活跃 session 阻止历史过期和源回收。源回收先准入时，即使读的是其他源文件，普通事务也会收到 `SOURCE_GC_ACTIVE`，直至最后一个源回收意图完成。这个判断来自持久的 `units.state=deleting`，跨服务重启和 owner 接管生效。覆盖范围限于通过 broker 登记的 session。
 
 GC 只接纳无 named、native、build 或 reader 引用的已登记 unit。DELETING／intent 提交后，逐 key 探测并保存 exact target，签发普通 STOP 条件 PUT；条件失败由当前 owner 重新探测同一 intent。确认 STOP 后，签发仅能删除原 payload version 的票据，最后核对全部屏障及版本不存在，再原子完成计账。Adopt 保留 nonce 和删除目标；已签发的旧 PUT／STOP／DELETE 可晚到，但不能改变其他版本或复活 payload。
 
@@ -71,7 +73,7 @@ GC 每轮最多 16 个逻辑 unit、64 MiB，按登记原始费用保守接纳�
 | PostgreSQL COMMIT | 复用[协议帧 proxy](../test/vane/postgres_commit_proxy.py)，分别在转发前断开、收到服务端 `COMMIT`＋ReadyForQuery `I` 后丢响应；独立观察必须是全旧或全新状态 |
 | 事务内错误 | 测试 trigger 在 head／refs 更新之后、回执提交之前抛错；全部七表状态和 S3 版本恢复原样 |
 | 两个 broker CAS | 测试 advisory gate 加 `pg_stat_activity` 锁等待握手，固定一个 winner；独立 observer 看不到中间态，另一个明确 revision conflict |
-| 服务崩溃 | 在持久 GC intent 和已落 STOP 后，实际 SIGKILL 两个自有服务；重启核对完整状态，再接管并显式完成 GC；旧精确 DELETE 安全、旧 STOP 失败，reader pin 继续可读 |
+| 服务崩溃和源回收准入 | 持久登记源回收，确认 STOP 并签发精确 DELETE 后，实际 SIGKILL 两个自有服务。重启和接管后，普通事务仍被拒绝。旧 DELETE 可在新 owner 重新准入前到达。回收完成后恢复普通事务，重放相同 DELETE 时七表与对象版本保持一致。既有 generation intent 与 reader pin 同时复验 |
 
 所有故障由事件、协议帧或数据库锁状态选择；sleep 只用于 readiness／握手轮询，不以持续时间挑选崩溃窗口。Fixture 只关闭自己启动的进程，不复用或改动已有服务。
 
@@ -91,16 +93,24 @@ uv pip install --python /tmp/r6-backend-env/bin/python \
 
 [独立 CI](../.github/workflows/VortexRemoteBackend.yml)固定 action 和 MinIO 构件，安装 PostgreSQL 15，选择 runner 可用 CPU，依次运行 #91 模型与真实 backend conformance，保留 rule／report 和服务日志；不运行性能或长期负载。报告记录实际 PostgreSQL minor、客户端与执行源码身份，不能把本地 15.13 结果外推成所有 minor 均已通过。
 
-## 本轮冻结结果
+## 当前组件验收
 
-冻结专项通过 **458 项接口契约检查**，其中 26 项预期拒绝核对完整状态不变；另外通过 **9 项服务能力检查、7 组故障／并发观测**。PostgreSQL 和 MinIO 实际 SIGKILL 的退出码均为 **-9**；PostgreSQL 日志出现 WAL redo，重启后的 metadata／对象版本与崩溃前精确一致，随后显式完成原 GC intent。重启服务的 CPU affinity 仍为 6–11。原始副本、邻居对象、回执与固定 ReadView 的独立断言均通过。
+当前开发基线上的本地验收通过 **485 项接口契约检查**，包括 **35 项预期拒绝**，另有 **9 项服务能力检查**和 **7 组故障／并发观测**。源历史过期后、源已准入 GC 且尚未写 STOP 时，重放封存均被拒绝，七表状态和对象版本保持一致。过期源仍拒绝普通 SQL 捕获。两个临时服务实际退出码均为 `-9`，PostgreSQL 再次完成 WAL redo。验收核对普通事务先登记时阻止源回收，以及源回收先准入时在 DELETE 在途、服务重启、owner 接管和完成之前拒绝普通事务。回收完成后重放旧的精确 DELETE 票据，七表状态与对象版本保持一致。
+
+同一版本的 #91 协议回归通过 **40 个固定场景、21 个负对照和 1,342 个有界状态**。本地测试使用 CPU 6–11，真实 AWS 部署和原生远程 SQL 依各自后续验收推进。[协议模型结果](native-vortex-remote-publication.md#有界验证结果)
+
+## 2026-11-07 的历史结果
+
+原 #92 基于叠栈提交 `95f82fc574a8e9741f8022d92801fea1e12e26f8`。历史专项通过 **458 项接口契约检查**，其中 26 项预期拒绝核对完整状态不变，另通过 **9 项服务能力检查、7 组故障／并发观测**。PostgreSQL 和 MinIO 实际 SIGKILL 的退出码均为 **-9**，PostgreSQL 日志记录 WAL redo。重启后的 metadata 和对象版本与崩溃前一致，随后显式完成原 GC intent。
 
 Backend 主报告为 `/tmp/ducklake-vortex-r6-backend-proof-v2-20261107/report.json`，SHA-256 **`80cbf5bfb5c478efe50f784b0389052de041e2942d83493128a55099aafd871d`**。报告记录全部检查名／状态摘要、负向结果、S3 上游状态与请求次数、PostgreSQL COMMIT 协议观测、故障退出码、最终七表／版本清单、客户端版本、CPU／线程环境与执行源码 SHA；不包含可使用的签名票据。源码执行前后及冻结后复核一致，affinity 已恢复。
 
-#91 的模型回归保持 **39 场景、18 个不安全变体反例、905＋437 个有界状态**全部通过；状态集合摘要与 #91 相同。报告为 `/tmp/ducklake-vortex-r6-model-proof-20261107/report.json`，SHA-256 `7b17e499882bce102e58ad232f19baab3fdc0eb9429c0afcbe565cb6244510ef`。
+当时同时通过 **39 个模型场景、18 个负对照和 905＋437 个有界状态**。历史报告为 `/tmp/ducklake-vortex-r6-model-proof-20261107/report.json`，SHA-256 `7b17e499882bce102e58ad232f19baab3fdc0eb9429c0afcbe565cb6244510ef`。
 
 Vane 原基础 launcher 按独立非 Ray／Ray 进程，在 CPU 6–11 通过 **1,222＋32＝1,254 项**，可选依赖缺失跳过 **11＋4＝15 项**；日志为 `/tmp/ducklake-vortex-r6-backend-base-20261107.log`。格式、文档链接、workflow YAML、copyleft 与 `git diff --check` 通过。专项目录的 `checkout-audit.json` 核对 #91 的原生源码／依赖 pin，以及相同的已安装 `_native`、DuckLake 和 Vortex artifact SHA；本轮没有修改 Vane 包源或重建／重装 native provider。
 
-真实 AWS bucket、跨主机网络、TLS／IAM 部署、数据库 HA／掉电持久性、reader 故障回收、UUID／epoch 推进、类型化 DuckLake metadata、原生远程 SQL 与 ANN 仍未完成。
+## 后续验收
+
+真实 AWS bucket、跨主机网络、TLS／IAM 部署、数据库 HA／掉电持久性、reader 故障回收、UUID／epoch 推进、类型化 DuckLake metadata、原生远程 SQL 与 ANN 仍待验收。
 
 下一项推荐先做 **R6 PostgreSQL 类型化 metadata 与 UUID／epoch 生命周期契约验证**，随后补 reader session fencing／pin 回收并把 broker 边界接到原生调用。满足这些前置条件后再解除 native 限制；固定 ReadView fan-out、读位置等待与分布式 top-k 继续独立验收，R7 SPFresh 在线更新仍未接入。
