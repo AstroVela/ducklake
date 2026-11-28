@@ -178,6 +178,20 @@ CREATE TABLE bound_heads(table_uuid uuid PRIMARY KEY REFERENCES typed_tables(tab
  request text REFERENCES requests(id));
 CREATE TABLE bound_readers(reader text PRIMARY KEY REFERENCES readers(id),table_uuid uuid NOT NULL REFERENCES typed_tables(table_uuid),
  snapshot_id bigint NOT NULL,identity jsonb NOT NULL);
+CREATE TABLE reader_sessions(session_uuid uuid PRIMARY KEY,owner_uuid uuid NOT NULL,lock_key bigint NOT NULL UNIQUE,
+ backend_pid integer NOT NULL,backend_start timestamptz NOT NULL,fence bigint NOT NULL CHECK(fence>0),
+ state text NOT NULL CHECK(state IN ('active','closed','reclaiming','reclaimed')),intent jsonb,receipt jsonb,
+ CHECK((state='active' AND fence=1 AND intent IS NULL AND receipt IS NULL) OR
+       (state='closed' AND fence=2 AND intent IS NULL AND receipt IS NOT NULL) OR
+       (state='reclaiming' AND fence=2 AND intent IS NOT NULL AND receipt IS NULL) OR
+       (state='reclaimed' AND fence=2 AND intent IS NOT NULL AND receipt IS NOT NULL)));
+CREATE TABLE reader_session_views(reader text PRIMARY KEY REFERENCES bound_readers(reader),
+ session_uuid uuid NOT NULL REFERENCES reader_sessions(session_uuid),session_fence bigint NOT NULL CHECK(session_fence=1),
+ accepted_materializations bigint NOT NULL DEFAULT 0 CHECK(accepted_materializations>=0),
+ UNIQUE(reader,session_uuid,session_fence));
+CREATE TABLE reader_reclaims(reader text PRIMARY KEY,
+ session_uuid uuid NOT NULL REFERENCES reader_sessions(session_uuid),original_fence bigint NOT NULL CHECK(original_fence=1),
+ receipt jsonb NOT NULL,FOREIGN KEY(reader,session_uuid,original_fence) REFERENCES reader_session_views(reader,session_uuid,session_fence));
 """
 
 

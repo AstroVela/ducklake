@@ -1,6 +1,6 @@
 # DuckLake＋Vortex 总设计与 roadmap
 
-本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，基于 #93 合入后的开发提交 `7716a403`。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
+本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，基于 #94 合入后的开发提交 `d21d4609`。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
 
 本文是随代码维护的仓库总纲。初稿阅读副本见 [ChatGPT Page](https://chatgpt.com/space/page_0c2fa263e4dc81919bfaea100e8008cd)。
 
@@ -293,7 +293,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
 | R5 容量与产品契约 | **部分完成**。已有浮点、请求 epoch、回执、reference／WAL、容量 admission、私有查询目录和 UUID 退休的确定性验收。退休历史用例覆盖 inline 表、表级配置、源文件、generation 及原生块复用 | 更大数据上的质量、延迟与吞吐，以及长期磁盘和 RSS 容量仍待验证 |
-| R6 云端与分布式 | **组件层验证**。协议模型、PostgreSQL／MinIO broker 和 typed 元数据已有独立证据。BoundCatalog 将表 UUID、字段和快照统一绑定到发布与 ReadView，覆盖原子退休、独立 pin 和精确版本回收。[绑定组件](native-vortex-bound-readviews.md) | 验收 reader session 所有权、fencing 和持久 pin 回收，再验证原生接入、真实 AWS／TLS／IAM、HA、固定视图 fan-out 和分布式 top-k |
+| R6 云端与分布式 | **组件层验证**。协议模型、PostgreSQL／MinIO broker 和 typed 元数据已有独立证据。BoundCatalog 将表 UUID、字段和快照统一绑定到发布与 ReadView，覆盖原子退休、独立 pin 和精确版本回收。Reader session 绑定视图、确立所有权，并支持失效后的受预算显式回收。[绑定组件](native-vortex-bound-readviews.md) · [Reader session](native-vortex-reader-sessions.md) | 验收真实 Vortex／SPFresh 编码、最小查询和原生入口，再验证真实 AWS／TLS／IAM、HA、固定视图 fan-out 和分布式 top-k |
 | R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
 
 原 RFC 的静态索引、实时可见、B/F/T、compaction／GC 目标在 R0–R3 有对应实现；其 Iceberg 专属物化、云端 fencing 和分布式 serving 并未因 DuckLake 本地链路通过而完成。保留原 RFC 作为历史来源，本文件作为 DuckLake 路线的总纲。
@@ -328,7 +328,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 R4 和 R5 的性能验证继续暂缓。R7 仍按增量更新的收益证据决定。
 
-R6 下一步验证 reader session 的所有权和 fencing，以及读者崩溃后何时可以安全回收持久 pin。保持普通事务的源保护。随后验收原生调用接线、云端部署和分布式查询。STOP 与协议元数据累积的容量边界仍待验证。[绑定组件后续验收](native-vortex-bound-readviews.md#剩余边界与下一项)
+R6 增加 reader session 的所有权、fencing 与受预算的持久 pin 回收。MinIO GET 释放全局 control 行锁，操作连接存活时回收等待该 session 的 operation lock。Fence 推进后禁止新的 GET 授权和副本验收，已授权的单次精确版本 GET 与已持久验收的副本可以晚于 fence。下一步验证真实 Vortex／SPFresh 文件、typed row／ReadView 的物理身份及最小查询。普通事务的源保护继续适用。STOP 与协议元数据累积的容量边界仍待验证。[Reader session 契约](native-vortex-reader-sessions.md)
 
 ## 12. 文档与实现导航
 
@@ -358,6 +358,7 @@ R6 下一步验证 reader session 的所有权和 fencing，以及读者崩溃�
 | [R6 PostgreSQL／S3 最小后端](native-vortex-postgres-s3-backend.md) | 真实事务、精确版本、签名票据、未知响应和受预算的崩溃恢复 |
 | [R6 PostgreSQL 类型化元数据与 UUID／epoch](native-vortex-postgres-typed-lifecycle.md) | PostgreSQL 物理类型、字段与行身份、全 uint64 窗口、原回执、原子退休和故障恢复 |
 | [R6 Typed UUID／发布／ReadView 绑定](native-vortex-bound-readviews.md) | 复合外键、跨 UUID 隔离、每表发布 CAS、原子退休、精确快照与受保护的旧视图 |
+| [R6 Reader session 与持久 pin 回收](native-vortex-reader-sessions.md) | PG lifetime lock、在途读取与回收排序、共享预算及故障恢复 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。

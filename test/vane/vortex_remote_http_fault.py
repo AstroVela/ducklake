@@ -1,4 +1,4 @@
-"""A loopback HTTP fixture: pause before forwarding or lose a completed reply."""
+"""A loopback HTTP fixture for delayed requests, lost replies and redirects."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
@@ -8,7 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 class Fault:
     def __init__(self, endpoint, mode):
-        assert mode in ("before_forward", "drop_reply")
+        assert mode in ("before_forward", "drop_reply", "redirect")
         self.endpoint, self.mode = urlsplit(endpoint), mode
         self.entered, self.release, self.completed = threading.Event(), threading.Event(), threading.Event()
         self.observation = {"requests": 0, "forwarded": False, "status": None}
@@ -28,6 +28,14 @@ class Fault:
                 owner.entered.set()
                 if not owner.release.wait(timeout=30):
                     self.close_connection = True
+                    return
+                if owner.mode == "redirect":
+                    owner.observation["status"] = 307
+                    self.send_response(307)
+                    self.send_header("Location", "/redirect-target")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    owner.completed.set()
                     return
                 upstream = http.client.HTTPConnection(owner.endpoint.hostname, owner.endpoint.port, timeout=10)
                 try:
@@ -49,7 +57,7 @@ class Fault:
                     upstream.close()
                     owner.completed.set()
 
-            do_PUT = do_DELETE = handle_request
+            do_GET = do_PUT = do_DELETE = handle_request
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
