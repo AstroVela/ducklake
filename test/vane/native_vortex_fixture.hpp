@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
@@ -31,9 +32,11 @@ inline void Write(const string &path, const string &text) {
 	Require(std::rename((path + ".pending").c_str(), path.c_str()) == 0, "Cannot publish native view evidence");
 }
 
-inline string TableUUID(Connection &connection) {
-	auto result = SQL(connection, "SELECT table_uuid::VARCHAR FROM __ducklake_metadata_lake.ducklake_table "
-	                              "WHERE table_name='items' AND end_snapshot IS NULL");
+inline string TableUUID(Connection &connection, const string &catalog = "lake") {
+	auto meta = KeywordHelper::WriteQuoted("__ducklake_metadata_" + catalog, '"');
+	auto result = SQL(connection, "SELECT t.table_uuid::VARCHAR FROM " + meta + ".ducklake_table t JOIN " + meta +
+	                                  ".ducklake_schema s USING(schema_id) WHERE t.table_name='items' AND "
+	                                  "s.schema_name='main' AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL");
 	Require(result->RowCount() == 1, "Fixture requires one current items UUID");
 	return StringValue::Get(result->GetValue(0, 0));
 }

@@ -11,23 +11,27 @@ into uncleared center accumulators.
 only for a supplied allowed-row mask in the static bridge. It preserves the
 unmasked path and the existing head, page and check budgets.
 [Vortex #33](https://github.com/AstroVela/vortex/pull/33) initializes the counts
-and clears the existing scratch centers before each initialization trial.
-Neither changes the native format or ABI.
+and clears the existing scratch centers before each initialization trial. It
+also saves the first candidate when the batch's summed distance exceeds the
+per-vector sentinel. Both fixes use the existing native format and ABI.
 
 ## Exact source closure
 
-Pin the DuckLake Rust query crate, standalone qualification probe, SDK source
-check and CI Vortex checkout to `9133de570e7ad634aea43beb1cbbd4ea559a5491`.
-The workspace root `Cargo.lock` is authoritative for both Rust members; CI's
-cache key now hashes that tracked file.
+The DuckLake Rust query crate, standalone qualification probe, SDK source
+check and both validation workflows use
+`8a3b12a4a2f90dde6ba7f158ba63fb43537da39d`. It combines both SPFresh fixes with
+the verified-source URI and reader lifecycle fixes from the preceding pin.
+It also registers DuckDB full-text SQL only when a full-text provider is available.
+The workspace root `Cargo.lock` covers both Rust members. The native provider
+cache also includes the wrapper's ordinary workspace lockfile.
 
 Pin the DuckDB Vortex wrapper to
-`d266a922e58aee4f8ac7b57a38b09262f656ce36`
+`684bf8b0bfe305feeff155e0b3eb335540444b07`
 ([wrapper #38](https://github.com/AstroVela/duckdb-vortex/pull/38)). Its ordinary and distributed Vane
 workspaces both consume the same Vortex revision, including their lockfiles,
 installed-wheel identity check and strict release-source check. The native
 DuckLake configuration uses the ordinary wrapper; the distributed provider uses
-the separate Vane workspace.
+the separate Vane workspace. Its vector-only build keeps vector SQL available.
 
 Build and sign the Vortex and DuckLake artifacts together. The DuckLake provider
 wheel declares the exact new Vortex dependency wheel. Keep the installed Vane
@@ -37,7 +41,11 @@ features stay disabled in this configuration.
 
 The raw SPFresh source remains pinned to
 `5893eb61ee3b18610b6b00f1939be7dae1af8904`, with Vortex's reviewed static patch.
-The static LLVM OpenMP 18.1.8 and zstd archives retain their qualified identities.
+The SDK verifies the LLVM OpenMP 18.1.8 source archive against SHA-256
+`60ed57245e73894e4a2a89b15889f367bd906abfe6d3f92e1718223d4b496150`.
+The final-pin validation at `19f5d221` rebuilt `libomp.a` and recorded the
+output SHA-256 `efb12d1c1769296a7ef8a66f6bf9bbbfba21be75a1a4021edf303f533b51da6e`
+for that build. The build reused the qualified static zstd archive.
 There is one required source revision per component, without alternate pins,
 compatibility branches, native retries or fallback paths.
 
@@ -49,8 +57,9 @@ The frozen filtered-query proof reuses byte-identical native artifacts:
 SDK and passes with the fix. The builder's seven workspace groups previously
 reported 2,185 uninitialized-memory errors in 12 contexts; strict Memcheck
 reports zero after the initialization fix, under both qualified OpenMP links.
-Those proofs are upstream evidence; the installed-provider checks below qualify
-this consumer revision separately.
+Those proofs cover the upstream changes. The installed-provider checks below
+were run against the original DuckLake #65 head
+`fd1afc257de34338fd7d738f3a090a4ab11d8f49`.
 
 The fixed canary gate and exploration-quality reporting remain unchanged.
 A bounded regression does not establish arbitrary-data recall, production
@@ -58,10 +67,11 @@ throughput or long-run liveness. In particular, the preceding 60-second /
 four-reader workload exceeded its existing 90-second drain deadline, and the
 original 512-row / 8D silent stop remains unresolved.
 
-## Installed-provider qualification
+## Installed-provider qualification at `fd1afc25`
 
-The new artifacts were signed and installed together in an isolated environment
-with the byte-identical Vane `0.3.0.dev1` base wheel. That base reports engine
+The original #65 used Vortex `9133de57` and wrapper `d266a922`. Its artifacts
+were signed and installed together in an isolated environment with the
+byte-identical Vane `0.3.0.dev1` base wheel. That base reports engine
 `v1.5.5-vane.e14bf92d40` and source ID `e957000277`. The DuckLake wheel requires
 the exact new Vortex wheel version, and all probes run without an SDK-directory
 environment override.

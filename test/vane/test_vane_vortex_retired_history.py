@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -528,11 +529,12 @@ def recover(root):
     baseline = json.loads((root / "before.json").read_text())
     old_sources = {k: v for k, v in baseline_files.items() if k.endswith(".vortex")}
     generation_ids = {r["generation"] for r in decoded(baseline, "vortex", "ducklake_vortex_generations_v1")}
-    c = BASE.connect(root)
+    c = BASE.connect(root, root / "extensions")
     try:
         actual = snapshot(c)
         require(
-            set(actual["native"]) == set(NATIVE_TABLES) and len(actual["vortex"]) == 13,
+            expected["native"].keys() == actual["native"].keys() == set(NATIVE_TABLES)
+            and expected["vortex"].keys() == actual["vortex"].keys() == set(REF.METADATA_TABLES),
             "Incomplete native/Vortex inventory",
         )
         require(actual == expected, "Native recovery changed committed metadata or inline history")
@@ -625,6 +627,64 @@ def recover(root):
         c.close()
 
 
+def native_case(driver, root, kind, mode, case_report):
+    case = root / ("native-" + kind + "-" + mode)
+    case.mkdir(mode=0o700)
+    (case / "private").mkdir(mode=0o700)
+    action = "history-" + ("t-" if kind == "t" else "") + mode
+    with (case / "driver.log").open("w") as log:
+        process = subprocess.Popen(
+            [str(driver), str(case), action],
+            env=dict(os.environ, TMPDIR=str(case / "private")),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            SCRATCH.wait_at(process, case / "checkpoint", "history_prepared", case_report["applied_affinity"])
+            (case / "baseline-files.json").write_text(json.dumps(SCRATCH.protected_files(case), indent=2) + "\n")
+            (case / "checkpoint").unlink()
+            (case / "release-history_prepared").write_text("release\n")
+            if mode.startswith("pause-"):
+                stage = mode.removeprefix("pause-")
+                SCRATCH.wait_at(process, case / "checkpoint", stage, case_report["applied_affinity"])
+                (case / "files.json").write_text(json.dumps(SCRATCH.protected_files(case), indent=2) + "\n")
+                SCRATCH.kill(process, case_report, kind + ":" + stage)
+            else:
+                require(
+                    process.wait(timeout=180) == 0,
+                    "Native retired-history fixture failed: " + str(case / "driver.log"),
+                )
+                require(
+                    (case / "checkpoint").read_text() == "history_complete", "Native history fixture did not finish"
+                )
+                (case / "files.json").write_text(json.dumps(SCRATCH.protected_files(case), indent=2) + "\n")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=20)
+    with (case / "recovery.log").open("w") as log:
+        result = subprocess.run(
+            [sys.executable, "-I", str(SCRIPT), "--recover", str(case)],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+        )
+    require(result.returncode == 0, "Installed retired-history recovery failed: " + str(case / "recovery.log"))
+    evidence = json.loads((case / "recovery.json").read_text())
+    require(
+        evidence["cpus"] == case_report["applied_affinity"] and evidence["threads"] == case_report["threads"],
+        "Recovery affinity or threads changed",
+    )
+    observation = {
+        "kind": kind,
+        "mode": mode,
+        "status": "passed",
+        "storage_observations": {p.stem: json.loads(p.read_text()) for p in case.glob("storage-*.json")},
+    }
+    clean_cache(case)
+    return observation
+
+
 def native(driver, root, report):
     cases = [("t", "ok"), ("bft", "ok"), ("bft", "held"), ("bft", "conflict")]
     cases += [
@@ -645,64 +705,25 @@ def native(driver, root, report):
         ("t", "pause-" + stage)
         for stage in ("history_inline_drop_staged", "source_expiry_committed", "history_after_checkpoint")
     ]
-    for kind, mode in cases:
-        case = root / ("native-" + kind + "-" + mode)
-        case.mkdir(mode=0o700)
-        (case / "private").mkdir(mode=0o700)
-        action = "history-" + ("t-" if kind == "t" else "") + mode
-        with (case / "driver.log").open("w") as log:
-            process = subprocess.Popen(
-                [str(driver), str(case), action],
-                env=dict(os.environ, TMPDIR=str(case / "private")),
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-            try:
-                SCRATCH.wait_at(process, case / "checkpoint", "history_prepared", report["applied_affinity"])
-                (case / "baseline-files.json").write_text(json.dumps(SCRATCH.protected_files(case), indent=2) + "\n")
-                (case / "checkpoint").unlink()
-                (case / "release-history_prepared").write_text("release\n")
-                if mode.startswith("pause-"):
-                    stage = mode.removeprefix("pause-")
-                    SCRATCH.wait_at(process, case / "checkpoint", stage, report["applied_affinity"])
-                    (case / "files.json").write_text(json.dumps(SCRATCH.protected_files(case), indent=2) + "\n")
-                    SCRATCH.kill(process, report, kind + ":" + stage)
-                else:
-                    require(
-                        process.wait(timeout=180) == 0,
-                        "Native retired-history fixture failed: " + str(case / "driver.log"),
-                    )
-                    require(
-                        (case / "checkpoint").read_text() == "history_complete", "Native history fixture did not finish"
-                    )
-                    (case / "files.json").write_text(json.dumps(SCRATCH.protected_files(case), indent=2) + "\n")
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=20)
-        with (case / "recovery.log").open("w") as log:
-            result = subprocess.run(
-                [sys.executable, "-I", str(SCRIPT), "--recover", str(case)],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                timeout=180,
-            )
-        require(result.returncode == 0, "Installed retired-history recovery failed: " + str(case / "recovery.log"))
-        evidence = json.loads((case / "recovery.json").read_text())
-        require(
-            evidence["cpus"] == report["applied_affinity"] and evidence["threads"] == report["threads"],
-            "Recovery affinity or threads changed",
-        )
-        report["native_cases"].append(
-            {
-                "kind": kind,
-                "mode": mode,
-                "status": "passed",
-                "storage_observations": {p.stem: json.loads(p.read_text()) for p in case.glob("storage-*.json")},
-            }
-        )
-        clean_cache(case)
-        print("native and fresh recovery", kind, mode, "passed", flush=True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for first in range(0, len(cases), 2):
+            batch = cases[first : first + 2]
+            receipts = [
+                {"applied_affinity": report["applied_affinity"], "threads": report["threads"], "sigkill": []}
+                for _ in batch
+            ]
+            futures = [
+                pool.submit(native_case, driver, root, kind, mode, receipt)
+                for (kind, mode), receipt in zip(batch, receipts)
+            ]
+            # Keep the crash evidence if recovery fails, and dispatch the next batch only after success.
+            wait(futures)
+            for receipt in receipts:
+                report["sigkill"].extend(receipt["sigkill"])
+            for future in futures:
+                observation = future.result()
+                report["native_cases"].append(observation)
+                print("native and fresh recovery", observation["kind"], observation["mode"], "passed", flush=True)
 
 
 def main():

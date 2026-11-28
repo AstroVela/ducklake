@@ -119,6 +119,9 @@ class Checks:
         ticket = self.call("source-ticket-" + name, self.b.source_ticket, unit, data, token)
         self.call("put-source-" + name, B.dispatch, ticket, data)
         self.call("seal-source-" + name, self.b.seal_source, unit, token)
+        refs = [(r["kind"], r["holder"]) for r in self.image["refs"] if r["unit"] == unit]
+        state = next(u["state"] for u in self.image["units"] if u["id"] == unit)
+        require(state == "ready" and refs == [("native", unit)], "Source seal did not promote its build reference")
         return unit
 
     def prepare(self, name, source="source:b", expected=None):
@@ -304,6 +307,8 @@ def exercise(h, report, root):
     h.call("native-history-remains-independent", b.plan_gc, a, h.token(), B.Budget(), rejected="REFERENCED")
     h.call("end-ordinary-transaction", b.close_view, "ordinary")
     h.call("expire-native-source", b.expire_native, a, h.token())
+    h.call("reject-expired-source-reseal", b.seal_source, a, h.token(), rejected="SOURCE_CLOSED")
+    h.call("expired-source-remains-invisible", b.capture, "expired", "sql", a, rejected="EXPIRED_NATIVE_HISTORY")
     h.collect(a)
     require(b.copies["old"] == copied, "GC revoked the private byte copy")
     h.call("close-old-copy", b.close_view, "old")
@@ -472,7 +477,7 @@ def exercise(h, report, root):
     h.call("cancel-CAS-loser", b.cancel, "cas-second", h.token())
     h.collect("generation:cas-second")
 
-    # Crash the two owned services with a durable partial deletion intent.
+    # Crash both owned services with durable source and generation deletion intents.
     h.ready("restart", source_b)
     h.call("cancel-before-restart", b.cancel, "restart", h.token())
     unit, budget = "generation:restart", B.Budget()
@@ -480,13 +485,99 @@ def exercise(h, report, root):
     key = next(o["key"] for o in h.image["objects"] if o["unit"] == unit and o["role"] == "index")
     stop, body = h.call("register-STOP-before-crash", b.stop, unit, key, h.token(), budget)
     h.call("STOP-applied-without-metadata-ACK", B.dispatch, stop, body)
+
+    source = h.source("restart-source")
+    h.call("expire-source-before-gate-test", b.expire_native, source, h.token())
+    source_budget = B.Budget()
+    h.call("ordinary-before-source-admission", b.capture, "source-gate-before", "sql", source_b)
+    h.call(
+        "source-admission-waits-for-ordinary",
+        b.plan_gc,
+        source,
+        h.token(),
+        source_budget,
+        rejected="ORDINARY_TRANSACTION",
+    )
+    h.call("close-ordinary-before-source-admission", b.close_view, "source-gate-before")
+    h.call("admit-source-delete", b.plan_gc, source, h.token(), source_budget)
+    h.call("reject-deleting-source-reseal-before-STOP", b.seal_source, source, h.token(), rejected="SOURCE_CLOSED")
+    h.call(
+        "ordinary-after-source-admission",
+        b.capture,
+        "source-gate-active",
+        "sql",
+        source_b,
+        rejected="SOURCE_GC_ACTIVE",
+    )
+    source_key = next(o["key"] for o in h.image["objects"] if o["unit"] == source)
+    source_stop, source_body = h.call("register-source-STOP", b.stop, source, source_key, h.token(), source_budget)
+    h.call("apply-source-STOP", B.dispatch, source_stop, source_body)
+    require(
+        h.call("confirm-source-STOP", b.stop, source, source_key, h.token(), source_budget)[0] is None,
+        "Source STOP did not confirm",
+    )
+    source_delete = h.call(
+        "issue-source-DELETE-before-crash", b.delete_payload, source, source_key, h.token(), source_budget
+    )
+    require(source_delete is not None, "Missing old source DELETE ticket")
+    source_intent = next(row for row in h.image["gc"] if row["unit"] == source)
+    source_version = source_intent["targets"][source_key]
+    require(source_version is not None, "Missing exact source target")
+    h.call(
+        "ordinary-with-source-DELETE-in-flight",
+        b.capture,
+        "source-gate-active",
+        "sql",
+        source_b,
+        rejected="SOURCE_GC_ACTIVE",
+    )
     h.call("pin-reader-before-service-crash", b.capture, "restart-reader")
     before = h.image
     s.restart()
     require(h.observe() == before, "Server restart changed committed metadata or object versions")
     b = B.Backend(s.dsn, b.schema, B.S3Objects(s.root_client, s.bucket, b.objects.prefix))
     h.b = b
+    h.call(
+        "ordinary-after-service-restart",
+        b.capture,
+        "source-gate-active",
+        "sql",
+        source_b,
+        rejected="SOURCE_GC_ACTIVE",
+    )
     h.call("new-owner-after-service-restart", b.takeover, h.token())
+    h.call(
+        "ordinary-after-source-owner-transfer",
+        b.capture,
+        "source-gate-active",
+        "sql",
+        source_b,
+        rejected="SOURCE_GC_ACTIVE",
+    )
+    h.call("deliver-old-source-DELETE", B.dispatch, source_delete)
+    require(b.objects.read(source_key, source_version) is None, "Old source DELETE did not remove its exact target")
+    h.call(
+        "ordinary-before-source-completion",
+        b.capture,
+        "source-gate-active",
+        "sql",
+        source_b,
+        rejected="SOURCE_GC_ACTIVE",
+    )
+    resumed = B.Budget()
+    h.call("resume-source-intent", b.plan_gc, source, h.token(), resumed)
+    resumed_intent = next(row for row in h.image["gc"] if row["unit"] == source)
+    require(
+        all(resumed_intent[field] == source_intent[field] for field in ("nonce", "targets")),
+        "Source recovery changed its intent or exact target",
+    )
+    result = h.call("complete-resumed-source-intent", b.finish_gc, source, h.token(), resumed)
+    require(result == {"objects": 1, "bytes": resumed.admitted[source]}, "Source recovery changed its charge")
+    h.call("ordinary-after-source-completion", b.capture, "source-gate-active", "sql", source_b)
+    before_replay = h.image
+    h.call("replay-old-source-DELETE-with-ordinary-open", B.dispatch, source_delete)
+    require(h.image == before_replay, "Replaying the old source DELETE changed physical or metadata state")
+    h.call("close-ordinary-after-source-completion", b.close_view, "source-gate-active")
     h.collect(unit)
     h.call("old-exact-DELETE-after-owner-transfer", B.dispatch, deletion)
     h.call("old-STOP-after-owner-transfer", B.dispatch, stop, body, rejected="HTTP_412")

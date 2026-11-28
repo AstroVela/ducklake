@@ -39,25 +39,31 @@ SELECT * FROM ducklake_retire_vortex_table(
 
 | 对象 | 退休行为 |
 | --- | --- |
-| 请求回执、epoch、managed 注册、写预算、optimizer policy | 只删除目标 UUID 的记录 |
+| 请求回执、epoch、managed 注册、写预算、optimizer policy 和重写回执 | 只删除目标 UUID 的记录 |
 | 所有命名索引及 generation refs | 同一提交中解除该 UUID 的全部命名引用 |
 | generation | 最后一个引用解除后标记 retired，后续由现有 GC 回收 |
 | build／rewrite 所有权 | 仍有记录则拒绝；先显式恢复和回收，再提交退休 |
 | catalog 级 maintenance／source retention／源删除意图 | 保持其现有作用域和生命周期 |
 | 调用方 reference JSON、未知文件、查询 scratch | 由各自所有权协议处理 |
-| DuckLake 表历史、inline 历史、源文件和 WAL | 保留原生历史及物理回收契约 |
+| DuckLake 表历史、inline 历史、按 table/file ID 登记的重写输入输出、源文件和 WAL | 保留原生历史及物理回收契约 |
 
 受管表仍拒绝普通逻辑 DROP；退休入口只为目标 UUID 开放这一操作。未管理表的普通 DuckLake SQL 语义保持，未通过退休入口完成的删除不能视为已经释放 Vortex UUID 状态。重开不会扫描接管旧孤儿状态；本轮没有为这些状态增加迁移或 fallback。
 
-成功后，在原生表历史仍可认证该 UUID 且同名表尚未重建时，重复退休返回同一 UUID／`retired=true`，不再推进快照。历史已过期的未知 UUID 明确失败；同名新表的 UUID 不符也失败。入口不凭名称、缺失记录或目录内容推定其他对象已经退休。
+成功后，重放要求原生历史同时确认该 UUID 是指定名称最后一张表，该名称对应此 UUID 的最终版本，且该版本已关闭、全部逻辑状态已释放。满足这些条件时返回同一 UUID／`retired=true`，快照保持不变。表改名后，用旧名退休会失败，即使后来已用新名退休。同名视图、UUID 不符的同名新表和历史已过期的未知 UUID 也会被拒绝。
+
+从候选版本的结束快照到最新快照，每个快照都必须保留。这个区间内的缺口可能隐藏同名的后继表，因此会拒绝重放。更早的快照过期不影响这个区间的证明。
 
 ## 提交与后台任务保护
 
-退休沿用写批次串行化锁。提交仍先取得写 admission，再取得 publication exclusive；随后持有 optimizer 元数据锁，直到原生 DROP 与 UUID 记录删除提交完成。内部提交重试为零，冲突由调用方显式重试。
+退休依次取得写批次串行化锁、写 admission、publication 独占锁和 optimizer 元数据锁，随后才打开退休快照，并持锁直到原生事务提交或回滚。先发布的命名索引会随表退役，先完成的 build 若仍有所有权记录则阻止退休。随后排队的索引创建与 build 要等到退休提交后重新查表。内部提交重试为零，冲突由调用方显式重试。
+
+rewrite 可以在退休前读到旧 generation。取得 publication 独占锁后，它在登记所有权的事务中用表 ID 重新查表，核对 UUID、表名及所属 schema，并确认命名索引的版本和引用仍与读到的一致。若退休已经提交，排队的 rewrite 会在写入 build 或 rewrite 记录前被拒绝，旧 UUID 的退休请求仍可重放。成功取得所有权的 rewrite 在最终提交前还会复核输入文件和索引。
 
 enabled policy 或仍在执行的任务阻止退休。执行标记覆盖 worker 取出任务到完成错误处理的整个范围，包括加载元数据前和等待写者的阶段。取消标记不能代替任务结束；已复制的待执行任务也须在运行前重新确认调度归属。
 
 元数据提交成功后才释放内存中的 policy、取消及错误记录，避免旧 UUID 消耗 16-policy 容量或再次保存已退休状态。取消、注入错误和真实元数据冲突必须同时回滚 DROP、引用变化与 UUID 状态删除。
+
+运行时按 lake OID、元数据 OID、表 UUID 和索引名登记策略。取消操作更新目标挂载的持久化策略，只有该挂载已登记的 worker 才会收到取消。退休会一并回收目标 UUID 在已分离挂载中留下的注册。旧挂载的任务仍在执行时，须等任务退出后才能退休。其他活动 catalog 即使使用相同的表 UUID 和索引名，也会继续调度并 flush 自己的写入。
 
 ## 物理回收与旧读者
 
@@ -67,7 +73,7 @@ enabled policy 或仍在执行的任务阻止退休。执行标记覆盖 worker 
 
 ## 确定性验证
 
-入口为 [安装态 coordinator](../test/vane/test_vane_vortex_table_uuid.py) 和 [native fixture](../test/vane/native_vortex_uuid_fixture.hpp)。固定 typed row 模型、13 张 Vortex 元数据表、原生表历史、snapshot 身份及全部 data／indexes 文件摘要用于恢复比较。
+入口为 [安装态 coordinator](../test/vane/test_vane_vortex_table_uuid.py) 和 [native fixture](../test/vane/native_vortex_uuid_fixture.hpp)。固定 typed row 模型、16 张 Vortex 元数据表、原生表历史、snapshot 身份及全部 data／indexes 文件摘要用于恢复比较。
 
 ```bash
 env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local-fast python -I \
@@ -76,9 +82,13 @@ env -u VORTEX_SPFRESH_NATIVE VANE_RUNNER=local-fast python -I \
   --cpus 6,7,8,9,10,11 --output-dir /fresh/table-uuid-proof
 ```
 
-覆盖另一 UUID 的回执、待清理 build、引用和实际 B 查询保持不变，同名重建后的旧写入／推进／退休拒绝、100,000 回执配额释放、17 次 policy 槽位复用、普通读者保护、共享 B 引用解除、活跃及取消中的任务、未结束 build、八个并发相同退休、真实冲突、取消和 SIGKILL。恢复必须由新的安装态进程显式执行，不能把重开视为维护已自动恢复。
+覆盖另一 UUID 的回执、待清理 build、引用和实际 B 查询保持不变，同名重建后的旧写入／推进／退休拒绝、同名视图和改名后的重放、100,000 回执配额释放、17 次 policy 槽位复用、普通读者保护、共享 B 引用解除、活跃及取消中的任务、未结束 build、并发创建索引与 build 在退休前后的两种顺序、八个并发相同退休、真实冲突、取消和 SIGKILL。恢复由新的安装态进程显式执行。
 
-本轮专项验收通过 **6 组公开契约、25 个 native／安装态重开场景**，其中 **5 次实际 SIGKILL** 位于 DROP 提交前、索引引用暂存后、回执暂存后、全部 UUID 状态暂存后及提交后。取消和注入错误分别覆盖取得写锁后到提交前的七个阶段。
+## 原分支的历史验证
+
+以下数字和构件摘要记录原分支的 2026-11-06 验证。当前开发分支的恢复检查涵盖 16 张 Vortex 元数据表，并覆盖原生提交前的最后一个取消、故障和崩溃边界。[历史提交](https://github.com/AstroVela/ducklake/commit/e4cd030bb8fbe657179c045d75a2a5f65e1fe3b1)
+
+当时的专项验收通过 **6 组公开契约、25 个 native／安装态重开场景**，其中 **5 次实际 SIGKILL** 位于 DROP 提交前、索引引用暂存后、回执暂存后、全部 UUID 状态暂存后及提交后。取消和注入错误分别覆盖取得写锁后到提交前的七个阶段。
 
 真实冲突通过另一个连接提交独立的空原生 snapshot／changes 记录，竞争本次 DROP 的 snapshot 主键。测试确认实际冲突错误，逐项比较回滚后的 13 张元数据表、原生历史与业务行，再显式重试成功；不会把未形成冲突的并发更新计为冲突验收。
 

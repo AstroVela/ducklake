@@ -73,6 +73,14 @@ def exercise(proof, native, root, checks, workers):
         and row["reclaimable_rows"] == 2048,
         "Planner did not durably select whole-file pruning",
     )
+    generation = "generation-" + row["run_id"]
+    owners = [owner for owner in native.call("build-status") if owner["generation"] == generation]
+    require(len(owners) == 1, "Prune did not register its task generation")
+    sealed = json.loads(Path(owners[0]["reference_path"]).read_text())
+    require(
+        SEG.generation({"reference": sealed}) == generation and M.files([{"reference": sealed}]) == [healthy],
+        "Prune sealed a different generation or retained inventory",
+    )
     no_output(native)
     native.call("sql", BG.APP.append_sql(native, root))
     native.sql("INSERT INTO expected SELECT rowid,id,embedding,category,payload FROM lake.items WHERE id>=10000")
@@ -87,7 +95,8 @@ def exercise(proof, native, root, checks, workers):
     ready = SEG.segments(head)
     require(
         head["reference"]["publication"] == row["run_id"]
-        and SEG.generation(ready[-1]) == row["candidate_generation"]
+        and SEG.generation(ready[-1]) == generation == row["candidate_generation"]
+        and ready[-1]["reference"] == sealed
         and ready[:2] == parts
         and M.files([ready[-1]]) == [healthy],
         "Pruning lost exact task ownership, retained coverage or an unselected B",
@@ -147,6 +156,7 @@ def exercise(proof, native, root, checks, workers):
     checks.extend(
         [
             "one B drops only its fully masked member and rebuilds retained coverage; both unselected generations remain byte-identical",
+            "prune publishes the sealed registered generation and exact retained inventory after concurrent writes",
             "concurrent T/flush/T commits survive atomic source/index publication without allocating a replacement data file",
             "current and historical row IDs/typed values, category filtering and B/F/T top-k match native visibility",
             "index GC preserves native historical sources; explicit source GC preserves healthy bytes and old/new views with delayed fetch",
@@ -251,7 +261,7 @@ def interruption(driver, root, kind, checks):
         M.stop(native)
 
 
-def crash(driver, root, stage, checks):
+def crash(driver, root, stage, checks, *, append_after_restart=False):
     native = CAT.Native(driver, root / "native")
     try:
         setup(native, root)
@@ -267,6 +277,11 @@ def crash(driver, root, stage, checks):
             head["revision"] == 1 + committed and RW.active_rows(native) == (2048 if committed else 4096),
             "SIGKILL recovered a partial prune transaction",
         )
+        native.sql(
+            f"SELECT CASE WHEN count(*)={int(committed)} THEN true "
+            "ELSE error('SIGKILL split the physical prune marker from publication') END "
+            "FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1"
+        )
         if committed:
             require(
                 head["reference"]["publication"] == durable["run_id"]
@@ -274,18 +289,42 @@ def crash(driver, root, stage, checks):
                 "Recovery lost the committed task's generation/publication pair",
             )
         OPT.steady(native, OPT.status(native))
-        native.call("optimizer-resume")
-        row = BG.published(native, 2)
+        if append_after_restart:
+            SEG.add_f(native, 5000)
+            native.call("append", "knn", root / "artifacts" / "later-B.json", 2)
+            require(native.call("head", "knn")["revision"] == 3, "Later append must publish a higher revision")
+            native.sql(
+                "SELECT CASE WHEN state='published' THEN true "
+                "ELSE error('resume lost the committed prune receipt') END "
+                "FROM ducklake_resume_vortex_optimizer('lake','main','items','knn')"
+            )
+            row = OPT.steady(native, OPT.status(native))
+            require(
+                row["published_revision"] == 2
+                and row["run_id"] == durable["run_id"]
+                and row["candidate_generation"] == durable["candidate_generation"],
+                "Recovery must retain the original prune run, generation and revision",
+            )
+        else:
+            native.call("optimizer-resume")
+            row = BG.published(native, 2)
         BG.stop(native)
         require(
             row["run_count"] == (1 if committed else 2), "Recovery replayed committed work or retried automatically"
         )
         native.call("maintenance-resume")
         recalls = []
-        M.qualify(native, "recovered", recalls, 1)
+        M.qualify(native, "recovered", recalls, 2 if append_after_restart else 1)
         no_output(native)
         BG.finish(native)
-        checks.append(f"SIGKILL at {stage} restores a complete old/new plan; only explicit resume permits fresh work")
+        if append_after_restart:
+            checks.append(
+                "recovery reconciles the original prune receipt after an independent append advances revision"
+            )
+        else:
+            checks.append(
+                f"SIGKILL at {stage} restores a complete old/new plan; only explicit resume permits fresh work"
+            )
         return {"fixture_recalls": recalls}
     finally:
         M.stop(native)
@@ -404,6 +443,9 @@ def main():
                 "optimizer_rewritten",
             ]
         ]
+        cases.append(
+            ("crash-later-append", lambda d, r, c: crash(d, r, "rewrite_after_commit", c, append_after_restart=True))
+        )
         report["cases"] = []
         for name, run in cases:
             directory = root / name

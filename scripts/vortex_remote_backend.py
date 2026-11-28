@@ -5,7 +5,7 @@ for one registered key, checksum and condition (or one exact DELETE version).
 No operation retries, schema migration, local storage or alternate backend.
 """
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 import base64
 import hashlib
@@ -65,25 +65,33 @@ class Ticket:
     headers: tuple = field(repr=False)
 
 
-def dispatch(ticket, body=None):
-    """One HTTP attempt. A disconnected response never triggers an implicit retry."""
+@contextmanager
+def _send_once(ticket, body=None, *, connect_timeout=30, read_timeout=30):
     parsed = urlsplit(ticket.url)
     require(parsed.scheme == "https" or (parsed.scheme == "http" and parsed.hostname == "127.0.0.1"), "HTTPS_REQUIRED")
     if parsed.scheme == "https":
         connection = http.client.HTTPSConnection(
-            parsed.hostname, parsed.port, timeout=30, context=ssl.create_default_context()
+            parsed.hostname, parsed.port, timeout=connect_timeout, context=ssl.create_default_context()
         )
     else:
-        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=30)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=connect_timeout)
     try:
+        connection.connect()
+        connection.sock.settimeout(read_timeout)
         connection.request(ticket.method, parsed.path + "?" + parsed.query, body=body, headers=dict(ticket.headers))
-        response = connection.getresponse()
+        with closing(connection.getresponse()) as response:
+            yield response
+    finally:
+        connection.close()
+
+
+def dispatch(ticket, body=None):
+    """One HTTP attempt. A disconnected response never triggers an implicit retry."""
+    with _send_once(ticket, body) as response:
         data, headers = response.read(MIB + 1), dict(response.getheaders())
         require(len(data) <= MIB, "HTTP_METADATA_BUDGET")
         require(response.status in (200, 204), f"HTTP_{response.status}")
         return {k.lower(): v for k, v in headers.items()}
-    finally:
-        connection.close()
 
 
 class S3Objects:
@@ -127,12 +135,36 @@ class S3Objects:
             require(version and version != "null", "EXACT_VERSION_REQUIRED")
             params["VersionId"] = version
             operation, method = "delete_object", "DELETE"
+        return self._signed_ticket(operation, method, params, headers)
+
+    def _signed_ticket(self, operation, method, params, headers):
+        key, version = params["Key"], params.get("VersionId")
         url = self.client.generate_presigned_url(operation, Params=params, ExpiresIn=300)
         query = parse_qs(urlsplit(url).query)
         signed = set(query.get("X-Amz-SignedHeaders", [""])[0].split(";"))
         require({"host", *[k.lower() for k in headers]} <= signed, "REQUIRED_HEADERS_NOT_SIGNED")
-        require(version is None or query.get("versionId") == [version], "DELETE_VERSION_NOT_BOUND")
+        require(version is None or query.get("versionId") == [version], f"{method}_VERSION_NOT_BOUND")
         return Ticket(method, key, url, tuple(sorted(headers.items())))
+
+    def read_exact_once(self, key, version):
+        self.key(key)
+        require(version and version != "null", "EXACT_VERSION_REQUIRED")
+        params = {"Bucket": self.bucket, "Key": key, "VersionId": version}
+        ticket = self._signed_ticket("get_object", "GET", params, {})
+        config = self.client.meta.config
+        # The SDK signs this request. Dispatch it directly so region redirects cannot resend it.
+        with _send_once(ticket, connect_timeout=config.connect_timeout, read_timeout=config.read_timeout) as response:
+            if response.status == 404:
+                return None
+            require(response.status == 200, f"HTTP_{response.status}")
+            version_id = response.getheader("x-amz-version-id")
+            require(version_id not in (None, "null"), "VERSIONING_REQUIRED")
+            size, etag = response.length, response.getheader("ETag")
+            require(size is not None and etag is not None, "INCOMPLETE_OBJECT")
+            require(size <= LIMITS["source"], "OBJECT_BUDGET")
+            data = response.read(LIMITS["source"] + 1)
+            require(len(data) == size, "INCOMPLETE_OBJECT")
+            return {"version": version_id, "etag": etag, "data": data, "sha": sha(data), "size": size}
 
     def read(self, key, version=None):
         self.key(key)
@@ -177,7 +209,7 @@ class Budget:
 
 DDL = """
 CREATE TABLE control (
- singleton boolean PRIMARY KEY CHECK(singleton), layout integer NOT NULL CHECK(layout=2),
+ singleton boolean PRIMARY KEY CHECK(singleton), layout integer NOT NULL CHECK(layout=1),
  catalog uuid NOT NULL, table_uuid uuid NOT NULL, epoch bigint NOT NULL CHECK(epoch>0),
  owner bigint NOT NULL CHECK(owner>0), revision bigint NOT NULL, head text,
  bucket text NOT NULL, prefix text NOT NULL, endpoint text NOT NULL);
@@ -197,7 +229,7 @@ CREATE TABLE gc (unit text PRIMARY KEY REFERENCES units(id), nonce uuid NOT NULL
 
 
 class Backend:
-    """Storage/transaction primitives and single-root fixtures in a fresh v2 schema.
+    """Storage/transaction primitives and single-root fixtures in a fresh schema.
 
     control-row locking serializes metadata mutations across broker processes.
     BoundCatalog is the typed publication entry. Native SQL is not connected.
@@ -224,7 +256,7 @@ class Backend:
                 c.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(self.schema)))
                 c.execute(DDL)
                 c.execute(
-                    "INSERT INTO control VALUES(true,2,%s,%s,%s,1,0,NULL,%s,%s,%s)",
+                    "INSERT INTO control VALUES(true,1,%s,%s,%s,1,0,NULL,%s,%s,%s)",
                     (
                         catalog,
                         table_uuid,
@@ -235,31 +267,45 @@ class Backend:
                     ),
                 )
 
+    @staticmethod
+    def _begin_transaction(c):
+        c.execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+        c.execute("SET LOCAL synchronous_commit=on")
+
     @contextmanager
-    def transaction(self, token=None):
-        c, committing = self.connect(), False
+    def _transaction(self, c, *, rollback=False):
+        committing = False
         try:
-            c.execute("BEGIN ISOLATION LEVEL READ COMMITTED")
-            c.execute("SET LOCAL synchronous_commit=on")
-            state = c.execute("SELECT * FROM control WHERE singleton FOR UPDATE").fetchone()
-            require(state and state["layout"] == 2, "UNSUPPORTED_LAYOUT")
-            require(
-                state["bucket"] == self.objects.bucket
-                and state["prefix"] == self.objects.prefix
-                and state["endpoint"] == self.objects.client.meta.endpoint_url,
-                "STORE_BINDING_MISMATCH",
-            )
-            if token is not None:
-                require(state["owner"] == token, "FENCED")
-            yield c, state
-            committing = True
-            c.execute("COMMIT")
+            self._begin_transaction(c)
+            yield
+            if rollback:
+                c.execute("ROLLBACK")
+            else:
+                committing = True
+                c.execute("COMMIT")
         except psycopg.OperationalError as error:
             if committing and error.sqlstate is None:
                 raise CommitUnknown("Reconcile the original request; do not delete prepared objects") from None
             raise
-        finally:
-            c.close()
+
+    def _control(self, c, token=None, *, lock=True):
+        query = "SELECT * FROM control WHERE singleton"
+        state = c.execute(query + " FOR UPDATE" if lock else query).fetchone()
+        require(state and state["layout"] == 1, "UNSUPPORTED_LAYOUT")
+        require(
+            state["bucket"] == self.objects.bucket
+            and state["prefix"] == self.objects.prefix
+            and state["endpoint"] == self.objects.client.meta.endpoint_url,
+            "STORE_BINDING_MISMATCH",
+        )
+        if token is not None:
+            require(state["owner"] == token, "FENCED")
+        return state
+
+    @contextmanager
+    def transaction(self, token=None):
+        with closing(self.connect()) as c, self._transaction(c):
+            yield c, self._control(c, token)
 
     def state(self):
         with self.connect() as c:
@@ -295,6 +341,7 @@ class Backend:
         require(raw is not None and raw["sha"] == obj["sha"] and raw["size"] == obj["size"], "IDENTITY_MISMATCH")
 
     def takeover(self, expected):
+        require(type(expected) is int and 1 <= expected <= 2**63 - 1, "BAD_OWNER")
         with self.transaction(expected) as (c, state):
             require(state["owner"] < 2**63 - 1, "OWNER_EXHAUSTED")
             c.execute("UPDATE control SET owner=owner+1 WHERE singleton")
@@ -317,26 +364,40 @@ class Backend:
             c.execute("INSERT INTO refs VALUES('build',%s,%s)", (unit, unit))
         return unit
 
+    @staticmethod
+    def _source_for_build(c, unit):
+        obj = c.execute(
+            "SELECT o.* FROM units u JOIN objects o ON o.unit=u.id AND o.role='source' "
+            "JOIN refs r ON r.unit=u.id AND r.holder=u.id AND r.kind='build' "
+            "WHERE u.id=%s AND u.kind='source' AND u.state='allocated'",
+            (unit,),
+        ).fetchone()
+        require(obj is not None, "SOURCE_CLOSED")
+        return obj
+
+    def _source_ticket(self, c, unit, data):
+        obj = self._source_for_build(c, unit)
+        self.identity(obj, {"sha": sha(data), "size": len(data)})
+        return self.objects.ticket(obj["key"], data=data, condition="*")
+
     def source_ticket(self, unit, data, token):
         with self.transaction(token) as (c, _):
-            row = c.execute("SELECT * FROM units WHERE id=%s", (unit,)).fetchone()
-            require(row and row["kind"] == "source" and row["state"] == "allocated", "SOURCE_CLOSED")
-            obj = self.files(c, unit)[0]
-            self.identity(obj, {"sha": sha(data), "size": len(data)})
-            return self.objects.ticket(obj["key"], data=data, condition="*")
+            return self._source_ticket(c, unit, data)
+
+    def _seal_source(self, c, unit):
+        obj = self._source_for_build(c, unit)
+        raw = self.objects.read(obj["key"])
+        self.identity(obj, raw)
+        c.execute(
+            "UPDATE objects SET sealed=true,version=%s,etag=%s WHERE key=%s",
+            (raw["version"], raw["etag"], obj["key"]),
+        )
+        c.execute("UPDATE units SET state='ready' WHERE id=%s", (unit,))
+        c.execute("UPDATE refs SET kind='native' WHERE kind='build' AND holder=%s AND unit=%s", (unit, unit))
 
     def seal_source(self, unit, token):
         with self.transaction(token) as (c, _):
-            obj = self.files(c, unit)[0]
-            raw = self.objects.read(obj["key"])
-            self.identity(obj, raw)
-            c.execute(
-                "UPDATE objects SET sealed=true,version=%s,etag=%s WHERE key=%s",
-                (raw["version"], raw["etag"], obj["key"]),
-            )
-            c.execute("UPDATE units SET state='ready' WHERE id=%s AND state='allocated'", (unit,))
-            c.execute("DELETE FROM refs WHERE kind='build' AND holder=%s", (unit,))
-            c.execute("INSERT INTO refs VALUES('native',%s,%s)", (unit, unit))
+            self._seal_source(c, unit)
 
     def prepare(self, name, source, data, token, expected, table_uuid, epoch=1, rows=128, dimension=8, segments=1):
         require(re.fullmatch(r"[a-z0-9-]{1,80}", name), "BAD_REQUEST_ID")
@@ -488,6 +549,13 @@ class Backend:
             c.execute("UPDATE requests SET state='cancelled' WHERE id=%s", (name,))
             c.execute("DELETE FROM refs WHERE kind='build' AND holder=%s", (name,))
 
+    @staticmethod
+    def _require_source_gc_idle(c):
+        require(
+            not c.execute("SELECT 1 FROM units WHERE kind='source' AND state='deleting' LIMIT 1").fetchone(),
+            "SOURCE_GC_ACTIVE",
+        )
+
     def capture(self, name, kind="vector", source=None):
         require(kind in ("vector", "sql"), "BAD_READER_KIND")
         with self.transaction() as (c, state):
@@ -500,6 +568,7 @@ class Backend:
                     c.execute("SELECT 1 FROM refs WHERE kind='native' AND unit=%s", (source,)).fetchone(),
                     "EXPIRED_NATIVE_HISTORY",
                 )
+                self._require_source_gc_idle(c)
                 units = [source]
             for unit in units:
                 require(

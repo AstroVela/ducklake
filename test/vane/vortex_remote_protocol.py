@@ -389,7 +389,9 @@ class Protocol:
         }
         # These assignments stand for ONE durable metadata transaction, not a client-side multi-write sequence.
         self.m.update(head=name, revision=revision, refs=sorted([req["source"], req["unit"]]))
-        req.update(state="committed", receipt=receipt)
+        req.update(
+            state="committed", receipt=None if not ack and self.mutant == "omit_receipt_on_lost_ack" else receipt
+        )
         self.m["units"][req["unit"]]["state"] = "ready"
         self.m["commits"].append(record)
         del self.local["frames"][key]
@@ -411,7 +413,14 @@ class Protocol:
     def capture(self, name, kind="vector", source="source-a"):
         need(name not in self.m["views"] and kind in ("vector", "sql"), "VIEW_EXISTS_OR_KIND")
         req = self.request(self.m["head"])
-        need(kind != "sql" or source in self.m["native"], "EXPIRED_NATIVE_HISTORY")
+        if kind == "sql":
+            need(source in self.m["native"], "EXPIRED_NATIVE_HISTORY")
+            if self.mutant != "allow_sql_during_source_gc":
+                # A durable source intent closes admission across collector crashes and owner transfer.
+                need(
+                    not any(u["kind"] == "source" and u["state"] == "deleting" for u in self.m["units"].values()),
+                    "SOURCE_GC_ACTIVE",
+                )
         units = sorted([req["source"], req["unit"]]) if kind == "vector" else [source]
         if self.mutant == "mixed_readview" and kind == "vector":
             units[units.index(req["source"])] = "source-b" if req["source"] == "source-a" else "source-a"
@@ -538,7 +547,7 @@ class Protocol:
         target = current["id"] if current is not None else None
         message = f"stop:{unit}:{key}:{target}:{token}"
         need(message not in self.wire, "RPC_ALREADY_REGISTERED")
-        intent["targets"][key] = target
+        intent["targets"][key] = None if self.mutant == "omit_gc_payload_target" else target
         body = compact(
             {"kind": "vortex-stop-v1", "catalog": CATALOG, "table": TABLE, "key": key, "intent": intent["nonce"]}
         )
@@ -588,7 +597,12 @@ class Protocol:
         files = self.m["units"][unit]["files"]
         if self.mutant != "omit_stop_barrier":
             need(set(intent["barriers"]) == set(files), "STOP_NOT_CONFIRMED")
-        need(not any(v["kind"] == "payload" for k in files for v in self.store.get(k, [])), "PAYLOAD_REMAINS")
+        targets = intent["targets"]
+        need(targets.keys() == set(files), "GC_TARGETS_INCOMPLETE")
+        need(
+            all(version is None or self.version(key, version) is None for key, version in targets.items()),
+            "PAYLOAD_REMAINS",
+        )
         self.m["units"][unit]["state"] = "deleted"
         self.m["completed"][unit] = {"objects": 1, "bytes": self.m["units"][unit]["charge"]}
         if self.mutant == "delete_stop_after_finish":

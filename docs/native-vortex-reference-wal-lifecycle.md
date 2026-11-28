@@ -23,12 +23,11 @@ Caller cleanup must be based on its own known output and confirmed publication;
 uncertain or failed publication requires reconciliation first.
 
 Query scratch lives under the caller-selected temporary root, outside managed
-data. Normal completion removes it; process SIGKILL cannot run destructors.
-Native metadata recovery and managed collectors neither adopt nor sweep these
-unregistered private copies. The crash fixtures retain and authenticate them in
-their own isolated temporary namespaces. Owner-controlled temporary-root cleanup
-after process termination is a separate lifecycle from metadata checkpoint and
-managed generation GC; this proof does not introduce a crash-scratch sweeper.
+data. Normal completion releases the payload and its active registration. SIGKILL
+can leave the registered payload for explicit collection using the diagnostic
+`scratch_root`. The crash fixtures verify metadata recovery and managed collectors
+preserve these private copies. The separate [query scratch protocol](native-vortex-query-scratch-lifecycle.md)
+covers ownership and bounded cleanup after the query process exits.
 
 ## Checkpoint scope and protection
 
@@ -44,8 +43,9 @@ CHECKPOINT __ducklake_metadata_lake;
 The attachment must be the intended local DuckLake metadata file. Its hidden
 native metadata database is directly addressable by this prototype's qualified
 name but is omitted from `duckdb_databases()` and `duckdb_tables()` enumeration.
-The proof reads all 13 declared Vortex metadata tables explicitly; missing tables
-fail, rather than producing an empty or partial snapshot.
+The current proof reads all 16 Vortex metadata tables by name. After the
+recovery checkpoint and closing DuckLake, a read-only connection to the
+physical native metadata file verifies the exact table inventory.
 
 `CHECKPOINT lake` invokes DuckLake's flush, snapshot-expiration, compaction and
 cleanup sequence. It is a different operation with different side effects.
@@ -106,7 +106,7 @@ After the incremental non-editable runtime install and matching-provider build
 from the [native workflow](vane-native-vortex-proof.md), run:
 
 ```bash
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_reference_wal.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_reference_wal.py \
     --driver /path/to/build/ducklake_vortex_write_driver \
     --cpus 6,7,8,9,10,11 --output-dir /tmp/vortex-reference-wal
 ```
@@ -115,7 +115,9 @@ The [native-provider CI workflow](../.github/workflows/VaneNativeVortex.yml)
 executes the same probe on an available runner CPU and retains its report,
 native/recovery logs, committed-state snapshots and file-identity manifests.
 
-## Result
+## Historical qualification on 2026-11-06
+
+The original qualification used [commit `db72e6ed`](https://github.com/AstroVela/ducklake/commit/db72e6edff094461c73e7bdefcc042693e7a58f4).
 
 The complete [installed-provider proof](../test/vane/test_vane_vortex_reference_wal.py)
 passed **4 native/reopen scenarios** and **8 actual SIGKILL/recovery boundaries**.
