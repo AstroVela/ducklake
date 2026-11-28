@@ -1,6 +1,6 @@
 # DuckLake＋Vortex 总设计与 roadmap
 
-本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，基于 #95 合入后的开发提交 `c0fa417`。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
+本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，基于 #96 合入后的开发提交 `1be4191d`。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
 
 本文是随代码维护的仓库总纲。初稿阅读副本见 [ChatGPT Page](https://chatgpt.com/space/page_0c2fa263e4dc81919bfaea100e8008cd)。
 
@@ -287,7 +287,11 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 R7 本地实验使用实际 RocksDB 和 SPFresh AddIndexSPFresh／DeleteIndex。在 `c0fa417` 和当前 Vortex 固定点上复验通过 156 次 ANN 查询比较、47 项拒绝检查和 6 个真实 SIGKILL 边界，fixture 最低 recall 1.0。同步写入执行 posting 页数上限。封存前先检查 64 MiB 文件预算，只读重开后核对 posting sizes 和每个 VID 的可见性，最后复核文件清单。业务已提交而 ANN 落后时崩溃，重开保留 T 数据，完整回执重放不推进业务 snapshot。显式推进后才更新动态实验水位，私有旧视图在 canonical checkpoint GC 后继续查询。[R7 本地原生增删／checkpoint／旧 ReadView](native-vortex-spfresh-updates.md)
 
-该证据限于同步 posting 增删、关闭 checkpoint 与明确的私有版本副本。实验发布指针位于本地，生产 SQL／optimizer 使用 `spfresh.static`。LIRE split／merge／reassign 和复制 checkpoint 的性能收益仍待验证。R6 远程 codec 接线继续暂缓。
+该证据覆盖同步 posting 增删、关闭 checkpoint 和私有版本副本。实验发布指针位于本地，生产 SQL／optimizer 使用 `spfresh.static`。整份复制 checkpoint 的性能收益仍待验证。R6 远程 codec 接线继续暂缓。
+
+### 9.5 R7 受控 LIRE 重平衡
+
+#97 的原始提交 `01ad28e8` 基于旧版 #96（`c8cf4248`），使用显式单线程队列执行原生 split、merge 和 reassign。该提交记录了 252 次 ANN 比较、388 次显式 drain、10 项拒绝检查和 3 个 SIGKILL 边界，最低 recall 为 1.0。新基线的验收需要在 #96 的封存和只读重开检查下验证物理 posting、逐 VID 可见性、旧 ReadView 和同输入 merge 对照。每轮 drain 的预算为 16 次嵌套操作和 64 MiB posting 写入。[受控 LIRE 的协议与历史结果](native-vortex-spfresh-lire.md)
 
 ## 10. 统一 roadmap
 
@@ -302,7 +306,7 @@ R7 本地实验使用实际 RocksDB 和 SPFresh AddIndexSPFresh／DeleteIndex。
 | R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
 | R5 容量与产品契约 | **部分完成**。已有浮点、请求 epoch、回执、reference／WAL、容量 admission、私有查询目录和 UUID 退休的确定性验收。退休历史用例覆盖 inline 表、表级配置、源文件、generation 及原生块复用 | 更大数据上的质量、延迟与吞吐，以及长期磁盘和 RSS 容量仍待验证 |
 | R6 云端与分布式 | **组件层验证，后续接线暂缓**。协议模型、PostgreSQL／MinIO broker 和 typed 元数据已有独立证据。BoundCatalog 将表 UUID、字段和快照统一绑定到发布与 ReadView，覆盖原子退休、独立 pin 和精确版本回收。Reader session 绑定视图、确立所有权，并支持失效后的受预算显式回收。[绑定组件](native-vortex-bound-readviews.md) · [Reader session](native-vortex-reader-sessions.md) | 验收真实 Vortex／SPFresh 编码、最小查询和原生入口，再验证真实 AWS／TLS／IAM、HA、固定视图 fan-out 和分布式 top-k |
-| R7 SPFresh 原生在线更新 | **本地组件验证**。[原生增删与旧 ReadView](native-vortex-spfresh-updates.md)覆盖同步 Add/Delete、关闭 checkpoint、受预算回收和业务提交后的独立 ANN 推进。生产使用静态 provider | LIRE 重平衡、动态 provider 与 DuckLake 元数据的原子绑定、并发与候选恢复／回收，之后单独验证质量和收益 |
+| R7 SPFresh 原生在线更新 | **本地组件验证**。#96 覆盖同步 Add/Delete、关闭 checkpoint、受预算回收和业务提交后的独立 ANN 推进。#97 的受控 LIRE 历史结果见第 9.5 节。生产使用静态 provider | 在已合入的 #96 上复验 LIRE，再验证动态候选的持久登记、取消和崩溃回收、元数据原子发布与后台并发 |
 
 原 RFC 的静态索引、实时可见、B/F/T、compaction／GC 目标在 R0–R3 有对应实现；其 Iceberg 专属物化、云端 fencing 和分布式 serving 并未因 DuckLake 本地链路通过而完成。保留原 RFC 作为历史来源，本文件作为 DuckLake 路线的总纲。
 
@@ -340,7 +344,7 @@ R4 和 R5 的性能验证继续暂缓。
 
 ### R7 原生重平衡
 
-下一份确定性实验覆盖有预算的 LIRE split／merge／reassign，包括重开后 native VID、posting、version labels 和旧 ReadView 的一致性。之后再验证动态 provider 的提交游标、DuckLake 元数据原子绑定、并发视图和候选恢复／回收。[R7 本地增删与旧视图](native-vortex-spfresh-updates.md)
+先在开发基线上复验受控 LIRE 的 split／merge／reassign，保留 #96 对 checkpoint 文件预算、posting sizes 和逐 VID 可见性的检查。通过后验证动态候选的持久登记、取消和受预算的崩溃回收，再接入 DuckLake 元数据原子发布和后台并发。[R7 本地增删与旧视图](native-vortex-spfresh-updates.md) · [受控 LIRE](native-vortex-spfresh-lire.md)
 
 ### R6 实际文件与远程接线
 
@@ -376,6 +380,7 @@ R6 增加 reader session 的所有权、fencing 与受预算的持久 pin 回收
 | [R6 Typed UUID／发布／ReadView 绑定](native-vortex-bound-readviews.md) | 复合外键、跨 UUID 隔离、每表发布 CAS、原子退休、精确快照与受保护的旧视图 |
 | [R6 Reader session 与持久 pin 回收](native-vortex-reader-sessions.md) | PG lifetime lock、在途读取与回收排序、共享预算及故障恢复 |
 | [R7 本地 SPFresh 增删与旧 ReadView](native-vortex-spfresh-updates.md) | RocksDB／Add/Delete、关闭 checkpoint、物理行身份、旧视图与受预算回收 |
+| [R7 受控 LIRE 重平衡](native-vortex-spfresh-lire.md) | 显式单线程推进、持久 posting 与 version、最近分区核对和同输入 merge 对照 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。

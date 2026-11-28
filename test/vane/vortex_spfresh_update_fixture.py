@@ -118,13 +118,13 @@ def visibility(mapping, live):
     return "".join("1" if address(row) in live else "0" for row in mapping)
 
 
-def seal(executable, root, capture, mapping, log):
+def seal(executable, root, capture, mapping, log, *, lire=False):
     validate_capture(capture)
     require(len(mapping) <= ROWS and len({address(r) for r in mapping}) == len(mapping), "VID_MAP")
     live = {address(r): r for r in capture["rows"]}
     require(set(live) <= {address(r) for r in mapping}, "VID_MAP")
     require(all(row == live[address(row)] for row in mapping if address(row) in live), "VID_MAP")
-    files, _ = validate_checkpoint(executable, root, visibility(mapping, live), log)
+    files, _ = validate_checkpoint(executable, root, visibility(mapping, live), log, lire=lire)
     body = {"format_version": 1, "capture": capture, "mapping": mapping, "files": files}
     # Persist every declared native file before the single publication pointer.
     for name in body["files"]:
@@ -213,12 +213,14 @@ class Worker:
         self.log.close()
 
 
-def validate_checkpoint(executable, root, expected_visibility, log, *, expected_files=None, retain_reader=False):
+def validate_checkpoint(
+    executable, root, expected_visibility, log, *, expected_files=None, retain_reader=False, lire=False
+):
     native = root / "native"
     files = inventory(native)
     if expected_files is not None:
         require(files == expected_files, "GENERATION_CHANGED")
-    worker = Worker(executable, "open", native, log)
+    worker = Worker(executable, "open-lire" if lire else "open", native, log)
     try:
         require(worker.ready["live"] == expected_visibility.count("1"), "NATIVE_ROW_COUNT")
         require(worker.ready["visibility"] == expected_visibility, "NATIVE_VID_VISIBILITY")
@@ -343,7 +345,7 @@ class Catalog:
             observe("after_publish")
             return head
 
-    def read(self, executable, private, capture, log):
+    def read(self, executable, private, capture, log, *, lire=False):
         with (self.root / "lock").open("rb") as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
             head = self.head()
@@ -353,7 +355,7 @@ class Catalog:
             )
             body = clone(self.root / head["generation"], private)
             require(body["capture"] == capture, "READVIEW_CHANGED")
-            return ReadView(executable, private, body, log)
+            return ReadView(executable, private, body, log, lire=lire)
 
     def collect(self, name, objects, bytes_):
         require(1 <= objects <= 16 and 1 <= bytes_ <= LIMIT, "GC_BUDGET")
@@ -372,11 +374,17 @@ class Catalog:
 
 
 class ReadView:
-    def __init__(self, executable, private, body, log):
+    def __init__(self, executable, private, body, log, *, lire=False):
         self.root, self.body = private, body
         live = {address(row) for row in body["capture"]["rows"]}
         _, self.worker = validate_checkpoint(
-            executable, private, visibility(body["mapping"], live), log, expected_files=body["files"], retain_reader=True
+            executable,
+            private,
+            visibility(body["mapping"], live),
+            log,
+            expected_files=body["files"],
+            retain_reader=True,
+            lire=lire,
         )
 
     def query(self, vector, k):

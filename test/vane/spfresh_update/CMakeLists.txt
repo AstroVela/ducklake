@@ -19,8 +19,9 @@ add_library(spfresh_update_core STATIC ${core})
 target_compile_definitions(spfresh_update_core
                            PUBLIC ROCKSDB SPTAG_ROCKSDB_ONLY SPTAG_DISABLE_NUMA)
 target_include_directories(
-  spfresh_update_core PUBLIC "${SPFRESH_SOURCE}/AnnService"
-                             "${ROCKSDB_INCLUDE_DIR}" "${ZSTD_INCLUDE_DIR}")
+  spfresh_update_core
+  PUBLIC "${SPFRESH_SOURCE}/AnnService" "${ROCKSDB_INCLUDE_DIR}"
+         "${ZSTD_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(
   spfresh_update_core PUBLIC OpenMP::OpenMP_CXX Threads::Threads TBB::tbb
                              "${ROCKSDB_LIBRARY}" "${ZSTD_LIBRARY}")
