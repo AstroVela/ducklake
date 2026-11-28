@@ -1,10 +1,10 @@
 # DuckLake＋Vortex 总设计与 roadmap
 
-本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，基于 #94 合入后的开发提交 `d21d4609`。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
+本文是 DuckLake＋Vortex 实时向量检索的统一设计入口，基于 #95 合入后的开发提交 `c0fa417`。分项 proof 文档保留各次实验的历史，本文说明当前采用的方案、能力边界和后续顺序。
 
 本文是随代码维护的仓库总纲。初稿阅读副本见 [ChatGPT Page](https://chatgpt.com/space/page_0c2fa263e4dc81919bfaea100e8008cd)。
 
-**当前结论：本地原生基本链路已实现并通过端到端验证；持续写入下的长期维护稳态尚未完成。** 已支持提交后即时查询、后台 flush、独立 B 段构建、选择性合并、数据重写、受事务保护的 GC 和崩溃恢复。当前没有接入 SPFresh 原生在线增删改，也没有完成云端或分布式向量查询。
+**当前结论：本地原生基本链路已实现并通过端到端验证；持续写入下的长期维护稳态尚未完成。** 已支持提交后即时查询、后台 flush、独立 B 段构建、选择性合并、数据重写、受事务保护的 GC 和崩溃恢复。生产仍使用静态 SPFresh；本轮新增独立的 R7 原生增删／重开／旧视图组件验证，尚未接入生产 SQL 或完成 LIRE 重平衡。云端与分布式向量查询仍未完成，R6 按当前优先级暂缓。
 
 ## 1. 基线与设计范围
 
@@ -23,6 +23,8 @@
 #93 复用 broker 的 PostgreSQL 事务，在独立组件中验证类型化元数据、表 UUID 和完整 uint64 请求 epoch。验收覆盖原回执、原子退休与同名重建。[类型化元数据验收](native-vortex-postgres-typed-lifecycle.md)
 
 #94 将 typed UUID、字段和源快照绑定到 source、generation、发布与 ReadView。组件回归覆盖跨 UUID 隔离、规范引用的原子退休、旧视图和精确版本 GC。[身份与 ReadView 验收](native-vortex-bound-readviews.md)
+
+#95 在新建 `layout=1` schema 上增加 reader session、精确版本 GET 授权、持久副本验收和受预算的 pin 回收。[Reader session 验收](native-vortex-reader-sessions.md)
 
 当前生产验证范围为单进程独占 native DuckDB 元数据目录、本地受管 POSIX 文件、无分区／未加密的固定业务 schema、Float32 有限向量和平方 L2 距离。并发客户端与后台维护位于这一所有权范围内。
 
@@ -281,6 +283,12 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 当前没有与 Turbopuff 同数据／同硬件／同质量门槛的对照结果，也不能把这些小规模 fixture 的召回推广为任意数据集的质量保证。
 
+### 9.4 R7 原生增删的本地组件证据
+
+[R7 本地原生增删／checkpoint／旧 ReadView](native-vortex-spfresh-updates.md)使用实际 RocksDB 和 SPFresh AddIndexSPFresh／DeleteIndex。在 `c0fa417` 和当前 Vortex 固定点上复验通过 156 次 ANN 查询比较、23 项拒绝检查和 6 个真实 SIGKILL 边界，fixture 最低 recall 1.0。业务写入走 DuckLake 原生受管事务、回执与 flush。业务已提交而 ANN 落后时崩溃，重开保留 T 数据和回执，显式推进后才更新动态实验水位。完整私有旧视图在 canonical checkpoint GC 后仍可查询。
+
+该证据限于同步 posting 增删、关闭 checkpoint 与明确的私有版本副本。实验发布指针位于本地，生产 SQL／optimizer 使用 `spfresh.static`。LIRE split／merge／reassign 和复制 checkpoint 的性能收益仍待验证。R6 远程 codec 接线继续暂缓。
+
 ## 10. 统一 roadmap
 
 本表按 DuckLake 实际路线编号。R0–R3 已合入 `dev/ducklake-vortex`，验证范围以第 1、8、9 节为准。R4 的退出条件包括持续写入期间的清理进展。
@@ -293,14 +301,16 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 | R3 物理回收与读者保护 | **已实现并验证**：重写、稀疏 B→F、退休、意图 GC、旧视图、事务完成唤醒 | 已通过受控取消／崩溃边界；持续吞吐问题转入 R4 |
 | R4 长期维护稳态 | **暂缓，未完成**。历史 A/B 候选已撤回，固定 CPU 的 A/A 未达到精度门槛。历史引用诊断测得大输入的路径处理循环平均 30.637 ms | 历史文件名预筛选已撤回，当前路径身份有异名符号链接回归。持续清理与开放停滞仍待验收。当前基线的 30 分钟稳态验证暂缓 |
 | R5 容量与产品契约 | **部分完成**。已有浮点、请求 epoch、回执、reference／WAL、容量 admission、私有查询目录和 UUID 退休的确定性验收。退休历史用例覆盖 inline 表、表级配置、源文件、generation 及原生块复用 | 更大数据上的质量、延迟与吞吐，以及长期磁盘和 RSS 容量仍待验证 |
-| R6 云端与分布式 | **组件层验证**。协议模型、PostgreSQL／MinIO broker 和 typed 元数据已有独立证据。BoundCatalog 将表 UUID、字段和快照统一绑定到发布与 ReadView，覆盖原子退休、独立 pin 和精确版本回收。Reader session 绑定视图、确立所有权，并支持失效后的受预算显式回收。[绑定组件](native-vortex-bound-readviews.md) · [Reader session](native-vortex-reader-sessions.md) | 验收真实 Vortex／SPFresh 编码、最小查询和原生入口，再验证真实 AWS／TLS／IAM、HA、固定视图 fan-out 和分布式 top-k |
-| R7 SPFresh 原生在线更新 | **候选后续路线，未接入** | 先证明相对独立静态 B 的必要性；设计可持久化版本、并发快照、撤销／恢复与 GC 协议，再验证原生增删改接口 |
+| R6 云端与分布式 | **组件层验证，后续接线暂缓**。协议模型、PostgreSQL／MinIO broker 和 typed 元数据已有独立证据。BoundCatalog 将表 UUID、字段和快照统一绑定到发布与 ReadView，覆盖原子退休、独立 pin 和精确版本回收。Reader session 绑定视图、确立所有权，并支持失效后的受预算显式回收。[绑定组件](native-vortex-bound-readviews.md) · [Reader session](native-vortex-reader-sessions.md) | 验收真实 Vortex／SPFresh 编码、最小查询和原生入口，再验证真实 AWS／TLS／IAM、HA、固定视图 fan-out 和分布式 top-k |
+| R7 SPFresh 原生在线更新 | **本地组件验证**。[原生增删与旧 ReadView](native-vortex-spfresh-updates.md)覆盖同步 Add/Delete、关闭 checkpoint、受预算回收和业务提交后的独立 ANN 推进。生产使用静态 provider | LIRE 重平衡、动态 provider 与 DuckLake 元数据的原子绑定、并发与候选恢复／回收，之后单独验证质量和收益 |
 
 原 RFC 的静态索引、实时可见、B/F/T、compaction／GC 目标在 R0–R3 有对应实现；其 Iceberg 专属物化、云端 fencing 和分布式 serving 并未因 DuckLake 本地链路通过而完成。保留原 RFC 作为历史来源，本文件作为 DuckLake 路线的总纲。
 
-可增量接收业务更新的链路已实现。新版本提交后位于 T 或 F，T 经 flush 进入 F，F 可构建成独立的静态 B。SPFresh 原生在线更新是 R7 的候选路线。
+可增量接收业务更新的链路已实现。新版本提交后位于 T 或 F，T 经 flush 进入 F，F 可构建成独立的静态 B。R7 的实验另行验证了 SPFresh 原生增删，业务事务和可见性继续由 DuckLake 管理。
 
-## 11. R4 下一步验证
+## 11. 后续验证
+
+### R4 维护稳态
 
 **候选先验证当前路径身份和错误语义。** 历史文件名预筛选针对旧的词法规范化。当前实现会解析本地符号链接，异名链接仍可引用同一文件。受控 A/B 只接受保留目录项身份、访问检查及出错行为的候选。
 
@@ -326,9 +336,15 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 4. 选择一个有测量证据的热点做验证性改动，沿用现有格式和出错语义。候选达到预设收益后保留，未达门槛时记录结果并撤回改动。
 5. 30 分钟稳态验证继续暂缓。当前长测工具按三个阶段运行，通过查询前后的提交水位进行验证。恢复前先让长测使用查询实际捕获的 ReadView 快照，对齐历史稳态阶段和写入节奏，并将 canary 与 exploration 的 recall ≥0.8 都设为通过条件。保留 90 秒 drain、最终行和旧回执检查。用更长且重复的运行检查后半程积压斜率、清理速率和资源增长，确认维护能跟上持续写入。[当前长测工具](../test/vane/test_vane_vortex_sustained_load.py)
 
-R4 和 R5 的性能验证继续暂缓。R7 仍按增量更新的收益证据决定。
+R4 和 R5 的性能验证继续暂缓。
 
-R6 增加 reader session 的所有权、fencing 与受预算的持久 pin 回收。MinIO GET 释放全局 control 行锁，操作连接存活时回收等待该 session 的 operation lock。Fence 推进后禁止新的 GET 授权和副本验收，已授权的单次精确版本 GET 与已持久验收的副本可以晚于 fence。下一步验证真实 Vortex／SPFresh 文件、typed row／ReadView 的物理身份及最小查询。普通事务的源保护继续适用。STOP 与协议元数据累积的容量边界仍待验证。[Reader session 契约](native-vortex-reader-sessions.md)
+### R7 原生重平衡
+
+下一份确定性实验覆盖有预算的 LIRE split／merge／reassign，包括重开后 native VID、posting、version labels 和旧 ReadView 的一致性。之后再验证动态 provider 的提交游标、DuckLake 元数据原子绑定、并发视图和候选恢复／回收。[R7 本地增删与旧视图](native-vortex-spfresh-updates.md)
+
+### R6 实际文件与远程接线
+
+R6 增加 reader session 的所有权、fencing 与受预算的持久 pin 回收。MinIO GET 释放全局 control 行锁，操作连接存活时回收等待该 session 的 operation lock。Fence 推进后禁止新的 GET 授权和副本验收，已授权的单次精确版本 GET 与已持久验收的副本可以晚于 fence。普通事务的源保护继续适用。真实 Vortex／SPFresh 文件、typed row／ReadView 的物理身份及最小查询暂缓验证，STOP 与协议元数据累积的容量边界仍待验证。[Reader session 契约](native-vortex-reader-sessions.md)
 
 ## 12. 文档与实现导航
 
@@ -359,6 +375,7 @@ R6 增加 reader session 的所有权、fencing 与受预算的持久 pin 回收
 | [R6 PostgreSQL 类型化元数据与 UUID／epoch](native-vortex-postgres-typed-lifecycle.md) | PostgreSQL 物理类型、字段与行身份、全 uint64 窗口、原回执、原子退休和故障恢复 |
 | [R6 Typed UUID／发布／ReadView 绑定](native-vortex-bound-readviews.md) | 复合外键、跨 UUID 隔离、每表发布 CAS、原子退休、精确快照与受保护的旧视图 |
 | [R6 Reader session 与持久 pin 回收](native-vortex-reader-sessions.md) | PG lifetime lock、在途读取与回收排序、共享预算及故障恢复 |
+| [R7 本地 SPFresh 增删与旧 ReadView](native-vortex-spfresh-updates.md) | RocksDB／Add/Delete、关闭 checkpoint、物理行身份、旧视图与受预算回收 |
 | [原生查询核心](../src/vortex_query/src/lib.rs)／[ReadView](../src/storage/ducklake_vortex_read_view.cpp)／[optimizer](../src/storage/ducklake_vortex_optimizer.cpp) | 对照实现与当前常量 |
 
 后续能力或验证结论变化时，同时更新本文的基线、roadmap 状态、边界和证据入口。单次 proof 的历史结果继续保留；被撤回的实现和未关闭的失败不在总纲中写成已完成。

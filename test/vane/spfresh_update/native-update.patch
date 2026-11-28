@@ -1,0 +1,231 @@
+diff --git a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
+index ca0eb26..f88c3f6 100644
+--- a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
++++ b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
+@@ -13,7 +13,9 @@
+ #include "inc/Core/Common/FineGrainedLock.h"
+ #include "PersistentBuffer.h"
+ #include "inc/Core/Common/PostingSizeRecord.h"
++#ifndef SPTAG_ROCKSDB_ONLY
+ #include "ExtraSPDKController.h"
++#endif
+ #include <chrono>
+ #include <map>
+ #include <cmath>
+@@ -162,7 +164,11 @@ namespace SPTAG::SPANN {
+     public:
+         ExtraDynamicSearcher(const char* dbPath, int dim, int postingBlockLimit, bool useDirectIO, float searchLatencyHardLimit, int mergeThreshold, bool useSPDK = false, int batchSize = 64, int bufferLength = 3) {
+             if (useSPDK) {
++                #ifdef SPTAG_ROCKSDB_ONLY
++                throw std::runtime_error("This probe requires RocksDB, UseSPDK is unsupported");
++#else
+                 db.reset(new SPDKIO(dbPath, 1024 * 1024, MaxSize, postingBlockLimit + bufferLength, 1024, batchSize));
++#endif
+                 m_postingSizeLimit = postingBlockLimit * PageSize / (sizeof(ValueType) * dim + sizeof(int) + sizeof(uint8_t));
+             } else {
+ #ifdef ROCKSDB
+@@ -1116,6 +1122,8 @@ namespace SPTAG::SPANN {
+             std::shared_ptr<VectorIndex> p_index,
+             SearchStats* p_stats, std::set<int>* truth, std::map<int, std::set<int>>* found) override
+         {
++            SearchStats localStats{};
++            if (p_stats == nullptr) p_stats = &localStats;
+             auto exStart = std::chrono::high_resolution_clock::now();
+ 
+             // const auto postingListCount = static_cast<uint32_t>(p_exWorkSpace->m_postingIDs.size());
+@@ -1140,7 +1148,9 @@ namespace SPTAG::SPANN {
+             std::chrono::microseconds remainLimit = m_hardLatencyLimit - std::chrono::microseconds((int)p_stats->m_totalLatency);
+ 
+             auto readStart = std::chrono::high_resolution_clock::now();
+-            db->MultiGet(p_exWorkSpace->m_postingIDs, &postingLists, remainLimit);
++            if (db->MultiGet(p_exWorkSpace->m_postingIDs, &postingLists, remainLimit) != ErrorCode::Success) {
++                throw std::runtime_error("RocksDB posting read failed");
++            }
+             auto readEnd = std::chrono::high_resolution_clock::now();
+ 
+             for (uint32_t pi = 0; pi < postingLists.size(); ++pi) {
+@@ -1549,6 +1559,11 @@ namespace SPTAG::SPANN {
+         }
+ 
+         bool AllFinished() { return m_splitThreadPool->allClear() && m_reassignThreadPool->allClear(); }
++        ErrorCode Checkpoint() override {
++            if (db->Checkpoint() != ErrorCode::Success) return ErrorCode::Fail;
++            return m_postingSizes.Save(m_opt->m_ssdInfoFile);
++        }
++
+         void ForceCompaction() override { db->ForceCompaction(); }
+         void GetDBStats() override { 
+             db->GetStat();
+diff --git a/AnnService/inc/Core/SPANN/ExtraRocksDBController.h b/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
+index 5ebe241..3bec5fb 100644
+--- a/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
++++ b/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
+@@ -8,6 +8,7 @@
+ #include "inc/Helper/StringConvert.h"
+ 
+ #include "rocksdb/db.h"
++#include "rocksdb/env.h"
+ #include "rocksdb/filter_policy.h"
+ #include "rocksdb/rate_limiter.h"
+ #include "rocksdb/slice.h"
+@@ -30,14 +31,13 @@ namespace SPTAG::SPANN
+             bool FullMergeV2(const rocksdb::MergeOperator::MergeOperationInput& merge_in,
+                 rocksdb::MergeOperator::MergeOperationOutput* merge_out) const override
+             {
+-                size_t length = (merge_in.existing_value)->size();
++                size_t length = merge_in.existing_value ? merge_in.existing_value->size() : 0;
+                 for (const rocksdb::Slice& s : merge_in.operand_list) {
+                     length += s.size();
+                 }
+                 (merge_out->new_value).resize(length);
+-                memcpy((char*)((merge_out->new_value).c_str()), 
+-                    (merge_in.existing_value)->data(), (merge_in.existing_value)->size());
+-                size_t start = (merge_in.existing_value)->size();
++                size_t start = merge_in.existing_value ? merge_in.existing_value->size() : 0;
++                if (start) memcpy(merge_out->new_value.data(), merge_in.existing_value->data(), start);
+                 for (const rocksdb::Slice& s : merge_in.operand_list) {
+                     memcpy((char*)((merge_out->new_value).c_str() + start), s.data(), s.size());
+                     start += s.size();
+@@ -68,13 +68,20 @@ namespace SPTAG::SPANN
+         };
+ 
+     public:
++        inline static bool ReadOnly = false;
++        class QuietLogger : public rocksdb::Logger {
++            void Logv(const char*, va_list) override {}
++        };
++
+         RocksDBIO(const char* filePath, bool usdDirectIO, bool wal = false) {
+             dbPath = std::string(filePath);
+             //dbOptions.statistics = rocksdb::CreateDBStatistics();
+-            dbOptions.create_if_missing = true;
++            dbOptions.create_if_missing = !ReadOnly;
++            dbOptions.info_log = std::make_shared<QuietLogger>();
+             if (!wal) {
+-                dbOptions.IncreaseParallelism();
++                dbOptions.IncreaseParallelism(1);
+                 dbOptions.OptimizeLevelStyleCompaction();
++                dbOptions.max_background_jobs = 1;
+                 dbOptions.merge_operator.reset(new AnnMergeOperator);
+                 // dbOptions.statistics = rocksdb::CreateDBStatistics();
+ 
+@@ -83,7 +90,7 @@ namespace SPTAG::SPANN
+                 dbOptions.target_file_size_multiplier = 2;
+                 dbOptions.max_bytes_for_level_base = 16 * 1024UL * 1024 * 1024;
+                 dbOptions.max_bytes_for_level_multiplier = 4;
+-                dbOptions.max_subcompactions = 16;
++                dbOptions.max_subcompactions = 1;
+                 dbOptions.num_levels = 4;
+                 dbOptions.level0_file_num_compaction_trigger = 1;
+                 dbOptions.level_compaction_dynamic_level_bytes = false;
+@@ -115,7 +122,7 @@ namespace SPTAG::SPANN
+                 // block cache options
+                 rocksdb::BlockBasedTableOptions table_options;
+                 // table_options.block_cache = rocksdb::NewSimCache(rocksdb::NewLRUCache(1UL << 30), (8UL << 30), -1);
+-                table_options.block_cache = rocksdb::NewLRUCache(3UL << 30);
++                table_options.block_cache = rocksdb::NewLRUCache(64UL << 20);
+                 // table_options.no_block_cache = true;
+ 
+                 // filter options
+@@ -130,10 +137,11 @@ namespace SPTAG::SPANN
+                 dbOptions.use_direct_reads = true;
+             }
+ 
+-            auto s = rocksdb::DB::Open(dbOptions, dbPath, &db);
++            auto s = ReadOnly ? rocksdb::DB::OpenForReadOnly(dbOptions, dbPath, &db)
++                             : rocksdb::DB::Open(dbOptions, dbPath, &db);
+             LOG(Helper::LogLevel::LL_Info, "SPFresh: New Rocksdb: %s\n", filePath);
+             if (s != rocksdb::Status::OK()) {
+-                LOG(Helper::LogLevel::LL_Error, "\e[0;31mRocksdb Open Error\e[0m: %s\n", s.getState());
++                throw std::runtime_error("RocksDB open failed: " + s.ToString());
+             }
+         }
+ 
+@@ -149,6 +157,10 @@ namespace SPTAG::SPANN
+ 	    }
+         }
+ 
++        ErrorCode Checkpoint() override {
++            return db->FlushWAL(true).ok() ? ErrorCode::Success : ErrorCode::Fail;
++        }
++
+         void ShutDown() override {
+             db->Close();
+             //DestroyDB(dbPath, dbOptions);
+diff --git a/AnnService/inc/Core/SPANN/IExtraSearcher.h b/AnnService/inc/Core/SPANN/IExtraSearcher.h
+index 03f36db..4b46189 100644
+--- a/AnnService/inc/Core/SPANN/IExtraSearcher.h
++++ b/AnnService/inc/Core/SPANN/IExtraSearcher.h
+@@ -291,6 +291,8 @@ namespace SPTAG {
+             virtual bool AllFinished() { return false; }
+             virtual void GetDBStats() { return; }
+             virtual void GetIndexStats(int finishedInsert, bool cost, bool reset) { return; }
++            virtual ErrorCode Checkpoint() { return ErrorCode::Undefined; }
++
+             virtual void ForceCompaction() { return; }
+ 
+             virtual bool CheckValidPosting(SizeType postingID) = 0;
+diff --git a/AnnService/inc/Helper/KeyValueIO.h b/AnnService/inc/Helper/KeyValueIO.h
+index 5379a89..85436eb 100644
+--- a/AnnService/inc/Helper/KeyValueIO.h
++++ b/AnnService/inc/Helper/KeyValueIO.h
+@@ -16,6 +16,8 @@ namespace SPTAG
+ 
+             virtual void ShutDown() = 0;
+ 
++            virtual ErrorCode Checkpoint() { return ErrorCode::Undefined; }
++
+             virtual ErrorCode Get(const std::string& key, std::string* value) { return ErrorCode::Undefined; }
+ 
+             virtual ErrorCode Get(SizeType key, std::string* value) = 0;
+diff --git a/AnnService/src/Core/Common/InstructionUtils.cpp b/AnnService/src/Core/Common/InstructionUtils.cpp
+index ee338eb..e087d56 100644
+--- a/AnnService/src/Core/Common/InstructionUtils.cpp
++++ b/AnnService/src/Core/Common/InstructionUtils.cpp
+@@ -64,25 +64,15 @@ namespace SPTAG {
+ #endif
+ #endif
+             }
+-#if defined(SPTAG_STATIC_ONLY) && defined(__GNUC__)
++#if defined(__GNUC__)
+             // Check OS register-state support as well as every emitted ISA subset.
+             HW_AVX = __builtin_cpu_supports("avx");
+             HW_AVX2 = __builtin_cpu_supports("avx2");
+             HW_AVX512 = __builtin_cpu_supports("avx512f")
+                 && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq");
+ #endif
+-            if (HW_AVX512)
+-                LOG(Helper::LogLevel::LL_Info, "Using AVX512 InstructionSet!\n");
+-            else if (HW_AVX2)
+-                LOG(Helper::LogLevel::LL_Info, "Using AVX2 InstructionSet!\n");
+-            else if (HW_AVX)
+-                LOG(Helper::LogLevel::LL_Info, "Using AVX InstructionSet!\n");
+-            else if (HW_SSE2)
+-                LOG(Helper::LogLevel::LL_Info, "Using SSE2 InstructionSet!\n");
+-            else if (HW_SSE)
+-                LOG(Helper::LogLevel::LL_Info, "Using SSE InstructionSet!\n");
+-            else
+-                LOG(Helper::LogLevel::LL_Info, "Using NONE InstructionSet!\n");
++            // The global logger is not constructed during CPU feature initialization.
++
+         }
+     }
+ }
+diff --git a/AnnService/src/Core/SPANN/SPANNIndex.cpp b/AnnService/src/Core/SPANN/SPANNIndex.cpp
+index cb22593..5496784 100644
+--- a/AnnService/src/Core/SPANN/SPANNIndex.cpp
++++ b/AnnService/src/Core/SPANN/SPANNIndex.cpp
+@@ -369,11 +369,9 @@ namespace SPTAG
+                 m_workspace->m_postingIDs.clear();
+ 
+                 float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
+-#ifdef SPTAG_STATIC_ONLY
+-                // A head's distance does not bound rows in other postings.
+-                // Explicit head, page and check budgets bound static searches.
++// A head distance does not bound posting rows. Preserve the existing
++                // explicit head/page/check budgets for the dynamic probe too.
+                 limitDist = std::numeric_limits<float>::infinity();
+-#endif
+                 for (int i = 0; i < p_queryResults->GetResultNum(); ++i)
+                 {
+                     auto res = p_queryResults->GetResult(i);

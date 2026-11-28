@@ -1,0 +1,2 @@
+# Preserve the exact whitespace in fixed upstream patch context.
+test/vane/spfresh_update/native-update.patch -whitespace
