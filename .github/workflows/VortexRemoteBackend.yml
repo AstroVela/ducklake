@@ -45,6 +45,9 @@ jobs:
           python -I test/vane/test_vane_vortex_remote_backend.py --cpus "$cpu" \
             --pg-bin "$(pg_config --bindir)" --minio "$RUNNER_TEMP/r6-minio" \
             --object-data-dir "$RUNNER_TEMP/r6-object-data" --output-dir "$RUNNER_TEMP/r6-backend-proof"
+          python -I test/vane/test_vane_vortex_postgres_metadata.py --cpus "$cpu" \
+            --pg-bin "$(pg_config --bindir)" --minio "$RUNNER_TEMP/r6-minio" \
+            --object-data-dir "$RUNNER_TEMP/r6-typed-object-data" --output-dir "$RUNNER_TEMP/r6-typed-proof"
       - name: Retain fixed contract evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -54,3 +57,6 @@ jobs:
             ${{ runner.temp }}/r6-model-proof/*.json
             ${{ runner.temp }}/r6-backend-proof/*.json
             ${{ runner.temp }}/r6-backend-proof/services/*.log
+            ${{ runner.temp }}/r6-typed-proof/*.json
+            ${{ runner.temp }}/r6-typed-proof/*.log
+            ${{ runner.temp }}/r6-typed-proof/services/*.log
