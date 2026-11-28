@@ -271,49 +271,68 @@ def check_writer_tokens(h, source, source_data):
         ("finish-gc", h.x.finish_gc, (table_uuid, source)),
     ):
         h.call("missing-owner-" + name, method, *args, None, budget, rejected="BAD_OWNER")
-    for label, token in (("bool", True), ("float", 1.0), ("string", "1"), ("zero", 0), ("overflow", 2**63)):
+    invalid_tokens = (("bool", True), ("float", 1.0), ("string", "1"), ("zero", 0), ("overflow", 2**63))
+    for label, token in invalid_tokens:
         h.call("publish-owner-" + label, h.x.publish, *request, token, rejected="BAD_OWNER")
+    for label, token in (*invalid_tokens, ("missing", None), ("negative", -1)):
+        h.call("takeover-owner-" + label, h.b.takeover, token, rejected="BAD_OWNER")
     require(not budget.admitted, "Missing owner changed the GC budget")
 
 
-def check_request_guards(h, table_uuid, receipt):
+def check_request_guards(h, name, source, receipt):
+    table_uuid = h.context(name)[1]
     wrong_objects = B.S3Objects(h.s.root_client, h.s.bucket, "wrong-prefix/")
     wrong_backend = B.Backend(h.s.dsn, h.b.schema, wrong_objects)
     wrong = X.BoundCatalog(wrong_backend, M.TypedMetadata(wrong_backend))
     original = (table_uuid, 1, "original")
     pending = (table_uuid, 1, "replacement", h.token())
-    for name, method, args in (
+    for operation, method, args in (
         ("status", wrong.status, original),
         ("reconcile", wrong.reconcile, (*original, receipt["payload_hash"])),
         ("cancel", wrong.cancel, pending),
     ):
-        h.call(name + "-wrong-store", method, *args, rejected="STORE_BINDING_MISMATCH")
+        h.call(operation + "-wrong-store", method, *args, rejected="STORE_BINDING_MISMATCH")
 
-    # The rest of the fresh schema still contains real requests and receipts.
+    copy_view, sql_view = "layout-vector", "layout-sql"
+    h.capture(name, copy_view)
+    h.capture(name, sql_view, "sql", source)
+    for view in (copy_view, sql_view):
+        h.call("materialize-" + view, h.x.materialize, view)
+
+    # Keep the bound requests, active readers and their pins in the fresh schema.
     with h.b.connect() as c:
         state = c.execute("DELETE FROM typed_catalog WHERE singleton RETURNING *").fetchone()
         require(state["layout"] == 1, "Missing-layout fixture did not start in layout 1")
         try:
             before = O.observe(h.b, h.s, BASE, T)
-            for name, method, args in (
+            copies = deepcopy(h.copies())
+            for operation, method, args in (
                 ("status", h.x.status, original),
                 ("reconcile", h.x.reconcile, (*original, receipt["payload_hash"])),
                 ("cancel", h.x.cancel, pending),
+                ("release-copy-pin", h.x.release_copy_pin, (copy_view,)),
+                ("close-view", h.x.close_view, (sql_view,)),
             ):
                 try:
                     method(*args)
                 except M.MetadataError as error:
-                    require(str(error) == "UNSUPPORTED_TYPED_LAYOUT", f"Unexpected {name} error: {error}")
+                    require(str(error) == "UNSUPPORTED_TYPED_LAYOUT", f"Unexpected {operation} error: {error}")
                 else:
-                    raise AssertionError(name + " accepted a missing typed layout")
+                    raise AssertionError(operation + " accepted a missing typed layout")
                 require(O.observe(h.b, h.s, BASE, T) == before, "Layout rejection changed the durable state")
-                h.report["checks"].append({"name": name + "-missing-layout", "rejected": "UNSUPPORTED_TYPED_LAYOUT"})
+                require(h.copies() == copies, "Layout rejection changed a private copy")
+                h.report["checks"].append(
+                    {"name": operation + "-missing-layout", "rejected": "UNSUPPORTED_TYPED_LAYOUT"}
+                )
         finally:
             c.execute(
                 "INSERT INTO typed_catalog VALUES(%(singleton)s,%(layout)s,%(snapshot)s,%(next_table_id)s,%(next_row_id)s)",
                 state,
             )
     h.check()
+    h.call("release-pin-with-valid-layout", h.x.release_copy_pin, copy_view)
+    for view in (copy_view, sql_view):
+        h.call("close-with-valid-layout-" + view, h.x.close_view, view)
 
 
 def check_source_replay(h, neighbor_source):
@@ -370,7 +389,7 @@ def check_source_replay(h, neighbor_source):
         rejected="PAYLOAD_MISMATCH",
     )
     h.ready(name, "replacement", alternate)
-    check_request_guards(h, table_uuid, receipt)
+    check_request_guards(h, name, source, receipt)
     h.publish(name, "replacement")
     h.call("expire-original-source-after-replacement", h.x.expire_native, table_uuid, source, token)
     h.call(
@@ -434,6 +453,7 @@ def check_abandoned_sources(h, neighbor_source):
     )
     ticket = h.call("ticket-before-owner-exits", h.x.source_ticket, *context, late, data, old_owner)
     owner = h.call("take-over-after-source-registration", h.b.takeover, old_owner)
+    h.call("stale-owner-cannot-take-over", h.b.takeover, old_owner, rejected="FENCED")
     h.call("old-owner-cannot-abandon-source", h.x.abandon_source, *context, late, old_owner, rejected="FENCED")
     neighbor = h.context("neighbor")
     h.call(

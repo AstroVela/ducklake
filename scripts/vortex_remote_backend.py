@@ -295,6 +295,7 @@ class Backend:
         require(raw is not None and raw["sha"] == obj["sha"] and raw["size"] == obj["size"], "IDENTITY_MISMATCH")
 
     def takeover(self, expected):
+        require(type(expected) is int and 1 <= expected <= 2**63 - 1, "BAD_OWNER")
         with self.transaction(expected) as (c, state):
             require(state["owner"] < 2**63 - 1, "OWNER_EXHAUSTED")
             c.execute("UPDATE control SET owner=owner+1 WHERE singleton")

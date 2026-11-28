@@ -468,6 +468,7 @@ class BoundCatalog:
     def release_copy_pin(self, reader_id):
         require(reader_id in self.copies, "COPY_INCOMPLETE")
         with self.backend.transaction() as (c, _):
+            self.metadata.catalog(c)
             require(
                 c.execute(
                     "SELECT 1 FROM bound_readers b JOIN readers r ON r.id=b.reader WHERE reader=%s AND NOT closed",
@@ -479,6 +480,7 @@ class BoundCatalog:
 
     def close_view(self, reader_id):
         with self.backend.transaction() as (c, _):
+            self.metadata.catalog(c)
             require(
                 c.execute("SELECT 1 FROM bound_readers WHERE reader=%s", (reader_id,)).fetchone(),
                 "UNKNOWN_BOUND_READER",

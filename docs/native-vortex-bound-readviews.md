@@ -21,7 +21,7 @@ Storage 和 typed catalog 的布局号都是 **`1`**。使用当前 DDL 初始�
 
 `bound_units` 通过复合外键同时约束 typed table 的 UUID／table ID／schema／维度，以及 storage unit 的 ID／UUID。API 还从实际字段与 typed 历史重新计算身份，拒绝跨 UUID source、GC、错误 schema 和没有持久化绑定的接管；相同 bytes／SHA 不能替代业务身份。跨行身份使用外键，跨步骤变更使用 PostgreSQL 事务。[PG 约束](https://www.postgresql.org/docs/15/ddl-constraints.html)
 
-注册、封存、发布、捕获与退休沿用 `control … FOR UPDATE` 串行化。绑定写入口要求正整数 owner token，并在同一事务中检查当前 owner。状态查询和回执对账检查 storage 布局、对象存储绑定和 typed 布局。Source／generation、head、引用和回执一起提交。实际 GC 原语在其事务内保留 owner、引用、intent 与预算校验，复合外键固定 unit 的 UUID。[PG 行锁](https://www.postgresql.org/docs/15/explicit-locking.html)
+注册、封存、发布、捕获与退休沿用 `control … FOR UPDATE` 串行化。绑定写入口与 owner 接管在开启事务前校验正整数 owner token，再在 control 行锁内比较当前 owner。状态查询和回执对账检查 storage 布局、对象存储绑定和 typed 布局。Source／generation、head、引用和回执一起提交。实际 GC 原语在其事务内保留 owner、引用、intent 与预算校验，复合外键固定 unit 的 UUID。[PG 行锁](https://www.postgresql.org/docs/15/explicit-locking.html)
 
 ## 发布、窗口与退休
 
@@ -41,7 +41,7 @@ Native 历史引用和 reader pin 独立保留。活跃的普通 SQL session 在
 
 一次 capture 固定查询当时的 typed snapshot 和全部 pin。Source 的构建 snapshot 可以早于查询 snapshot，因此视图同时保存两种身份，并用**物理 row ID 交集**描述 source 在查询中的可见性。更新／删除的旧物理行消失，新 inline 行有新地址；没有按业务键把旧向量混回当前版本。
 
-`materialize` 在 control 行锁内验证 typed 行摘要和完整 pin，固定精确对象版本。远程 GET 在该锁外执行，完成后重新持锁验证视图和 pin，再保存完整私有副本。若视图在 GET 期间关闭或解除 pin，当前物化失败。完整副本可显式解除 pin，在表退休、同名重建、原对象 GC 和 owner 接管后仍可读取。Server 重启测试保留了独立 reader 对象；不宣称 reader 进程死亡后其内存副本可恢复。
+`materialize` 在 control 行锁内验证 typed 行摘要和完整 pin，固定精确对象版本。远程 GET 在该锁外执行，完成后重新持锁验证视图和 pin，再保存完整私有副本。若视图在 GET 期间关闭或解除 pin，当前物化失败。解除 pin 和关闭视图都在同一个 control 行锁事务内校验 typed 布局，失败时保留 reader 状态、pin 和私有副本。完整副本解除 pin 后，在表退休、同名重建、原对象 GC 和 owner 接管后仍可读取。Server 重启测试保留了独立 reader 对象；不宣称 reader 进程死亡后其内存副本可恢复。
 
 回收的 STOP body 使用 **unit 登记的 UUID**，不再使用单例 fixture 的 table seed。旧 UUID 的精确 DELETE 可跨越同名重建后完成，但只删除旧 key 的旧版本；旧 PUT 被已保留的 STOP 拒绝，不会触及新 UUID 对象。没有通过 LIST 接管未知文件或自动删除 STOP。
 
@@ -59,10 +59,10 @@ Source／artifact／向量各 **64 MiB**，manifest **1 MiB**，物理行 **100,
 | 退休与私有视图 | Named root／引用与 typed 生命周期一起释放，reader pin 阻止 GC；完整副本解除 pin 后经历规范 GC 和同名新 UUID，逐值保持 |
 | 真正晚到的对象请求 | HTTP 握手暂停旧 DELETE，期间创建并发布同名新 UUID，放行后旧版本 DELETE 为 204；取消并 GC 后才放行的旧 PUT 为 412 |
 | 故障与接管 | 实际 SIGKILL PG／MinIO，重启先核对完整状态，再 fencing 旧 owner、显式 adopt 原请求并发布；原 expected revision、输入身份和原 reader 副本保持 |
-| 写入与回执 | 无效 owner 在写入口被拒绝，接管后发布仍要求请求已 adopt。配错存储前缀或缺少 typed 布局时拒绝查询、对账和取消 |
+| 写入与回执 | 无效 owner 在写入口和接管前被拒绝，接管失败时原 owner 保持有效。成功接管后发布仍要求请求已 adopt。配错存储前缀或缺少 typed 布局时拒绝查询、对账和取消 |
 | 请求重放 | 相同 typed snapshot 的不同物理 source 得到不同请求摘要。旧 source 过期和 GC 后，完全相同的 prepare 与对账均返回原结果 |
 | Source GC | 验证普通 SQL 和 source GC 的两种准入顺序，以及上传中断后的显式放弃、精确封存保护和 STOP 回收 |
-| 私有副本物化 | 固定 GET 等待点。独立表可以提交；关闭视图或解除 pin 后，在途物化不得登记副本 |
+| 私有副本物化 | 固定 GET 等待点，独立表可以提交。关闭视图或解除 pin 后，在途物化不得登记副本。缺少 typed 布局时，解除 pin 和关闭视图均保留原状态 |
 
 ## 复现与证据
 
@@ -77,7 +77,7 @@ Source／artifact／向量各 **64 MiB**，manifest **1 MiB**，物理行 **100,
 
 ### 当前开发基线验收
 
-在新建 `layout=1` schema 上，绑定专项通过 **349 项检查，其中 66 项预期拒绝**，并完成 10 组故障和并发观测。PostgreSQL 和 MinIO 的实际 SIGKILL 退出码均为 `-9`。恢复在这次运行所创建的 schema 中验证。
+在新建 `layout=1` schema 上，绑定专项通过 **366 项检查，其中 76 项预期拒绝**，并完成 10 组故障和并发观测。PostgreSQL 和 MinIO 的实际 SIGKILL 退出码均为 `-9`。恢复在这次运行所创建的 schema 中验证。
 
 同基线的 typed 回归通过 **175 项检查，其中 91 项预期拒绝**，完成 9 组故障观测。后端回归通过 **485 项检查，其中 35 项预期拒绝**，完成 9 项能力探测和 7 组故障观测。协议模型通过 **40 个场景和 21 个反例**，探索的 1,342 个状态及状态集合摘要与开发基线一致。各套真实服务回归均在 180 秒期限内完成。
 
