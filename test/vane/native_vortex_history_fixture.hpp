@@ -62,9 +62,11 @@ inline string HistorySnapshot(DuckDB &database) {
 	for (auto name :
 	     {"ducklake_vortex_builds_v1", "ducklake_vortex_generation_refs_v1", "ducklake_vortex_generations_v1",
 	      "ducklake_vortex_indexes_v1", "ducklake_vortex_keyed_tables_v1", "ducklake_vortex_maintenance_v1",
-	      "ducklake_vortex_optimizer_v2", "ducklake_vortex_request_epochs_v1", "ducklake_vortex_rewrites_v1",
-	      "ducklake_vortex_source_deletions_v1", "ducklake_vortex_source_retention_v1",
-	      "ducklake_vortex_write_budgets_v1", "ducklake_vortex_write_requests_v2"}) {
+	      "ducklake_vortex_optimizer_rewrite_receipts_v1", "ducklake_vortex_optimizer_v2",
+	      "ducklake_vortex_request_epochs_v1", "ducklake_vortex_retired_sources_v1",
+	      "ducklake_vortex_rewrite_outputs_v1", "ducklake_vortex_rewrites_v1", "ducklake_vortex_source_deletions_v1",
+	      "ducklake_vortex_source_retention_v1", "ducklake_vortex_write_budgets_v1",
+	      "ducklake_vortex_write_requests_v2"}) {
 		HistoryRows(json, vortex, owner, name);
 	}
 	auto tables =
@@ -195,8 +197,9 @@ struct HistoryFixture : KeyedFixture {
 		                        "'category':'A'::VARCHAR,'payload':'seed-'||i}) FROM range(" +
 		                            to_string(start) + "," + to_string(start + count) + ")t(i)");
 		Connection owner(database);
-		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", request, input->GetValue(0, 0),
-		                                 Value::LIST(LogicalType::BIGINT, {}), 1, TableUUID(owner));
+		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", request,
+		                                 input->GetValue(0, 0), Value::LIST(LogicalType::BIGINT, {}), 1,
+		                                 TableUUID(owner));
 	}
 
 	DuckLakeVortexSourceGCResult Sources(const std::function<void(const string &)> &observe = {}) {
@@ -219,7 +222,7 @@ struct HistoryFixture : KeyedFixture {
 
 	void RetireAndRecreate() {
 		Connection owner(database);
-		DuckLakeVortexWriteBatch::RetireTable(owner, "lake", "main", "items", old_uuid);
+		DuckLakeVortexWriteBatch::RetireTable(owner, *setup.context, "lake", "main", "items", old_uuid);
 		SQL(setup, "CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
 		           "CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items');"
 		           "SELECT * FROM ducklake_create_vortex_index('lake','main','items','knn'," +

@@ -1,6 +1,6 @@
 # R6 远程对象所有权与原子发布协议
 
-本轮基于 [Draft #90](https://github.com/AstroVela/ducklake/pull/90) 的 `48293724a8d3b0652a689a7c85e01e7892369ca8`，交付远程协议设计、可执行模型、独立 oracle 与确定性验证。总入口为 [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)。**生产 `src/`、SQL 接口、provider、依赖 pin 和 native DuckDB 限制沿用 #90；本轮没有接入真实 PostgreSQL／S3，也没有完成分布式 ANN。**
+本轮以 #90 合入后的 `083384bb` 为开发基线，交付远程协议设计、可执行模型和独立 oracle。生产验证范围为 native DuckDB 与本地受管 POSIX 文件。真实 PostgreSQL／S3 适配器和分布式 ANN 仍待独立验收。[#90 合入提交](https://github.com/AstroVela/ducklake/commit/083384bbcbb23a1161049e01053becfde43ce3ee) · [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)
 
 本地验证固定 CPU **6–11**，继承现有线程环境；既有原生测试的 DuckDB `threads=2` 设置保持。本模型不创建 DuckDB 或 ANN 线程。保留事务保护与预算，继续暂缓 R4 A/A、性能 A/B、长期稳态及依赖稳定负载的 R5 资格测试；耗时只记录为观察值。
 
@@ -67,7 +67,9 @@ flowchart LR
 
 捕获 ReadView 时，在一个 metadata 事务里读取 committed root／输入快照并登记其完整 source／generation pin，与发布和 GC 使用同一锁定顺序。不能先读 head、稍后再 pin；pin 时若对象已经 DELETING，捕获失败。一个视图的向量、可见性、过滤和业务列仍绑定同一快照，后续分布式 fan-out 也须携带这一个身份。
 
-Reader session 与 writer owner 分开。更换 owner、重开 writer 或 metadata checkpoint 都不能删除活跃 reader pin。普通 SQL 事务继续阻止 native 历史过期与 source 删除，包括与目标文件无关的普通事务；不把检查缩小成“只查向量读者”。
+Reader session 与 writer owner 分开。活跃 reader pin 跨 owner 切换、writer 重开和 metadata checkpoint 保留。
+
+普通 SQL 事务启动与源回收准入在同一 catalog 的元数据事务边界上互斥。普通事务先登记时，即使读取其他源文件，历史过期和源回收也要等待。源回收先准入时，持久的 DELETING 意图关闭普通事务准入，直到最后一个源回收意图确认登记版本均已不存在并提交完成回执。owner 接管和进程重开都依据持久意图重建这一判断。已发出的 DELETE 仍可到达。完成回执提交后，重复 DELETE 只会命中已不存在的精确版本。
 
 读者只有在精确版本的全部字节已下载、尺寸和 SHA 验证完成、私有资源已登记后，才可显式解除远程 pin。规范对象被回收后，完整私有副本仍归该读者所有。模型验证的是副本身份保持，不执行真实 ANN；真实缓存仍须复用本地 scratch 的活跃保护和预算。**不以 TTL 到期直接删除 pin**；reader 故障的安全 session fencing／pin 回收属于后续真实 adapter 工作。
 
@@ -80,7 +82,7 @@ flowchart LR
     P --> S[条件写入普通 STOP 对象]
     S --> V[核对固定 nonce 并确认屏障]
     V --> E[只删除 intent 登记的 payload version]
-    E --> F[确认 payload 全部不存在，完成一次计账]
+    E --> F[确认登记版本均已不存在，完成一次计账]
     F --> K[保留 STOP；晚到条件上传失败]
 ```
 
@@ -88,7 +90,7 @@ flowchart LR
 2. 每个登记 key 若尚不存在，持久记录空 target，发送 `If-None-Match: *` 的 STOP；若当前是登记的完整 payload，认证尺寸／SHA、保存其 version ID，再用其 opaque ETag 作 `If-Match` 写 STOP。STOP 包含 catalog、UUID、key、intent nonce，是小型普通对象。
 3. HEAD 与 STOP 间若旧上传先到，条件 STOP 失败。当前 owner 显式重新探测同一 intent，记录新出现的确切 payload 版本，再发条件 STOP；不改请求、不接管未知内容。当前已是匹配 nonce 的 STOP 时，只补齐 metadata 确认。
 4. 每个屏障确认后，删除对应的确切 payload version。空 target 没有 payload 可删；未知响应先按原 version 核对。禁止无版本 DELETE、按“当前版本”删除、删除 STOP 或扫描陌生 key。旧 collector 已发出的 DELETE 只可能影响同一个退休 payload。
-5. 所有登记 payload 均不存在且 STOP 完整后，持久完成回执。重开不隐式回收；显式恢复保留原 nonce，按当前轮预算重新接纳，完成只计账一次。
+5. 按登记清单确认每个 key 的 STOP 和 target。对非空 target 仅探测登记的精确版本，确认均已不存在后提交完成回执。显式恢复沿用原 nonce，并按当前轮预算重新接纳，同一意图只完成一次计账。独立 oracle 可以检查完整物理记录以检出漏登记的残留 payload。
 
 反例的具体顺序是：旧 payload PUT 已发出但未生效 → 取消并接管 → GC 完成 → 旧 PUT 才生效。若只撤销 metadata owner、只删除 payload、删除屏障或使用 S3 delete marker，key 仍可能重新接收旧 payload。普通 STOP 令旧条件创建失败；它不是把 S3 delete marker 换一个名字。条件屏障是本协议的必要能力，缺失时拒绝该后端。
 
@@ -116,26 +118,28 @@ python3 -I test/vane/test_vane_vortex_remote_protocol.py \
 | publication | 一个 ready 候选、两个 owner、一个 reader；begin／三个 stage／commit／cancel、接管／adopt、捕获／复制／解除 pin／close、writer crash | 10 |
 | late-upload-gc | 一个已取消候选、两个 key、一个 GC intent、一个已发出的 index PUT 及一个复制 RPC；STOP 探测／条件竞争、指定版本 DELETE、完成 | 12 |
 
-固定场景另覆盖竞争 revision、不改身份的 adopt、旧回执、新 head、部分／损坏上传、UUID／epoch 拒绝、共享预算、普通 SQL 全局保护、native 引用独立性、跨 owner GC 和旧私有视图。发布逐项插入 13 个逻辑 crash cut，GC 插入 7 个逻辑 crash cut；清除对应 writer 的局部 frame／round 后显式恢复，已经发出的 RPC 可以继续到达。这是逻辑故障探索，**没有真实 SIGKILL、真实数据库重启或服务端故障注入**。
+固定场景覆盖竞争 revision、保留身份的 adopt、旧回执、新 head、部分／损坏上传、UUID／epoch 拒绝、共享预算、native 引用独立性、跨 owner GC 和旧私有视图。源回收专项分别检查普通事务先启动、源回收先准入、DELETE 在途、重开与接管、物理删除后完成回执尚未提交，以及完成后的旧 DELETE 重放。发布逐项插入 13 个逻辑中断点，generation 回收插入 7 个。清除对应 writer 的局部 frame 或 round 后显式恢复，已经发出的 RPC 可以继续到达。真实进程崩溃、数据库重启及服务端故障留待后端验收。
 
-18 个故意不安全的协议变体必须各自触发 oracle：移除 owner fence、revision CAS、提交前复核、摘要校验；拆分原子发布；混合视图、接管时丢 pin、adopt 改身份、回执跟随 head；绕过引用、预算、普通事务；缺少 STOP、误删当前版本、删除 STOP、扫陌生 key、无条件 PUT、把 STOP 换成 delete marker。反例保存完整轨迹，不把变体被模型拒绝误计为 oracle 找到反例。
+21 个协议变体必须各自触发独立 oracle。用例覆盖绕过 owner fence、revision CAS、提交前复核、摘要校验、引用、预算及普通事务保护，以及拆分发布、混合视图、接管丢 pin、adopt 改身份和回执跟随 head。文件侧覆盖缺少 STOP、误删当前版本、删除 STOP、扫陌生 key、无条件 PUT 和使用 delete marker 模拟 STOP。新增变体覆盖源回收中放行普通事务、ACK 丢失时缺失持久回执，以及漏登记删除 target。反例保留完整轨迹，并记录触发的 oracle 断言。
 
 模型里的尺寸和 SHA 是固定 fixture 的符号身份；它没有实现 Vortex 字节编码、真实 SHA 下载校验、PG 类型编码、S3 SDK、网络鉴权、时间／lease、reader 故障回收、跨 catalog 或任意数量进程。它验证安全性和固定恢复序列，不能证明公平调度、最终完成、服务可用性或性能。
 
-## 本轮结果
+## 有界验证结果
 
-冻结验证通过 **39 个固定场景、18 个不安全变体反例**。两个 kernel 合计 **1,342 个状态、21,036 次动作尝试、7,050 次成功转移**；每个拒绝动作均保持状态不变。状态数按各自独立初始条件分别统计，不把两个 kernel 称为完整的全系统探索。
+有界验证通过 **40 个固定场景、21 个负对照**。两个 kernel 合计 **1,342 个状态、21,036 次动作尝试、7,050 次成功转移**。每个拒绝动作均保持状态不变。状态数按各自独立初始条件分别统计。
 
 | Kernel | 深度 | 状态 | 动作尝试 | 成功转移 | 状态集合 SHA-256 |
 | --- | --- | --- | --- | --- | --- |
 | publication | 10 | 905 | 15,100 | 5,525 | `c3f1202d366f4def12cb8cb8505a913b3fb27086fbb3d750256c69bae1d432f8` |
 | late-upload-gc | 12 | 437 | 5,936 | 1,525 | `7115d8f137383e36cad90fcd8290ce59d0d495b64b17889510a4014d2f35b51b` |
 
-主报告为 `/tmp/ducklake-vortex-remote-publication-proof-v2-20261106/report.json`，SHA-256 **`915b978cd8919d61959e030de2186f416b966e49df945ae5bcbb9dcaf3d8ea7d`**。报告包含全部固定场景与反例轨迹、两个状态集合摘要、执行源码 SHA、CPU 6–11、继承的线程环境和 affinity 恢复核对；源码执行前后及冻结后复核一致。`rule.json` 保留预先声明的探索规则。
+### 2026-11-06 的历史安装验证
 
-Vane 基础 launcher 按原方式分为非 Ray 与 Ray 进程，在相同 CPU 集合通过 **1,222＋32＝1,254 项**，可选依赖缺失跳过 **11＋4＝15 项**，日志为 `/tmp/ducklake-vortex-remote-base-20261106.log`。格式检查、文档相对链接、workflow YAML、copyleft 检查通过；本轮未重建 native 构件。
+原 #91 基于叠栈提交 `48293724a8d3b0652a689a7c85e01e7892369ca8`。历史报告为 `/tmp/ducklake-vortex-remote-publication-proof-v2-20261106/report.json`，SHA-256 **`915b978cd8919d61959e030de2186f416b966e49df945ae5bcbb9dcaf3d8ea7d`**。报告记录当时的 39 个固定场景与 18 个反例轨迹、两个状态集合摘要、执行源码 SHA、CPU 6–11、继承的线程环境和 affinity 恢复核对。`rule.json` 保留预先声明的探索规则。
 
-| 保持 #90 的安装构件 | SHA-256 |
+同一次历史验证中，Vane 基础 launcher 分非 Ray 与 Ray 进程通过 **1,222＋32＝1,254 项**，可选依赖缺失跳过 **11＋4＝15 项**，日志为 `/tmp/ducklake-vortex-remote-base-20261106.log`。格式检查、文档相对链接、workflow YAML 和 copyleft 检查通过。
+
+| 历史验证使用的安装构件 | SHA-256 |
 | --- | --- |
 | Vane `_native` | `8ca20bd4c8a4203f239ff6d785c45575241d3b2c8d1f8e9fc184d90de1d54876` |
 | DuckLake provider artifact | `70106b76f9951f9657d546c5b50eac7d8b5a0dde518c513bb7e6fbc6a40d2f3f` |

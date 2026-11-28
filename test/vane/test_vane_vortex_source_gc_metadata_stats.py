@@ -18,12 +18,21 @@ def sample():
         catalog + table
         for table in ("ducklake_data_file f", "ducklake_delete_file f", "ducklake_table t", "ducklake_schema s")
     )
+    intent = (
+        GC.INTENT_QUERY + "((data_file_id=1 AND path COLLATE C='a.vortex' AND path_is_relative=true))"
+        " AND device=1 AND inode=2 AND file_bytes=3 AND digest='sha256:" + "a" * 64 + "'"
+    )
     statements = (
         ["BEGIN TRANSACTION"] * 10
         + ["COMMIT"] * 5
         + [known] * 4
-        + ["SELECT count(*) FROM " + catalog + "ducklake_files_scheduled_for_deletion WHERE data_file_id=1"] * 4
+        + [
+            "SELECT count(*) FROM " + catalog + "ducklake_files_scheduled_for_deletion "
+            "WHERE ((data_file_id=1 AND path COLLATE C='a.vortex' AND path_is_relative=true))"
+        ]
+        * 4
         + ["SELECT table_uuid,reference FROM " + catalog + "ducklake_vortex_indexes_v1"] * 4
+        + [intent] * 2
         + ["SELECT other_" + str(i) for i in range(15)]
     )
     queries = []
@@ -38,6 +47,7 @@ def sample():
         "source_before_plan",
         "source_delete_intent_committed",
         "source_before_unlink",
+        "source_unlinked_before_sync",
         "source_after_unlink",
         "source_delete_completed",
     ] * 2
@@ -61,9 +71,9 @@ class MetadataTests(unittest.TestCase):
     def test_nested_commits_are_excluded_and_partition_conserves(self):
         value = sample()
         parts, top = GC.trace_partition(value)
-        self.assertEqual(len(top), 42)
+        self.assertEqual(len(top), 44)
         self.assertEqual(parts["commit"], 60)
-        self.assertEqual(parts["outside_sql"], 496)
+        self.assertEqual(parts["outside_sql"], 472)
         self.assertEqual(sum(parts.values()), 1000)
         report = GC.summarize([value, copy.deepcopy(value)])
         self.assertEqual(report["excluded_nested_queries"], 10)
@@ -91,6 +101,23 @@ class MetadataTests(unittest.TestCase):
         del value["queries"][index]
         with self.assertRaises(AssertionError):
             GC.trace_partition(value)
+
+    def test_nested_commits_must_belong_to_outer_commits(self):
+        value = sample()
+        begin = value["queries"][0]["begin_ns"] + 2
+        for query in value["queries"]:
+            if query["depth"] == 1:
+                query.update(begin_ns=begin, end_ns=begin + 1)
+        with self.assertRaisesRegex(AssertionError, "outer COMMIT"):
+            GC.trace_partition(value)
+
+    def test_intent_checks_require_full_identity_even_with_unchanged_counts(self):
+        for replacement in (GC.INTENT_QUERY + "data_file_id=1", "SELECT 1"):
+            value = sample()
+            query = next(q for q in value["queries"] if q["sql"].startswith(GC.INTENT_QUERY))
+            query["sql"] = replacement
+            with self.assertRaisesRegex(AssertionError, "deletion-intent"):
+                GC.trace_partition(value)
 
     def test_partial_or_inconsistent_split_fails(self):
         for field in ("bind_plan_ns", "execute_fetch_ns"):

@@ -47,7 +47,7 @@ remain independent; admission is not a total disk/RSS bound.
    validated separately from filesystem publication.
 5. Exercise the last admission slot concurrently, cancellation, native commit
    conflict, budget reconfiguration rollback, actual SIGKILL before/after commit
-   and after rejection. Reopen and compare typed business state, all 13 Vortex
+   and after rejection. Reopen and compare typed business state, all 16 Vortex
    metadata tables, receipts, snapshots, budgets and source identities.
 
 No compatibility or fallback is introduced. Missing schema, unsupported types
@@ -63,7 +63,7 @@ Rust 1.91.0. It adds no dependencies or production entry points.
 
 ```bash
 python -I test/vane/test_vane_vortex_capacity_model.py
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_capacity.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_capacity.py \
   --driver /path/to/ducklake_vortex_write_driver \
   --probe /path/to/ducklake-vortex-index-probe \
   --cpus 6,7,8,9,10,11 --output-dir /new/private/capacity-proof
@@ -75,22 +75,27 @@ and restores its original affinity. Timeouts detect hung fixtures; elapsed
 seconds are observations only. CI selects an available CPU rather than assuming
 the local machine's CPU IDs.
 
-Each write rejection compares all 13 Vortex metadata tables, snapshot identities,
-a typed business aggregate and hashes of all fixture source/delete/index files.
-Independent generated row ranges and typed values check accepted state. Native
-recovery additionally compares every business row exactly and uses a separate
-process for each reopen. Generated provider caches are removed only after their
-fixture process has closed; database, source, index and recovery evidence remain.
+Each write rejection compares all 16 current Vortex metadata tables, the native
+file and deletion inventories, snapshot identities, a typed business aggregate
+and hashes of fixture source, delete and index files. The accepted physical rows
+are checked against the generated vectors with NULL-safe equality. Native
+recovery compares every business row and checks each exact durable receipt and
+replay against the expected request and commit boundary in a separate process.
+The final-slot race waits for both writers to queue before releasing admission.
+Database, source, index and recovery evidence remain after the closed fixture's
+reproducible provider cache is removed.
 
 The four physical/vector cases each build a genuine 65-row B first. This keeps
 F below its own row quota when the global guard is exercised. The 4,096D case
-rewrites that B with 64 surviving rows and proves current admission reuse while
-an ordinary reader retains the old file. GC waits for that reader independently.
+rewrites that B with 64 surviving rows and checks the registered replacement and
+its exact released physical slot. An ordinary reader retains the old file and
+GC waits for that reader.
 
 Source-byte checks use authentic encoded file sizes with configurable limits
 at `S-1`, `S`, `S+1`; they do not claim a real Vortex file of exactly 64 MiB.
 Genuine three-B query leases likewise use authenticated artifact sums at
-`A-1`, `A`, `A+1`, always within the existing 64 MiB plan ceiling. The separate
+`A-1`, `A`, `A+1`, always within the existing 64 MiB plan ceiling. An admitted
+lease must return an exact typed hit from each of the three B segments. The separate
 opaque-store fixture exercises the true 64 MiB artifact and 1 MiB store-manifest
 limits. Native envelope fixtures test canonical declaration parsing, including
 1 MiB manifests with 4,096 short paths, without publishing invented files or ANN
@@ -100,9 +105,10 @@ The receipt fixture reuses the existing epoch proof: one real no-op deletion
 receipt supplies a fixed 100,000-row catalog. This validates admission count,
 retirement and stale epochs; it is not a trace of 100,000 business API writes.
 
-## Result
+## Historical qualification on 2026-11-06
 
-The final installed proof passed on 2026-11-06, based on Draft #86
+The original installed proof passed on 2026-11-06 at
+[commit `79595276`](https://github.com/AstroVela/ducklake/commit/7959527601c93640d202a589230ecb3bfe1fe45b), based on Draft #86
 (`db72e6edff094461c73e7bdefcc042693e7a58f4`). Production `src/`, dependency pins,
 thread configuration, transaction protection and hard limits are unchanged.
 No compatibility layer or fallback was added.

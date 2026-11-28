@@ -15,6 +15,9 @@ statement ok
 CREATE TABLE lake.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)
 
 statement ok
+SET VARIABLE request_table_uuid = (SELECT t.table_uuid::VARCHAR FROM __ducklake_metadata_lake.ducklake_table t JOIN __ducklake_metadata_lake.ducklake_schema s USING(schema_id) WHERE t.table_name='items' AND s.schema_name='main' AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL)
+
+statement ok
 CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'items')
 
 statement ok
@@ -45,7 +48,7 @@ statement ok
 SET VARIABLE seed_batch=(SELECT list({'id':i::BIGINT,'embedding':[i,0]::FLOAT[],'category':'A'::VARCHAR,'payload':'original'::VARCHAR}) FROM range(512)t(i))
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','seed',getvariable('seed_batch'),[]::BIGINT[],1::UBIGINT)
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','seed',getvariable('seed_batch'),[]::BIGINT[],1::UBIGINT,getvariable('request_table_uuid'))
 
 query I
 SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items','knn','__WORKING_DIRECTORY__/__TEST_DIR__/planning-first.json',2,1)
@@ -65,7 +68,7 @@ statement ok
 SET VARIABLE first_batch=(SELECT list({'id':i::BIGINT,'embedding':[i+0.125,0]::FLOAT[],'category':'B'::VARCHAR,'payload':NULL::VARCHAR}) FROM range(256)t(i))
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','first-half',getvariable('first_batch'),[]::BIGINT[],1::UBIGINT)
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','first-half',getvariable('first_batch'),[]::BIGINT[],1::UBIGINT,getvariable('request_table_uuid'))
 
 statement ok
 CALL ducklake_flush_inlined_data('lake',table_name=>'items')
@@ -74,7 +77,7 @@ statement ok
 SET VARIABLE second_batch=(SELECT list({'id':i::BIGINT,'embedding':[i+0.125,0]::FLOAT[],'category':'B'::VARCHAR,'payload':NULL::VARCHAR}) FROM range(256,512)t(i))
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','second-half',getvariable('second_batch'),[]::BIGINT[],1::UBIGINT)
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','second-half',getvariable('second_batch'),[]::BIGINT[],1::UBIGINT,getvariable('request_table_uuid'))
 
 query III
 SELECT count(*),count(DISTINCT id),count(*) FILTER(WHERE category='B' AND payload IS NULL) FROM lake.items
@@ -86,10 +89,15 @@ SELECT revision FROM ducklake_retire_vortex_index_segment('lake','main','items',
 ----
 3
 
-query IT
-SELECT id,payload FROM ducklake_vortex_search('lake','main','items','knn',[0.125,0]::FLOAT[],1,category=>'B')
+query ITTII
+SELECT id,category,payload,(embedding=[0.125,0]::FLOAT[])::INTEGER,(distance=0)::INTEGER FROM ducklake_vortex_search('lake','main','items','knn',[0.125,0]::FLOAT[],1,category=>'B')
 ----
-0	NULL
+0	B	NULL	1	1
+
+query ITTII
+SELECT id,category,payload,(embedding=[511.125,0]::FLOAT[])::INTEGER,(distance=0)::INTEGER FROM ducklake_vortex_search('lake','main','items','knn',[511.125,0]::FLOAT[],1,category=>'B')
+----
+511	B	NULL	1	1
 
 query I
 SELECT count(*) FROM lake.items AT(VERSION=>getvariable('original_snapshot')) WHERE category='A' AND payload='original'
@@ -105,7 +113,7 @@ SELECT revision FROM ducklake_append_vortex_index_segment('lake','main','items',
 4
 
 statement ok
-SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','first-half',getvariable('first_batch'),[]::BIGINT[],1::UBIGINT)
+SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn','first-half',getvariable('first_batch'),[]::BIGINT[],1::UBIGINT,getvariable('request_table_uuid'))
 
 query III
 SELECT count(*),count(DISTINCT id),(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2) FROM lake.items
