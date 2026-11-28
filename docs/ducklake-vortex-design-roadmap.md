@@ -328,7 +328,7 @@ maintenance 复用现有单 worker，对 build 恢复／回收、退休 generati
 
 R4 和 R5 的性能验证继续暂缓。R7 仍按增量更新的收益证据决定。
 
-R6 增加 reader session 的所有权、fencing 与受预算的持久 pin 回收。MinIO GET 期间释放全局 control 行锁，当前 session 的回收仍须等待读取退出。下一步验证真实 Vortex／SPFresh 文件、typed row／ReadView 的物理身份及最小查询。普通事务的源保护继续适用。STOP 与协议元数据累积的容量边界仍待验证。[Reader session 契约](native-vortex-reader-sessions.md)
+R6 增加 reader session 的所有权、fencing 与受预算的持久 pin 回收。MinIO GET 释放全局 control 行锁，操作连接存活时回收等待该 session 的 operation lock。Fence 推进后禁止新的 GET 授权和副本验收，已授权的单次精确版本 GET 与已持久验收的副本可以晚于 fence。下一步验证真实 Vortex／SPFresh 文件、typed row／ReadView 的物理身份及最小查询。普通事务的源保护继续适用。STOP 与协议元数据累积的容量边界仍待验证。[Reader session 契约](native-vortex-reader-sessions.md)
 
 ## 12. 文档与实现导航
 

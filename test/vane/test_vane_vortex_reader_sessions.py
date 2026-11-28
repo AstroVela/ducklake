@@ -31,6 +31,7 @@ RULE = {
     "schema": 1,
     "layouts": {"storage": 1, "typed": 1},
     "reader_session": "One lifetime connection, explicit terminal fence, no TTL/reconnect/adoption.",
+    "materialization": "One exact version per grant, durable copy acceptance before delivery.",
     "budget": "Caller's existing <=16 work items / <=64 MiB, zero payload bytes for pin cleanup.",
     "scope": "Real PG/S3 component contracts; opaque source/index fixtures, no native remote ANN.",
     "acceptance": "All independent state/value/lock and handshake checks pass; no timing gate.",
@@ -51,16 +52,15 @@ def wait_until(predicate, label):
 
 class Checks(H.Checks):
     def __init__(self, *args):
-        self.copy_history, self.locks = {}, []
+        self.locks = []
         super().__init__(*args)
 
     def check(self):
         raw, typed, expected, locks = O.observe(self.b, self.s, H.O, BASE, T)
         T.inspect(typed, self.model)
         H.O.inspect(raw, typed, expected, self.copies(), self.raw)
-        O.inspect(raw, self.copies(), locks, self.raw, self.copy_history)
+        O.inspect(raw, self.copies(), self.raw)
         self.raw, self.typed, self.locks = raw, typed, locks
-        self.copy_history = deepcopy(self.copies())
 
     def cleanup(self, label, fn, *args, **kwargs):
         raw, typed = self.raw, self.typed
@@ -402,9 +402,8 @@ def session_waiter(h, session):
     return waiter if waiter and waiter["blockers"] else None
 
 
-def inflight(h, report, kill_operation):
-    # Use a separate broker object/client; its real GET result is held before
-    # returning to materialize. The physical oracle keeps its own independent client.
+def inflight(h, report, reader, *, kill_operation=False, pause_before_dispatch=False):
+    # Pause one real GET on either side of dispatch, using a client separate from the oracle.
     backend = B.Backend(
         h.s.dsn, h.b.schema, B.S3Objects(S.client(h.s.endpoint, "r6-admin", h.s.secret), h.s.bucket, h.b.objects.prefix)
     )
@@ -412,18 +411,39 @@ def inflight(h, report, kill_operation):
     h.reader_processes.append(bound)
     session = h.call("open-inflight-session", bound.open_session, str(uuid.uuid4()), str(uuid.uuid4()))
     h.sessions.append(session)
-    reader = "inflight-operation" if kill_operation else "inflight-lifetime"
     h.call("capture-" + reader, bound.capture, session, *h.context("neighbor"), reader)
+    units = next(v["units"] for v in h.raw["readers"] if v["id"] == reader)
+    versions = {obj["key"]: obj["version"] for obj in h.raw["objects"] if obj["unit"] in units}
+    require(len(versions) > 1, "Expected a ReadView that needs more than one object grant")
     original = backend.objects.read
     entered, release = threading.Event(), threading.Event()
     observations = []
 
+    def pause_get():
+        entered.set()
+        require(release.wait(30), "Held GET was not released")
+
     def hold(key, version=None):
+        first = not observations
+        if first and pause_before_dispatch:
+            pause_get()
+        with h.b.connect() as c:
+            phase = c.execute(
+                "SELECT state,fence FROM reader_sessions WHERE session_uuid=%s", (uuid.UUID(session.id),)
+            ).fetchone()
+        require(versions.get(key) == version and version is not None, "GET did not use its exact planned version")
         result = original(key, version)
-        observations.append({"key": key, "version": result["version"], "sha": result["sha"], "size": result["size"]})
-        if len(observations) == 1:
-            entered.set()
-            require(release.wait(30), "Held GET was not released")
+        observations.append(
+            {
+                "key": key,
+                "version": result["version"],
+                "sha": result["sha"],
+                "size": result["size"],
+                "session_at_dispatch": phase,
+            }
+        )
+        if first and not pause_before_dispatch:
+            pause_get()
         return result
 
     backend.objects.read = hold
@@ -452,7 +472,7 @@ def inflight(h, report, kill_operation):
             with h.b.connect() as c:
                 c.execute("SELECT 1 FROM control WHERE singleton FOR UPDATE NOWAIT").fetchone()
             h.mutate("concurrent-writer", "write-while-" + reader, [H.row(2, reader)])
-            require(not reclaim.done(), "Reclaimer finished while the old GET was held")
+            require(not reclaim.done(), "Reclaimer advanced the fence while the operation lock was held")
             require(
                 next(s for s in h.raw["reader_sessions"] if s["session_uuid"] == session.id)["state"] == "active",
                 "Reclaimer bypassed the in-flight operation",
@@ -466,6 +486,14 @@ def inflight(h, report, kill_operation):
                         "Operation backend was not terminated",
                     )
                 reclaim.result(timeout=15)
+            if pause_before_dispatch:
+                require(not observations, "GET was sent before the fence")
+                h.reclaim(session.id, [reader], budget)
+                require(
+                    accepted_materializations(h, reader) == 0
+                    and not any(r["kind"] == "reader" and r["holder"] == reader for r in h.raw["refs"]),
+                    "Reclaimed view acquired a copy or retained a pin",
+                )
             release.set()
             try:
                 pending.result(timeout=15)
@@ -483,6 +511,11 @@ def inflight(h, report, kill_operation):
     require(
         reader not in bound.copies and len(observations) == 1, "Stale operation installed a copy or issued another GET"
     )
+    require(
+        observations[0]["session_at_dispatch"]
+        == ({"state": "reclaimed", "fence": 2} if pause_before_dispatch else {"state": "active", "fence": 1}),
+        "GET did not dispatch at the expected fence",
+    )
     h.check()
     for label, fn, args in (
         ("capture", bound.capture, (session, *h.context("neighbor"), "fenced-new")),
@@ -493,8 +526,9 @@ def inflight(h, report, kill_operation):
         h.call("fenced-" + reader + "-" + label, fn, *args, rejected="READER_FENCED")
     require(len(observations) == 1, "Fenced RPC reached S3")
     backend.objects.read = original
-    h.cleanup("reclaim-" + reader, cleanup.view, session.id, 1, reader, h.token(), budget)
-    h.cleanup("finish-" + reader, cleanup.finish, session.id, 1, h.token(), budget)
+    if not pause_before_dispatch:
+        h.cleanup("reclaim-" + reader, cleanup.view, session.id, 1, reader, h.token(), budget)
+        h.cleanup("finish-" + reader, cleanup.finish, session.id, 1, h.token(), budget)
     session.disconnect()
     report["faults"].append(
         {
@@ -503,6 +537,7 @@ def inflight(h, report, kill_operation):
             "reclaimer_waited_for_session_operation_lock": True,
             "another_table_write_committed_while_waiting": True,
             "operation_backend_terminated": kill_operation,
+            "paused_before_dispatch": pause_before_dispatch,
             "copy_published": False,
         }
     )
@@ -517,6 +552,10 @@ def paired_readers(h, proxy, reader, objects):
     h.sessions.append(session)
     h.call("capture-" + reader, owner.capture, session, *h.context("neighbor"), reader)
     return owner, peer, session
+
+
+def accepted_materializations(h, reader):
+    return next(v["accepted_materializations"] for v in h.raw["reader_session_views"] if v["reader"] == reader)
 
 
 def rejected_materialization(pending, code):
@@ -585,8 +624,8 @@ def graceful_close_during_get(h, report):
                 release_get.set()
                 wire.release_ack.set()
         require(
-            requests and all(phase == {"state": "active", "fence": 1} for phase in requests),
-            "An old materialization dispatched a GET after the terminal fence",
+            requests == [{"state": "active", "fence": 1}],
+            "Closed view authorized another GET or first GET dispatched after the fence",
         )
         require(
             reader not in peer.copies and session.connection.closed, "A closed session left a new copy or connection"
@@ -611,6 +650,7 @@ def invalidate_during_materialize_ack(h, report):
             owner, peer, session = paired_readers(h, wire, reader, h.b.objects)
             if action == "unpin":
                 existing = deepcopy(h.call("copy-before-unpin-ack", owner.materialize, session, reader))
+            initial_acceptance = accepted_materializations(h, reader)
             wire.armed.set()
             with ThreadPoolExecutor(max_workers=2) as pool:
                 pending = pool.submit(peer.materialize, session, reader)
@@ -644,6 +684,10 @@ def invalidate_during_materialize_ack(h, report):
                 h.call("close-peer-view-after-unpin-ack", owner.close_view, session, reader)
                 h.call("close-peer-session-after-unpin-ack", owner.close_session, session)
             h.check()
+            require(
+                accepted_materializations(h, reader) == initial_acceptance,
+                "Invalidated materialization left a durable acceptance",
+            )
         report["faults"].append(
             {
                 "operation": reader,
@@ -653,6 +697,64 @@ def invalidate_during_materialize_ack(h, report):
                 "copy_published": False,
             }
         )
+
+
+def return_accepted_copy_after_fence(h, report):
+    reader = "fence-after-copy-acceptance"
+    session = h.new_session(reader)
+    h.view(session, reader)
+    first = deepcopy(h.call("first-copy-acceptance", h.x.materialize, session, reader))
+    peer = X.BoundCatalog(h.b, h.m)
+    h.reader_processes.append(peer)
+    accept = peer._accept_materialization
+    acknowledged, release = threading.Event(), threading.Event()
+    operation = {}
+
+    def pause_after_ack(c, *args):
+        acceptance = accept(c, *args)
+        operation.update(pid=c.info.backend_pid, acceptance=acceptance)
+        acknowledged.set()
+        require(release.wait(30), "Acknowledged acceptance was not released")
+        return acceptance
+
+    peer._accept_materialization = pause_after_ack
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(peer.materialize, session, reader)
+        try:
+            require(acknowledged.wait(15), "The acceptance COMMIT was not acknowledged")
+            h.check()
+            require(
+                first["acceptance"] == 1 and operation["acceptance"] == accepted_materializations(h, reader) == 2,
+                "The second copy lacks a distinct durable acceptance",
+            )
+            with h.b.connect() as c:
+                require(
+                    c.execute("SELECT pg_terminate_backend(%s,5000) AS killed", (operation["pid"],)).fetchone()["killed"],
+                    "Accepted operation backend was not terminated",
+                )
+            h.call("close-view-after-copy-acceptance", h.x.close_view, session, reader)
+            closed = h.call("close-session-after-copy-acceptance", h.x.close_session, session)
+            require(
+                closed["fence"] == 2 and accepted_materializations(h, reader) == 2 and reader not in peer.copies,
+                "Expected a durable closed fence before delivery of the accepted copy",
+            )
+            release.set()
+            result = pending.result(timeout=15)
+        finally:
+            release.set()
+    require(result == dict(first, acceptance=2) == peer.copies[reader], "Late delivery changed the accepted copy")
+    h.check()
+    h.call("fenced-session-cannot-accept-again", peer.materialize, session, reader, rejected="READER_FENCED")
+    report["faults"].append(
+        {
+            "operation": reader,
+            "acceptance_acknowledged": True,
+            "acceptance_before_fence": result["acceptance"],
+            "durable_fence_before_delivery": closed["fence"],
+            "operation_backend_terminated": True,
+            "same_view_and_payload_after_fence": True,
+        }
+    )
 
 
 def budget_case(h, source, report):
@@ -821,7 +923,7 @@ def uncertain(h, report):
 
 
 def reader_uncertain(h, report):
-    for phase in ("capture", "materialize"):
+    for phase in ("capture", "materialize", "acceptance"):
         for mode in ("before_forward", "ack_lost"):
             reader = "unknown-" + phase + "-" + mode
             with P.CommitProxy("127.0.0.1", h.s.pg_port, mode) as proxy:
@@ -832,10 +934,19 @@ def reader_uncertain(h, report):
                     "open-" + phase + "-unknown-session", bound.open_session, str(uuid.uuid4()), str(uuid.uuid4())
                 )
                 h.sessions.append(session)
-                if phase == "materialize":
+                if phase != "capture":
                     h.call("capture-before-materialize-unknown", bound.capture, session, *h.context("neighbor"), reader)
                 before = (h.raw, h.typed)
-                proxy.armed.set()
+                if phase == "acceptance":
+                    accept = bound._accept_materialization
+
+                    def arm_acceptance(*args):
+                        proxy.armed.set()
+                        return accept(*args)
+
+                    bound._accept_materialization = arm_acceptance
+                else:
+                    proxy.armed.set()
                 try:
                     if phase == "capture":
                         bound.capture(session, *h.context("neighbor"), reader)
@@ -855,13 +966,21 @@ def reader_uncertain(h, report):
                 session.disconnect()
                 report["faults"].append({"operation": phase, **proxy.observation})
             h.check()
-            if mode == "before_forward" or phase == "materialize":
-                require((h.raw, h.typed) == before, "Unforwarded/read-only operation changed durable pins")
-            pins_exist = mode == "ack_lost" or phase == "materialize"
+            if mode == "before_forward" or phase != "capture":
+                expected = deepcopy(before[0])
+                if phase == "acceptance" and mode == "ack_lost":
+                    link = next(v for v in expected["reader_session_views"] if v["reader"] == reader)
+                    link["accepted_materializations"] = 1
+                    expected["reader_session_views"].sort(key=O.encode)
+                require((h.raw, h.typed) == (expected, before[1]), "Unknown COMMIT changed unexpected durable state")
+            pins_exist = mode == "ack_lost" or phase != "capture"
             if pins_exist:
+                view = next(r for r in h.raw["readers"] if r["id"] == reader)
                 require(
-                    any(r["id"] == reader and not r["closed"] for r in h.raw["readers"]),
-                    "Captured view lost its durable pin",
+                    not view["closed"]
+                    and {r["unit"] for r in h.raw["refs"] if r["kind"] == "reader" and r["holder"] == reader}
+                    == set(view["units"]),
+                    "Unknown COMMIT removed a durable pin",
                 )
             h.reclaim(session.id, [reader] if pins_exist else [])
 
@@ -912,11 +1031,11 @@ def lifetime_uncertain(h, report):
 
 
 def mutants(h, report):
-    base, typed, expected, locks = O.observe(h.b, h.s, H.O, BASE, T)
+    base, _, _, _ = O.observe(h.b, h.s, H.O, BASE, T)
     copies = h.copies()
-    O.inspect(base, copies, locks)
+    O.inspect(base, copies)
     variants = []
-    for name in ("wrong-fence", "missing-session-link", "reassign-owner", "wrong-copy-owner"):
+    for name in ("wrong-fence", "missing-session-link", "reassign-owner", "wrong-copy-owner", "unaccepted-copy"):
         raw, private = deepcopy(base), deepcopy(copies)
         if name == "wrong-fence":
             raw["reader_sessions"][0]["fence"] = 17
@@ -924,10 +1043,12 @@ def mutants(h, report):
             raw["reader_session_views"].pop()
         elif name == "reassign-owner":
             raw["reader_sessions"][0]["owner_uuid"] = str(uuid.uuid4())
-        else:
+        elif name == "wrong-copy-owner":
             private["control-copy"]["session_uuid"] = str(uuid.uuid4())
+        else:
+            private["control-copy"]["acceptance"] += 1
         try:
-            O.inspect(raw, private, locks, base, copies)
+            O.inspect(raw, private, base)
         except AssertionError:
             variants.append(name)
         else:
@@ -949,10 +1070,12 @@ def exercise(h, report, root):
     proxy_eof(h, report)
     worker_crash(h, source_a, report, root)
     h.create("concurrent-writer")
-    inflight(h, report, False)
-    inflight(h, report, True)
+    inflight(h, report, "inflight-lifetime")
+    inflight(h, report, "inflight-operation", kill_operation=True)
+    inflight(h, report, "fence-after-get-authorization", kill_operation=True, pause_before_dispatch=True)
     graceful_close_during_get(h, report)
     invalidate_during_materialize_ack(h, report)
+    return_accepted_copy_after_fence(h, report)
     budget_case(h, source_b, report)
     rollback_cases(h)
     uncertain(h, report)

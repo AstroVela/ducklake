@@ -187,6 +187,7 @@ CREATE TABLE reader_sessions(session_uuid uuid PRIMARY KEY,owner_uuid uuid NOT N
        (state='reclaimed' AND fence=2 AND intent IS NOT NULL AND receipt IS NOT NULL)));
 CREATE TABLE reader_session_views(reader text PRIMARY KEY REFERENCES bound_readers(reader),
  session_uuid uuid NOT NULL REFERENCES reader_sessions(session_uuid),session_fence bigint NOT NULL CHECK(session_fence=1),
+ accepted_materializations bigint NOT NULL DEFAULT 0 CHECK(accepted_materializations>=0),
  UNIQUE(reader,session_uuid,session_fence));
 CREATE TABLE reader_reclaims(reader text PRIMARY KEY,
  session_uuid uuid NOT NULL REFERENCES reader_sessions(session_uuid),original_fence bigint NOT NULL CHECK(original_fence=1),

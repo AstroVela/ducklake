@@ -464,7 +464,7 @@ class BoundCatalog:
                 (reader_id, table["table_uuid"], query["snapshot_id"], Jsonb(identity)),
             )
             c.execute(
-                "INSERT INTO reader_session_views VALUES(%s,%s,%s)",
+                "INSERT INTO reader_session_views(reader,session_uuid,session_fence) VALUES(%s,%s,%s)",
                 (reader_id, canonical_uuid(session.id), session.fence),
             )
         return identity
@@ -481,6 +481,17 @@ class BoundCatalog:
         refs = c.execute("SELECT unit FROM refs WHERE kind='reader' AND holder=%s", (reader_id,)).fetchall()
         require({r["unit"] for r in refs} == set(view["units"]), "VIEW_NOT_PINNED")
         return view
+
+    def _accept_materialization(self, c, session, reader_id, view):
+        with self.backend._transaction(c):
+            require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
+            accepted = c.execute(
+                """UPDATE reader_session_views SET accepted_materializations=accepted_materializations+1
+                WHERE reader=%s AND session_uuid=%s AND session_fence=%s RETURNING accepted_materializations""",
+                (reader_id, canonical_uuid(session.id), session.fence),
+            ).fetchone()
+            require(accepted is not None, "READER_VIEW_OWNER_MISMATCH")
+        return accepted["accepted_materializations"]
 
     def materialize(self, session, reader_id):
         with session.serialized_operation(self.backend, self.metadata) as c:
@@ -506,7 +517,9 @@ class BoundCatalog:
                 "objects": {},
             }
             for obj in files:
-                session.require_lock(c)
+                # Authorize just this version while the fence and its pins are serialized.
+                with self.backend._transaction(c, rollback=True):
+                    require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
                 raw = self.backend.objects.read(obj["key"], obj["version"])
                 session.require_lock(c)
                 self.backend.identity(obj, raw)
@@ -517,9 +530,7 @@ class BoundCatalog:
                 with self.backend._transaction(c):
                     require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
                 # A peer may have removed pins while the COMMIT acknowledgement was in transit.
-                # Keep the control row locked through publication. Closing c ends this read-only check.
-                self.backend._begin_transaction(c)
-                require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
+                result["acceptance"] = self._accept_materialization(c, session, reader_id, view)
                 self.copies[reader_id] = result
         return result
 
