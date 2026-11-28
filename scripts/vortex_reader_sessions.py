@@ -95,10 +95,10 @@ class ReaderSession:
             self.require_lock(c)
 
     @contextmanager
-    def materialization(self, backend, metadata):
+    def serialized_operation(self, backend, metadata):
         require(self.backend is backend and self.metadata is metadata, "READER_CATALOG_MISMATCH")
         with closing(backend.connect()) as c:
-            # Keep this lock until the confirmed copy is installed or the connection closes.
+            # Keep the session operation ordered through local completion and disconnect.
             c.execute("SELECT pg_advisory_lock(%s::integer,%s::integer)", _operation_key(self.key))
             yield c
 

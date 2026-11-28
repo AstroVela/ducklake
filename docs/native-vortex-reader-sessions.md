@@ -24,13 +24,13 @@ Session UUID 不复用。一个 incarnation 从 fence **1** 的 active 开始，
 
 Capture、materialize、解除 copy pin 和关闭视图都必须携带所属 session。跨 session 的 materialize／close／unpin 在访问 S3 前拒绝；writer owner 轮换不撤销仍活跃的独立 reader。
 
-Materialize 使用独立 PG 连接，并以同一 key 的两个 32 位整数获取 session 级 operation lock。该锁与用单个 bigint 标识的 lifetime lock 位于不同的 advisory 锁空间。它跨越两个短 metadata 事务，并持续到副本登记或连接关闭。[PG advisory 锁函数](https://www.postgresql.org/docs/15/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS)
+Materialize 使用独立 PG 连接，并以同一 key 的两个 32 位整数获取 session 级 operation lock。该锁与用单个 bigint 标识的 lifetime lock 位于不同的 advisory 锁空间。该 operation lock 在网络读取、COMMIT 确认和副本登记期间持续持有，随操作连接关闭而释放。[PG advisory 锁函数](https://www.postgresql.org/docs/15/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS)
 
-第一个短事务在 control 行锁内验证 session、view 和完整 pin，固定 typed 行与精确对象版本。事务结束后执行 GET，每次 GET 前后验证实际 lifetime lock。第二个短事务重新持锁校验 session、物化视图和 pin。确认 COMMIT 并再次验证 lifetime lock 后才登记副本。COMMIT 不确定时持久 pin 仍保留。
+第一个短事务在 control 行锁内验证 session、view 和完整 pin，固定 typed 行与精确对象版本。事务结束后执行 GET，每次 GET 前后验证实际 lifetime lock。第二个短事务重新持锁校验 session、物化视图和 pin。收到 COMMIT 确认后，再在 control 行锁内核对持久 fence、视图和 pin，并在该锁内登记副本。COMMIT 不确定时持久 pin 仍保留。
 
-回收先等待目标 session 的 operation lock，再取得全局 control 行锁。这个等待期间，其他表可以提交。正常关闭视图或解除 pin 可以先于最终校验完成，使当前物化失败。Lifetime 连接失效后，在途 GET 的结果不登记为副本，调用也不能继续下一次 GET。若操作连接被终止，回收可先完成，恢复执行的旧调用仍失败。已交付的私有副本可以继续读取。
+显式回收和正常关闭 session 都先等待目标 session 的 operation lock，再取得全局 control 行锁。等待期间其他表可以提交。关闭单个视图或解除 pin 可以先完成，包括物化 COMMIT 已提交而确认尚未到达的时候。收到确认后的持久状态校验会拒绝这些已经失效的物化。Lifetime 连接失效后，在途 GET 的结果不登记为副本，调用也不能继续下一次 GET。若操作连接被终止，回收可先完成，恢复执行的旧调用仍失败。已交付的私有副本可以继续读取。
 
-`disconnect` 只关闭自己的 lifetime 连接，不修改持久 pin。正常 `close_session` 要求所属视图全部关闭；成功提交后才断开连接。关闭的 COMMIT 不确定也会关闭自己的连接，但 metadata 只能通过原 session 身份查询／显式回收，不自动清理或重新打开旧 UUID。
+`disconnect` 只关闭自己的 lifetime 连接，不修改持久 pin。正常 `close_session` 要求所属视图全部关闭。成功提交后在同一 operation lock 的保护下断开 lifetime 连接。关闭的 COMMIT 不确定也会断开该连接，后续通过原 session 身份核对结果或显式回收。
 
 ## 显式、受预算的回收
 
@@ -56,6 +56,7 @@ Fencing 不提前撤销普通 SQL 保护：尚未被显式关闭的 `kind=sql` v
 | --- | --- |
 | 活跃、暂停与崩溃 reader | 独立 reader broker 进程实际 SIGSTOP／SIGCONT，锁仍在时回收拒绝；实际 SIGKILL 后 pin／SQL 保护仍持久，只有显式 fence／逐 view 回收才解除 |
 | 在途 GET | 真实 GET 已完成但结果在测试握手处暂停，终止 lifetime backend，观察 reclaimer 等待目标 session 的 advisory lock。另一张表在等待期间提交。放行旧结果后，旧调用不能登记副本或继续下一次 GET。另一场同时终止操作 backend，回收可先提交，旧调用恢复后仍失败 |
+| 正常关闭与 COMMIT 确认 | 暂停真实 GET，验证正常关闭等待目标 session 且另一张表可提交。关闭已提交、确认仍暂停时，旧 session 不能发起 GET。另在物化确认暂停时通过第二个 BoundCatalog 关闭视图或解除 pin，恢复后不得登记新副本 |
 | 所有权与约束 | 跨 session 的读取／unpin／close／回收、重复 UUID、非法 fence、旧 writer、复合外键及 CHECK 拒绝。Begin、view 和 finish 拒绝无效 writer owner，且保持持久状态和预算。Writer 轮换后活跃 reader 仍可 materialize |
 | 全局预算 | 17 个 view；同一预算先登记一个 canonical GC unit、一个 session intent，再释放 14 个 view，恰好 16 项；下一项拒绝。另一次显式预算清理剩余 3 view 并 finish，canonical 字节计数保持 |
 | 事务回滚与未知提交 | Capture／begin／view／finish 的暂存后 trigger 错误；open／close／capture／materialize／begin／view／finish 各覆盖 COMMIT 转发前断开和确认后丢 ACK，全部旧或全部新，按原身份查询或显式继续；materialize 不得发布未经确认的完整副本 |
@@ -82,13 +83,13 @@ Open／capture 的未知提交也可能留下未交付给调用方的持久 sess
 
 | 验证 | 结果 |
 | --- | --- |
-| Reader session | 303 项检查，含 50 项预期拒绝。19 组故障观测、4 个不安全变体反例 |
+| Reader session | 316 项检查，含 50 项预期拒绝。22 组故障观测、4 个不安全变体反例 |
 | 绑定 | 373 项检查，含 76 项预期拒绝。10 组故障与并发观测 |
 | Typed | 175 项检查，含 91 项预期拒绝。9 组故障观测 |
 | 后端 | 485 项检查，含 35 项预期拒绝。9 项能力探测、7 组故障观测 |
 | 协议模型 | 40 个场景、21 个反例，1,342 个状态的集合摘要与开发基线一致 |
 
-两组在途 GET 用例都观察到回收等待目标 session 的 advisory lock，且另一张表在等待期间提交。失效调用各完成一次 GET，均未登记副本。原共享预算的 16 个工作项上限和 payload 字节计数通过验证。
+两组在途 GET 用例都观察到回收等待目标 session 的 advisory lock，且另一张表在等待期间提交。失效调用各完成一次 GET，均未登记副本。三组暂停 COMMIT 确认的回归覆盖正常关闭、跨实例关闭视图和跨实例解除 pin。失效物化均未登记副本，正常关闭等待期间另一张表完成写入。共享预算的 16 个工作项上限和 payload 字节计数通过验证。
 
 ### 原叠栈验收
 

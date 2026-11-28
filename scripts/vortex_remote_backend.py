@@ -235,12 +235,16 @@ class Backend:
                     ),
                 )
 
+    @staticmethod
+    def _begin_transaction(c):
+        c.execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+        c.execute("SET LOCAL synchronous_commit=on")
+
     @contextmanager
     def _transaction(self, c, *, rollback=False):
         committing = False
         try:
-            c.execute("BEGIN ISOLATION LEVEL READ COMMITTED")
-            c.execute("SET LOCAL synchronous_commit=on")
+            self._begin_transaction(c)
             yield
             if rollback:
                 c.execute("ROLLBACK")

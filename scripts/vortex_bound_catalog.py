@@ -394,30 +394,34 @@ class BoundCatalog:
         return ReaderSession.open(self.backend, self.metadata, session_uuid, owner_uuid)
 
     def close_session(self, session):
-        try:
-            with session.operation(self.backend, self.metadata) as (c, _):
-                require(
-                    not c.execute(
-                        "SELECT 1 FROM reader_session_views b JOIN readers r ON r.id=b.reader WHERE b.session_uuid=%s AND NOT r.closed",
-                        (canonical_uuid(session.id),),
-                    ).fetchone(),
-                    "READER_VIEWS_REMAIN",
-                )
-                receipt = {
-                    "session_uuid": session.id,
-                    "owner_uuid": session.owner,
-                    "original_fence": session.fence,
-                    "fence": session.fence + 1,
-                    "closed": True,
-                }
-                c.execute(
-                    "UPDATE reader_sessions SET fence=fence+1,state='closed',receipt=%s WHERE session_uuid=%s",
-                    (Jsonb(receipt), canonical_uuid(session.id)),
-                )
-        except CommitUnknown:
+        with session.serialized_operation(self.backend, self.metadata) as c:
+            try:
+                with self.backend._transaction(c):
+                    self.backend._control(c)
+                    session.require_active(c)
+                    require(
+                        not c.execute(
+                            "SELECT 1 FROM reader_session_views b JOIN readers r ON r.id=b.reader WHERE b.session_uuid=%s AND NOT r.closed",
+                            (canonical_uuid(session.id),),
+                        ).fetchone(),
+                        "READER_VIEWS_REMAIN",
+                    )
+                    receipt = {
+                        "session_uuid": session.id,
+                        "owner_uuid": session.owner,
+                        "original_fence": session.fence,
+                        "fence": session.fence + 1,
+                        "closed": True,
+                    }
+                    c.execute(
+                        "UPDATE reader_sessions SET fence=fence+1,state='closed',receipt=%s WHERE session_uuid=%s",
+                        (Jsonb(receipt), canonical_uuid(session.id)),
+                    )
+                    session.require_lock(c)
+            except CommitUnknown:
+                session.disconnect()
+                raise
             session.disconnect()
-            raise
-        session.disconnect()
         return receipt
 
     def capture(self, session, name, table_uuid, schema_hash, reader_id, kind="vector", source=None):
@@ -465,8 +469,10 @@ class BoundCatalog:
             )
         return identity
 
-    @staticmethod
-    def _pinned_view(c, reader_id):
+    def _materialization_view(self, c, session, reader_id):
+        self.backend._control(c)
+        session.require_active(c)
+        session.view(c, reader_id)
         view = c.execute(
             "SELECT r.*,b.identity,b.table_uuid,b.snapshot_id FROM readers r JOIN bound_readers b ON b.reader=r.id WHERE r.id=%s AND NOT r.closed",
             (reader_id,),
@@ -477,13 +483,10 @@ class BoundCatalog:
         return view
 
     def materialize(self, session, reader_id):
-        with session.materialization(self.backend, self.metadata) as c:
+        with session.serialized_operation(self.backend, self.metadata) as c:
             # This snapshot is read-only. Roll back its row lock before any S3 request.
             with self.backend._transaction(c, rollback=True):
-                self.backend._control(c)
-                session.require_active(c)
-                session.view(c, reader_id)
-                view = self._pinned_view(c, reader_id)
+                view = self._materialization_view(c, session, reader_id)
                 table = c.execute("SELECT * FROM typed_tables WHERE table_uuid=%s", (view["table_uuid"],)).fetchone()
                 query, rows = self.snapshot(c, table, view["snapshot_id"])
                 require(query == view["identity"]["query"], "READVIEW_BINDING_CHANGED")
@@ -512,11 +515,11 @@ class BoundCatalog:
 
             with self._copies_lock:
                 with self.backend._transaction(c):
-                    self.backend._control(c)
-                    session.require_active(c)
-                    session.view(c, reader_id)
-                    require(self._pinned_view(c, reader_id) == view, "READVIEW_BINDING_CHANGED")
-                session.require_lock(c)
+                    require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
+                # A peer may have removed pins while the COMMIT acknowledgement was in transit.
+                # Keep the control row locked through publication. Closing c ends this read-only check.
+                self.backend._begin_transaction(c)
+                require(self._materialization_view(c, session, reader_id) == view, "READVIEW_BINDING_CHANGED")
                 self.copies[reader_id] = result
         return result
 

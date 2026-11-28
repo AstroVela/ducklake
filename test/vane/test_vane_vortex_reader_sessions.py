@@ -389,6 +389,19 @@ def proxy_eof(h, report):
     )
 
 
+def session_waiter(h, session):
+    key = session.key & (2**64 - 1)
+    with h.b.connect() as c:
+        waiter = c.execute(
+            """SELECT l.pid,pg_blocking_pids(l.pid) AS blockers FROM pg_locks l
+            WHERE l.locktype='advisory' AND NOT l.granted AND l.mode='ExclusiveLock'
+            AND l.objsubid=2 AND l.classid::bigint=%s AND l.objid::bigint=%s
+            AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())""",
+            (key >> 32, key & (2**32 - 1)),
+        ).fetchone()
+    return waiter if waiter and waiter["blockers"] else None
+
+
 def inflight(h, report, kill_operation):
     # Use a separate broker object/client; its real GET result is held before
     # returning to materialize. The physical oracle keeps its own independent client.
@@ -427,21 +440,13 @@ def inflight(h, report, kill_operation):
             wait_until(lambda: lock_missing(h, session.id), "inflight lifetime lock release")
             reclaim = pool.submit(cleanup.begin, session.id, 1, h.token(), budget)
             waiting = {}
-            key = session.key & (2**64 - 1)
 
             def blocked():
-                with h.b.connect() as c:
-                    row = c.execute(
-                        """SELECT l.pid,pg_blocking_pids(l.pid) AS blockers FROM pg_locks l
-                        WHERE l.locktype='advisory' AND NOT l.granted AND l.mode='ExclusiveLock'
-                        AND l.objsubid=2 AND l.classid::bigint=%s AND l.objid::bigint=%s
-                        AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())""",
-                        (key >> 32, key & (2**32 - 1)),
-                    ).fetchone()
-                if row and row["blockers"]:
-                    waiting.update(row)
-                    return True
-                return False
+                waiter = session_waiter(h, session)
+                if waiter is None:
+                    return False
+                waiting.update(waiter)
+                return True
 
             wait_until(blocked, "reclaimer waits on this session's operation lock")
             with h.b.connect() as c:
@@ -501,6 +506,153 @@ def inflight(h, report, kill_operation):
             "copy_published": False,
         }
     )
+
+
+def paired_readers(h, proxy, reader, objects):
+    backend = B.Backend(h.s.dsn + f" port={proxy.port}", h.b.schema, objects)
+    metadata = M.TypedMetadata(backend)
+    owner, peer = X.BoundCatalog(backend, metadata), X.BoundCatalog(backend, metadata)
+    h.reader_processes.extend((owner, peer))
+    session = h.call("open-" + reader, owner.open_session, str(uuid.uuid4()), str(uuid.uuid4()))
+    h.sessions.append(session)
+    h.call("capture-" + reader, owner.capture, session, *h.context("neighbor"), reader)
+    return owner, peer, session
+
+
+def rejected_materialization(pending, code):
+    try:
+        pending.result(timeout=15)
+    except B.ContractError as error:
+        require(str(error) == code, f"Expected {code}, got {error}")
+    else:
+        raise AssertionError("An invalidated materialization returned a copy")
+
+
+def graceful_close_during_get(h, report):
+    reader = "graceful-close-during-get"
+    objects = B.S3Objects(S.client(h.s.endpoint, "r6-admin", h.s.secret), h.s.bucket, h.b.objects.prefix)
+    with P.CommitProxy("127.0.0.1", h.s.pg_port, "ack_paused") as wire:
+        owner, peer, session = paired_readers(h, wire, reader, objects)
+        read_object = objects.read
+        entered, release_get = threading.Event(), threading.Event()
+        requests = []
+
+        def read(key, version=None):
+            with h.b.connect() as c:
+                phase = c.execute(
+                    "SELECT state,fence FROM reader_sessions WHERE session_uuid=%s", (uuid.UUID(session.id),)
+                ).fetchone()
+            requests.append(phase)
+            result = read_object(key, version)
+            if len(requests) == 1:
+                entered.set()
+                require(release_get.wait(30), "First GET result was not released")
+            return result
+
+        objects.read = read
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = pool.submit(peer.materialize, session, reader)
+            try:
+                require(entered.wait(15), "The real GET did not reach its handshake")
+                h.call("graceful-close-view-during-get", owner.close_view, session, reader)
+                wire.armed.set()
+                closing = pool.submit(owner.close_session, session)
+                wait_until(lambda: session_waiter(h, session), "graceful close waits for the in-flight read")
+                require(not wire.ack_paused.is_set() and not closing.done(), "Close jumped ahead of the held GET")
+                h.mutate("concurrent-writer", "write-during-graceful-close", [H.row(2, reader)])
+                require(
+                    next(s for s in h.raw["reader_sessions"] if s["session_uuid"] == session.id)["state"] == "active",
+                    "Session was fenced while the old read was still running",
+                )
+
+                release_get.set()
+                rejected_materialization(pending, "VIEW_CLOSED")
+                require(wire.ack_paused.wait(15) and not closing.done(), "Close acknowledgement did not pause")
+                h.check()
+                closed = next(s for s in h.raw["reader_sessions"] if s["session_uuid"] == session.id)
+                require(
+                    closed["state"] == "closed" and closed["fence"] == 2 and not lock_missing(h, session.id),
+                    "The server did not commit a closed session while the lifetime lock remained",
+                )
+                dispatched = len(requests)
+                stale = pool.submit(peer.materialize, session, reader)
+                wait_until(lambda: session_waiter(h, session), "reader waits for the pending close acknowledgement")
+                require(len(requests) == dispatched, "A fenced session dispatched a GET")
+                wire.release_ack.set()
+                require(closing.result(timeout=15) == closed["receipt"], "Close did not return the durable receipt")
+                rejected_materialization(stale, "READER_FENCED")
+            finally:
+                release_get.set()
+                wire.release_ack.set()
+        require(
+            requests and all(phase == {"state": "active", "fence": 1} for phase in requests),
+            "An old materialization dispatched a GET after the terminal fence",
+        )
+        require(
+            reader not in peer.copies and session.connection.closed, "A closed session left a new copy or connection"
+        )
+        h.check()
+    report["faults"].append(
+        {
+            "operation": reader,
+            "close_waited_for_session_operation_lock": True,
+            "another_table_write_committed_while_waiting": True,
+            "read_blocked_during_close_ack": True,
+            "get_dispatch_states": requests,
+            "copy_published": False,
+        }
+    )
+
+
+def invalidate_during_materialize_ack(h, report):
+    for action, error in (("close", "VIEW_CLOSED"), ("unpin", "VIEW_NOT_PINNED")):
+        reader = action + "-during-copy-ack"
+        with P.CommitProxy("127.0.0.1", h.s.pg_port, "ack_paused") as wire:
+            owner, peer, session = paired_readers(h, wire, reader, h.b.objects)
+            if action == "unpin":
+                existing = deepcopy(h.call("copy-before-unpin-ack", owner.materialize, session, reader))
+            wire.armed.set()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                pending = pool.submit(peer.materialize, session, reader)
+                try:
+                    require(
+                        wire.ack_paused.wait(15) and not pending.done() and reader not in peer.copies,
+                        "The copy appeared before its COMMIT acknowledgement",
+                    )
+                    if action == "close":
+                        h.call("close-peer-view-during-copy-ack", owner.close_view, session, reader)
+                        closing = pool.submit(owner.close_session, session)
+                        wait_until(lambda: session_waiter(h, session), "normal close waits through the copy COMMIT")
+                        require(not closing.done(), "Normal close outran the copy operation")
+                    else:
+                        h.call("release-peer-pin-during-copy-ack", owner.release_copy_pin, session, reader)
+                        require(owner.copies[reader] == existing, "The previously returned copy changed")
+                    require(
+                        not any(r["kind"] == "reader" and r["holder"] == reader for r in h.raw["refs"]),
+                        "The other instance did not remove the durable pins",
+                    )
+                    wire.release_ack.set()
+                    rejected_materialization(pending, error)
+                    if action == "close":
+                        require(
+                            closing.result(timeout=15)["fence"] == 2, "Normal close did not reach its terminal fence"
+                        )
+                finally:
+                    wire.release_ack.set()
+            require(reader not in peer.copies, "A second instance published a copy after removal of the pins")
+            if action == "unpin":
+                h.call("close-peer-view-after-unpin-ack", owner.close_view, session, reader)
+                h.call("close-peer-session-after-unpin-ack", owner.close_session, session)
+            h.check()
+        report["faults"].append(
+            {
+                "operation": reader,
+                **wire.observation,
+                "peer_removed_pins_before_ack": True,
+                "materialize_rejected": error,
+                "copy_published": False,
+            }
+        )
 
 
 def budget_case(h, source, report):
@@ -799,6 +951,8 @@ def exercise(h, report, root):
     h.create("concurrent-writer")
     inflight(h, report, False)
     inflight(h, report, True)
+    graceful_close_during_get(h, report)
+    invalidate_during_materialize_ack(h, report)
     budget_case(h, source_b, report)
     rollback_cases(h)
     uncertain(h, report)
