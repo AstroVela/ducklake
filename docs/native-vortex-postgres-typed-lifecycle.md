@@ -2,6 +2,8 @@
 
 本轮以 #92 合入后的开发提交 `9c3db00b` 为基线。独立的 typed metadata 组件复用 PostgreSQL／S3 broker 的 owner 和事务边界，在真实 PostgreSQL 上验证固定布局与生命周期。[组件实现](../scripts/vortex_postgres_metadata.py) · [发布 broker](native-vortex-postgres-s3-backend.md) · [总设计与 roadmap](ducklake-vortex-design-roadmap.md)
 
+#94 在新建 PostgreSQL schema 中将 source、generation、引用和退休统一绑定到 typed 身份。本文记录 #93 的独立 typed 组件和历史验证。[Typed UUID、发布与 ReadView 绑定](native-vortex-bound-readviews.md)
+
 **本轮资格限于 broker 组件层。** 原生 C++／Rust、现有 DuckLake inline codec、native DuckDB 限制、SQL 接口、provider 和 #92 发布 adapter 均不修改。Vane 远程 SQL／ANN、实际 source／generation 与 typed UUID 的统一绑定仍未接入。新组件不读旧 typed 布局、不迁移、不自动转换 UUID／epoch，也不新增兼容路径或 fallback。
 
 本地保持 CPU **6–11**、原线程环境、原生 `threads=2`、既有事务保护和预算。原生 maintenance 的单 worker／全局预算保持。R4 A/A、性能 A/B、长期稳态和依赖稳定负载的 R5 资格继续暂缓；时间只作为观察值。

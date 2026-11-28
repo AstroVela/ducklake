@@ -2,7 +2,7 @@
 
 本轮以 #91 合入后的 `9032cbf6` 为开发基线，在真实 PostgreSQL 事务与 S3 API 上验证远程发布协议。[#91 合入提交](https://github.com/AstroVela/ducklake/commit/9032cbf6c42c7590198bf3f7753eb8a0f3d5f3d1) · [DuckLake＋Vortex 总设计与 roadmap](ducklake-vortex-design-roadmap.md)
 
-后续 [PostgreSQL 类型化 metadata 与 UUID／epoch 契约](native-vortex-postgres-typed-lifecycle.md)已新增独立 typed 组件与真实 PG 确定性验证；本文保留 #92 的发布 adapter 基线与历史结果。Typed UUID 和实际 source／generation 的统一绑定、原生调用接线仍需后续完成。
+#93 新增独立 typed 组件，#94 在新建 PostgreSQL schema 中将 source、generation、引用和退休绑定到 typed 身份。本文记录 #92 的发布 adapter 基线与历史结果。[类型化元数据与 UUID／epoch 契约](native-vortex-postgres-typed-lifecycle.md) · [Typed UUID、发布与 ReadView 绑定](native-vortex-bound-readviews.md)
 
 交付的是可独立调用的[实验性 backend](../scripts/vortex_remote_backend.py)及真实服务 conformance，**尚未接入 Vane SQL、原生维护调度或 ANN 查询**。生产 C++／Rust、native DuckDB 限制、SQL 接口与 provider 保持 #91；现有原生普通事务保护不变。测试使用独立私有 schema 和受登记约束的 S3 namespace，上传受控 opaque 字节与真实 manifest；不把它们当作真实 Vortex／SPFresh 编码资格。
 

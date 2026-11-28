@@ -182,7 +182,7 @@ CREATE TABLE control (
  owner bigint NOT NULL CHECK(owner>0), revision bigint NOT NULL, head text,
  bucket text NOT NULL, prefix text NOT NULL, endpoint text NOT NULL);
 CREATE TABLE units (id text PRIMARY KEY, kind text NOT NULL, charge bigint NOT NULL CHECK(charge>0),
- state text NOT NULL, snapshot text);
+ state text NOT NULL, snapshot text,table_uuid uuid NOT NULL,UNIQUE(id,table_uuid));
 CREATE TABLE objects (key text PRIMARY KEY, unit text NOT NULL REFERENCES units(id), role text NOT NULL,
  size bigint NOT NULL, sha text, version text, etag text, sealed boolean NOT NULL DEFAULT false);
 CREATE TABLE requests (id text PRIMARY KEY, payload_hash text NOT NULL, source text NOT NULL REFERENCES units(id),
@@ -197,10 +197,10 @@ CREATE TABLE gc (unit text PRIMARY KEY REFERENCES units(id), nonce uuid NOT NULL
 
 
 class Backend:
-    """One catalog, one table UUID/epoch and one named index in a private v1 schema.
+    """Storage/transaction primitives and single-root fixtures in a fresh schema.
 
     control-row locking serializes metadata mutations across broker processes.
-    Native business SQL and distributed serving are deliberately not connected.
+    BoundCatalog is the typed publication entry. Native SQL is not connected.
     """
 
     def __init__(self, dsn, schema, objects):
@@ -306,7 +306,10 @@ class Backend:
         unit = "source:" + name
         with self.transaction(token) as (c, state):
             key = self.objects.prefix + f"{state['table_uuid']}/owner-{token}/source-{name}"
-            c.execute("INSERT INTO units VALUES(%s,'source',%s,'allocated',%s)", (unit, len(data), snapshot))
+            c.execute(
+                "INSERT INTO units VALUES(%s,'source',%s,'allocated',%s,%s)",
+                (unit, len(data), snapshot, state["table_uuid"]),
+            )
             c.execute(
                 "INSERT INTO objects(key,unit,role,size,sha) VALUES(%s,%s,'source',%s,%s)",
                 (key, unit, len(data), sha(data)),
@@ -369,7 +372,10 @@ class Backend:
                 "INPUT_SNAPSHOT_CHANGED",
             )
             prefix = self.objects.prefix + f"{table_uuid}/owner-{token}/{name}/"
-            c.execute("INSERT INTO units VALUES(%s,'generation',%s,'allocated',NULL)", (unit, len(data)))
+            c.execute(
+                "INSERT INTO units VALUES(%s,'generation',%s,'allocated',NULL,%s)",
+                (unit, len(data), state["table_uuid"]),
+            )
             c.execute(
                 "INSERT INTO objects(key,unit,role,size,sha) VALUES(%s,%s,'index',%s,%s),(%s,%s,'manifest',0,NULL)",
                 (prefix + "index", unit, len(data), sha(data), prefix + "manifest", unit),
@@ -592,7 +598,9 @@ class Backend:
                 {
                     "kind": "vortex-stop-v1",
                     "catalog": str(state["catalog"]),
-                    "table": str(state["table_uuid"]),
+                    "table": str(
+                        c.execute("SELECT table_uuid FROM units WHERE id=%s", (unit,)).fetchone()["table_uuid"]
+                    ),
                     "key": key,
                     "intent": str(intent["nonce"]),
                 }
@@ -633,7 +641,9 @@ class Backend:
                     {
                         "kind": "vortex-stop-v1",
                         "catalog": str(state["catalog"]),
-                        "table": str(state["table_uuid"]),
+                        "table": str(
+                            c.execute("SELECT table_uuid FROM units WHERE id=%s", (unit,)).fetchone()["table_uuid"]
+                        ),
                         "key": obj["key"],
                         "intent": str(intent["nonce"]),
                     }
