@@ -253,6 +253,40 @@ def exercise_native_limits(probe, root, source, report):
     )
 
 
+def exercise_missing_trailing_vid(probe, root, source, report):
+    target = root / "missing-trailing-vid"
+    body = F.clone(source, target)
+    (target / "seal.json").unlink()
+    mapping = body["mapping"]
+    last_vid = len(mapping) - 1
+    live = {F.address(row) for row in body["capture"]["rows"]}
+    live.remove(F.address(mapping[last_vid]))
+    expected = F.visibility(mapping, live)
+    log = root / "missing-trailing-vid.log"
+
+    worker = F.Worker(probe, "update", target / "native", log)
+    try:
+        require(worker.call("delete", last_vid) == {"deleted": True}, "Expected live final VID")
+        require(worker.call("checkpoint") == {"saved": True}, "Could not checkpoint final tombstone")
+        worker.close()
+    finally:
+        worker.stop()
+    F.validate_checkpoint(probe, target, expected, log)
+
+    path = target / "native/versions.bin"
+    labels = bytearray(path.read_bytes())
+    deleted, total, columns = struct.unpack_from("=iii", labels)
+    require((deleted, total, columns) == (expected.count("0"), len(mapping), 1), "Unexpected native label header")
+    require(labels.pop() == 0xFE and expected[-1] == "0", "Expected a trailing tombstone")
+    # Both counters decrease together. The live count and every preceding flag stay identical.
+    struct.pack_into("=ii", labels, 0, deleted - 1, total - 1)
+    path.write_bytes(labels)
+    rejected(
+        report, "missing-trailing-deleted-vid",
+        lambda: F.validate_checkpoint(probe, target, expected, log), "NATIVE_VID_VISIBILITY",
+    )
+
+
 def exercise_manifests(root, source, head, report):
     catalog = F.Catalog(root / "manifest-catalog")
     F.clone(source, catalog.root / "g1")
@@ -575,6 +609,7 @@ def exercise(args, root, report):
         qualify(report, "seed", view, initial)
         rejected(report, "current-generation-GC", lambda: catalog.collect("g1", 16, F.LIMIT), "REFERENCED")
         exercise_native_limits(args.probe, root, catalog.root / "g1", report)
+        exercise_missing_trailing_vid(args.probe, root, catalog.root / "g1", report)
         exercise_manifests(root, catalog.root / "g1", head, report)
         exercise_reopen_inventory(args.probe, root, catalog.root / "g1", report)
         require(catalog.head() == head, "Private regression changed the published head")

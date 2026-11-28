@@ -58,11 +58,11 @@ ReadView 在发布／回收锁保护下校验并完整复制封存 checkpoint，
 
 ## 当前开发基线复验
 
-在 `c0fa417` 上以 Vortex `42beeb3a` 的静态补丁和固定 SPFresh 源码重新构建探针。复验在 CPU 6–11 上通过 **156 次 ANN 查询比较、46 项预期拒绝和 6 个真实 SIGKILL 边界**，最低 recall **1.0**。两个已退休 checkpoint 均各回收 1 个对象，私有旧 ReadView 在回收后仍可查询。
+在 `c0fa417` 上以 Vortex `42beeb3a` 的静态补丁和固定 SPFresh 源码重新构建探针。复验在 CPU 6–11 上通过 **156 次 ANN 查询比较、47 项预期拒绝和 6 个真实 SIGKILL 边界**，最低 recall **1.0**。两个已退休 checkpoint 均各回收 1 个对象，私有旧 ReadView 在回收后仍可查询。
 
 确定性回归覆盖 labels 保存失败、恢复旧 labels 后只读重开行数不符、同步 posting 超限、RocksDB 缺失 posting 和超大 head／seal。对同一份 256 行 seed 删除 127、128、129 行，分别重开得到 129、128、127 个 live rows，删除全部行时拒绝 checkpoint。独立 oracle 拒绝用并列命中代替更近的行，并接受同距替换和 Float32 舍入后的正确距离。
 
-文件总量恰好 64 MiB 时重开一次，超出 1 字节时重开次数为零。两类记录均覆盖截断和尾随字节。可见行数相同的旧 labels、对调两个 VID 的可见性、多出的已删除 VID，以及与实际 posting 长度不符的记录均被拒绝。重开期间新增文件或等长改写内容会阻止封存，私有 ReadView 校验失败会关闭其进程。
+文件总量恰好 64 MiB 时重开一次，超出 1 字节时重开次数为零。两类记录均覆盖截断和尾随字节。可见行数相同的旧 labels、对调两个 VID 的可见性、多出的已删除 VID，以及与实际 posting 长度不符的记录均被拒绝。单独删除最后一个已删除 VID 的标签并调整两个计数后，可见总数和此前每个 VID 的状态都相同，重开仍会拒绝这份缺失标签的记录。重开期间新增文件或等长改写内容会阻止封存，私有 ReadView 校验失败会关闭其进程。
 
 普通读事务和业务 WAL 恢复用有序业务 SQL 核对行。实际 ReadView 另外通过其 snapshot、物理 RowRef、Vortex 文件和独立 ANN oracle 核对。
 
