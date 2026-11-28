@@ -4,6 +4,7 @@
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_schema_entry.hpp"
+#include "storage/ducklake_transaction.hpp"
 
 #ifdef DUCKLAKE_ENABLE_VORTEX
 #include "functions/ducklake_table_functions.hpp"
@@ -24,17 +25,12 @@
 
 namespace duckdb {
 
-DataFileFormat DuckLakeVortex::GetFormat(const DuckLakeCatalog &catalog, SchemaIndex schema, TableIndex table) {
-	string format;
-	if (!catalog.TryGetConfigOption("experimental_data_file_format", format, schema, table)) {
-		return DataFileFormat::PARQUET;
-	}
-	return DataFileFormatFromString(format);
+DataFileFormat DuckLakeVortex::GetFormat(ClientContext &context, DuckLakeCatalog &catalog, TableIndex table) {
+	return DuckLakeTransaction::Get(context, catalog).GetDataFileFormat(table);
 }
 
-DataFileFormat DuckLakeVortex::GetFormat(DuckLakeTableEntry &table) {
-	return GetFormat(table.ParentCatalog().Cast<DuckLakeCatalog>(),
-	                 table.schema.Cast<DuckLakeSchemaEntry>().GetSchemaId(), table.GetTableId());
+DataFileFormat DuckLakeVortex::GetFormat(ClientContext &context, DuckLakeTableEntry &table) {
+	return GetFormat(context, table.ParentCatalog().Cast<DuckLakeCatalog>(), table.GetTableId());
 }
 
 void DuckLakeVortex::ValidateEnabled() {
@@ -96,26 +92,31 @@ string LocalWritePath(ClientContext &context, const string &path) {
 	return result;
 }
 
+unique_ptr<FunctionData> BindVortexFile(ClientContext &context, const string &path, TableFunction &scan,
+                                        vector<LogicalType> &types, vector<string> &names) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (fs.IsRemoteFile(path) || path.find("://") != string::npos) {
+		throw NotImplementedException("Experimental DuckLake Vortex reads require local files");
+	}
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto &entry = catalog.GetEntry<TableFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "_read_vortex_file");
+	scan = entry.functions.GetFunctionByArguments(context, {LogicalType::VARCHAR});
+	vector<Value> inputs {Value(path)};
+	named_parameter_map_t parameters;
+	vector<LogicalType> input_types;
+	vector<string> input_names;
+	TableFunctionRef ref;
+	TableFunctionBindInput input(inputs, parameters, input_types, input_names, scan.function_info.get(), nullptr, scan,
+	                             ref);
+	return scan.bind(context, input, types, names);
+}
+
 class VortexReader : public BaseFileReader {
 public:
 	VortexReader(ClientContext &context, const OpenFileInfo &file, DuckLakeTableEntry &table) : BaseFileReader(file) {
-		auto &fs = FileSystem::GetFileSystem(context);
-		if (fs.IsRemoteFile(file.path) || file.path.find("://") != string::npos) {
-			throw NotImplementedException("Experimental DuckLake Vortex reads require local files");
-		}
-		auto &catalog = Catalog::GetSystemCatalog(context);
-		auto &entry = catalog.GetEntry<TableFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "_read_vortex_file");
-		scan = entry.functions.GetFunctionByArguments(context, {LogicalType::VARCHAR});
-		vector<Value> inputs {Value(file.path)};
-		named_parameter_map_t parameters;
-		vector<LogicalType> input_types;
-		vector<string> input_names;
-		TableFunctionRef ref;
-		TableFunctionBindInput input(inputs, parameters, input_types, input_names, scan.function_info.get(), nullptr,
-		                             scan, ref);
 		vector<LogicalType> types;
 		vector<string> names;
-		bind_data = scan.bind(context, input, types, names);
+		bind_data = BindVortexFile(context, file.path, scan, types, names);
 		auto schema = DuckLakeMultiFileReader::ColumnsFromFieldData(table.GetFieldData());
 		unordered_map<string, MultiFileColumnDefinition *> fields;
 		for (auto &column : schema) {
@@ -431,7 +432,7 @@ DuckLakeCopyOptions DuckLakeVortex::CopyOptions(ClientContext &context, DuckLake
 	};
 	DuckLakeCopyOptions result(std::move(info), std::move(function));
 	result.bind_data = std::move(bind);
-	result.file_path = path;
+	result.file_path = input.data_path;
 	result.file_extension = "vortex";
 	result.filename_pattern.SetFilenamePattern("ducklake-{uuidv7}");
 	result.use_tmp_file = false;

@@ -2,16 +2,19 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
 #include <functional>
-#include <mutex>
+#include <tuple>
 
 namespace duckdb {
 class ClientContext;
 class Connection;
+class DatabaseInstance;
 class ExtensionLoader;
 class DuckLakeTransaction;
-class StorageLockKey;
-struct DuckLakeVortexRewriteState;
+struct DuckLakeVortexTableRetirement;
+
+using DuckLakeVortexPolicyKey = std::tuple<idx_t, idx_t, string, string>;
 
 struct DuckLakeVortexWriteBudget {
 	idx_t inline_rows, inline_bytes, unindexed_rows, unindexed_bytes;
@@ -26,6 +29,8 @@ struct DuckLakeVortexOptimizerConfig {
 class DuckLakeVortexOptimizer {
 public:
 	static void Initialize(Connection &owner, const string &catalog);
+	static void CheckIndexDefinition(DuckLakeTransaction &transaction, const string &table_uuid,
+	                                 const DuckLakeVortexIndex &index);
 	static void Enable(ClientContext &context, const DuckLakeVortexOptimizerConfig &config,
 	                   const std::function<void(const string &)> &observe = nullptr);
 	static string Resume(ClientContext &context, const string &catalog, const string &schema, const string &table,
@@ -36,6 +41,7 @@ public:
 	static void ConfigureCompaction(ClientContext &context, const string &catalog, const string &schema,
 	                                const string &table, const string &index, bool enabled, idx_t min_deleted_rows,
 	                                idx_t min_deleted_percent);
+	static void RecordRewritePublication(DuckLakeTransaction &transaction, const DuckLakeVortexRewriteState &plan);
 	static void EnableMaintenance(ClientContext &context, const string &catalog, idx_t max_objects, idx_t max_bytes,
 	                              const std::function<void(const string &)> &observe = nullptr);
 	static void ResumeMaintenance(ClientContext &context, const string &catalog,
@@ -47,12 +53,15 @@ public:
 	                                     idx_t keep_snapshots, idx_t min_age_seconds);
 	static void SetWriteBudget(ClientContext &context, const string &catalog, const string &schema, const string &table,
 	                           const string &index, const DuckLakeVortexWriteBudget &budget);
-	static void CheckRewriteToF(ClientContext &context, const DuckLakeVortexRewriteState &rewrite);
-	static unique_ptr<StorageLockKey> AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context);
-	static unique_ptr<StorageLockKey> ReserveWrite(ClientContext &context);
-	static std::unique_lock<std::mutex> LockTableRetirement(ClientContext &context, const string &catalog,
-	                                                        const string &table_uuid);
-	static void FinishTableRetirement(ClientContext &context, const string &table_uuid);
+	static void CheckRewriteToF(ClientContext &context, const DuckLakeVortexRewriteState &rewrite, idx_t live_rows,
+	                            idx_t source_bytes);
+	static DuckLakeVortexCollectionLock &WriteAdmissionLock(DatabaseInstance &db);
+	static unique_ptr<DuckLakeVortexCollectionLock::Key>
+	AdmitWrite(DuckLakeTransaction &transaction, ClientContext &context,
+	           unique_ptr<DuckLakeVortexCollectionLock::Key> &publication_guard);
+	static void CheckTableRetirement(ClientContext &context, DuckLakeTransaction &transaction,
+	                                 DuckLakeVortexTableRetirement &retirement);
+	static void FinishTableRetirement(ClientContext &context, const DuckLakeVortexTableRetirement &retirement);
 };
 
 void RegisterDuckLakeVortexOptimizer(ExtensionLoader &loader);

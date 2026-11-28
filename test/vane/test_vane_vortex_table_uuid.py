@@ -36,6 +36,7 @@ STAGES = (
     "retire_after_indexes",
     "retire_after_requests",
     "retire_after_stage",
+    "retire_before_native_commit",
 )
 MIB = 1024 * 1024
 
@@ -57,8 +58,33 @@ def advance(c, uuid, epoch):
     )[0]
 
 
-def retire(c, uuid):
-    return query(c, "SELECT * FROM ducklake_retire_vortex_table('lake','main','items'," + quote(uuid) + ")")[0]
+def append(c, uuid, request, rows, epoch=1):
+    return WRITE.query_parameters(
+        c,
+        "SELECT * FROM ducklake_write_vortex_batch('lake','main','items','knn',?,"
+        "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::UBIGINT,?::VARCHAR)",
+        [request, rows, epoch, uuid],
+    )[0]
+
+
+def retire(c, uuid, table="items"):
+    return WRITE.query_parameters(c, "SELECT * FROM ducklake_retire_vortex_table('lake','main',?,?)", [table, uuid])[0]
+
+
+def retire_after_cancel(c, uuid):
+    from vane import TransactionException
+
+    in_flight = (
+        "TransactionContext Error: Failed to commit: Vortex table retirement is blocked by an in-flight optimizer task"
+    )
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            return retire(c, uuid)
+        except TransactionException as error:
+            if str(error) != in_flight or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 def state(c):
@@ -95,6 +121,7 @@ def owned(c, uuid):
         "ducklake_vortex_rewrites_v1",
         "ducklake_vortex_keyed_tables_v1",
         "ducklake_vortex_optimizer_v2",
+        "ducklake_vortex_optimizer_rewrite_receipts_v1",
         "ducklake_vortex_write_budgets_v1",
         "ducklake_vortex_request_epochs_v1",
         "ducklake_vortex_write_requests_v2",
@@ -121,10 +148,6 @@ def configure(c, root, dimension):
         + f",{dimension},100000,4194304,100000,67108864)"
     )
     c.execute("SELECT * FROM ducklake_cancel_vortex_optimizer('lake','main','items','knn')")
-    deadline = time.monotonic() + 60
-    while BASE.status(c)["running"]:
-        require(time.monotonic() < deadline, "Optimizer did not stop")
-        time.sleep(0.01)
     c.execute("SELECT * FROM ducklake_set_vortex_write_budget('lake','main','items','knn',1000,4194304,4096,67108864)")
 
 
@@ -159,16 +182,21 @@ def public(root, report):
         require(mutate(c, old, "same-id", original) == receipt, "Pinned receipt retry changed")
         configure(c, path, 8)
         rejected(c, path, lambda: c.execute("DROP TABLE lake.items"), "Managed Vortex tables require")
-        require(retire(c, old) == {"table_uuid": old, "retired": True}, "Retirement returned wrong UUID")
+        require(retire_after_cancel(c, old) == {"table_uuid": old, "retired": True}, "Retirement returned wrong UUID")
         require(not any(owned(c, old).values()), "Retired UUID retained metadata")
+        c.execute('CREATE TABLE lake."İtems"(id BIGINT)')
+        c.execute('DROP TABLE lake."İtems"')
         stable = state(c)
         require(
-            retire(c, old) == {"table_uuid": old, "retired": True} and state(c) == stable,
+            query(c, "SELECT * FROM ducklake_retire_vortex_table('lake','MAIN','Items'," + quote(old) + ")")[0]
+            == {"table_uuid": old, "retired": True}
+            and state(c) == stable,
             "Retirement replay changed native snapshots",
         )
         new = recreate(c, path, 128)
         require(new != old and EPOCH.status(c)["request_epoch"] == 1, "Same-name table inherited UUID or epoch")
         for call in (
+            lambda: append(c, old, "same-id", original),
             lambda: mutate(c, old, "same-id", original),
             lambda: mutate(c, old, "unseen", original),
             lambda: advance(c, old, 1),
@@ -185,6 +213,82 @@ def public(root, report):
             "Old payload crossed UUID boundary",
         )
         require(advance(c, new, 1)["request_epoch"] == 2, "New UUID epoch could not advance")
+        require(retire(c, new)["table_uuid"] == new, "Could not retire the second incarnation")
+        rejected(c, path, lambda: retire(c, old), "Unknown Vortex table retirement UUID")
+        stable = state(c)
+        require(retire(c, new)["table_uuid"] == new and state(c) == stable, "Latest retirement replay changed state")
+    finally:
+        c.close()
+
+    c, path = bootstrap("same-name-view")
+    try:
+        old = WRITE.table_uuid(c)
+        retire(c, old)
+        c.execute("CREATE VIEW lake.items AS SELECT 71::BIGINT AS marker")
+        rejected(c, path, lambda: retire(c, old), "items is not")
+        rejected(
+            c,
+            path,
+            lambda: c.execute(
+                "SELECT * FROM ducklake_rewrite_vortex_index_segment('lake','main','items','knn','old',?,1)",
+                [str(path / "indexes" / "late.json")],
+            ),
+            "items is not",
+        )
+        require(REF.rows(c, "SELECT marker FROM lake.items") == [[71]], "Retirement changed the same-name view")
+    finally:
+        c.close()
+
+    c, path = bootstrap("renamed-table-replay")
+    try:
+        c.execute("CREATE TABLE lake.original(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)")
+        c.execute("CALL ducklake_set_option('lake','experimental_data_file_format','vortex',table_name=>'original')")
+        c.execute("INSERT INTO lake.original VALUES (41,[1.0]::FLOAT[],'A','survives')")
+        uuid = WRITE.table_uuid(c, "original")
+        require(not any(owned(c, uuid).values()), "Rename fixture already owns Vortex metadata")
+        c.execute("ALTER TABLE lake.original RENAME TO renamed")
+        rejected(c, path, lambda: retire(c, uuid, "original"), "Unknown Vortex table retirement UUID")
+        require(
+            WRITE.table_uuid(c, "renamed") == uuid
+            and REF.rows(c, "SELECT id,payload FROM lake.renamed") == [[41, "survives"]],
+            "Old-name retirement changed the renamed table",
+        )
+        require(retire(c, uuid, "renamed") == {"table_uuid": uuid, "retired": True}, "Final-name retirement failed")
+        rejected(c, path, lambda: retire(c, uuid, "original"), "Unknown Vortex table retirement UUID")
+        stable = state(c)
+        require(retire(c, uuid, "renamed")["retired"] and state(c) == stable, "Final-name replay changed state")
+    finally:
+        c.close()
+
+    c, path = bootstrap("expired-name-replay")
+    try:
+        old = WRITE.table_uuid(c)
+        retire(c, old)
+        latest = recreate(c, path)
+        retire(c, latest)
+        history_sql = (
+            f"SELECT table_uuid::VARCHAR,begin_snapshot,end_snapshot FROM {REF.META}.ducklake_table "
+            "WHERE table_name='items' ORDER BY begin_snapshot"
+        )
+        history = c.execute(history_sql).fetchall()
+        require([row[0] for row in history] == [old, latest], "Missing same-name table history")
+        rejected(c, path, lambda: retire(c, old), "Unknown Vortex table retirement UUID")
+        require(retire(c, latest)["table_uuid"] == latest, "Intact history lost the final UUID")
+
+        def expire(versions):
+            c.execute("BEGIN")
+            removed = c.execute(
+                "SELECT count(*) FROM ducklake_expire_snapshots('lake', versions => " + str(versions) + ")"
+            ).fetchone()[0]
+            c.execute("COMMIT")
+            require(removed == len(versions), "Native expiry did not remove the selected versions")
+
+        expire([0])
+        require(retire(c, latest)["table_uuid"] == latest, "An earlier gap revoked a complete retirement interval")
+        expire(list(range(history[1][1], history[1][2])))
+        require(c.execute(history_sql).fetchall() == history[:1], "Expiry did not leave only the older incarnation")
+        for uuid in (old, latest):
+            rejected(c, path, lambda: retire(c, uuid), "Unknown Vortex table retirement UUID")
     finally:
         c.close()
 
@@ -223,7 +327,7 @@ def public(root, report):
             identities.append(uuid)
             mutate(c, uuid, "cycle", WRITE.rows(i, 1))
             configure(c, path, 8)
-            retire(c, uuid)
+            require(retire_after_cancel(c, uuid) == {"table_uuid": uuid, "retired": True}, "Wrong UUID on retirement")
             require(not any(owned(c, uuid).values()), "UUID retirement retained quota or policy state")
             if i != 16:
                 recreate(c, path)
@@ -274,6 +378,14 @@ def public(root, report):
             + quote(path / "indexes/foreign.json")
             + ",8,1)"
         )
+        rewrite_receipts = f"{REF.META}.ducklake_vortex_optimizer_rewrite_receipts_v1"
+        c.executemany(
+            f"INSERT INTO {rewrite_receipts} VALUES (?, 'knn', 'completed', 'generation', 2)",
+            [(target,), (foreign,)],
+        )
+        require(
+            owned(c, target)["ducklake_vortex_optimizer_rewrite_receipts_v1"] == 1, "Missing target rewrite receipt"
+        )
         names = [
             name
             for name in REF.METADATA_TABLES
@@ -283,6 +395,8 @@ def public(root, report):
                 "ducklake_vortex_maintenance_v1",
                 "ducklake_vortex_source_deletions_v1",
                 "ducklake_vortex_source_retention_v1",
+                "ducklake_vortex_retired_sources_v1",
+                "ducklake_vortex_rewrite_outputs_v1",
             )
         ]
         before = {
@@ -355,11 +469,9 @@ def recover(path, committed):
     uuid = path.joinpath("table-uuid").read_text()
     expected = json.loads(path.joinpath("expected.json").read_text())
     sealed = json.loads(path.joinpath("files.json").read_text())
-    c = BASE.connect(path)
+    c = BASE.connect(path, path / "extensions")
     try:
-        require(
-            state(c) == expected, "Reopen changed one of 13 metadata tables, table history, snapshots or typed rows"
-        )
+        require(state(c) == expected, "Reopen changed Vortex metadata, table history, snapshots or typed rows")
         require(SCRATCH.protected_files(path) == sealed, "Reopen changed source/generation/caller files")
         if committed:
             require(expected["rows"] == [] and not any(owned(c, uuid).values()), "Committed retirement retained state")
@@ -391,7 +503,20 @@ def recover(path, committed):
 
 
 def native(driver, root, report):
-    ordinary = ["ok", "build-blocked", "held", "optimizer-blocked", "race", "conflict"]
+    ordinary = [
+        "ok",
+        "build-blocked",
+        "held",
+        "optimizer-blocked",
+        "race",
+        "conflict",
+        "concurrent-index",
+        "concurrent-build",
+        "concurrent-rewrite",
+        "live-catalog",
+        "rebound-catalog",
+        "reattached-policy-capacity-reuse",
+    ]
     ordinary += [kind + "-" + stage for kind in ("cancel", "fail") for stage in STAGES]
     cases = [(mode, None) for mode in ordinary]
     cases += [
@@ -401,6 +526,7 @@ def native(driver, root, report):
             "retire_after_indexes",
             "retire_after_requests",
             "retire_after_stage",
+            "retire_before_native_commit",
             "retire_after_commit",
         )
     ]

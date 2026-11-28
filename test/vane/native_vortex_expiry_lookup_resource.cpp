@@ -53,16 +53,19 @@ int main(int argc, char **argv) {
 		}
 		DuckDB database(argv[1]);
 		Connection connection(database);
+		const bool lookup = string(argv[2]) == "lookup";
 		Query(connection, "SET threads=2; BEGIN TRANSACTION");
 		Query(connection, "DELETE FROM ducklake_snapshot WHERE snapshot_id IN "
 		                  "(SELECT snapshot_id FROM ducklake_snapshot ORDER BY snapshot_id LIMIT 2)");
+		const bool retirement_marker = bool(connection.TableInfo("ducklake_vortex_retired_sources_v1"));
 		ViewJSON json;
 		auto report = json.Object();
 		json.Text(report, "variant", argv[2]);
+		json.Add(report, "physical_retirement_marker", yyjson_mut_bool(json.doc.get(), retirement_marker));
 		json.Number(report, "peak_rss_before_bytes", PeakRSS());
 		json.Number(report, "rss_before_bytes", CurrentRSS());
 		vector<int64_t> snapshots;
-		if (string(argv[2]) == "lookup") {
+		if (lookup) {
 			auto result = Query(connection, "SELECT snapshot_id FROM ducklake_snapshot ORDER BY snapshot_id");
 			ReadCost(json, report, "retained_snapshots", *result);
 			json.Number(report, "rss_with_snapshot_result_bytes", CurrentRSS());
@@ -72,23 +75,35 @@ int main(int argc, char **argv) {
 		}
 		json.Number(report, "snapshot_vector_bytes", snapshots.size() * sizeof(int64_t));
 		json.Number(report, "snapshot_vector_capacity_bytes", snapshots.capacity() * sizeof(int64_t));
-		auto files = Query(connection, string(argv[2]) == "lookup"
-		                                   ? "SELECT data_file_id, table_id, path, path_is_relative, begin_snapshot, "
-		                                     "end_snapshot FROM ducklake_data_file WHERE end_snapshot IS NOT NULL"
-		                                   : "SELECT data_file_id, table_id, path, path_is_relative FROM "
-		                                     "ducklake_data_file WHERE end_snapshot IS NOT NULL AND NOT EXISTS "
-		                                     "(SELECT snapshot_id FROM ducklake_snapshot WHERE snapshot_id >= "
-		                                     "begin_snapshot AND snapshot_id < end_snapshot)");
+		string file_query = "SELECT data_file_id, table_id, path, path_is_relative";
+		if (lookup) {
+			file_query += ", begin_snapshot, end_snapshot";
+		}
+		if (retirement_marker) {
+			file_query += ", EXISTS (SELECT 1 FROM ducklake_vortex_retired_sources_v1 marker "
+			              "WHERE marker.data_file_id = data.data_file_id)";
+		}
+		file_query += " FROM ducklake_data_file data WHERE end_snapshot IS NOT NULL";
+		if (!lookup) {
+			file_query += " AND NOT EXISTS (SELECT snapshot_id FROM ducklake_snapshot "
+			              "WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot)";
+		}
+		auto files = Query(connection, file_query);
 		ReadCost(json, report, "data_files", *files);
 		json.Number(report, "rss_with_file_result_bytes", CurrentRSS());
-		idx_t eligible = 0;
+		vector<idx_t> eligible;
 		for (auto &row : *files) {
-			if (string(argv[2]) == "baseline" ||
-			    DuckLakeFileCanExpire(snapshots, row.GetBaseValue(4), row.GetBaseValue(5), false)) {
-				eligible++;
+			if (!lookup || DuckLakeFileCanExpire(snapshots, row.GetBaseValue(4), row.GetBaseValue(5), false)) {
+				eligible.push_back(row.GetValue<idx_t>(0));
 			}
 		}
-		json.Number(report, "eligible_files", eligible);
+		std::sort(eligible.begin(), eligible.end());
+		auto ids = json.Array();
+		for (auto id : eligible) {
+			yyjson_mut_arr_append(ids, yyjson_mut_uint(json.doc.get(), id));
+		}
+		json.Number(report, "eligible_files", eligible.size());
+		json.Add(report, "eligible_file_ids", ids);
 		json.Number(report, "peak_rss_after_bytes", PeakRSS());
 		json.Number(report, "rss_after_bytes", CurrentRSS());
 		Query(connection, "ROLLBACK");

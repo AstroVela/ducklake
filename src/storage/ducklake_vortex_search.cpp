@@ -1,9 +1,13 @@
 #include "storage/ducklake_vortex_search.hpp"
 #include "storage/ducklake_vortex_query_ffi.hpp"
 #include "storage/ducklake_vortex_control.hpp"
+#include "duckdb/common/opener_file_system.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "common/ducklake_vortex_gc_io.hpp"
 #include "common/ducklake_vortex_json.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_vortex_index_catalog.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <cmath>
@@ -17,16 +21,34 @@ vector<Value> DuckLakeVortexSearch::CollectScratch(ClientContext &context, const
 	if (!context.transaction.IsAutoCommit()) {
 		throw InvalidInputException("Vortex query scratch collection requires autocommit");
 	}
-	if (root.empty() || max_objects < 1 || max_objects > 16 || max_bytes < 1 || max_bytes > 64 * 1024 * 1024) {
+	if (root.size() < 2 || root.size() > 65536 || root[0] != '/' || root.back() == '/' || root.find('\0') != string::npos || max_objects < 1 ||
+	    max_objects > 16 || max_bytes < 1 || max_bytes > 64 * 1024 * 1024) {
 		throw InvalidInputException("Invalid Vortex query scratch collection budgets or root");
 	}
-	auto &catalog = Catalog::GetCatalog(context, catalog_name).Cast<DuckLakeCatalog>();
-	if (!catalog.MetadataType().empty() && catalog.MetadataType() != "duckdb") {
-		throw InvalidInputException("Native query scratch ownership requires DuckDB metadata");
+	for (const auto &component : StringUtil::Split(root.substr(1), '/')) {
+		if (component.empty() || component == "." || component == "..") {
+			throw InvalidInputException("Vortex query scratch collection requires the canonical diagnostic root");
+		}
 	}
-	auto data_path = catalog.DataPath();
+	constexpr const char *operation = "Vortex query scratch collection";
+	auto identity = DuckLakeVortexIndex::ResolveCatalog(context, catalog_name, false, operation);
+	auto &resolved = Catalog::GetCatalog(context, catalog_name);
+	if (resolved.GetAttached().oid != identity.lake_oid) {
+		throw TransactionException("Vortex query scratch collection catalog attachment changed");
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto data_path = fs.ExpandPath(resolved.Cast<DuckLakeCatalog>().DataPath());
+	const auto lock_path = root + ".lock";
+	std::function<void(const string &)> check = [&](const string &stage) {
+		if (observe) {
+			observe(stage);
+		}
+		DuckLakeVortexIndex::ResolveCatalog(context, catalog_name, false, operation, &identity);
+		vortex_detail::CheckDirectoryAccess(context, root);
+		fs.Cast<OpenerFileSystem>().VerifyCanAccessFile(lock_path);
+	};
 	vector<DuckLakeVortexSourceBuffer> sources;
-	DuckLakeVortexControl control {context, observe, nullptr, sources};
+	DuckLakeVortexControl control {context, check, nullptr, sources};
 	DuckLakeVortexScratchInput input {reinterpret_cast<const uint8_t *>(data_path.data()),
 	                                  data_path.size(),
 	                                  reinterpret_cast<const uint8_t *>(root.data()),

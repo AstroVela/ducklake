@@ -6,7 +6,7 @@ native_test_selection = "test/sql/vortex/*"
 
 [vane]
 repository = "AstroVela/vane"
-revision = "e14bf92d4053141697a59dcbd6098677cbddb80a"
+revision = "14b4fc6a45f9c0a593202f1eb32f1062d365703e"
 
 [vcpkg]
 repository = "microsoft/vcpkg"
