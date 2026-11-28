@@ -13,7 +13,7 @@
 | 动态输入 | 显式 flush 后的实际 native ReadView；绑定 UUID、schema、字段 ID、snapshot、文件版本及物理 RowRef |
 | SPFresh | 固定 `5893eb61ee3b18610b6b00f1939be7dae1af8904`，实际 RocksDB 8.9.1；UseKV=true／UseSPDK=false |
 | Vortex 构建输入 | 与当前 workflow 的源码固定点一致，使用 `42beeb3a72769869a3d3d16887a011ee7f922362` 的 `static-only.patch`，包含 BKTree 首轮聚类中心初始化修正 |
-| 查询／构建 | 64 个 head、64 search heads、12 pages、4 replicas、MaxCheck=4096；native build/search 各使用原来的单线程设置，DuckDB threads=2 |
+| 查询／构建 | 64 个 head、64 search heads、每个 posting 最多 12 页、4 replicas、MaxCheck=4096。head 选取、head 构建和 SSD 构建／搜索各配置 1 个线程，固定 SDK 在 seed 写入 posting 时创建 20 个写线程。DuckDB threads=2 |
 | 资源 | CPU 6–11；13 项线程环境全部继承且保持；原生输入 100,000 物理行、source/vector/artifact 各 64 MiB、manifest 1 MiB；mutation 1,000 操作／4 MiB；GC 每次最多 16 逻辑对象／64 MiB |
 | 新存储依赖 | 只链接独立测试探针；RocksDB 后台任务／subcompaction 各 1，block cache 64 MiB；不改生产 provider 或现有线程环境 |
 
@@ -25,7 +25,7 @@
 2. 新向量在 T 中立即参加既有命名 B＋T 查询。未 flush 的数据不能成为这个文件型动态实验的输入。
 3. 显式 flush 后调用 native ReadView，固定这次调用实际捕获的 snapshot、文件清单、可见物理 RowRef 和业务列。
 4. 从已验证且关闭的 checkpoint 复制一个新的私有候选；按物理 RowRef 差集调用原生 Delete/Add，不按业务 ID 推测 native VID。新增 VID 单调追加，删除版本保留映射。
-5. 同步 RocksDB WAL，保存 posting-size record、head、version labels，关闭原生句柄。逐文件 fsync、清单封存和目录 fsync 后，才允许 expected-revision 发布。
+5. 同步 RocksDB WAL，保存 posting-size record、head 和 version labels，再关闭原生句柄。只读重开后核对 native live-row 数与捕获行数，随后逐文件 fsync、封存清单并 fsync 目录。通过这些检查后，才允许按 expected revision 发布。
 
 这里的 `head.json` 是[实验 fixture](../test/vane/vortex_spfresh_update_fixture.py) 的单一本地发布指针，采用锁、原子 rename 和目录 fsync。它**尚未在 DuckLake 元数据事务中注册或原子发布动态索引**。业务事务与索引水位分开推进；实验查询要求确切水位匹配，失配直接拒绝。生产命名查询继续通过原有 B/F/T 路径执行。
 
@@ -37,13 +37,13 @@ ReadView 在发布／回收锁保护下校验并完整复制封存 checkpoint，
 
 原生增删成功本身不是发布或业务 ACK。候选在 mutation 后、checkpoint 后被 SIGKILL，都没有可接受的 seal；完成 seal 但尚未发布的候选也不会被恢复过程自动采用。发布前崩溃保留原 head；发布后响应丢失则核对持久的原 revision／generation，不自动重建或改写旧请求。
 
-另一个场景在 DuckLake mutation 已提交、数据仍在 T、ANN 尚未推进时，实际 SIGKILL 业务进程。重开后业务数据和回执从原生 WAL 恢复，既有 B/F/T 查询立即返回新版本；动态实验仍明确报告水位落后。只有显式 flush、Add/Delete、checkpoint 和发布完成，动态查询才推进到新 snapshot。
+另一个场景在 DuckLake mutation 已提交、数据仍在 T、ANN 尚未推进时，实际 SIGKILL 业务进程。重开后核对完整重放回执与崩溃前回执相等，并检查重放前后的 DuckLake snapshot 均为原提交 snapshot。既有 B/F/T 查询立即返回新版本，动态实验仍报告水位落后。完成显式 flush、Add/Delete、checkpoint 和发布后，动态查询才推进到新 snapshot。
 
 本轮 GC 只验证实验中**已封存且不再被 head 引用**的 canonical checkpoint，按原对象／字节上限计费。未封存候选保留作证据，没有自动扫描接管或删除。生产 managed generation/source/scratch 的 GC 协议未改变；动态候选登记、取消与部分回收的完整生产协议仍待后续实现。
 
 ## 独立验收与 SDK 修正
 
-[协调器](../test/vane/test_vane_vortex_spfresh_updates.py) 获取真实 native ReadView；[独立验收基准](../test/vane/vortex_spfresh_update_oracle.py) 另外查询该确切 snapshot 的历史 SQL、物理行地址和实际 Vortex 文件，按 Float32 IEEE 位比较向量和 typed 值，并穷举平方 L2 检查 native 命中、距离、排序和 recall。native Float32 距离使用相对／绝对 1e-5 容差；现有生产 SQL 的双精度重排与全局平局规则保持。穷举仅用于验收，不参与查询返回，也没有增加 exact-scan fallback。
+协调器获取真实 native ReadView。独立 oracle 核对同一 snapshot 的历史 SQL、物理行地址和实际 Vortex 文件，按 Float32 IEEE 位比较向量和 typed 值。计算参考平方 L2 前，查询向量先舍入为 Float32。recall 只按 top-k 剩余位置计入截断距离处的并列命中。native Float32 距离继续使用相对／绝对 1e-5 容差，recall 门槛为 0.8。[协调器](../test/vane/test_vane_vortex_spfresh_updates.py) [独立 oracle](../test/vane/vortex_spfresh_update_oracle.py)
 
 独立探针所需的 [SDK patch](../test/vane/spfresh_update/native-update.patch) 在固定 Vortex `static-only.patch` 之后应用，仅进入测试构建：
 
@@ -51,12 +51,16 @@ ReadView 在发布／回收锁保护下校验并完整复制封存 checkpoint，
 - 修复已复现的 CPU feature 全局初始化期间访问尚未构造的 logger 的崩溃。
 - 动态查询使用合法的本地 SearchStats，检查 RocksDB 读取错误；沿用既有静态查询的显式 head/page/check 路由预算，修复 head 命中被置为无效后错误跳过 posting 的空结果。
 - 增加明确的只读打开和 checkpoint 操作，保存 posting-size record 并同步 WAL；支持 RocksDB merge 的空 existing value。
+- 同步 append 在 posting 锁内、写入前检查配置的页数上限。超限会终止私有候选，保持原发布指针。RocksDB posting 读取失败时保留状态诊断并拒绝查询。
+- version labels 保存失败会中断 checkpoint。非空 SPANN checkpoint 按已扣除删除数的 live-row 数判定。head 和 seal 各在 1 MiB 上限内读取，seal 的摘要和内容使用同一次读取。
 
 空结果控制使用同一份冻结 checkpoint：旧探针返回空，修正后 1／3／10 个命中均可取得。旧探针及日志保留在 `/tmp/ducklake-r7-probe-before-head-fix-20261107` 和 `/tmp/ducklake-r7-native-rank-{pilot,fixed}-20261107.log`；初始化崩溃的旧二进制也独立保留。该对照不是性能 A/B。
 
 ## 当前开发基线复验
 
-在 `c0fa417` 上以 Vortex `42beeb3a` 的静态补丁和固定 SPFresh 源码重新构建探针。复验在 CPU 6–11 上通过 **156 次 ANN 查询比较、23 项预期拒绝和 6 个真实 SIGKILL 边界**，最低 recall **1.0**。两个已退休 checkpoint 分别回收 **1 对象／131,589 字节**和 **1 对象／144,006 字节**。私有旧 ReadView 在回收后仍可查询。
+在 `c0fa417` 上以 Vortex `42beeb3a` 的静态补丁和固定 SPFresh 源码重新构建探针。复验在 CPU 6–11 上通过 **156 次 ANN 查询比较、30 项预期拒绝和 6 个真实 SIGKILL 边界**，最低 recall **1.0**。两个已退休 checkpoint 均各回收 1 个对象，私有旧 ReadView 在回收后仍可查询。
+
+确定性回归覆盖 labels 保存失败、恢复旧 labels 后只读重开行数不符、同步 posting 超限、RocksDB 缺失 posting 和超大 head／seal。对同一份 256 行 seed 删除 127、128、129 行，分别重开得到 129、128、127 个 live rows，删除全部行时拒绝 checkpoint。独立 oracle 拒绝用并列命中代替更近的行，并接受同距替换和 Float32 舍入后的正确距离。
 
 普通读事务和业务 WAL 恢复用有序业务 SQL 核对行。实际 ReadView 另外通过其 snapshot、物理 RowRef、Vortex 文件和独立 ANN oracle 核对。
 

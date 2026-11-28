@@ -1,5 +1,17 @@
+diff --git a/AnnService/inc/Core/DefinitionList.h b/AnnService/inc/Core/DefinitionList.h
+index 812cc3c..f1f0457 100644
+--- a/AnnService/inc/Core/DefinitionList.h
++++ b/AnnService/inc/Core/DefinitionList.h
+@@ -66,6 +66,7 @@ DefineErrorCode(DimensionSizeMismatch, 0x0017)
+ DefineErrorCode(ExternalAbort, 0x0018)
+ DefineErrorCode(EmptyDiskIO, 0x0019)
+ DefineErrorCode(DiskIOFail, 0x0020)
++DefineErrorCode(PostingCapacityExceeded, 0x0021)
+ 
+ // 0x1000 ~ 0x1FFF  Index Build Status
+ 
 diff --git a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
-index ca0eb26..f88c3f6 100644
+index ca0eb26..1d53da8 100644
 --- a/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
 +++ b/AnnService/inc/Core/SPANN/ExtraDynamicSearcher.h
 @@ -13,7 +13,9 @@
@@ -24,7 +36,39 @@ index ca0eb26..f88c3f6 100644
                  m_postingSizeLimit = postingBlockLimit * PageSize / (sizeof(ValueType) * dim + sizeof(int) + sizeof(uint8_t));
              } else {
  #ifdef ROCKSDB
-@@ -1116,6 +1122,8 @@ namespace SPTAG::SPANN {
+@@ -985,6 +991,7 @@ namespace SPTAG::SPANN {
+ 
+         checkDeleted:
+             if (!p_index->ContainSample(headID)) {
++                if (!m_opt->m_update) return ErrorCode::VectorNotFound;
+                 for (int i = 0; i < appendNum; i++)
+                 {
+                     uint32_t idx = i * m_vectorInfoSize;
+@@ -1007,8 +1014,13 @@ namespace SPTAG::SPANN {
+                 if (!p_index->ContainSample(headID)) {
+                     goto checkDeleted;
+                 }
++                if (!m_opt->m_update && m_postingSizes.GetSize(headID) > m_postingSizeLimit - appendNum) {
++                    return ErrorCode::PostingCapacityExceeded;
++                }
+                 auto appendIOBegin = std::chrono::high_resolution_clock::now();
+-                if (db->Merge(headID, appendPosting) != ErrorCode::Success) {
++                const auto status = db->Merge(headID, appendPosting);
++                if (status != ErrorCode::Success) {
++                    if (!m_opt->m_update) return status;
+                     LOG(Helper::LogLevel::LL_Error, "Merge failed! Posting Size:%d, limit: %d\n", m_postingSizes.GetSize(headID), m_postingSizeLimit);
+                     GetDBStats();
+                     exit(1);
+@@ -1017,7 +1029,7 @@ namespace SPTAG::SPANN {
+                 appendIOSeconds = std::chrono::duration_cast<std::chrono::microseconds>(appendIOEnd - appendIOBegin).count();
+                 m_postingSizes.IncSize(headID, appendNum);
+             }
+-            if (m_postingSizes.GetSize(headID) > (m_postingSizeLimit + reassignThreshold)) {
++            if (m_opt->m_update && m_postingSizes.GetSize(headID) > (m_postingSizeLimit + reassignThreshold)) {
+                 // SizeType VID = *(int*)(&appendPosting[0]);
+                 // LOG(Helper::LogLevel::LL_Error, "Split Triggered by inserting VID: %d, reAssign: %d\n", VID, reassignThreshold);
+                 // GetDBStats();
+@@ -1116,6 +1128,8 @@ namespace SPTAG::SPANN {
              std::shared_ptr<VectorIndex> p_index,
              SearchStats* p_stats, std::set<int>* truth, std::map<int, std::set<int>>* found) override
          {
@@ -33,7 +77,7 @@ index ca0eb26..f88c3f6 100644
              auto exStart = std::chrono::high_resolution_clock::now();
  
              // const auto postingListCount = static_cast<uint32_t>(p_exWorkSpace->m_postingIDs.size());
-@@ -1140,7 +1148,9 @@ namespace SPTAG::SPANN {
+@@ -1140,7 +1154,9 @@ namespace SPTAG::SPANN {
              std::chrono::microseconds remainLimit = m_hardLatencyLimit - std::chrono::microseconds((int)p_stats->m_totalLatency);
  
              auto readStart = std::chrono::high_resolution_clock::now();
@@ -44,7 +88,17 @@ index ca0eb26..f88c3f6 100644
              auto readEnd = std::chrono::high_resolution_clock::now();
  
              for (uint32_t pi = 0; pi < postingLists.size(); ++pi) {
-@@ -1549,6 +1559,11 @@ namespace SPTAG::SPANN {
+@@ -1507,7 +1523,8 @@ namespace SPTAG::SPANN {
+                 for (int i = 0; i < replicaCount; i++)
+                 {
+                     // AppendAsync(selections[i].node, 1, appendPosting_ptr);
+-                    Append(p_index.get(), selections[i].node, 1, appendPosting);
++                    const auto status = Append(p_index.get(), selections[i].node, 1, appendPosting);
++                    if (!m_opt->m_update && status != ErrorCode::Success) return status;
+                 }
+             }
+             return ErrorCode::Success;
+@@ -1549,6 +1566,11 @@ namespace SPTAG::SPANN {
          }
  
          bool AllFinished() { return m_splitThreadPool->allClear() && m_reassignThreadPool->allClear(); }
@@ -57,7 +111,7 @@ index ca0eb26..f88c3f6 100644
          void GetDBStats() override { 
              db->GetStat();
 diff --git a/AnnService/inc/Core/SPANN/ExtraRocksDBController.h b/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
-index 5ebe241..3bec5fb 100644
+index 5ebe241..b1205ed 100644
 --- a/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
 +++ b/AnnService/inc/Core/SPANN/ExtraRocksDBController.h
 @@ -8,6 +8,7 @@
@@ -152,6 +206,22 @@ index 5ebe241..3bec5fb 100644
          void ShutDown() override {
              db->Close();
              //DestroyDB(dbPath, dbOptions);
+@@ -186,12 +198,12 @@ namespace SPTAG::SPANN
+             db->MultiGet(rocksdb::ReadOptions(), db->DefaultColumnFamily(),
+                 num_keys, slice_keys, slice_values, statuses);
+ 
+-            for (int i = 0; i < num_keys; i++) {
+-                if (statuses[i] != rocksdb::Status::OK()) {
++            for (size_t i = 0; i < num_keys; i++) {
++                if (!statuses[i].ok()) {
++                    LOG(Helper::LogLevel::LL_Error, "Error in MultiGet at posting %zu: %s\n", i, statuses[i].ToString().c_str());
+                     delete[] slice_keys;
+                     delete[] slice_values;
+                     delete[] statuses;
+-                    LOG(Helper::LogLevel::LL_Error, "\e[0;31mError in MultiGet\e[0m: %s, key: %d\n", statuses[i].getState(), *((SizeType*)(keys[i].data())));
+                     return ErrorCode::Fail;
+                 }
+                 values->push_back(slice_values[i].ToString());
 diff --git a/AnnService/inc/Core/SPANN/IExtraSearcher.h b/AnnService/inc/Core/SPANN/IExtraSearcher.h
 index 03f36db..4b46189 100644
 --- a/AnnService/inc/Core/SPANN/IExtraSearcher.h
@@ -212,10 +282,38 @@ index ee338eb..e087d56 100644
      }
  }
 diff --git a/AnnService/src/Core/SPANN/SPANNIndex.cpp b/AnnService/src/Core/SPANN/SPANNIndex.cpp
-index cb22593..5496784 100644
+index cb22593..4c9d074 100644
 --- a/AnnService/src/Core/SPANN/SPANNIndex.cpp
 +++ b/AnnService/src/Core/SPANN/SPANNIndex.cpp
-@@ -369,11 +369,9 @@ namespace SPTAG
+@@ -106,7 +106,7 @@ namespace SPTAG
+             {
+ #ifndef SPTAG_STATIC_ONLY
+                 if (m_options.m_useKV) {
+-                    if (m_options.m_inPlace) {
++                    if (m_options.m_inPlace && m_options.m_update) {
+                         m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                     }
+                     else {
+@@ -150,7 +150,7 @@ namespace SPTAG
+             {
+ #ifndef SPTAG_STATIC_ONLY
+                 if (m_options.m_useKV) {
+-                    if (m_options.m_inPlace) {
++                    if (m_options.m_inPlace && m_options.m_update) {
+                         m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                     }
+                     else {
+@@ -320,8 +320,7 @@ namespace SPTAG
+             if ((ret = m_index->SaveIndexData(p_indexStreams)) != ErrorCode::Success) return ret;
+ 
+             if (m_options.m_excludehead) IOBINARY(p_indexStreams[m_index->GetIndexFiles()->size()], WriteBinary, sizeof(std::uint64_t) * m_index->GetNumSamples(), (char*)(m_vectorTranslateMap.get()));
+-            m_versionMap.Save(m_options.m_deleteIDFile);
+-            return ErrorCode::Success;
++            return m_versionMap.Save(m_options.m_deleteIDFile);
+         }
+ 
+ #pragma region K-NN search
+@@ -369,11 +368,9 @@ namespace SPTAG
                  m_workspace->m_postingIDs.clear();
  
                  float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
@@ -229,3 +327,28 @@ index cb22593..5496784 100644
                  for (int i = 0; i < p_queryResults->GetResultNum(); ++i)
                  {
                      auto res = p_queryResults->GetResult(i);
+@@ -898,7 +895,7 @@ namespace SPTAG
+ #ifndef SPTAG_STATIC_ONLY
+                 if (m_options.m_useKV)
+                 {
+-                    if (m_options.m_inPlace) {
++                    if (m_options.m_inPlace && m_options.m_update) {
+                         m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                     }
+                     else {
+diff --git a/AnnService/src/Core/VectorIndex.cpp b/AnnService/src/Core/VectorIndex.cpp
+index 5043738..1b115e0 100644
+--- a/AnnService/src/Core/VectorIndex.cpp
++++ b/AnnService/src/Core/VectorIndex.cpp
+@@ -284,7 +284,10 @@ VectorIndex::SaveIndex(std::string& p_config, const std::vector<ByteArray>& p_in
+ ErrorCode
+ VectorIndex::SaveIndex(const std::string& p_folderPath)
+ {
+-    if (!m_bReady || GetNumSamples() - GetNumDeleted() == 0) return ErrorCode::EmptyIndex;
++    if (!m_bReady) return ErrorCode::EmptyIndex;
++    // SPANN reports live rows already.
++    const auto liveRows = GetIndexAlgoType() == IndexAlgoType::SPANN ? GetNumSamples() : GetNumSamples() - GetNumDeleted();
++    if (liveRows == 0) return ErrorCode::EmptyIndex;
+ 
+     std::string folderPath(p_folderPath);
+     if (!folderPath.empty() && *(folderPath.rbegin()) != FolderSep)

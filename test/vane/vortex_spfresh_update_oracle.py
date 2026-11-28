@@ -66,14 +66,12 @@ def capture(connection, captured):
 def qualify(hits, expected, vector, k, minimum=0.8):
     rows = {key(r["row_ref"]): r for r in expected}
     require(len(rows) == len(expected), "Reference row addresses are not unique")
-    ranked = sorted(
-        (
-            (sum((float(v) - float(q)) ** 2 for v, q in zip(r["row"]["embedding"], vector)), key(r["row_ref"]))
-            for r in expected
-        ),
-        key=lambda item: (item[0], item[1]),
-    )
-    target = min(k, len(ranked))
+    query = [struct.unpack("!f", struct.pack("!f", v))[0] for v in vector]
+    scores = {
+        address: sum((float(v) - q) ** 2 for v, q in zip(row["row"]["embedding"], query))
+        for address, row in rows.items()
+    }
+    target = min(k, len(scores))
     require(len(hits) == target, "Native result is incomplete")
     seen, distances = set(), []
     for hit in hits:
@@ -81,17 +79,18 @@ def qualify(hits, expected, vector, k, minimum=0.8):
         require(address in rows and address not in seen, "Invisible or duplicate native hit")
         seen.add(address)
         require(bits(hit["row"]) == bits(rows[address]["row"]), "Native hit payload came from another version")
-        exact = sum((float(v) - float(q)) ** 2 for v, q in zip(rows[address]["row"]["embedding"], vector))
         require(
-            math.isfinite(hit["distance"]) and math.isclose(hit["distance"], exact, rel_tol=1e-5, abs_tol=1e-5),
+            math.isfinite(hit["distance"])
+            and math.isclose(hit["distance"], scores[address], rel_tol=1e-5, abs_tol=1e-5),
             "Native distance differs",
         )
         distances.append(hit["distance"])
     require(distances == sorted(distances), "Native rank is not ascending")
-    cutoff = ranked[target - 1][0] if target else -1
-    # Equal-distance neighbors at the cutoff are interchangeable in this native
-    # component test. The production global RowRef tie order is unchanged.
-    eligible = {address for distance, address in ranked if distance <= cutoff}
-    recall = len(seen & eligible) / target if target else 1.0
+    if target == 0:
+        return 1.0
+    cutoff = sorted(scores.values())[target - 1]
+    closer = {address for address, distance in scores.items() if distance < cutoff}
+    tied_hits = sum(scores[address] == cutoff for address in seen)
+    recall = (len(seen & closer) + min(tied_hits, target - len(closer))) / target
     require(recall >= minimum, "Native recall is below the existing 0.8 gate")
     return recall

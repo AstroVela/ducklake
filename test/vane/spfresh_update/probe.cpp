@@ -15,6 +15,7 @@
 using SPTAG::ErrorCode;
 namespace fs = std::filesystem;
 constexpr int DIM = 8;
+constexpr int HEADS = 64;
 constexpr int ROWS = 100000;
 
 static void require(bool yes, const char *message) {
@@ -78,7 +79,7 @@ static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, co
 	paths(*index, root);
 	set(*index, "SelectHead", "isExecute", "true");
 	set(*index, "SelectHead", "SelectHeadType", "Random");
-	set(*index, "SelectHead", "Count", "64");
+	set(*index, "SelectHead", "Count", std::to_string(HEADS));
 	set(*index, "SelectHead", "NumberOfThreads", "1");
 	set(*index, "BuildHead", "isExecute", "true");
 	set(*index, "BuildHead", "DistCalcMethod", "L2");
@@ -111,15 +112,25 @@ static std::shared_ptr<SPTAG::SPANN::Index<float>> seed(const fs::path &root, co
 
 int main(int argc, char **argv) {
 	try {
-		require(argc == 3 || argc == 4, "Usage: probe seed ROOT VECTORS | probe open|update ROOT");
+		require(argc == 3 || argc == 4, "Usage: probe seed ROOT VECTORS | probe open|update|remove-postings ROOT");
 		fs::path root(argv[2]);
 		require(root.is_absolute(), "Absolute root required");
+		const std::string mode(argv[1]);
+		if (mode == "remove-postings" && argc == 3) {
+			// The regression calls this on a disposable copy of a closed seed.
+			require(fs::is_directory(root / "kv"), "Posting database missing");
+			SPTAG::SPANN::RocksDBIO db((root / "kv").c_str(), false);
+			for (SPTAG::SizeType head = 0; head < HEADS; ++head)
+				check(db.Delete(head), "RemovePosting");
+			check(db.Checkpoint(), "CheckpointPostings");
+			return 0;
+		}
 		std::shared_ptr<SPTAG::SPANN::Index<float>> index;
-		if (std::string(argv[1]) == "seed" && argc == 4)
+		if (mode == "seed" && argc == 4)
 			index = seed(root, argv[3]);
 		else {
-			require((std::string(argv[1]) == "open" || std::string(argv[1]) == "update") && argc == 3, "Unknown mode");
-			SPTAG::SPANN::RocksDBIO::ReadOnly = std::string(argv[1]) == "open";
+			require((mode == "open" || mode == "update") && argc == 3, "Unknown mode");
+			SPTAG::SPANN::RocksDBIO::ReadOnly = mode == "open";
 			index = open(root);
 		}
 		std::cout << "R7 {\"ready\":true,\"live\":" << index->GetNumSamples() << "}" << std::endl;
@@ -141,7 +152,12 @@ int main(int argc, char **argv) {
 				for (auto &v : vectors)
 					require(bool(in >> v) && std::isfinite(v), "Invalid vector");
 				std::vector<SPTAG::SizeType> ids(count);
-				check(index->AddIndexSPFresh(vectors.data(), count, DIM, ids.data()), "AddIndexSPFresh");
+				const auto status = index->AddIndexSPFresh(vectors.data(), count, DIM, ids.data());
+				if (status == ErrorCode::PostingCapacityExceeded) {
+					std::cout << "R7 {\"error\":\"POSTING_CAPACITY\"}" << std::endl;
+					return 1;
+				}
+				check(status, "AddIndexSPFresh");
 				out << "{\"ids\":[";
 				for (int i = 0; i < count; i++)
 					out << (i ? "," : "") << ids[i];
