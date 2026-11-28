@@ -5,7 +5,7 @@ for one registered key, checksum and condition (or one exact DELETE version).
 No operation retries, schema migration, local storage or alternate backend.
 """
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 import base64
 import hashlib
@@ -236,30 +236,40 @@ class Backend:
                 )
 
     @contextmanager
-    def transaction(self, token=None):
-        c, committing = self.connect(), False
+    def _transaction(self, c, *, rollback=False):
+        committing = False
         try:
             c.execute("BEGIN ISOLATION LEVEL READ COMMITTED")
             c.execute("SET LOCAL synchronous_commit=on")
-            state = c.execute("SELECT * FROM control WHERE singleton FOR UPDATE").fetchone()
-            require(state and state["layout"] == 1, "UNSUPPORTED_LAYOUT")
-            require(
-                state["bucket"] == self.objects.bucket
-                and state["prefix"] == self.objects.prefix
-                and state["endpoint"] == self.objects.client.meta.endpoint_url,
-                "STORE_BINDING_MISMATCH",
-            )
-            if token is not None:
-                require(state["owner"] == token, "FENCED")
-            yield c, state
-            committing = True
-            c.execute("COMMIT")
+            yield
+            if rollback:
+                c.execute("ROLLBACK")
+            else:
+                committing = True
+                c.execute("COMMIT")
         except psycopg.OperationalError as error:
             if committing and error.sqlstate is None:
                 raise CommitUnknown("Reconcile the original request; do not delete prepared objects") from None
             raise
-        finally:
-            c.close()
+
+    def _control(self, c, token=None, *, lock=True):
+        query = "SELECT * FROM control WHERE singleton"
+        state = c.execute(query + " FOR UPDATE" if lock else query).fetchone()
+        require(state and state["layout"] == 1, "UNSUPPORTED_LAYOUT")
+        require(
+            state["bucket"] == self.objects.bucket
+            and state["prefix"] == self.objects.prefix
+            and state["endpoint"] == self.objects.client.meta.endpoint_url,
+            "STORE_BINDING_MISMATCH",
+        )
+        if token is not None:
+            require(state["owner"] == token, "FENCED")
+        return state
+
+    @contextmanager
+    def transaction(self, token=None):
+        with closing(self.connect()) as c, self._transaction(c):
+            yield c, self._control(c, token)
 
     def state(self):
         with self.connect() as c:

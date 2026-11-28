@@ -2,6 +2,8 @@
 
 本轮以 #93 合入后的开发提交 `7716a403` 为基线，通过 BoundCatalog 将 typed 元数据接入 PostgreSQL／S3 broker。[BoundCatalog 实现](../scripts/vortex_bound_catalog.py) · [类型化元数据](native-vortex-postgres-typed-lifecycle.md) · [发布 broker](native-vortex-postgres-s3-backend.md) · [总设计与 roadmap](ducklake-vortex-design-roadmap.md)
 
+[Reader session 所有权与持久 pin 回收](native-vortex-reader-sessions.md)将显式 session 纳入 typed reader 调用。两层继续使用 `layout=1` 的新建 schema。本文的验收记录对应 #94。
+
 **本轮验证组件身份与可见性契约。** Source／index 使用不透明 bytes fixture，未生成或查询原生 Vortex／SPFresh 文件，不能据此宣称远程 ANN、过滤或 top-k 已接通。原生 C++／Rust、SQL、provider 和远程配置限制保持不变。
 
 本地固定 CPU **6–11**，继承现有线程环境，原生 `threads=2` 不变；事务保护与预算保持。R4 A/A、性能 A/B、长期稳态及依赖稳定负载的 R5 资格继续暂缓，耗时仅作观察。

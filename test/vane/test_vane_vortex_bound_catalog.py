@@ -12,6 +12,7 @@ import subprocess
 import sys
 from threading import Event
 import time
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 import uuid
 
@@ -30,8 +31,10 @@ def load(name, path):
 
 B = load("vortex_remote_backend", HERE.parents[1] / "scripts/vortex_remote_backend.py")
 M = load("vortex_postgres_metadata", HERE.parents[1] / "scripts/vortex_postgres_metadata.py")
+R = load("vortex_reader_sessions", HERE.parents[1] / "scripts/vortex_reader_sessions.py")
 X = load("vortex_bound_catalog", HERE.parents[1] / "scripts/vortex_bound_catalog.py")
 O = load("bound_oracle", HERE / "vortex_bound_catalog_oracle.py")
+RS = load("reader_sessions_oracle", HERE / "vortex_reader_sessions_oracle.py")
 T = load("bound_typed_oracle", HERE / "vortex_postgres_metadata_oracle.py")
 BASE = load("bound_storage_oracle", HERE / "vortex_remote_backend_oracle.py")
 S = load("bound_services", HERE / "vortex_remote_services.py")
@@ -85,6 +88,8 @@ class Checks:
         self.model, self.tables, self.reader_processes = T.Model(), {}, [bound]
         self.raw = None
         self.check()
+        self.session = self.call("open-reader-session", bound.open_session, str(uuid.uuid4()), str(uuid.uuid4()))
+        self.sessions = [self.session]
 
     def token(self):
         return self.b.state()["owner"]
@@ -216,7 +221,7 @@ class Checks:
         return self.call("publish-" + name + "-" + request, self.x.publish, *context, epoch, request, self.token())
 
     def capture(self, name, reader, kind="vector", source=None):
-        return self.call("capture-" + reader, self.x.capture, *self.context(name), reader, kind, source)
+        return self.call("capture-" + reader, self.x.capture, self.session, *self.context(name), reader, kind, source)
 
     def collect(self, table_uuid, unit, budget=None, start=True):
         budget = B.Budget() if budget is None else budget
@@ -297,21 +302,21 @@ def check_request_guards(h, name, source, receipt):
     h.capture(name, copy_view)
     h.capture(name, sql_view, "sql", source)
     for view in (copy_view, sql_view):
-        h.call("materialize-" + view, h.x.materialize, view)
+        h.call("materialize-" + view, h.x.materialize, h.session, view)
 
     # Keep the bound requests, active readers and their pins in the fresh schema.
     with h.b.connect() as c:
         state = c.execute("DELETE FROM typed_catalog WHERE singleton RETURNING *").fetchone()
         require(state["layout"] == 1, "Missing-layout fixture did not start in layout 1")
         try:
-            before = O.observe(h.b, h.s, BASE, T)
+            before = RS.observe(h.b, h.s, O, BASE, T)[:2]
             copies = deepcopy(h.copies())
             for operation, method, args in (
                 ("status", h.x.status, original),
                 ("reconcile", h.x.reconcile, (*original, receipt["payload_hash"])),
                 ("cancel", h.x.cancel, pending),
-                ("release-copy-pin", h.x.release_copy_pin, (copy_view,)),
-                ("close-view", h.x.close_view, (sql_view,)),
+                ("release-copy-pin", h.x.release_copy_pin, (h.session, copy_view)),
+                ("close-view", h.x.close_view, (h.session, sql_view)),
             ):
                 try:
                     method(*args)
@@ -319,7 +324,7 @@ def check_request_guards(h, name, source, receipt):
                     require(str(error) == "UNSUPPORTED_TYPED_LAYOUT", f"Unexpected {operation} error: {error}")
                 else:
                     raise AssertionError(operation + " accepted a missing typed layout")
-                require(O.observe(h.b, h.s, BASE, T) == before, "Layout rejection changed the durable state")
+                require(RS.observe(h.b, h.s, O, BASE, T)[:2] == before, "Layout rejection changed the durable state")
                 require(h.copies() == copies, "Layout rejection changed a private copy")
                 h.report["checks"].append(
                     {"name": operation + "-missing-layout", "rejected": "UNSUPPORTED_TYPED_LAYOUT"}
@@ -330,9 +335,9 @@ def check_request_guards(h, name, source, receipt):
                 state,
             )
     h.check()
-    h.call("release-pin-with-valid-layout", h.x.release_copy_pin, copy_view)
+    h.call("release-pin-with-valid-layout", h.x.release_copy_pin, h.session, copy_view)
     for view in (copy_view, sql_view):
-        h.call("close-with-valid-layout-" + view, h.x.close_view, view)
+        h.call("close-with-valid-layout-" + view, h.x.close_view, h.session, view)
 
 
 def check_source_replay(h, neighbor_source):
@@ -418,11 +423,12 @@ def check_source_replay(h, neighbor_source):
         "sql-first-defers-source-GC", h.x.plan_gc, table_uuid, source, token, budget, rejected="ORDINARY_TRANSACTION"
     )
     require(not budget.admitted, "A deferred GC charged the budget")
-    h.call("end-sql-first", h.x.close_view, "sql-first")
+    h.call("end-sql-first", h.x.close_view, h.session, "sql-first")
     h.call("admit-source-GC-first", h.x.plan_gc, table_uuid, source, token, budget)
     h.call(
         "source-GC-first-defers-SQL",
         h.x.capture,
+        h.session,
         *h.context("neighbor"),
         "gc-first-sql",
         "sql",
@@ -438,7 +444,7 @@ def check_source_replay(h, neighbor_source):
         "GC changed the original receipt",
     )
     h.capture("neighbor", "sql-after-GC", "sql", neighbor_source)
-    h.call("close-sql-after-GC", h.x.close_view, "sql-after-GC")
+    h.call("close-sql-after-GC", h.x.close_view, h.session, "sql-after-GC")
 
 
 def check_abandoned_sources(h, neighbor_source):
@@ -507,11 +513,10 @@ def check_readview_materialization(h, source):
         name = "get-" + action
         identity = h.capture("neighbor", name, "sql", source)
         if action == "unpin":
-            h.call("complete-first-copy", h.x.materialize, name)
+            h.call("complete-first-copy", h.x.materialize, h.session, name)
         client = S.client(h.s.endpoint, "r6-admin", h.s.secret)
         objects = B.S3Objects(client, h.s.bucket, h.b.objects.prefix)
-        backend = B.Backend(h.s.dsn, h.b.schema, objects)
-        reader = X.BoundCatalog(backend, M.TypedMetadata(backend))
+        reader = X.BoundCatalog(h.b, h.m)
         h.reader_processes.append(reader)
         entered, release = Event(), Event()
         requested_versions = []
@@ -522,8 +527,8 @@ def check_readview_materialization(h, source):
             require(release.wait(10), "GET was not released")
 
         client.meta.events.register("before-send.s3.GetObject", pause_get)
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(reader.materialize, name)
+        with patch.object(h.b.objects, "read", objects.read), ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(reader.materialize, h.session, name)
             try:
                 require(entered.wait(10) and not pending.done(), "Exact-version GET did not reach its handshake")
                 with h.b.connect() as c:
@@ -531,9 +536,9 @@ def check_readview_materialization(h, source):
                 if action == "keep":
                     h.mutate("items", "write-during-reader-GET", [row(2, "other table updated")])
                 elif action == "close":
-                    h.call("close-during-GET", h.x.close_view, name)
+                    h.call("close-during-GET", h.x.close_view, h.session, name)
                 else:
-                    h.call("unpin-during-GET", h.x.release_copy_pin, name)
+                    h.call("unpin-during-GET", h.x.release_copy_pin, h.session, name)
             finally:
                 release.set()
             copy = h.call("materialize-with-" + action, pending.result, timeout=15, rejected=error)
@@ -543,9 +548,9 @@ def check_readview_materialization(h, source):
         else:
             require(name not in reader.copies, "Invalidated ReadView retained an in-flight copy")
         if action == "keep":
-            h.call("close-after-GET", reader.close_view, name)
+            h.call("close-after-GET", reader.close_view, h.session, name)
         elif action == "unpin":
-            h.call("close-after-unpin-GET", h.x.close_view, name)
+            h.call("close-after-unpin-GET", h.x.close_view, h.session, name)
         h.report["faults"].append({"operation": "bound-materialize-" + action, "exact_gets": len(requested_versions)})
 
 
@@ -567,7 +572,9 @@ def exercise(h, report):
         rejected="UNIT_BINDING_MISMATCH",
     )
     h.call("foreign-GC-rejected", h.x.plan_gc, bu, source_a, h.token(), B.Budget(), rejected="UNIT_BINDING_MISMATCH")
-    h.call("stale-schema-rejected", h.x.capture, "items", au, "00" * 32, "bad-schema", rejected="STALE_SCHEMA")
+    h.call(
+        "stale-schema-rejected", h.x.capture, h.session, "items", au, "00" * 32, "bad-schema", rejected="STALE_SCHEMA"
+    )
     with h.b.connect() as c:
         h.call(
             "foreign-table-id-FK-rejected",
@@ -668,7 +675,9 @@ def exercise(h, report):
         if mode == "before_forward":
             require((h.raw, h.typed) == before, "Unforwarded retirement changed state")
     h.call("retire-receipt-replay", h.m.retire, "items", au, h.token(), model=lambda: h.model.retire(au))
-    h.call("retired-capture-rejected", h.x.capture, *h.context("items"), "retired-view", rejected="STALE_TABLE")
+    h.call(
+        "retired-capture-rejected", h.x.capture, h.session, *h.context("items"), "retired-view", rejected="STALE_TABLE"
+    )
     h.call(
         "old-view-still-pinned",
         h.x.plan_gc,
@@ -678,16 +687,16 @@ def exercise(h, report):
         B.Budget(),
         rejected="REFERENCED",
     )
-    old_copy = deepcopy(h.call("materialize-old-view-after-retire", h.x.materialize, "old-view"))
-    new_copy = deepcopy(h.call("materialize-new-view-after-retire", h.x.materialize, "new-view"))
+    old_copy = deepcopy(h.call("materialize-old-view-after-retire", h.x.materialize, h.session, "old-view"))
+    new_copy = deepcopy(h.call("materialize-new-view-after-retire", h.x.materialize, h.session, "new-view"))
     require(
         len(old_copy["rows"]) == len(new_copy["rows"]) == 65
         and old_copy["rows"][0]["payload"] == "value"
         and new_copy["rows"][0]["payload"] == "changed",
         "Old/new payload snapshot was mixed",
     )
-    h.call("unpin-old-copy", h.x.release_copy_pin, "old-view")
-    h.call("unpin-new-copy", h.x.release_copy_pin, "new-view")
+    h.call("unpin-old-copy", h.x.release_copy_pin, h.session, "old-view")
+    h.call("unpin-new-copy", h.x.release_copy_pin, h.session, "new-view")
     h.collect(au, "generation:" + h.x.request_key(au, 1, "same"))
     h.collect(au, "generation:" + h.x.request_key(au, 2, "same"))
     h.call(
@@ -698,7 +707,7 @@ def exercise(h, report):
         h.token(),
         rejected="ORDINARY_TRANSACTION",
     )
-    h.call("end-unrelated-SQL-reader", h.x.close_view, "neighbor-sql")
+    h.call("end-unrelated-SQL-reader", h.x.close_view, h.session, "neighbor-sql")
     h.call("expire-retired-source", h.x.expire_native, au, source_a, h.token())
     # Delay an exact old-source DELETE across same-name recreation and publication.
     budget = B.Budget()
@@ -733,7 +742,7 @@ def exercise(h, report):
         "Canonical GC changed private view copies",
     )
     for label, fn, args in (
-        ("stale-UUID-capture", h.x.capture, ("items", au, a["schema_hash"], "bad-old")),
+        ("stale-UUID-capture", h.x.capture, (h.session, "items", au, a["schema_hash"], "bad-old")),
         ("stale-UUID-publication", h.x.publish, ("items", au, a["schema_hash"], 1, "same", h.token())),
         (
             "new-UUID-cannot-adopt-old-source",
@@ -791,6 +800,8 @@ def exercise(h, report):
         c.execute("DROP FUNCTION reject_bound_publish()")
     h.publish("neighbor", "rollback")
     h.ready("items", "restart", new_source)
+    neighbor_copy = deepcopy(h.call("neighbor-copy-before-server-crash", h.x.materialize, h.session, "neighbor-vector"))
+    old_session = h.session
     before = deepcopy((h.raw, h.typed))
     h.s.restart()
     h.check()
@@ -802,6 +813,8 @@ def exercise(h, report):
     h.b, h.m, h.x = writer, metadata, bound
     h.reader_processes.append(bound)
     h.call("owner-transfer-after-restart", writer.takeover, old_token)
+    h.session = h.call("new-reader-session-after-restart", bound.open_session, str(uuid.uuid4()), str(uuid.uuid4()))
+    h.sessions.append(h.session)
     h.call("old-owner-fenced", bound.adopt, *h.context("items"), 1, "restart", old_token, rejected="FENCED")
     h.call(
         "new-owner-must-adopt-before-publish",
@@ -843,13 +856,19 @@ def exercise(h, report):
         receipt = h.publish("items", request)
         require(h.publish("items", request) == receipt, "Publication retry changed its original receipt")
     h.capture("items", "current-view")
-    h.call("current-view-still-readable", h.x.materialize, "current-view")
-    h.call("neighbor-old-view-still-readable", h.x.materialize, "neighbor-vector")
-    h.call("close-old-independent-copy", h.reader_processes[0].close_view, "old-view")
-    h.call("close-new-independent-copy", h.reader_processes[0].close_view, "new-view")
+    h.call("current-view-still-readable", h.x.materialize, h.session, "current-view")
+    require(h.copies()["neighbor-vector"] == neighbor_copy, "Server restart changed previously returned private bytes")
+    cleanup, budget = R.ReaderReclaimer(writer, metadata), B.Budget(objects=16)
+    h.call("fence-disconnected-old-session", cleanup.begin, old_session.id, 1, h.token(), budget)
+    for reader in ("old-view", "new-view", "neighbor-vector"):
+        h.call("reclaim-old-session-" + reader, cleanup.view, old_session.id, 1, reader, h.token(), budget)
+    h.call("finish-old-session-reclaim", cleanup.finish, old_session.id, 1, h.token(), budget)
+    old_session.disconnect()
+    h.call("close-current-view", h.x.close_view, h.session, "current-view")
     check_source_replay(h, source_b)
     check_abandoned_sources(h, source_b)
     check_readview_materialization(h, source_b)
+    h.call("close-current-session", h.x.close_session, h.session)
 
 
 def main():
@@ -866,7 +885,7 @@ def main():
     cpus = {int(v) for v in args.cpus.split(",")}
     require(cpus and cpus <= original, "Requested CPU set unavailable")
     threads = {n: os.environ.get(n) for n in THREADS}
-    sources = [Path(__file__), *[Path(m.__file__) for m in (B, M, X, O, T, BASE, S, P, HTTP)]]
+    sources = [Path(__file__), *[Path(m.__file__) for m in (B, M, R, X, O, RS, T, BASE, S, P, HTTP)]]
     hashes = {str(p): B.sha(p.read_bytes()) for p in sources}
     report = {
         "status": "running",
