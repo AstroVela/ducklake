@@ -39,7 +39,7 @@ Endpoint、bucket 和 prefix 随 catalog 持久登记，并进入 manifest 身�
 
 ## 对象、读者与 GC
 
-Source 先登记并持 build 引用，再条件上传、完整读回校验、封存精确版本并转为 native 引用。Generation 上传／封存 index 后，manifest 绑定 store、UUID／epoch／request、原 expected revision、输入 snapshot 与 source／index 的精确版本。发布只使用完整封存的候选；取消解除 build 引用，不直接删除对象。
+Source 登记后持有自身的 build 引用。封存只接受仍处于 allocated 且持有这条引用的 source。条件上传的对象经完整读回校验后，同一事务记录精确版本，将 source 转为 ready，并将该 build 引用转为 native。历史过期或进入回收后，重放封存返回 `SOURCE_CLOSED`。Generation 上传／封存 index 后，manifest 绑定 store、UUID／epoch／request、原 expected revision、输入 snapshot 与 source／index 的精确版本。发布只使用完整封存的候选；取消解除 build 引用，不直接删除对象。
 
 S3 payload 与 manifest 通过实际版本 GET 读回，重新校验尺寸和 SHA；ETag 只用作条件令牌。普通请求必须为 HTTPS，本地 fixture 只允许 loopback HTTP。未启用 versioning、存在启用中的 lifecycle、SDK 自动重试或非 SigV4 配置均不能进入对应操作；没有功能降级。
 
@@ -95,7 +95,7 @@ uv pip install --python /tmp/r6-backend-env/bin/python \
 
 ## 当前组件验收
 
-当前开发基线上的本地验收通过 **482 项接口契约检查**，包括 **32 项预期拒绝**，另有 **9 项服务能力检查**和 **7 组故障／并发观测**。两个临时服务实际退出码均为 `-9`，PostgreSQL 再次完成 WAL redo。验收核对普通事务先登记时阻止源回收，以及源回收先准入时在 DELETE 在途、服务重启、owner 接管和完成之前拒绝普通事务。回收完成后重放旧的精确 DELETE 票据，七表状态与对象版本保持一致。
+当前开发基线上的本地验收通过 **485 项接口契约检查**，包括 **35 项预期拒绝**，另有 **9 项服务能力检查**和 **7 组故障／并发观测**。源历史过期后、源已准入 GC 且尚未写 STOP 时，重放封存均被拒绝，七表状态和对象版本保持一致。过期源仍拒绝普通 SQL 捕获。两个临时服务实际退出码均为 `-9`，PostgreSQL 再次完成 WAL redo。验收核对普通事务先登记时阻止源回收，以及源回收先准入时在 DELETE 在途、服务重启、owner 接管和完成之前拒绝普通事务。回收完成后重放旧的精确 DELETE 票据，七表状态与对象版本保持一致。
 
 同一版本的 #91 协议回归通过 **40 个固定场景、21 个负对照和 1,342 个有界状态**。本地测试使用 CPU 6–11，真实 AWS 部署和原生远程 SQL 依各自后续验收推进。[协议模型结果](native-vortex-remote-publication.md#有界验证结果)
 

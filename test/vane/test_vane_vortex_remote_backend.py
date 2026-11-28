@@ -119,6 +119,9 @@ class Checks:
         ticket = self.call("source-ticket-" + name, self.b.source_ticket, unit, data, token)
         self.call("put-source-" + name, B.dispatch, ticket, data)
         self.call("seal-source-" + name, self.b.seal_source, unit, token)
+        refs = [(r["kind"], r["holder"]) for r in self.image["refs"] if r["unit"] == unit]
+        state = next(u["state"] for u in self.image["units"] if u["id"] == unit)
+        require(state == "ready" and refs == [("native", unit)], "Source seal did not promote its build reference")
         return unit
 
     def prepare(self, name, source="source:b", expected=None):
@@ -304,6 +307,8 @@ def exercise(h, report, root):
     h.call("native-history-remains-independent", b.plan_gc, a, h.token(), B.Budget(), rejected="REFERENCED")
     h.call("end-ordinary-transaction", b.close_view, "ordinary")
     h.call("expire-native-source", b.expire_native, a, h.token())
+    h.call("reject-expired-source-reseal", b.seal_source, a, h.token(), rejected="SOURCE_CLOSED")
+    h.call("expired-source-remains-invisible", b.capture, "expired", "sql", a, rejected="EXPIRED_NATIVE_HISTORY")
     h.collect(a)
     require(b.copies["old"] == copied, "GC revoked the private byte copy")
     h.call("close-old-copy", b.close_view, "old")
@@ -495,6 +500,7 @@ def exercise(h, report, root):
     )
     h.call("close-ordinary-before-source-admission", b.close_view, "source-gate-before")
     h.call("admit-source-delete", b.plan_gc, source, h.token(), source_budget)
+    h.call("reject-deleting-source-reseal-before-STOP", b.seal_source, source, h.token(), rejected="SOURCE_CLOSED")
     h.call(
         "ordinary-after-source-admission",
         b.capture,

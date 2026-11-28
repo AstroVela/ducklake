@@ -324,16 +324,21 @@ class Backend:
 
     def seal_source(self, unit, token):
         with self.transaction(token) as (c, _):
-            obj = self.files(c, unit)[0]
+            obj = c.execute(
+                "SELECT o.* FROM units u JOIN objects o ON o.unit=u.id AND o.role='source' "
+                "JOIN refs r ON r.unit=u.id AND r.holder=u.id AND r.kind='build' "
+                "WHERE u.id=%s AND u.kind='source' AND u.state='allocated'",
+                (unit,),
+            ).fetchone()
+            require(obj is not None, "SOURCE_CLOSED")
             raw = self.objects.read(obj["key"])
             self.identity(obj, raw)
             c.execute(
                 "UPDATE objects SET sealed=true,version=%s,etag=%s WHERE key=%s",
                 (raw["version"], raw["etag"], obj["key"]),
             )
-            c.execute("UPDATE units SET state='ready' WHERE id=%s AND state='allocated'", (unit,))
-            c.execute("DELETE FROM refs WHERE kind='build' AND holder=%s", (unit,))
-            c.execute("INSERT INTO refs VALUES('native',%s,%s)", (unit, unit))
+            c.execute("UPDATE units SET state='ready' WHERE id=%s", (unit,))
+            c.execute("UPDATE refs SET kind='native' WHERE kind='build' AND holder=%s AND unit=%s", (unit, unit))
 
     def prepare(self, name, source, data, token, expected, table_uuid, epoch=1, rows=128, dimension=8, segments=1):
         require(re.fullmatch(r"[a-z0-9-]{1,80}", name), "BAD_REQUEST_ID")
