@@ -10,9 +10,11 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import struct
 import subprocess
 import sys
 import time
+from unittest.mock import Mock, call, patch
 
 HERE = Path(__file__).resolve().parent
 
@@ -33,7 +35,10 @@ require, query, quote = BASE.require, BASE.query, BASE.quote
 RULE = {
     "schema": 1,
     "scope": "Local component experiment, actual SPFresh AddIndexSPFresh/DeleteIndex; production SQL still uses spfresh.static.",
-    "profile": "8D Float32 squared L2; 64 heads, 64 search heads, 12 pages, 4 replicas; one native build/search thread.",
+    "profile": (
+        "8D Float32 squared L2 with 64 heads, 64 search heads, 12 pages per posting and 4 replicas. "
+        "Head selection, head build and SSD build/search each configure one thread. The seed uses 20 posting writers."
+    ),
     "updates": "Synchronous posting updates; LIRE split/merge/reassign and sustained performance are not qualified.",
     "source": "Committed DuckLake managed mutations, flush, actual native ReadView snapshot and physical addresses.",
     "versions": "One private mutable candidate, explicit close/checkpoint/seal, expected-revision publication; no adoption/retry.",
@@ -115,17 +120,18 @@ def qualify(report, name, view, capture):
 
 
 def checkpoint_child(config):
-    def stop(stage):
+    def stop(stage, **evidence):
         if stage == config["stage"]:
-            print(json.dumps({"event": stage, "affinity": sorted(os.sched_getaffinity(0))}), flush=True)
+            print(json.dumps({"event": stage, "affinity": sorted(os.sched_getaffinity(0)), **evidence}), flush=True)
             require(sys.stdin.readline().strip() == "continue", "Fault handshake lost")
 
     root = Path(config["root"])
     catalog = F.Catalog(root)
     if config["operation"] == "ducklake":
-        c = BASE.connect(Path(config["lake"]))
-        K.mutate(c, "after-crash", config["rows"], [3])
-        stop("after_ducklake_commit")
+        lake = Path(config["lake"])
+        c = BASE.connect(lake, lake / "extensions")
+        receipt = K.mutate(c, "after-crash", config["rows"], [3])
+        stop("after_ducklake_commit", receipt=receipt)
         c.close()
     elif config["operation"] == "advance":
         F.advance(
@@ -158,7 +164,9 @@ def crash(report, root, operation, stage, **values):
                 selector.register(process.stdout, selectors.EVENT_READ)
                 require(selector.select(90), "Fault handshake deadline")
             event = json.loads(process.stdout.readline())
+            receipt = event.pop("receipt") if operation == "ducklake" else None
             require(event == {"event": stage, "affinity": sorted(os.sched_getaffinity(0))}, "Wrong crash boundary")
+            require(operation != "ducklake" or isinstance(receipt, dict), "Missing committed receipt")
             os.killpg(process.pid, signal.SIGKILL)
             require(process.wait(timeout=30) == -signal.SIGKILL, "No actual SIGKILL")
             report["faults"].append({"operation": operation, "stage": stage, "exit_code": -9})
@@ -166,13 +174,392 @@ def crash(report, root, operation, stage, **values):
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=30)
+    return receipt
+
+
+def exercise_native_limits(probe, root, source, report):
+    reopened = {}
+    for deleted in (127, 128, 129, 256):
+        target = root / f"native-delete-{deleted}"
+        F.clone(source, target)
+        log = root / f"native-delete-{deleted}.log"
+        worker = F.Worker(probe, "update", target / "native", log)
+        try:
+            for vid in range(deleted):
+                require(worker.call("delete", vid) == {"deleted": True}, "Expected a valid native deletion")
+            if deleted == 256:
+                rejected(report, "empty-checkpoint", lambda: worker.call("checkpoint"), "NATIVE_OPERATION_FAILED")
+                require(worker.process.wait(timeout=30) == 1, "Empty index did not reject cleanly")
+            else:
+                require(worker.call("checkpoint") == {"saved": True}, "Nonempty checkpoint failed")
+                worker.close()
+        finally:
+            worker.stop()
+        if deleted == 256:
+            require("SaveIndex:21" in log.read_text(), "Missing EmptyIndex diagnostic")
+            continue
+        _, view = F.validate_checkpoint(probe, target, "0" * deleted + "1" * (256 - deleted), log, retain_reader=True)
+        try:
+            reopened[str(deleted)] = view.ready["live"]
+            view.close()
+        finally:
+            view.stop()
+    report["native_live_rows_after_deletes"] = reopened
+
+    target = root / "native-posting-overflow"
+    F.clone(source, target)
+    worker = F.Worker(probe, "update", target / "native", root / "native-posting-overflow.log")
+    try:
+        require(
+            worker.call("add", 1000, *([0.0] * 8000)) == {"ids": list(range(256, 1256))},
+            "Insertion below posting capacity failed",
+        )
+        # Repeated vectors take the same route. 1,329 records of 37 bytes exceed 12 pages.
+        rejected(
+            report, "posting-capacity", lambda: worker.call("add", 329, *([0.0] * (329 * 8))), "POSTING_CAPACITY"
+        )
+        require(worker.process.wait(timeout=30) == 1, "Posting overflow did not reject cleanly")
+    finally:
+        worker.stop()
+
+    target = root / "native-missing-posting"
+    F.clone(source, target)
+    log = root / "native-missing-posting.log"
+    with log.open("wb") as stream:
+        subprocess.run(
+            [str(probe), "remove-postings", str(target / "native")],
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            check=True,
+            timeout=30,
+        )
+    rejected(
+        report, "missing-posting-on-reopen", lambda: F.Worker(probe, "open", target / "native", log),
+        "NATIVE_OPERATION_FAILED",
+    )
+    # A native query also propagates MultiGet errors when run on the disposable update handle.
+    worker = F.Worker(probe, "update", target / "native", log)
+    try:
+        rejected(
+            report, "missing-posting", lambda: worker.call("search", 3, *([0.0] * 8)), "NATIVE_OPERATION_FAILED"
+        )
+        require(worker.process.wait(timeout=30) == 1, "Missing posting did not reject cleanly")
+    finally:
+        worker.stop()
+    diagnostic = log.read_text()
+    require(
+        "NotFound" in diagnostic and "R7 rejected: RocksDB posting read failed" in diagnostic,
+        "Missing posting did not preserve the read error",
+    )
+
+
+def exercise_missing_trailing_vid(probe, root, source, report):
+    target = root / "missing-trailing-vid"
+    body = F.clone(source, target)
+    (target / "seal.json").unlink()
+    mapping = body["mapping"]
+    last_vid = len(mapping) - 1
+    live = {F.address(row) for row in body["capture"]["rows"]}
+    live.remove(F.address(mapping[last_vid]))
+    expected = F.visibility(mapping, live)
+    log = root / "missing-trailing-vid.log"
+
+    worker = F.Worker(probe, "update", target / "native", log)
+    try:
+        require(worker.call("delete", last_vid) == {"deleted": True}, "Expected live final VID")
+        require(worker.call("checkpoint") == {"saved": True}, "Could not checkpoint final tombstone")
+        worker.close()
+    finally:
+        worker.stop()
+    F.validate_checkpoint(probe, target, expected, log)
+
+    path = target / "native/versions.bin"
+    labels = bytearray(path.read_bytes())
+    deleted, total, columns = struct.unpack_from("=iii", labels)
+    require((deleted, total, columns) == (expected.count("0"), len(mapping), 1), "Unexpected native label header")
+    require(labels.pop() == 0xFE and expected[-1] == "0", "Expected a trailing tombstone")
+    # Both counters decrease together. The live count and every preceding flag stay identical.
+    struct.pack_into("=ii", labels, 0, deleted - 1, total - 1)
+    path.write_bytes(labels)
+    rejected(
+        report, "missing-trailing-deleted-vid",
+        lambda: F.validate_checkpoint(probe, target, expected, log), "NATIVE_VID_VISIBILITY",
+    )
+
+
+def exercise_manifests(root, source, head, report):
+    catalog = F.Catalog(root / "manifest-catalog")
+    F.clone(source, catalog.root / "g1")
+    head_path, seal_path = catalog.root / "head.json", catalog.root / "g1/seal.json"
+    watched = {head_path: [], seal_path: []}
+    original_open = Path.open
+
+    def track_reads(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        if path in watched:
+            stream.read = Mock(wraps=stream.read)
+            watched[path].append(stream.read)
+        return stream
+
+    with patch.object(Path, "open", track_reads):
+        require(catalog.publish("g1", 0) == head, "Private manifest publication differs")
+        require(len(watched[seal_path]) == 1, "Publication reopened its seal")
+        require(catalog.head() == head, "Private head verification differs")
+        require(len(watched[head_path]) == 1 and len(watched[seal_path]) == 2, "Head reopened its manifest")
+        require(
+            all(read.call_args_list == [call(F.MIB + 1)] for reads in watched.values() for read in reads),
+            "Manifest content was read without its byte limit",
+        )
+    for name, path in (("seal", seal_path), ("head", head_path)):
+        with path.open("r+b") as stream:
+            stream.truncate(F.MIB + 1)
+        with patch.object(Path, "open", track_reads):
+            rejected(report, f"oversized-{name}-before-read", catalog.head, "MANIFEST_BUDGET")
+        require(watched[path][-1].call_count == 0, "Oversized manifest content was read")
+
+
+def exercise_failed_checkpoints(probe, root, catalog, capture, report):
+    head = catalog.head()
+    source = catalog.root / head["generation"]
+    old_labels = (source / "native/versions.bin").read_bytes()
+    require(
+        len(F.verify(source)["capture"]["rows"]) != len(capture["rows"]),
+        "Stale label control needs a different live-row count",
+    )
+    target = catalog.root / "label-save-failure"
+    log = root / "label-save-failure.log"
+
+    def refuse_label_file(stage):
+        if stage == "after_mutation":
+            path = target / "native/versions.bin"
+            path.unlink()
+            path.mkdir()
+
+    rejected(
+        report,
+        "version-label-save-error",
+        lambda: F.advance(probe, source, target, capture, log, refuse_label_file),
+        "NATIVE_OPERATION_FAILED",
+    )
+    require("SaveIndex:3" in log.read_text(), "Missing FailedCreateFile label diagnostic")
+    require(not (target / "seal.json").exists(), "Failed label write acquired a seal")
+
+    target = catalog.root / "stale-labels"
+
+    def restore_old_labels(stage):
+        if stage == "after_checkpoint":
+            (target / "native/versions.bin").write_bytes(old_labels)
+
+    rejected(
+        report,
+        "stale-labels-on-closed-reopen",
+        lambda: F.advance(probe, source, target, capture, root / "stale-labels.log", restore_old_labels),
+        "NATIVE_ROW_COUNT",
+    )
+    require(not (target / "seal.json").exists(), "Native row mismatch acquired a seal")
+    require(catalog.head() == head, "Checkpoint failures changed the published head")
+
+
+def exercise_checkpoint_integrity(probe, root, catalog, capture, report):
+    head = catalog.head()
+    source = catalog.root / head["generation"]
+    previous = F.verify(source)
+    require(len(previous["capture"]["rows"]) == len(capture["rows"]), "Stale labels need a balanced update")
+    old_labels = (source / "native/versions.bin").read_bytes()
+    version_header = struct.calcsize("=iii")
+    posting_header = struct.calcsize("=ii")
+
+    def check(name, damage, code, diagnostic=None):
+        target = catalog.root / name
+        log = root / (name + ".log")
+
+        def after_checkpoint(stage):
+            if stage == "after_checkpoint":
+                damage(target / "native")
+
+        rejected(report, name, lambda: F.advance(probe, source, target, capture, log, after_checkpoint), code)
+        if diagnostic:
+            require(diagnostic in log.read_text(), "Checkpoint failure lost its loader diagnostic")
+        require(not (target / "seal.json").exists(), "Invalid checkpoint acquired a seal")
+        require(catalog.head() == head, "Invalid checkpoint changed the published head")
+
+    def truncate(path, bytes_):
+        with path.open("r+b") as stream:
+            stream.truncate(bytes_)
+
+    def swap_version_flags(native):
+        path = native / "versions.bin"
+        data = bytearray(path.read_bytes())
+        tombstone = 0xFE
+        deleted = data.index(tombstone, version_header)
+        live = next(i for i in range(version_header, len(data)) if data[i] != tombstone)
+        data[deleted], data[live] = data[live], data[deleted]
+        path.write_bytes(data)
+
+    def extra_deleted_vid(native):
+        path = native / "versions.bin"
+        data = bytearray(path.read_bytes())
+        deleted, total = struct.unpack_from("=ii", data)
+        struct.pack_into("=ii", data, 0, deleted + 1, total + 1)
+        data.append(0xFE)
+        path.write_bytes(data)
+
+    def bad_version_flag(native):
+        path = native / "versions.bin"
+        data = bytearray(path.read_bytes())
+        data[data.index(0xFF, version_header)] = 0xFD
+        path.write_bytes(data)
+
+    def remove_posting_size(native):
+        path = native / "posting-sizes.bin"
+        data = bytearray(path.read_bytes())
+        rows = struct.unpack_from("=i", data)[0]
+        struct.pack_into("=i", data, 0, rows - 1)
+        path.write_bytes(data[:-struct.calcsize("=i")])
+
+    def change_posting_size(native):
+        path = native / "posting-sizes.bin"
+        data = bytearray(path.read_bytes())
+        size = struct.unpack_from("=i", data, posting_header)[0]
+        struct.pack_into("=i", data, posting_header, size + 1)
+        path.write_bytes(data)
+
+    def append_byte(path):
+        with path.open("ab") as stream:
+            stream.write(b"X")
+
+    check(
+        "same-count-stale-labels", lambda native: (native / "versions.bin").write_bytes(old_labels),
+        "NATIVE_VID_VISIBILITY",
+    )
+    check("swapped-vid-labels", swap_version_flags, "NATIVE_VID_VISIBILITY")
+    check("extra-deleted-vid", extra_deleted_vid, "NATIVE_VID_VISIBILITY")
+    check("invalid-version-flag", bad_version_flag, "NATIVE_OPERATION_FAILED", "Failed to load SPFresh version labels")
+    check(
+        "truncated-version-labels", lambda native: truncate(native / "versions.bin", version_header),
+        "NATIVE_OPERATION_FAILED", "Failed to load SPFresh version labels",
+    )
+    check(
+        "truncated-posting-sizes", lambda native: truncate(native / "posting-sizes.bin", posting_header),
+        "NATIVE_OPERATION_FAILED", "Failed to load SPFresh posting sizes",
+    )
+    check(
+        "wrong-posting-head-count", remove_posting_size, "NATIVE_OPERATION_FAILED",
+        "SPFresh posting size count does not match the head count",
+    )
+    check("wrong-posting-length", change_posting_size, "NATIVE_OPERATION_FAILED", "SPFresh posting length differs")
+    for name, diagnostic in (("versions.bin", "version labels"), ("posting-sizes.bin", "posting sizes")):
+        check(
+            "trailing-" + name.split(".")[0], lambda native, name=name: append_byte(native / name),
+            "NATIVE_OPERATION_FAILED", "Failed to load SPFresh " + diagnostic,
+        )
+
+    start_worker = F.Worker
+
+    def reject_native_reopen(executable, mode, *args, **kwargs):
+        require(mode != "open", "Native reopen ran before checking the artifact budget")
+        return start_worker(executable, mode, *args, **kwargs)
+
+    with patch.object(F, "Worker", reject_native_reopen):
+        check(
+            "oversized-native-config-before-reopen", lambda native: truncate(native / "indexloader.ini", F.LIMIT + 1),
+            "ARTIFACT_BUDGET",
+        )
+
+
+def exercise_reopen_inventory(probe, root, source, report):
+    target = root / "reopen-budget"
+    body = F.clone(source, target)
+    seal_path = target / "seal.json"
+    seal_path.unlink()
+    native = target / "native"
+    padding = native / "padding.bin"
+    remaining = F.LIMIT - sum(entry["size"] for entry in body["files"].values())
+    require(remaining > 0, "Checkpoint seed exhausts artifact budget")
+    with padding.open("xb") as stream:
+        stream.truncate(remaining)
+
+    def seal():
+        return F.seal(probe, target, body["capture"], body["mapping"], root / "reopen-budget.log")
+
+    with patch.object(F, "Worker", wraps=F.Worker) as launch:
+        sealed = seal()
+        at_limit = launch.call_count
+        require(at_limit == 1 and launch.call_args.args[1] == "open", "Exact budget did not reopen once")
+    require(sum(entry["size"] for entry in sealed["files"].values()) == F.LIMIT, "Wrong exact-budget fixture")
+    require(F.verify(target) == sealed, "Exact-budget seal did not verify")
+    seal_path.unlink()
+    with padding.open("ab") as stream:
+        stream.write(b"x")
+    with patch.object(F, "Worker", side_effect=AssertionError("Over-budget native reopen")) as launch:
+        rejected(report, "total-budget-plus-one", seal, "ARTIFACT_BUDGET")
+        launch.assert_not_called()
+        over_limit = launch.call_count
+    require(not seal_path.exists(), "Over-budget checkpoint acquired a seal")
+    report["checkpoint_budget"] = {"limit_bytes": F.LIMIT, "at_limit_reopens": at_limit, "over_limit_reopens": over_limit}
+
+    padding.write_bytes(b"A")
+    added = native / "after-reopen.bin"
+    close = F.Worker.close
+    for name, changed_file in (("added", added), ("same-size-change", padding)):
+        def change_after_close(worker):
+            close(worker)
+            changed_file.write_bytes(b"B")
+
+        with patch.object(F.Worker, "close", change_after_close):
+            rejected(report, "reopen-inventory-" + name, seal, "NATIVE_REOPEN_CHANGED")
+        require(not seal_path.exists(), "Changed inventory acquired a seal")
+
+    private = root / "reopen-read-view"
+    F.clone(source, private)
+    start = F.Worker
+    workers = []
+
+    def change_after_open(*args, **kwargs):
+        worker = start(*args, **kwargs)
+        workers.append(worker)
+        (private / "native/after-open.bin").write_bytes(b"B")
+        return worker
+
+    with patch.object(F, "Worker", change_after_open):
+        rejected(
+            report, "read-view-inventory-after-open",
+            lambda: F.ReadView(probe, private, body, root / "reopen-read-view.log"), "NATIVE_REOPEN_CHANGED",
+        )
+    require(len(workers) == 1 and workers[0].process.poll() is not None, "Rejected reader still running")
+    require(F.verify(source) == body, "Inventory controls changed the seed")
+
+
+def exercise_oracle(report):
+    def row(offset, value):
+        return {
+            "row_ref": {"kind": "file", "file_id": 1, "row_offset": offset},
+            "row": {"id": offset, "embedding": [value, *([0.0] * 7)], "category": None, "payload": None},
+        }
+
+    rows = [row(i, x) for i, x in enumerate((0.0, 1.0, 1.0, 1.0))]
+    hits = [{**r, "distance": float(i != 0)} for i, r in enumerate(rows)]
+    try:
+        O.qualify(hits[1:], rows, [0.0] * 8, 3)
+    except AssertionError as error:
+        require(str(error) == "Native recall is below the existing 0.8 gate", "Wrong cutoff-tie rejection")
+    else:
+        raise AssertionError("Cutoff ties replaced a strictly closer row")
+    require(O.qualify([hits[0], *hits[2:]], rows, [0.0] * 8, 3) == 1.0, "Equivalent cutoff ties failed")
+    rounded = row(0, 16777218.0)
+    require(
+        O.qualify([{**rounded, "distance": 0.0}], [rounded], [16777217.1, *([0.0] * 7)], 1) == 1.0,
+        "Oracle scored the query before Float32 rounding",
+    )
+    report["oracle_controls"] = ["missing-closer-rejected", "equivalent-cutoff-ties", "float32-query-rounding"]
 
 
 def exercise(args, root, report):
     lake = root / "lake"
     lake.mkdir(mode=0o700)
     (lake / "indexes").mkdir(mode=0o700)
-    c = BASE.connect(lake, create=True)
+    extensions = lake / "extensions"
+    c = BASE.connect(lake, extensions, create=True)
     views = []
     try:
         c.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
@@ -221,17 +608,22 @@ def exercise(args, root, report):
         views.append(view)
         qualify(report, "seed", view, initial)
         rejected(report, "current-generation-GC", lambda: catalog.collect("g1", 16, F.LIMIT), "REFERENCED")
+        exercise_native_limits(args.probe, root, catalog.root / "g1", report)
+        exercise_missing_trailing_vid(args.probe, root, catalog.root / "g1", report)
+        exercise_manifests(root, catalog.root / "g1", head, report)
+        exercise_reopen_inventory(args.probe, root, catalog.root / "g1", report)
+        require(catalog.head() == head, "Private regression changed the published head")
 
         # Real ordinary DuckLake transaction observes its old logical version.
         ordinary = c.cursor()
         ordinary.execute("BEGIN")
-        before = BASE.raw(ordinary)
+        before = K.business_rows(ordinary)
         replacement = [
             {"id": 0, "embedding": [0.125, *([0.0] * 7)], "category": "B", "payload": "新版本-\0"},
             {"id": 10000, "embedding": [0.25, *([0.0] * 7)], "category": None, "payload": None},
         ]
         changed = K.mutate(c, "replace", replacement, [1])
-        require(BASE.raw(ordinary) == before, "Native update changed an old DuckLake transaction")
+        require(K.business_rows(ordinary) == before, "Native update changed an old DuckLake transaction")
         require(K.mutate(c, "replace", replacement, [1]) == changed, "Committed mutation replay changed")
         WRITE.rejected(lambda: K.mutate(c, "replace", replacement, [2]), "payload mismatch")
         pending = captured(c, report)
@@ -255,6 +647,7 @@ def exercise(args, root, report):
         c.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
         current = captured(c, report)
         F.validate_capture(current)
+        exercise_checkpoint_integrity(args.probe, root, catalog, current, report)
 
         for stage in ("after_mutation", "after_checkpoint", "after_seal"):
             name = "crash-" + stage.replace("_", "-")
@@ -359,16 +752,17 @@ def exercise(args, root, report):
             else:
                 raise AssertionError("Independent reference accepted unsafe result: " + name)
         report["unsafe_variants"] = variants
+        exercise_oracle(report)
 
         for item in views:
             item.close()
         views.clear()
         require(BASE.head(c) == static, "R7 experiment mutated production static publication")
-        expected_rows = deepcopy(BASE.raw(c))
+        expected_rows = deepcopy(K.business_rows(c))
         c.close()
-        c = BASE.connect(lake)
+        c = BASE.connect(lake, extensions)
         require(
-            BASE.raw(c) == expected_rows and K.mutate(c, "replace", replacement, [1]) == changed,
+            K.business_rows(c) == expected_rows and K.mutate(c, "replace", replacement, [1]) == changed,
             "DuckLake rows or receipts changed across reopen",
         )
         report["checks"].append("Native DuckLake reopen retains business rows, UUID, receipts and static publication")
@@ -377,13 +771,28 @@ def exercise(args, root, report):
         qualify(report, "fresh-process-after-DuckLake-reopen", reopened, current)
         c.close()
         final_rows = [{"id": 2, "embedding": [0.0625, *([0.0] * 7)], "category": "A", "payload": "已提交后崩溃"}]
-        crash(report, catalog.root, "ducklake", "after_ducklake_commit", lake=str(lake), rows=final_rows)
-        c = BASE.connect(lake)
+        receipt = crash(report, catalog.root, "ducklake", "after_ducklake_commit", lake=str(lake), rows=final_rows)
+        c = BASE.connect(lake, extensions)
         expected_rows = [r for r in expected_rows if r["id"] not in (2, 3)] + final_rows
         require(
-            BASE.raw(c) == sorted(expected_rows, key=lambda r: r["id"]), "DuckLake WAL recovery lost committed versions"
+            K.business_rows(c) == sorted(expected_rows, key=lambda r: r["id"]),
+            "DuckLake WAL recovery lost committed versions",
         )
-        require(K.mutate(c, "after-crash", final_rows, [3])["row_count"] == 2, "Crash replay lost receipt")
+        snapshot_sql = "SELECT id FROM ducklake_current_snapshot('lake')"
+        before_replay = query(c, snapshot_sql)[0]["id"]
+        replay = K.mutate(c, "after-crash", final_rows, [3])
+        after_replay = query(c, snapshot_sql)[0]["id"]
+        require(replay == receipt, "Crash replay changed the complete committed receipt")
+        require(
+            before_replay == receipt["snapshot_id"] == after_replay,
+            "Crash replay advanced the committed DuckLake snapshot",
+        )
+        report["crash_replay"] = {
+            "original_receipt": receipt,
+            "replayed_receipt": replay,
+            "snapshot_before": before_replay,
+            "snapshot_after": after_replay,
+        }
         lagging = captured(c, report)
         rejected(
             report,
@@ -399,6 +808,7 @@ def exercise(args, root, report):
         qualify(report, "old-view-after-DuckLake-SIGKILL", reopened, current)
         c.execute("CALL ducklake_flush_inlined_data('lake',table_name=>'items')")
         latest = captured(c, report)
+        exercise_failed_checkpoints(args.probe, root, catalog, latest, report)
         F.advance(args.probe, catalog.root / "g2", catalog.root / "g3", latest, root / "advance-recovered.log")
         recovered = catalog.publish("g3", 2)
         final = catalog.read(args.probe, root / "view-final", latest, root / "view-final.log")

@@ -11,7 +11,7 @@ import subprocess
 import tarfile
 
 SPFRESH = "5893eb61ee3b18610b6b00f1939be7dae1af8904"
-VORTEX = "122b63e0408a187a9d0ecdd129f1cbe12b6b46b2"
+VORTEX = "42beeb3a72769869a3d3d16887a011ee7f922362"
 HERE = Path(__file__).resolve().parent
 
 

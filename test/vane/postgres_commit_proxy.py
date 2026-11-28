@@ -1,4 +1,4 @@
-"""Test-only PostgreSQL wire proxy for deterministic COMMIT response loss."""
+"""Test-only PostgreSQL wire proxy for deterministic COMMIT response loss or delay."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def receive_frame(connection: socket.socket) -> tuple[bytes, bytes, bytes]:
 
 class CommitProxy:
     def __init__(self, upstream_host: str, upstream_port: int, mode: str):
-        if mode not in {"before_forward", "ack_lost"}:
+        if mode not in {"before_forward", "ack_lost", "ack_paused"}:
             raise ValueError("unknown COMMIT fault mode")
         self.upstream_host = upstream_host
         self.upstream_port = upstream_port
@@ -39,6 +39,8 @@ class CommitProxy:
         self.armed = threading.Event()
         self.stopped = threading.Event()
         self.dropped = threading.Event()
+        self.ack_paused = threading.Event()
+        self.release_ack = threading.Event()
         self.connections: set[socket.socket] = set()
         self.observation = {"mode": mode, "injected": 0, "commit_forwarded": False, "server_committed": False}
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -79,6 +81,7 @@ class CommitProxy:
 
     def disconnect(self) -> None:
         self.stopped.set()
+        self.release_ack.set()
         self.listener.close()
         with self.lock:
             connections = list(self.connections)
@@ -143,16 +146,26 @@ class CommitProxy:
                     connection.close()
 
     def backend(self, client: socket.socket, server: socket.socket, state: dict) -> None:
+        held = bytearray()
         try:
             while not self.stopped.is_set():
                 kind, payload, frame = receive_frame(server)
                 if state["withhold"]:
+                    if self.mode == "ack_paused":
+                        held.extend(frame)
                     if kind == b"C":
                         state["commit_tag"] = payload == b"COMMIT\0"
                         self.observation["command_complete"] = payload.rstrip(b"\0").decode("ascii", errors="replace")
                     if kind == b"Z":
                         self.observation["ready_status"] = payload.decode("ascii", errors="replace")
                         self.observation["server_committed"] = state["commit_tag"] and payload == b"I"
+                        if self.mode == "ack_paused" and self.observation["server_committed"]:
+                            self.ack_paused.set()
+                            if self.release_ack.wait(30) and not self.stopped.is_set():
+                                client.sendall(held)
+                                held.clear()
+                                state["withhold"] = False
+                                continue
                         self.disconnect()
                         self.dropped.set()
                         return

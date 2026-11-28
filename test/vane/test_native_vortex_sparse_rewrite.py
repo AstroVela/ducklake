@@ -372,10 +372,10 @@ def interruption(driver, root, kind, checks):
         M.stop(native)
 
 
-def crash(driver, root, stage, checks):
+def crash(driver, root, stage, checks, *, append_after_restart=False):
     native = CAT.Native(driver, root / "native")
     try:
-        single(native, root)
+        first = single(native, root)
         native.call("maintenance-cancel")
         native.call("optimizer-resume", stage, "pause")
         state = (
@@ -390,29 +390,53 @@ def crash(driver, root, stage, checks):
             head["revision"] == 1 + committed and RW.active_rows(native) == (32 if committed else 4096),
             "Crash split native F data and index publication",
         )
+        ended_sources = len(M.files([first])) if committed else 0
+        native.sql(
+            f"SELECT CASE WHEN count(*)={ended_sources} AND "
+            f"(SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_rewrite_outputs_v1)={int(committed)} "
+            "THEN true ELSE error('Crash split sparse rewrite change-feed markers') END "
+            "FROM __ducklake_metadata_lake.ducklake_vortex_retired_sources_v1"
+        )
         if committed:
             require(
                 head["reference"]["publication"] == durable["run_id"] and not SEG.segments(head),
                 "Restart lost the explicit F publication identity",
             )
         OPT.steady(native, OPT.status(native))
-        native.call("optimizer-resume")
-        row = OPT.wait(
-            native,
-            lambda s: s["compaction_reason"] == "no_segments" and not s["running"],
-            "post-crash F publication",
-        )
+        if append_after_restart:
+            SEG.add_f(native, 5000)
+            native.call("append", "knn", root / "artifacts" / "later-B.json", 2)
+            require(native.call("head", "knn")["revision"] == 3, "Later append must publish a higher revision")
+            native.sql(
+                "SELECT CASE WHEN state='published' THEN true "
+                "ELSE error('resume lost the committed sparse rewrite receipt') END "
+                "FROM ducklake_resume_vortex_optimizer('lake','main','items','knn')"
+            )
+            row = OPT.steady(native, OPT.status(native))
+            require(
+                row["published_revision"] == 2 and row["run_id"] == durable["run_id"],
+                "Recovery must retain revision 2 and the original rewrite run ID",
+            )
+        else:
+            native.call("optimizer-resume")
+            row = OPT.wait(
+                native,
+                lambda s: s["compaction_reason"] == "no_segments" and not s["running"],
+                "post-crash F publication",
+            )
         require(
             row["run_count"] == (1 if committed else 2),
             "Restart replayed committed F or automatically retried an interrupted task",
         )
         native.call("maintenance-resume")
         recalls = []
-        qualify(native, "recovered-F", recalls, 0)
+        qualify(native, "recovered-F", recalls, int(append_after_restart))
         BG.finish(native)
         checks.append(
             f"SIGKILL at {stage} recovers a complete old/new plan and only explicit resume permits fresh work"
         )
+        if append_after_restart:
+            checks.append("recovery reconciles the original F receipt after an independent append advances revision")
         return {"fixture_recalls": recalls}
     finally:
         M.stop(native)
@@ -532,6 +556,9 @@ def main():
                 "optimizer_rewritten",
             ]
         ]
+        cases.append(
+            ("crash-later-append", lambda d, r, c: crash(d, r, "rewrite_after_commit", c, append_after_restart=True))
+        )
         report["cases"] = []
         for name, run in cases:
             directory = root / name

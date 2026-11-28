@@ -16,19 +16,21 @@ managed writes before submitting any batches:
 connection.execute("SELECT * FROM ducklake_manage_vortex_writes('lake','main','items','knn')")
 sql = (
     "SELECT * FROM ducklake_mutate_vortex_batch('lake','main','items','knn',?,"
-    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT)"
+    "?::STRUCT(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR)[],?::BIGINT[],?::UBIGINT,?::VARCHAR)"
 )
 rows = [{'id': 1, 'embedding': [0.125, 0.0], 'category': 'A', 'payload': '最新向量'}]
-epoch = connection.execute(
-    "SELECT * FROM ducklake_vortex_request_status('lake','main','items','knn')"
-).fetchone()[1]
-request = ['request-1', rows, [2], epoch]  # Keep the same epoch on every retry.
+table_uuid, epoch = connection.execute(
+    "SELECT table_uuid, request_epoch FROM ducklake_vortex_request_status('lake','main','items','knn')"
+).fetchone()
+request = ['request-1', rows, [2], epoch, table_uuid]  # Save the full request for retries.
 receipt = connection.execute(sql, request).fetchone()
 assert connection.execute(sql, request).fetchone() == receipt
 ```
 
-The named index must exist with the matching dimension. Opt-in requires no
-current rows, no B segments and no prior request receipts for that table UUID.
+The named index is matched by its exact catalog key. Enrollment records its
+dimension so delete-only requests have stable canonical bytes. Opt-in requires
+no current rows, B segments across its named indexes, or prior request receipts
+for that table UUID.
 Fresh write catalog initialization creates `ducklake_vortex_keyed_tables_v1`,
 with actual native metadata primary/unique keys for UUID and table ID. Existing
 catalog layouts require fresh initialization; there is no migration or inferred
@@ -38,16 +40,18 @@ Unmanaged tables retain their append API and ordinary SQL semantics. Managed
 tables reject the append API, ordinary SQL INSERT/UPDATE/DELETE, and schema,
 rename or drop changes at native commit. Unrelated tables remain writable.
 Native flush, compaction, optimizer rewrites and source retention continue
-through their existing paths. Deletion files explicitly marked as flush output
-preserve committed versions; they do not authorize ordinary DML in that same
-transaction.
+through their existing paths. Ordinary deletes against newly flushed data still
+require managed write authority at commit, including when the delete removes
+the entire staging file.
 
 The commit check reads current managed ownership while holding the existing
 write-admission reservation through commit. Registration takes that same
 reservation. An ordinary transaction started before opt-in is therefore still
-rejected if it tries to commit after ownership is registered. Mutation authority
-is private to the dedicated native connection and is cleared on every return
-or failure. There is no SQL setting to bypass it.
+rejected if it tries to commit after ownership is registered. Admission checks
+the writer's original catalog and metadata attachments. Ordinary native commit
+retries verify those same attachments before staging another attempt. Mutation
+authority is private to the dedicated native connection and is cleared on every
+return or failure. There is no SQL setting to bypass it.
 
 ## Batch and retry semantics
 
@@ -71,10 +75,11 @@ The result is `table_uuid, request_id, payload_hash, row_count, snapshot_id, req
 Here `row_count` counts requested upserts plus deletes, including missing-key
 deletes. `snapshot_id` identifies the actual native snapshot: when a missing-key
 delete creates no data change it reports the existing snapshot. Its receipt
-still commits durably. The request catalog keeps its existing 100,000-record
-limit and never automatically expires records. Explicit [epoch retirement](native-vortex-request-epochs.md)
-atomically advances one table's durable fence and deletes its old-window receipts.
-It leaves business versions and index generations unchanged.
+still commits durably after the same admission, attachment, index and
+cancellation checks for the bound lake. The request catalog keeps its existing
+100,000-record limit. Explicit [epoch retirement](native-vortex-request-epochs.md)
+advances one table's durable fence and removes its old-window receipts in one
+transaction. Business versions and index generations stay the same.
 
 Identity is `(table_uuid, request_epoch, request_id)`. An exact current-epoch retry returns its original
 receipt without repeating any mutation. Changed content fails. Replaying an old
@@ -119,37 +124,31 @@ maintenance stage, see [automatic flow](native-vortex-automatic-flow.md).
 
 ```sh
 cmake --build build/runtime --target ducklake_vortex_write_driver
-VANE_RUNNER=local-fast python -I test/vane/test_vane_vortex_keyed_writes.py \
+VANE_RUNNER=local python -I test/vane/test_vane_vortex_keyed_writes.py \
     --driver build/runtime/ducklake_vortex_write_driver \
     --output-dir /tmp/vane-vortex-keyed-proof
 ```
 
 The installed-provider probe covers managed ownership, batch validation, write
-admission rollback after staged deletes, immutable B, T replacement, old request
+admission rollback after staged deletes, retirement of a committed unindexed
+file with an active historical reader, immutable B, T replacement, old request
 replay, concurrent same-key writes, table-scoped identity, independent B2,
-rewrite and source expiry. Queries compare typed rows and distances against an
-exact native visible-row oracle.
+rewrite and source expiry. Queries compare
+typed rows and distances against the visible-row oracle using the existing
+recall gate.
 
-The existing native write driver also checks a pre-opt-in transaction, a held
-ReadView through rewrite/GC, failures after delete/insert/before commit/after
-commit, cancellation and native conflict. Three real SIGKILL boundaries recover
-through installed Vane in fresh Python processes with a nonempty metadata WAL.
-Minimal SQL coverage is in `test/sql/vortex/native_vortex_keyed_writes.test`.
-
-Local qualification passed seven phases and 28 oracle comparisons, with minimum
-recall@10 0.9 against the unchanged 0.8 fixture gate. Returned visibility, typed
-versions, distances and uniqueness are hard correctness checks. All 13 native
-and recovery cases passed, including three real SIGKILLs. The 45 new SQL
-assertion blocks, including an independent canonical digest vector, and the
-existing 35 retention plus 28 append blocks passed through installed Vane.
-Native CI also runs their standard SQLLogicTest harness.
-
-The unchanged basic, append and source-retention probes passed 32, 16 and 16
-oracle comparisons respectively, with minimum recall 1.0. All seven original
-append recovery cases and 20 retention cases passed. Separate Vane release
-processes passed 1,222 non-Ray and 32 Ray tests, with 15 optional-dependency skips.
-The provider was incrementally rebuilt, signed with the public CI test key,
-packaged and installed against the unchanged pinned Vane/Vortex/SPFresh closure.
+The native write driver covers pre-enrollment transactions, catalog reattachment,
+enrollment with a B segment under another index name, missing-key cancellation
+while waiting for publication, writes with multiple attached lakes in immediate
+transaction mode, commit retries with stable and replaced attachments, a held
+ReadView through rewrite and GC, failures around commit, cancellation and native
+conflict. Three SIGKILL boundaries recover through installed Vane in fresh
+Python processes with a nonempty metadata WAL.
+The SQL fixture in `test/sql/vortex/native_vortex_keyed_writes.test` covers the
+independent digest vector, enrollment under a changed default collation, and
+rollback of partial and full deletes against transaction-local flush output.
+Qualification also runs the inherited source retention, append and basic flow
+probes and the Vane release suite against the pinned provider closure.
 
 The scope remains fixed-schema local POSIX storage, native DuckDB metadata and
 exclusive single-process catalog ownership. Direct modification of internal

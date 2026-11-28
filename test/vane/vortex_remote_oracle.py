@@ -23,15 +23,22 @@ def inspect(model, before=None, command=None, result=None):
     current = requests[meta["head"]]
     require(set(meta["refs"]) == {current["source"], current["unit"]}, "ATOMIC_REFERENCE_SET")
 
+    ordinary_open = any(view["kind"] == "sql" and not view["closed"] for view in meta["views"].values())
+    require(
+        not ordinary_open
+        or not any(unit["kind"] == "source" and unit["state"] == "deleting" for unit in units.values()),
+        "SQL_SOURCE_GC_OVERLAP",
+    )
     protected, complete = set(meta["native"]) | set(meta["refs"]), set(meta["native"]) | set(meta["refs"])
-    for req in requests.values():
+    for name, req in requests.items():
         if req["state"] == "prepared":
             protected.update((req["unit"], req["source"]))
-        if req["receipt"] is not None:
-            record = commits[req["receipt"]["revision"] - 1]
-            receipt = req["receipt"]
+        receipt = req["receipt"]
+        if receipt is not None:
+            revision = receipt["revision"]
             require(
-                record["request"] == receipt["request"]
+                1 <= revision <= len(commits)
+                and commits[revision - 1]["request"] == name == receipt["request"]
                 and receipt["payload_hash"] == req["digest"]
                 and receipt["table_uuid"] == req["table"]
                 and receipt["request_epoch"] == req["epoch"],
@@ -106,6 +113,8 @@ def inspect(model, before=None, command=None, result=None):
 
     for record in commits:
         req = requests[record["request"]]
+        receipt = req["receipt"]
+        require(receipt is not None and receipt["revision"] == record["revision"], "ATOMIC_PUBLICATION_RECEIPT")
         require(record["body"] is not None, "MISSING_MANIFEST")
         body = json.loads(record["body"])
         require(
@@ -130,6 +139,7 @@ def inspect(model, before=None, command=None, result=None):
     if before is None:
         return
     old = before.m
+    ordinary_was_open = any(v["kind"] == "sql" and not v["closed"] for v in old["views"].values())
     require(commits[: len(old["commits"])] == old["commits"], "COMMITTED_HISTORY_CHANGED")
     for name, req in old["requests"].items():
         fields = ("table", "epoch", "digest", "expected", "source", "unit", "index", "manifest")
@@ -145,7 +155,7 @@ def inspect(model, before=None, command=None, result=None):
             "CANCELLED_OR_RETIRED_REQUEST_PUBLISHED",
         )
     if command[0] == "expire_native":
-        require(not any(v["kind"] == "sql" and not v["closed"] for v in old["views"].values()), "SQL_GATE_WEAKENED")
+        require(not ordinary_was_open, "SQL_GATE_WEAKENED")
     if command[0] == "reconcile":
         require(result == old["requests"][command[1]]["receipt"], "RECONCILE_CHANGED_IDENTITY")
     for key, versions in before.store.items():
@@ -155,10 +165,13 @@ def inspect(model, before=None, command=None, result=None):
             continue
         require(command[0] == "deliver", "UNAUTHORIZED_PHYSICAL_DELETE")
         rpc = before.wire[command[1]]
+        unit = old["objects"][key]["unit"]
         require(
             rpc["op"] == "delete"
             and rpc["key"] == key
             and {v["id"] for v in removed} == {rpc["version"]}
+            and old["gc"][unit]["targets"][key] == rpc["version"]
             and all(v["kind"] == "payload" for v in removed),
             "DELETE_NOT_EXACT_VERSION",
         )
+        require(old["units"][unit]["kind"] != "source" or not ordinary_was_open, "SQL_SOURCE_DELETE_OVERLAP")

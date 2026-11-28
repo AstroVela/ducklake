@@ -33,8 +33,11 @@ METADATA_TABLES = (
     "ducklake_vortex_indexes_v1",
     "ducklake_vortex_keyed_tables_v1",
     "ducklake_vortex_maintenance_v1",
+    "ducklake_vortex_optimizer_rewrite_receipts_v1",
     "ducklake_vortex_optimizer_v2",
     "ducklake_vortex_request_epochs_v1",
+    "ducklake_vortex_retired_sources_v1",
+    "ducklake_vortex_rewrite_outputs_v1",
     "ducklake_vortex_rewrites_v1",
     "ducklake_vortex_source_deletions_v1",
     "ducklake_vortex_source_retention_v1",
@@ -78,7 +81,7 @@ def checkpoint(connection, root):
 
 
 def files(root):
-    selected = [*root.joinpath("data").rglob("*.vortex")]
+    selected = [p for p in root.joinpath("data").rglob("*") if p.is_file()]
     selected += [p for p in root.joinpath("indexes").rglob("*") if p.is_file()]
     selected += [p for p in root.joinpath("private").rglob("*") if p.is_file()]
     return {
@@ -116,13 +119,21 @@ def recover(root, extra):
     expected = json.loads((root / "expected.json").read_text())
     sealed = json.loads((root / "files.json").read_text())
     require(expected["rows"] == model(extra), "Native crash boundary did not represent the declared committed state")
-    c = BASE.connect(root)
+    c = BASE.connect(root, root / "extensions")
     try:
         require(
             snapshot(c) == expected, "Recovery changed typed rows, snapshots, receipts, policies or index ownership"
         )
         require(files(root) == sealed, "Recovery changed caller files, canonical generations or source identities")
-        require(not BASE.status(c)["running"], "Reopen implicitly resumed background optimization")
+        for worker, metadata_table in (
+            ("optimizer", "ducklake_vortex_optimizer_v2"),
+            ("maintenance", "ducklake_vortex_maintenance_v1"),
+        ):
+            active = rows(c, f"SELECT running FROM ducklake_vortex_{worker}_status('lake')")
+            require(
+                active == [[False]] * len(expected["metadata"][metadata_table]),
+                f"Reopen implicitly resumed {worker} or changed its policy count: {active}",
+            )
         require(not (root / "indexes/seed.json").exists(), "Recovery recreated a caller-deleted reference")
         require((root / "indexes/retained.json").is_file(), "A stale caller reference was collected implicitly")
         require(
@@ -144,8 +155,10 @@ def recover(root, extra):
         require(
             last["request_epoch"] == 2 and last["expired_requests"] == 2, "Last advance result changed after checkpoint"
         )
-        prior = KEYED.mutate(c, "window", [], [-999999], epoch=2)
-        require(KEYED.mutate(c, "window", [], [-999999], epoch=2) == prior, "Current receipt replay changed")
+        window = query(c, f"SELECT * FROM {WRITE.REQUESTS} WHERE request_id='window' AND request_epoch=2")
+        require(len(window) == 1, "Current window lost its durable receipt")
+        for _ in range(2):
+            require(KEYED.mutate(c, "window", [], [-999999], epoch=2) == window[0], "Current receipt replay changed")
         WRITE.rejected(lambda: KEYED.mutate(c, "unseen-expired", [], [-999999], epoch=1), "EXPIRED_REQUEST")
         require(snapshot(c) == expected, "Read/retry/expired-request checks changed committed state")
 
@@ -166,13 +179,23 @@ def recover(root, extra):
         # The same post-checkpoint request either resolves its committed receipt
         # or commits once after an interrupted/unsubmitted attempt.
         appended = [{"id": 12345, "embedding": [12345.0, 0.0], "category": "A", "payload": "after-checkpoint"}]
+        read_receipt = f"SELECT * FROM {WRITE.REQUESTS} WHERE request_id='after-checkpoint' AND request_epoch=2"
+        durable = query(c, read_receipt)
+        require(len(durable) == int(extra), "Unexpected receipt at the post-checkpoint commit boundary")
         receipt = KEYED.mutate(c, "after-checkpoint", appended, epoch=2)
-        require(KEYED.mutate(c, "after-checkpoint", appended, epoch=2) == receipt, "Post-checkpoint request duplicated")
+        after_write = snapshot(c)
+        if extra:
+            require([receipt] == durable and after_write == expected, "Lost response changed the committed receipt or state")
+        require(query(c, read_receipt) == [receipt], "Post-checkpoint response differs from its durable receipt")
+        require(
+            KEYED.mutate(c, "after-checkpoint", appended, epoch=2) == receipt and snapshot(c) == after_write,
+            "Post-checkpoint retry changed its receipt or committed state",
+        )
         require(
             rows(c, "SELECT id,embedding,category,payload FROM lake.items ORDER BY id") == model(True),
             "Retry reapplied wrong versions",
         )
-        require(wal_bytes(root) > 0 or extra, "A new committed write did not create a new metadata WAL")
+        require(bool(wal_bytes(root)) != extra, "Only a new committed write should create a new metadata WAL")
         check_query(c, model(True))
         final = snapshot(c)
         checkpoint(c, root)
@@ -182,6 +205,18 @@ def recover(root, extra):
         return {"status": "passed", "wal_before_recovery_checkpoint": before, "post_checkpoint_receipt": receipt}
     finally:
         c.close()
+
+
+def verify_table_inventory(root):
+    import vane
+
+    with vane.connect(
+        str(root / "metadata.ducklake"),
+        read_only=True,
+        config={"threads": "2", "autoinstall_known_extensions": "false", "autoload_known_extensions": "false"},
+    ) as physical:
+        tables = rows(physical, "SELECT table_name FROM duckdb_tables() WHERE starts_with(table_name,'ducklake_vortex_')")
+    require({row[0] for row in tables} == set(METADATA_TABLES), "Vortex metadata table inventory changed")
 
 
 def run_recovery(case, extra):
@@ -196,7 +231,12 @@ def run_recovery(case, extra):
 
 
 def prepare_recovery(case, threads):
-    (case / "files.json").write_text(json.dumps(files(case), indent=2) + "\n")
+    manifest = files(case)
+    require(
+        any(name.startswith("data/") and name.endswith("-delete.parquet") for name in manifest),
+        "Lifecycle fixture did not seal its position-delete source",
+    )
+    (case / "files.json").write_text(json.dumps(manifest, indent=2) + "\n")
     (case / "threads.json").write_text(json.dumps(threads, indent=2) + "\n")
 
 
@@ -299,7 +339,10 @@ def main():
     parser.add_argument("--extra", type=int, choices=(0, 1))
     args = parser.parse_args()
     if args.recover:
-        print(json.dumps(recover(args.recover.resolve(), bool(args.extra)), indent=2))
+        recovery_root = args.recover.resolve()
+        result = recover(recovery_root, bool(args.extra))
+        verify_table_inventory(recovery_root)
+        print(json.dumps(result, indent=2))
         return
     require(
         args.driver is not None and args.output_dir is not None and args.cpus is not None,

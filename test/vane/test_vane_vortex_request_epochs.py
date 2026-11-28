@@ -61,7 +61,7 @@ def create_table(connection, root, table, managed=True):
 def bootstrap(root):
     root.mkdir(mode=0o700)
     (root / "indexes").mkdir(mode=0o700)
-    c = BASE.connect(root, create=True)
+    c = BASE.connect(root, root / "extensions", create=True)
     c.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')")
     KEYED.manage(c)
     return c
@@ -92,7 +92,7 @@ def exercise(root, checks):
             "Old current-window retries changed receipts",
         )
         model = sorted([revived[0], replacement[0], *original[2:]], key=lambda r: r["id"])
-        require(BASE.raw(connection) == model, "Current receipt retry reapplied old upserts/deletes")
+        require(KEYED.business_rows(connection) == model, "Current receipt retry reapplied old upserts/deletes")
         WRITE.rejected(lambda: KEYED.mutate(connection, "seed", replacement, epoch=1), "payload mismatch")
         checks.append("current-epoch retries preserve receipts and newer typed versions; mismatched payload fails")
 
@@ -127,7 +127,7 @@ def exercise(root, checks):
             "Retirement crossed a table UUID boundary",
         )
         require(
-            BASE.raw(connection) == model
+            KEYED.business_rows(connection) == model
             and before_indexes
             == query(
                 connection,
@@ -191,7 +191,7 @@ def exercise(root, checks):
         require(advance(connection, 2) == next_window, "Last advance retry changed after a new epoch-3 request")
         WRITE.rejected(lambda: advance(connection, 1), "does not match current epoch")
         WRITE.rejected(lambda: KEYED.mutate(connection, "blocked", WRITE.rows(600, 1), epoch=2), "EXPIRED_REQUEST")
-        require(BASE.raw(connection) == model, "Full-capacity rejection or retirement changed current rows")
+        require(KEYED.business_rows(connection) == model, "Full-capacity rejection or retirement changed current rows")
         checks.append(
             "100,000 catalog receipts retain existing retries; retirement frees slots without changing the limit or other tables"
         )
@@ -262,16 +262,16 @@ def exercise(root, checks):
         finally:
             connection.execute("ROLLBACK")
         require(
-            BASE.raw(connection) == model and status(connection)["request_epoch"] == 3,
+            KEYED.business_rows(connection) == model and status(connection)["request_epoch"] == 3,
             "Invalid lifecycle input changed current state",
         )
         checks.append(
             "zero/negative/overflow/NULL epochs, old SQL arity and outer transactions reject without state changes"
         )
         connection.close()
-        connection = BASE.connect(root)
+        connection = BASE.connect(root, root / "extensions")
         require(
-            BASE.raw(connection) == model and status(connection)["request_epoch"] == 3,
+            KEYED.business_rows(connection) == model and status(connection)["request_epoch"] == 3,
             "Reopen lost epoch or typed versions",
         )
         require(
@@ -283,8 +283,42 @@ def exercise(root, checks):
         checks.append(
             "reopen preserves current receipts, last advance result, table-scoped epochs and stale-request rejection"
         )
+        expected_status = status(connection)
+        connection.execute("DETACH lake")
+        connection.execute(
+            "ATTACH " + quote("ducklake:" + str(root / "metadata.ducklake")) + " AS lake (READ_ONLY)"
+        )
+        require(status(connection) == expected_status, "Read-only attach changed request status")
+        WRITE.rejected(lambda: advance(connection, 3), "writable DuckLake attachment")
+        require(status(connection) == expected_status, "Read-only advance changed the request epoch")
+        checks.append("read-only status preserves the ledger and epoch advance rejects the attachment")
     finally:
         connection.close()
+
+
+def enrollment(root, checks):
+    c = bootstrap(root)
+    previous = "previously_written"
+    empty = "empty_advance"
+    try:
+        create_table(c, root, previous, managed=False)
+        WRITE.batch(c, "initial", WRITE.rows(0, 1), table=previous, epoch=1)
+        c.execute(f"DELETE FROM lake.{previous}")
+        WRITE.rejected(lambda: KEYED.manage(c, previous), "without prior batches")
+        require(advance(c, 1, previous)["expired_requests"] == 1, "First advance did not retire the prior batch")
+        require(advance(c, 2, previous)["expired_requests"] == 0, "Second advance should be empty")
+        require(status(c, previous)["retained_requests"] == 0, "Retirement did not empty the receipt ledger")
+        create_table(c, root, empty, managed=False)
+        require(advance(c, 1, empty)["expired_requests"] == 0, "Empty-only control unexpectedly retired a batch")
+        c.close()
+        c = BASE.connect(root, root / "extensions")
+        WRITE.rejected(lambda: KEYED.manage(c, previous), "without prior batches")
+        KEYED.manage(c, empty)
+        receipt = KEYED.mutate(c, "after-manage", WRITE.rows(0, 1), table=empty, epoch=2)
+        require(receipt["request_epoch"] == 2, "Empty-only control failed to enroll at its current epoch")
+        checks.append("managed enrollment preserves prior-batch history and admits tables with only empty advances")
+    finally:
+        c.close()
 
 
 def legacy(root, checks):
@@ -307,7 +341,7 @@ def legacy(root, checks):
         WRITE.rejected(
             lambda: c.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')"), "fresh write catalog"
         )
-        require(BASE.raw(c) == rows, "Legacy rejection changed managed rows")
+        require(KEYED.business_rows(c) == rows, "Legacy rejection changed managed rows")
         c.execute("DROP TABLE __ducklake_metadata_lake.ducklake_vortex_keyed_tables_v1")
         WRITE.rejected(
             lambda: c.execute("SELECT * FROM ducklake_initialize_vortex_writes('lake')"), "fresh write catalog"
@@ -320,7 +354,7 @@ def legacy(root, checks):
 
 
 def recover(case, committed):
-    c = BASE.connect(case)
+    c = BASE.connect(case, case / "extensions")
     try:
         state = status(c)
         require(
@@ -352,6 +386,7 @@ def native(driver, root, report):
     root.mkdir(mode=0o700)
     modes = (
         "ok",
+        "rebind-before-commit",
         "write-first",
         "advance-first",
         "parallel-advance",
@@ -366,7 +401,9 @@ def native(driver, root, report):
         case = root / mode
         case.mkdir(mode=0o700)
         with (case / "driver.log").open("w") as log:
-            result = subprocess.run([str(driver), str(case), "epoch-" + mode], stdout=log, stderr=subprocess.STDOUT)
+            result = subprocess.run(
+                [str(driver), str(case), "epoch-" + mode], stdout=log, stderr=subprocess.STDOUT, timeout=120
+            )
         require(result.returncode == 0, f"Native epoch case failed: {case / 'driver.log'}")
         report["native_cases"].append(mode)
         print("native", mode, "passed", flush=True)
@@ -407,6 +444,7 @@ def native(driver, root, report):
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                timeout=120,
             )
         require(result.returncode == 0, f"Epoch recovery failed: {case / 'recovery.log'}")
         report["native_cases"].append("SIGKILL-" + stage)
@@ -463,6 +501,7 @@ def main():
         with PIN.pinned_affinity(args.cpus):
             report["applied_affinity"] = sorted(os.sched_getaffinity(0))
             exercise(root / "public", report["checks"])
+            enrollment(root / "enrollment", report["checks"])
             legacy(root / "legacy", report["checks"])
             native(args.driver.resolve(), root / "native", report)
             SCRATCH.assert_released(private)

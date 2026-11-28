@@ -7,6 +7,12 @@ calls, eight excluded warmups and four separate diagnostics pass functional/inpu
 checks. Under the predeclared advancement rule, the full matrix is not started.
 No runtime change or new full-matrix/stability claim follows from this result.
 
+The formal results, hashes and installed-provider qualification below identify
+the November 6, 2026 stack. The current development port verifies inherited
+and restored affinity with the functional smoke and uses the same advancement
+rule for future formal runs.
+[Original experiment at `41516905`](https://github.com/AstroVela/ducklake/blob/4151690528fedc147a8e483476630fa7853d9a0c/docs/native-vortex-source-gc-affinity.md)
+
 This experiment follows the [unrestricted A/A study](native-vortex-source-gc-aa.md).
 That study did not demonstrate stable 2% precision under its declared interval
 and block-median checks. This step tests a fixed process CPU set while keeping
@@ -190,7 +196,7 @@ is qualified, a new runtime A/B must use matched explicit-object link order on
 both sides. R4 still needs real sustained-write backlog/resource
 validation; this focused experiment is not a thirty-minute steady-state test.
 
-## Final local qualification
+## Historical qualification
 
 Nine affinity regressions pass: invalid/unavailable sets, SMT/NUMA constraints,
 formal CPU headroom, actual child inheritance, unchanged thread environment,

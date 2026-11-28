@@ -217,6 +217,75 @@ class Checks:
         return actual
 
 
+def initialize_typed(services, backend, metadata, report):
+    before = BASE.observe(services.dsn, backend.schema, services.root_client, services.bucket)
+    for label, token, code in (("missing", None, "BAD_OWNER"), ("bool", True, "BAD_OWNER"), ("wrong", 2, "FENCED")):
+        try:
+            metadata.initialize(token)
+        except (M.MetadataError, B.ContractError) as error:
+            require(str(error) == code, "Unexpected typed initialization owner error")
+        else:
+            raise AssertionError("Typed initialization accepted " + label + " owner")
+        with backend.connect() as c:
+            require(
+                not c.execute(
+                    "SELECT 1 FROM pg_class WHERE relnamespace=current_schema()::regnamespace "
+                    "AND left(relname,6)='typed_'"
+                ).fetchone(),
+                "Rejected initialization created typed relations",
+            )
+        require(
+            BASE.observe(services.dsn, backend.schema, services.root_client, services.bucket) == before,
+            "Rejected initialization changed publication metadata or objects",
+        )
+        report["checks"].append({"name": "initialize-owner-" + label, "rejected": code})
+    metadata.initialize(1)
+
+
+def read_layout_cases(h):
+    backend = B.Backend(h.s.dsn, "r6_" + uuid.uuid4().hex, h.b.objects)
+    backend.initialize(str(uuid.uuid4()), str(uuid.uuid4()))
+    metadata = M.TypedMetadata(backend)
+    metadata.initialize(1)
+    name, identity = "layout-probe", str(uuid.uuid4())
+    table = metadata.create(name, identity, 2, 1)
+    receipt = metadata.mutate(name, identity, 1, "seed", [row(1)], [], table["schema_hash"], 1)
+    snapshot = receipt["snapshot_id"]
+    require(metadata.read(name, identity), "Layout fixture has no readable row")
+    require(metadata.status(name, identity)["retained_requests"] == 1, "Layout fixture has no receipt")
+
+    # Keep an otherwise readable registry in this private schema to exercise
+    # the API checks even when the database's layout constraint is absent.
+    with backend.transaction(1) as (c, _):
+        c.execute("ALTER TABLE typed_catalog DROP CONSTRAINT typed_catalog_layout_check")
+    for label, change, layout in (
+        ("unsupported", "UPDATE typed_catalog SET layout=2 WHERE singleton", 2),
+        ("missing", "DELETE FROM typed_catalog WHERE singleton", None),
+    ):
+        with backend.transaction(1) as (c, _):
+            require(c.execute(change).rowcount == 1, "Layout fixture did not change its singleton")
+        before = O.observe(backend)
+        require(
+            (before["state"]["layout"] if before["state"] else None) == layout,
+            "Layout fixture has an unexpected marker",
+        )
+        for operation, method, args in (
+            ("read", metadata.read, (name, identity)),
+            ("status", metadata.status, (name, identity)),
+            ("read-at", metadata.read_at, (identity, snapshot)),
+        ):
+            check = operation + "-typed-layout-" + label
+            try:
+                method(*args)
+            except M.MetadataError as error:
+                require(str(error) == "UNSUPPORTED_TYPED_LAYOUT", "Unexpected error for " + check)
+            else:
+                raise AssertionError("Expected rejection: " + check)
+            require(O.observe(backend) == before, "Rejected read changed the typed registry")
+            h.report["checks"].append({"name": check, "rejected": "UNSUPPORTED_TYPED_LAYOUT"})
+    h.check()
+
+
 def typed_cases(h, report):
     a, neighbor = h.create("items", ids=(3, 11, 24, 37, 48, 59, 70, 81)), h.create("neighbor")
     initial = [
@@ -382,6 +451,64 @@ def typed_cases(h, report):
         ):
             h.call("direct-SQL-type-constraint", c.execute, statement, rejected=psycopg.errors.CheckViolation)
     return a, neighbor
+
+
+def float32_integer_cases(h):
+    name = "float32-integers"
+    identity = h.create(name)
+    midpoint = 2**54 + 2**30
+    above = midpoint + 1
+    overflow_midpoint = 2**128 - 2**103
+    probe = row(
+        1, [above, -above], f32=above, numbers=[None, -above, midpoint, midpoint + 2**31, overflow_midpoint - 1]
+    )
+    receipt = h.mutate(name, "single-rounding", [probe])
+    words = {
+        "embedding": ["5a800001", "da800001"],
+        "f32": "5a800001",
+        "numbers": [None, "da800001", "5a800000", "5a800002", "7f7fffff"],
+    }
+    stored = next(r for r in h.image["rows"] if r["table_uuid"] == identity)
+    (binary,) = h.read(name)
+    require(
+        all(stored[k] == O.raw(binary)[k] == expected for k, expected in words.items()),
+        "Float32 integer rounding differs from fixed storage and API words",
+    )
+    schema = h.model.tables[identity]["schema_hash"]
+    for field, other in (
+        ("embedding", [midpoint, -above]),
+        ("f32", midpoint),
+        ("numbers", [None, -midpoint, midpoint, midpoint + 2**31, overflow_midpoint - 1]),
+    ):
+        h.call(
+            "single-rounding-retry-" + field,
+            h.m.mutate,
+            name,
+            identity,
+            1,
+            "single-rounding",
+            [dict(probe, **{field: other})],
+            [],
+            schema,
+            h.token(),
+            rejected="PAYLOAD_MISMATCH",
+        )
+    for value in (overflow_midpoint, -overflow_midpoint, 2**128):
+        h.call(
+            "float32-integer-overflow",
+            h.m.mutate,
+            name,
+            identity,
+            1,
+            "overflow",
+            [dict(probe, f32=value)],
+            [],
+            schema,
+            h.token(),
+            rejected="FLOAT_RANGE",
+        )
+    equivalent = dict(probe, f32=float(2**54 + 2**31))
+    require(h.mutate(name, "single-rounding", [equivalent]) == receipt, "Equivalent Float32 retry changed the receipt")
 
 
 def epoch_cases(h):
@@ -568,7 +695,8 @@ def retirement_cases(h):
         result = h.retire("same-name")
         require(h.retire("same-name") == result, "Retirement replay changed the snapshot")
         h.read("same-name", identity, snapshot)
-        new = h.create("same-name", ids=(5, 17, 29, 41, 53, 67, 79, 97))
+        new_fields = (5, 17, 29, 41, 53, 67, 79, 97)
+        new = h.create("same-name", ids=new_fields)
         h.mutate("same-name", "same-request", [row(3, payload="new-UUID")])
         h.call(
             "new-UUID-rejects-old-field-binding",
@@ -608,6 +736,37 @@ def retirement_cases(h):
         )
         h.read("same-name", identity, snapshot)
         require(new != identity, "Recreated table reused UUID")
+
+        new_snapshot = h.model.snapshot
+        retirement = h.retire("same-name")
+        retired_state = h.image
+        h.call(
+            "stale-retire-after-successor-retirement",
+            h.m.retire,
+            "same-name",
+            identity,
+            h.token(),
+            rejected="UNKNOWN_RETIREMENT_UUID",
+        )
+        require(
+            h.retire("same-name") == retirement and h.image == retired_state, "Latest retirement replay changed state"
+        )
+
+        same_layout = h.create("same-name", ids=new_fields)
+        schema = h.model.tables[new]["schema_hash"]
+        require(
+            same_layout != new and h.model.tables[same_layout]["schema_hash"] == schema,
+            "Same-layout recreation did not preserve the schema under a distinct UUID",
+        )
+        for label, method, args in (
+            ("write", h.m.mutate, (1, "same-request", [row(3, payload="new-UUID")], [], schema)),
+            ("advance", h.m.advance, (1,)),
+            ("retire", h.m.retire, ()),
+        ):
+            h.call("same-layout-stale-" + label, method, "same-name", new, *args, h.token(), rejected="STALE_TABLE")
+        h.mutate("same-name", "same-request", [row(4, payload="same-layout")])
+        h.read("same-name")
+        h.read("same-name", new, new_snapshot)
     finally:
         reader.close()
 
@@ -749,6 +908,102 @@ def quota(h, report):
         "retry_at_full": True,
         "advance_and_retire_release": True,
     }
+
+
+def owner_write_cases(h, old):
+    name = "items"
+    identity = h.ids[name]
+    table = h.model.tables[identity]
+    epoch = table["request_epoch"]
+    for operation, method, args in (
+        ("create", h.m.create, ("owner-probe", str(uuid.uuid4()), 2)),
+        ("mutate", h.m.mutate, (name, identity, epoch, "owner-probe", [row(88)], [], table["schema_hash"])),
+        ("advance", h.m.advance, (name, identity, epoch)),
+        ("retire", h.m.retire, (name, identity)),
+    ):
+        for label, token, code in (
+            ("missing", None, "BAD_OWNER"),
+            ("bool", True, "BAD_OWNER"),
+            ("zero", 0, "BAD_OWNER"),
+            ("float", float(h.token()), "BAD_OWNER"),
+            ("stale", old, "FENCED"),
+        ):
+            h.call(operation + "-owner-" + label, method, *args, token, rejected=code)
+
+
+def row_vector_capacity(h, report):
+    report["row_vector_capacity"] = {}
+    for kind, dimension, maximum in (("rows", 1, 100000), ("vectors", 4096, 4096)):
+        backend = B.Backend(h.s.dsn, "r6_" + uuid.uuid4().hex, h.b.objects)
+        backend.initialize(str(uuid.uuid4()), str(uuid.uuid4()))
+        metadata = M.TypedMetadata(backend)
+        owner = 1
+        metadata.initialize(owner)
+        identity = str(uuid.uuid4())
+        table = metadata.create(kind, identity, dimension, owner)
+        seeded = maximum - 1
+        # Seed legal historical rows in a separate schema, then cross the
+        # exact limit with normal API requests and inspect all five tables.
+        with backend.transaction(owner) as (c, _):
+            c.execute(
+                """INSERT INTO typed_rows(table_uuid,id,physical_row_id,dimension,begin_snapshot,embedding)
+                SELECT %s,n,n,%s,2,array_fill(0::real,ARRAY[%s]) FROM generate_series(1,%s) AS ids(n)""",
+                (uuid.UUID(identity), dimension, dimension, seeded),
+            )
+            c.execute("UPDATE typed_catalog SET snapshot=2,next_row_id=%s WHERE singleton", (seeded + 1,))
+
+        def mutate(request, rows, deletes=()):
+            return metadata.mutate(kind, identity, 1, request, rows, deletes, table["schema_hash"], owner)
+
+        vector = [0.0] * dimension
+        initial = O.observe_capacity(backend)
+        require(
+            initial["rows"]["active"] == seeded and initial["rows"]["vector_bytes"] == seeded * dimension * 4,
+            "Capacity fixture did not start one row below the limit",
+        )
+        mutate("exact-limit", [row(maximum, vector)])
+        full = O.observe_capacity(backend)
+        require(
+            full["rows"]["active"] == maximum and full["rows"]["vector_bytes"] == maximum * dimension * 4,
+            "Exact active-row/vector limit did not commit",
+        )
+        oversized = [row(1, vector, payload="replace"), row(maximum + 1, vector)]
+        try:
+            mutate("one-over", oversized)
+        except M.MetadataError as error:
+            require(str(error) == "ROW_VECTOR_BUDGET", "Wrong rejection at active-row/vector limit")
+        else:
+            raise AssertionError("Capacity limit allowed an extra row")
+        require(O.observe_capacity(backend) == full, "Capacity rejection changed committed typed state")
+        mutate("free-one", [], [2])
+        require(O.observe_capacity(backend)["rows"]["active"] == seeded, "Delete did not free active capacity")
+        receipt = mutate("one-over", oversized)
+        recovered = O.observe_capacity(backend)
+        require(
+            recovered["rows"]["active"] == maximum
+            and recovered["rows"]["vector_bytes"] == full["rows"]["vector_bytes"]
+            and recovered["state"]["snapshot"] == full["state"]["snapshot"] + 2
+            and recovered["state"]["next_row_id"] == full["state"]["next_row_id"] + 2
+            and recovered["rows"]["versions"] == full["rows"]["versions"] + 2
+            and len(recovered["receipts"]) == len(full["receipts"]) + 2
+            and receipt["snapshot_id"] == recovered["state"]["snapshot"],
+            "Capacity recovery left rows, snapshots, allocation or receipts from the rejected request",
+        )
+        report["checks"].extend(
+            [
+                {"name": kind + "-exact-limit", "state_sha256": B.sha(BASE.encode(full).encode())},
+                {"name": kind + "-above-limit", "rejected": "ROW_VECTOR_BUDGET"},
+                {"name": kind + "-after-delete", "state_sha256": B.sha(BASE.encode(recovered).encode())},
+            ]
+        )
+        report["row_vector_capacity"][kind] = {
+            "seeded_active_rows": seeded,
+            "accepted_active_rows": maximum,
+            "accepted_vector_bytes": maximum * dimension * 4,
+            "rejected_state_unchanged": True,
+            "admitted_after_delete": True,
+        }
+    h.check()
 
 
 def kill_worker(h, report, root):
@@ -899,9 +1154,11 @@ def main():
             backend.publish("anchor", 1)
             backend.capture("anchor-reader")
             metadata = M.TypedMetadata(backend)
-            metadata.initialize(1)
+            initialize_typed(services, backend, metadata, report)
             h = Checks(services, backend, metadata, report)
+            read_layout_cases(h)
             typed_cases(h, report)
+            float32_integer_cases(h)
             epoch_cases(h)
             commit_faults(h, report)
             rollback_cases(h)
@@ -922,20 +1179,11 @@ def main():
             h.b.takeover(old)
             h.original["control"][0]["owner"] = old + 1
             h.check()
-            identity = h.ids["items"]
-            h.call(
-                "stale-owner-fenced",
-                h.m.advance,
-                "items",
-                identity,
-                h.model.tables[identity]["request_epoch"],
-                old,
-                rejected="FENCED",
-            )
+            owner_write_cases(h, old)
             h.mutate("items", "after-restart-owner", [row(99)])
             h.read("items")
             require(h.b.materialize("anchor-reader"), "Original pinned object bytes disappeared")
-            h.check()
+            row_vector_capacity(h, report)
             report["final_state"] = h.image
             report["original_publication_sha256"] = B.sha(BASE.encode(h.original).encode())
         require(threads == {n: os.environ.get(n) for n in THREADS}, "Thread environment changed")

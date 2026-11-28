@@ -1,6 +1,9 @@
 #pragma once
 
 #include "native_vortex_fixture.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_vortex_index_catalog.hpp"
 #include "storage/ducklake_vortex_optimizer.hpp"
 #include "storage/ducklake_vortex_search.hpp"
@@ -15,10 +18,11 @@ struct KeyedFixture {
 	DuckDB &database;
 	Connection &setup;
 	string root;
+	const string table_uuid;
 	DuckLakeVortexIndex index;
 	Value rows, deletes;
 	KeyedFixture(DuckDB &db, Connection &connection, const string &path)
-	    : database(db), setup(connection), root(path),
+	    : database(db), setup(connection), root(path), table_uuid(TableUUID(setup)),
 	      rows(SQL(setup, "SELECT [{'id':0::BIGINT,'embedding':[0.125,0]::FLOAT[],'category':'A'::VARCHAR,"
 	                      "'payload':'更新'::VARCHAR},{'id':10000::BIGINT,'embedding':[0.25,0]::FLOAT[],"
 	                      "'category':NULL::VARCHAR,'payload':NULL::VARCHAR}]")
@@ -27,7 +31,7 @@ struct KeyedFixture {
 	}
 	void Manage() {
 		Connection owner(database);
-		DuckLakeVortexWriteBatch::Manage(owner, "lake", "main", "items", "knn");
+		DuckLakeVortexWriteBatch::Manage(owner, *setup.context, "lake", "main", "items", "knn");
 	}
 	void Seed() {
 		Manage();
@@ -36,8 +40,8 @@ struct KeyedFixture {
 		                       "'category':'A'::VARCHAR,'payload':'seed-'||i}) FROM range(256)t(i)")
 		                ->GetValue(0, 0);
 		Connection owner(database);
-		DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "seed", seed,
-		                                 Value::LIST(LogicalType::BIGINT, {}), 1, TableUUID(owner));
+		DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "seed", seed,
+		                                 Value::LIST(LogicalType::BIGINT, {}), 1, table_uuid);
 		SQL(setup, "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");
 		index = DuckLakeVortexIndex::BuildAndPublish(*setup.context, "lake", "main", "items", "knn",
 		                                             root + "/indexes/seed.json", 2, 1, nullptr, "", {},
@@ -55,8 +59,15 @@ struct KeyedFixture {
 		}
 	}
 	DuckLakeVortexWriteResult Mutate(Connection &owner, const std::function<void(const string &)> &observe = {}) {
-		return DuckLakeVortexWriteBatch::Mutate(owner, "lake", "main", "items", "knn", "change", rows, deletes, 1,
-		                                        TableUUID(owner), observe);
+		return DuckLakeVortexWriteBatch::Mutate(owner, *setup.context, "lake", "main", "items", "knn", "change", rows,
+		                                        deletes, 1, table_uuid, observe);
+	}
+	DuckLakeVortexWriteResult DeleteMissing(Connection &owner, ClientContext &caller,
+	                                        const std::function<void(const string &)> &observe = {}) {
+		return DuckLakeVortexWriteBatch::Mutate(
+		    owner, caller, "lake", "main", "items", "knn", "absent",
+		    Value::LIST(ListType::GetChildType(DuckLakeVortexWriteBatch::RowsType()), {}),
+		    Value::LIST(LogicalType::BIGINT, {Value::BIGINT(99999)}), 1, table_uuid, observe);
 	}
 	DuckLakeVortexSearchResult Search(Connection &reader, const std::function<void(const string &)> &observe = {}) {
 		DuckLakeVortexViewOptions options {};
@@ -91,8 +102,180 @@ struct KeyedFixture {
 	}
 };
 
+inline void CheckKeyedRebind(KeyedFixture &fixture, bool receipt_only) {
+	fixture.Manage();
+	auto &setup = fixture.setup;
+	auto attach = [&](const string &file, const string &data) {
+		SQL(setup, "DETACH lake; ATTACH " + Value("ducklake:" + fixture.root + "/" + file).ToSQLString() +
+		               " AS lake(DATA_PATH " + Value(fixture.root + "/" + data).ToSQLString() +
+		               ",DATA_INLINING_ROW_LIMIT 1000)");
+	};
+	bool switched = false;
+	auto switch_catalog = [&] {
+		attach("replacement.ducklake", "replacement-data");
+		switched = true;
+	};
+	bool rejected = false;
+	{
+		Connection writer(fixture.database);
+		try {
+			if (receipt_only) {
+				fixture.DeleteMissing(writer, *setup.context, [&](const string &stage) {
+					if (stage == "before_commit") {
+						switch_catalog();
+					}
+				});
+			} else {
+				writer.BeginTransaction();
+				SQL(writer, "INSERT INTO lake.items VALUES(7,[7,0],'A','stale')");
+				switch_catalog();
+				writer.Commit();
+			}
+		} catch (const std::exception &error) {
+			Require(StringUtil::Contains(error.what(), "attachment changed"), error.what());
+			rejected = true;
+		}
+	}
+	Require(switched && rejected, "A stale attachment committed managed rows or a receipt");
+	attach("metadata.ducklake", "data");
+	Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 0,
+	        "Stale ordinary writer changed managed rows");
+	Require(SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_write_requests_v2")
+	                ->GetValue(0, 0)
+	                .GetValue<idx_t>() == 0,
+	        "Stale missing-key delete committed a request receipt");
+}
+
+inline void CheckKeyedImmediateAttachments(KeyedFixture &fixture) {
+	fixture.Manage();
+	auto &setup = fixture.setup;
+	SQL(setup, "ATTACH " + Value("ducklake:" + fixture.root + "/neighbor.ducklake").ToSQLString() +
+	               " AS neighbor(DATA_PATH " + Value(fixture.root + "/neighbor-data").ToSQLString() +
+	               ", DATA_INLINING_ROW_LIMIT 1000)");
+	SQL(setup, "CREATE TABLE neighbor.items(id BIGINT,embedding FLOAT[],category VARCHAR,payload VARCHAR);"
+	           "CALL ducklake_set_option('neighbor','experimental_data_file_format','vortex',table_name=>'items');"
+	           "SELECT * FROM ducklake_initialize_vortex_indexes('neighbor');"
+	           "SELECT * FROM ducklake_initialize_vortex_writes('neighbor')");
+	DuckLakeVortexIndex::Create(*setup.context, "neighbor", "main", "items", "knn", fixture.root + "/indexes", 2);
+	SQL(setup, "SET GLOBAL immediate_transaction_mode=true");
+
+	Connection owner(fixture.database);
+	auto missing = fixture.DeleteMissing(owner, *setup.context);
+	auto retry = fixture.DeleteMissing(owner, *setup.context);
+	Require(missing.row_count == 1 && retry.payload_hash == missing.payload_hash &&
+	            retry.snapshot_id == missing.snapshot_id,
+	        "Missing-key receipt changed with another attached lake");
+
+	auto append = DuckLakeVortexWriteBatch::Append(owner, *setup.context, "neighbor", "main", "items", "knn", "append",
+	                                               fixture.rows, 1, TableUUID(owner, "neighbor"));
+	Require(append.row_count == 2 &&
+	            SQL(setup, "SELECT count(*) FROM neighbor.items")->GetValue(0, 0).GetValue<idx_t>() == 2,
+	        "An unrelated lake blocked append in immediate transaction mode");
+	Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 0,
+	        "Append or missing-key deletion changed the wrong lake");
+	for (auto name : {"lake", "neighbor"}) {
+		Require(SQL(setup,
+		            "SELECT count(*) FROM __ducklake_metadata_" + string(name) + ".ducklake_vortex_write_requests_v2")
+		                ->GetValue(0, 0)
+		                .GetValue<idx_t>() == 1,
+		        "The attached catalogs did not retain their own receipts");
+	}
+}
+
+inline void CheckOrdinaryRetryAttachments(KeyedFixture &fixture, bool rebind) {
+	auto &setup = fixture.setup;
+	auto attach = [&](const string &name, const string &path, const string &data) {
+		return "ATTACH " + Value("ducklake:" + fixture.root + "/" + path).ToSQLString() + " AS " + name +
+		       "(DATA_PATH " + Value(fixture.root + "/" + data).ToSQLString() + ", DATA_INLINING_ROW_LIMIT 1000)";
+	};
+	SQL(setup, "CREATE TABLE lake.destination(id BIGINT); CREATE TABLE lake.advance(id BIGINT)");
+	if (rebind) {
+		SQL(setup, attach("prepared", "replacement.ducklake", "replacement-data") +
+		               "; CREATE TABLE prepared.destination(id BIGINT);"
+		               "INSERT INTO prepared.destination VALUES(17); DETACH prepared");
+	}
+
+	Connection writer(fixture.database);
+	writer.BeginTransaction();
+	SQL(writer, "INSERT INTO lake.destination VALUES(41)");
+	// Start the first commit attempt with an older snapshot than the committed metadata.
+	SQL(setup, "INSERT INTO lake.advance VALUES(1)");
+	auto original = DatabaseManager::Get(*setup.context).GetDatabase("lake");
+	auto &catalog = original->GetCatalog().Cast<DuckLakeCatalog>();
+	idx_t attempts = 0;
+	catalog.SetQueryCallback([&](const string &query, std::chrono::steady_clock::duration) {
+		if (!StringUtil::Contains(query, ".ducklake_snapshot VALUES")) {
+			return;
+		}
+		attempts++;
+		if (rebind && attempts == 1) {
+			SQL(setup, "DETACH lake; " + attach("lake", "replacement.ducklake", "replacement-data"));
+		}
+	});
+	bool rejected = false;
+	try {
+		writer.Commit();
+	} catch (const std::exception &error) {
+		catalog.SetQueryCallback({});
+		Require(rebind && StringUtil::Contains(error.what(), "attachment changed before commit retry"), error.what());
+		rejected = true;
+	}
+	catalog.SetQueryCallback({});
+	if (!rebind) {
+		Require(!rejected && attempts == 2 &&
+		            SQL(setup, "SELECT id FROM lake.destination")->GetValue(0, 0).GetValue<int64_t>() == 41,
+		        "Ordinary native commit did not retry on unchanged attachments");
+		return;
+	}
+	auto replacement = SQL(setup, "SELECT count(*),min(id) FROM lake.destination");
+	Require(rejected && attempts == 1 && replacement->GetValue(0, 0).GetValue<idx_t>() == 1 &&
+	            replacement->GetValue(1, 0).GetValue<int64_t>() == 17,
+	        "Native commit retry affected the replacement attachment");
+	original.reset();
+	SQL(setup, "DETACH lake; " + attach("lake", "metadata.ducklake", "data"));
+	Require(SQL(setup, "SELECT count(*) FROM lake.destination")->GetValue(0, 0).GetValue<idx_t>() == 0,
+	        "Failed retry changed the original lake");
+}
+
 inline void RunKeyedFixture(DuckDB &database, Connection &setup, const string &root, const string &mode) {
 	KeyedFixture f(database, setup, root);
+	if (mode == "keyed-retry-ordinary" || mode == "keyed-retry-rebind") {
+		CheckOrdinaryRetryAttachments(f, mode == "keyed-retry-rebind");
+		return;
+	}
+	if (mode == "keyed-immediate-attachments") {
+		CheckKeyedImmediateAttachments(f);
+		return;
+	}
+	if (mode == "keyed-rebind-ordinary" || mode == "keyed-rebind-noop") {
+		CheckKeyedRebind(f, mode == "keyed-rebind-noop");
+		return;
+	}
+	if (mode == "keyed-enroll-with-segment") {
+		DuckLakeVortexIndex::Create(*setup.context, "lake", "main", "items", "empty", root + "/indexes", 2);
+		SQL(setup, "INSERT INTO lake.items SELECT i,[i::FLOAT,0],'A','seed' FROM range(256)t(i);"
+		           "CALL ducklake_flush_inlined_data('lake',table_name=>'items')");
+		auto indexed = DuckLakeVortexIndex::BuildAndPublish(*setup.context, "lake", "main", "items", "knn",
+		                                                    root + "/indexes/primary.json", 2, 1, nullptr, "", {},
+		                                                    DuckLakeVortexIndexOperation::APPEND);
+		Require(indexed.segments.size() == 1, "Fixture did not publish B in the original index");
+		SQL(setup, "DELETE FROM lake.items WHERE id>=0");
+		Require(SQL(setup, "SELECT count(*) FROM lake.items")->GetValue(0, 0).GetValue<idx_t>() == 0,
+		        "Fixture still has live rows");
+		Connection enrollment(database);
+		bool rejected = false;
+		try {
+			DuckLakeVortexWriteBatch::Manage(enrollment, *setup.context, "lake", "main", "items", "empty");
+		} catch (const InvalidInputException &error) {
+			Require(StringUtil::Contains(error.what(), "without prior batches or B segments"), error.what());
+			rejected = true;
+		}
+		Require(rejected && SQL(setup, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_vortex_keyed_tables_v1")
+		                            ->GetValue(0, 0)
+		                            .GetValue<idx_t>() == 0,
+		        "Enrollment ignored another index's B segment");
+		return;
+	}
 	if (mode == "keyed-preexisting") {
 		Connection stale(database);
 		stale.BeginTransaction();

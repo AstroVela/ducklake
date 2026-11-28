@@ -73,6 +73,33 @@ SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','
 ----
 cannot be NULL
 
+statement ok
+BEGIN
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,1,1)
+----
+compaction policy controls require autocommit
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,1,1)
+----
+compaction policy controls require autocommit
+
+statement ok
+ROLLBACK
+
+query II
+SELECT enabled,compaction_enabled FROM ducklake_vortex_optimizer_status('lake')
+----
+false	false
+
 query T
 SELECT state FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,128,50)
 ----
@@ -82,6 +109,17 @@ query IIII
 SELECT enabled,compaction_enabled,min_deleted_rows,min_deleted_percent FROM ducklake_vortex_optimizer_status('lake')
 ----
 false	true	128	50
+
+statement ok
+BEGIN TRANSACTION READ ONLY
+
+statement error
+SELECT * FROM ducklake_resume_vortex_optimizer('lake','main','items','knn')
+----
+optimizer resume controls require autocommit
+
+statement ok
+ROLLBACK
 
 statement ok
 DELETE FROM lake.items WHERE id<128
@@ -109,6 +147,22 @@ Unsupported optimizer policy version
 
 statement ok
 UPDATE __ducklake_metadata_lake.ducklake_vortex_optimizer_v2 SET config=replace(config,'"format_version":1','"format_version":2')
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/vortex_background_rewrite.ducklake' AS lake (READ_ONLY)
+
+statement error
+SELECT * FROM ducklake_set_vortex_data_compaction_policy('lake','main','items','knn',true,1,1)
+----
+compaction policy controls require a writable DuckLake attachment
+
+statement error
+SELECT * FROM ducklake_resume_vortex_optimizer('lake','main','items','knn')
+----
+optimizer resume controls require a writable DuckLake attachment
 
 statement ok
 DETACH lake
