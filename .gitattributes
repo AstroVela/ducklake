@@ -1,2 +1,4 @@
 # Preserve the exact whitespace in fixed upstream patch context.
 test/vane/spfresh_update/native-update.patch -whitespace
+test/vane/spfresh_update/native-lire.patch -whitespace
+test/vane/spfresh_update/native-merge-control.patch -whitespace

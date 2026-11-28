@@ -35,6 +35,9 @@ def main():
     parser.add_argument("--dependency-prefix", type=Path, required=True)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--cpus", required=True)
+    parser.add_argument(
+        "--merge-control", action="store_true", help="Build the native-only pre-fix merge counterexample"
+    )
     args = parser.parse_args()
     for path, revision in ((args.spfresh_source, SPFRESH), (args.vortex_source, VORTEX)):
         check(git(path, "rev-parse", "HEAD").decode().strip() == revision, "Unexpected upstream revision")
@@ -50,10 +53,13 @@ def main():
     check(len(archive) <= 64 * 1024 * 1024, "Upstream source archive budget")
     with tarfile.open(fileobj=io.BytesIO(archive)) as stream:
         stream.extractall(source, filter="data")
-    patches = (
+    patches = [
         args.vortex_source / "vortex-index-spfresh/native/static-only.patch",
         HERE / "spfresh_update/native-update.patch",
-    )
+        HERE / "spfresh_update/native-lire.patch",
+    ]
+    if args.merge_control:
+        patches.append(HERE / "spfresh_update/native-merge-control.patch")
     for patch in patches:
         subprocess.run(["git", "apply", str(patch.resolve())], cwd=source, check=True)
     inputs = {
@@ -62,6 +68,7 @@ def main():
             Path(__file__).resolve(),
             HERE / "spfresh_update/probe.cpp",
             HERE / "spfresh_update/CMakeLists.txt",
+            HERE / "spfresh_update/lire_control.h",
             *patches,
         )
     }
@@ -91,6 +98,7 @@ def main():
     report = {
         "schema": 1,
         "status": "built",
+        "profile": "lire-merge-control" if args.merge_control else "lire-fixed",
         "spfresh_revision": SPFRESH,
         "vortex_revision": VORTEX,
         "input_sha256": inputs,
