@@ -37,6 +37,8 @@ Schema hash 包含 field ID、ordinal、名称、逻辑类型、可空性和向�
 
 初始化、创建、写入、推进和退休均要求正整数 owner 令牌。令牌有效后，写操作复用 #92 的 `control … FOR UPDATE`，在同一事务内检查 owner fence、store binding 及操作涉及的 UUID、窗口和 schema hash。写批次把旧行版本关闭、新 typed 行、物理 row ID、快照分配和请求回执一起提交。没有实际数据效果的 delete 仍记录操作数与回执，并沿用现有 snapshot。
 
+当前行读取、状态查询和历史读取均在现有 broker 事务内检查 typed catalog 的布局记录。记录缺失或版本不受支持时返回 `UNSUPPORTED_TYPED_LAYOUT`。
+
 请求身份为 `(table_uuid, request_epoch, request_id)`。当前窗口的相同 typed 内容返回原回执，改变内容失败；重试不复活已经被后续操作删除的行。推进只清除目标 UUID 的当前窗口回执并原子保存下一窗口和最近一次推进结果，不改业务行、物理版本或其他 UUID。最近一次推进重试返回原结果，保留新窗口已提交回执；更早的推进重试失败。旧 epoch，包括从未提交过的 ID，均拒绝；future／零／非整数／越界 epoch 也拒绝。最大 uint64 不回绕。
 
 退休在一个事务内结束目标 UUID 的活跃行版本，释放其 managed 标记、epoch、最近推进状态和回执。表、字段和行的历史继续服务确切 snapshot 读取。退休回放按名称查找最后一个登记的实例，只有该 UUID 已退休时才返回原退休快照。同名新实例从 epoch 1 可使用同一 request ID，即使字段布局相同也使用新 UUID。真实旧 PostgreSQL REPEATABLE READ 事务仍能读其原 tuple snapshot，显式 `read_at(old_uuid,snapshot)` 继续读取保留历史。
@@ -72,7 +74,7 @@ Schema hash 包含 field ID、ordinal、名称、逻辑类型、可空性和向�
 
 依赖继续使用 [#92 requirements](../test/vane/requirements-remote-backend.txt)、PostgreSQL 15.13 与固定 MinIO SHA；对象 fixture 显式使用新的 `/dev/shm` 目录，结束后只删除自己创建的目录。[CI](../.github/workflows/VortexRemoteBackend.yml)在模型／backend conformance 后增加 typed 检查并留存证据，不运行稳定负载测试。Hosted runner 选择其可用 CPU，实际版本与 affinity 以报告为准。
 
-当前开发基线上的 PostgreSQL 专项通过 **169 项检查，其中 85 项预期拒绝，9 组故障或并发观测**。Writer、PostgreSQL 和 MinIO 实际退出码均为 `-9`。报告记录执行源码摘要、物理 PG 类型、容量、协议帧和最终状态。
+当前开发基线上的 PostgreSQL 专项通过 **175 项检查，其中 91 项预期拒绝，9 组故障或并发观测**。布局回归覆盖三种读取入口和两种异常布局记录，并核对拒绝前后的五张 typed 表。Writer、PostgreSQL 和 MinIO 实际退出码均为 `-9`。报告记录执行源码摘要、物理 PG 类型、容量、协议帧和最终状态。
 
 同期 #92 后端通过 485 项接口检查、9 项能力检查和 7 组故障或并发观测。#91 模型通过 40 个场景、21 个负对照和 1,342 个有界状态。
 

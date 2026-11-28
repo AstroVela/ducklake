@@ -250,6 +250,7 @@ class TypedMetadata:
 
     def status(self, name, table_uuid):
         with self.backend.transaction() as (c, _):
+            self.catalog(c)
             table = self.target(c, name, table_uuid)
             count = c.execute(
                 "SELECT count(*) AS n FROM typed_receipts WHERE table_uuid=%s", (table["table_uuid"],)
@@ -413,6 +414,7 @@ class TypedMetadata:
 
     def read(self, name, table_uuid):
         with self.backend.transaction() as (c, _):
+            self.catalog(c)
             table = self.target(c, name, table_uuid)
             return self._rows(c, table["table_uuid"], None)
 

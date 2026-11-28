@@ -242,6 +242,50 @@ def initialize_typed(services, backend, metadata, report):
     metadata.initialize(1)
 
 
+def read_layout_cases(h):
+    backend = B.Backend(h.s.dsn, "r6_" + uuid.uuid4().hex, h.b.objects)
+    backend.initialize(str(uuid.uuid4()), str(uuid.uuid4()))
+    metadata = M.TypedMetadata(backend)
+    metadata.initialize(1)
+    name, identity = "layout-probe", str(uuid.uuid4())
+    table = metadata.create(name, identity, 2, 1)
+    receipt = metadata.mutate(name, identity, 1, "seed", [row(1)], [], table["schema_hash"], 1)
+    snapshot = receipt["snapshot_id"]
+    require(metadata.read(name, identity), "Layout fixture has no readable row")
+    require(metadata.status(name, identity)["retained_requests"] == 1, "Layout fixture has no receipt")
+
+    # Keep an otherwise readable registry in this private schema to exercise
+    # the API checks even when the database's layout constraint is absent.
+    with backend.transaction(1) as (c, _):
+        c.execute("ALTER TABLE typed_catalog DROP CONSTRAINT typed_catalog_layout_check")
+    for label, change, layout in (
+        ("unsupported", "UPDATE typed_catalog SET layout=2 WHERE singleton", 2),
+        ("missing", "DELETE FROM typed_catalog WHERE singleton", None),
+    ):
+        with backend.transaction(1) as (c, _):
+            require(c.execute(change).rowcount == 1, "Layout fixture did not change its singleton")
+        before = O.observe(backend)
+        require(
+            (before["state"]["layout"] if before["state"] else None) == layout,
+            "Layout fixture has an unexpected marker",
+        )
+        for operation, method, args in (
+            ("read", metadata.read, (name, identity)),
+            ("status", metadata.status, (name, identity)),
+            ("read-at", metadata.read_at, (identity, snapshot)),
+        ):
+            check = operation + "-typed-layout-" + label
+            try:
+                method(*args)
+            except M.MetadataError as error:
+                require(str(error) == "UNSUPPORTED_TYPED_LAYOUT", "Unexpected error for " + check)
+            else:
+                raise AssertionError("Expected rejection: " + check)
+            require(O.observe(backend) == before, "Rejected read changed the typed registry")
+            h.report["checks"].append({"name": check, "rejected": "UNSUPPORTED_TYPED_LAYOUT"})
+    h.check()
+
+
 def typed_cases(h, report):
     a, neighbor = h.create("items", ids=(3, 11, 24, 37, 48, 59, 70, 81)), h.create("neighbor")
     initial = [
@@ -1112,6 +1156,7 @@ def main():
             metadata = M.TypedMetadata(backend)
             initialize_typed(services, backend, metadata, report)
             h = Checks(services, backend, metadata, report)
+            read_layout_cases(h)
             typed_cases(h, report)
             float32_integer_cases(h)
             epoch_cases(h)
